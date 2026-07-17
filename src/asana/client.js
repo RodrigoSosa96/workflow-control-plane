@@ -13,10 +13,11 @@ const STORY_FIELDS = "gid,type,resource_subtype,text,html_text,created_at,create
 const ATTACHMENT_FIELDS = "gid,name,resource_subtype,host,created_at,download_url,permanent_url,view_url,parent.gid";
 
 export class AsanaApiError extends Error {
-  constructor(message, { status } = {}) {
+  constructor(message, { status, kind = "api" } = {}) {
     super(message);
     this.name = "AsanaApiError";
     this.status = status;
+    this.kind = kind;
   }
 }
 
@@ -46,7 +47,7 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
     const retry = response.status === 429 && response.headers.get("retry-after")
       ? `; retry after ${response.headers.get("retry-after")} seconds`
       : "";
-    return new AsanaApiError(`Asana API ${response.status}: ${detail}${retry}`, { status: response.status });
+    return new AsanaApiError(`Asana API ${response.status}: ${detail}${retry}`, { status: response.status, kind: "api" });
   }
 
   async function request(path, query = {}) {
@@ -95,26 +96,28 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
     attachment: async (gid) => (await request(`attachments/${gid}`, { opt_fields: ATTACHMENT_FIELDS })).data,
     async downloadAttachment(gid) {
       const attachment = await client.attachment(gid);
-      if (attachment.host !== "asana") throw new AsanaApiError(`Attachment ${gid} is not Asana-hosted and cannot be downloaded by this CLI.`);
+      const attachmentError = (message, status) => new AsanaApiError(message, { status, kind: "attachment" });
+      if (attachment.host !== "asana") throw attachmentError(`Attachment ${gid} is not Asana-hosted and cannot be downloaded by this CLI.`);
       let downloadUrl;
-      try { downloadUrl = new URL(attachment.download_url); } catch { throw new AsanaApiError(`Attachment ${gid} does not expose a valid HTTPS download URL.`); }
-      if (downloadUrl.protocol !== "https:") throw new AsanaApiError(`Attachment ${gid} does not expose a valid HTTPS download URL.`);
+      try { downloadUrl = new URL(attachment.download_url); } catch { throw attachmentError(`Attachment ${gid} does not expose a valid HTTPS download URL.`); }
+      if (downloadUrl.protocol !== "https:") throw attachmentError(`Attachment ${gid} does not expose a valid HTTPS download URL.`);
       for (let redirects = 0; redirects <= 5; redirects += 1) {
         let response;
         try { response = await fetchImpl(downloadUrl, { headers: {}, redirect: "manual" }); }
-        catch (error) { throw new AsanaApiError(`Attachment download network failure: ${redact(error?.message || error).slice(0, 400)}`); }
-        if (response.status >= 300 && response.status < 400) {
+        catch (error) { throw attachmentError(`Attachment download network failure: ${redact(error?.message || error).slice(0, 400)}`); }
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
           const location = response.headers.get("location");
+          if (!location) throw attachmentError(`Attachment ${gid} returned a redirect without a Location header.`, response.status);
           let redirected;
-          try { redirected = new URL(location, downloadUrl); } catch { throw new AsanaApiError(`Attachment ${gid} returned an invalid redirect.`); }
-          if (redirected.protocol !== "https:") throw new AsanaApiError(`Attachment ${gid} did not return a valid HTTPS redirect.`);
+          try { redirected = new URL(location, downloadUrl); } catch { throw attachmentError(`Attachment ${gid} returned an invalid redirect.`, response.status); }
+          if (redirected.protocol !== "https:") throw attachmentError(`Attachment ${gid} did not return a valid HTTPS redirect.`, response.status);
           downloadUrl = redirected;
           continue;
         }
-        if (!response.ok) throw new AsanaApiError(`Attachment download failed with status ${response.status}.`, { status: response.status });
+        if (!response.ok) throw attachmentError(`Attachment download failed with status ${response.status}.`, response.status);
         let bytes;
         try { bytes = new Uint8Array(await response.arrayBuffer()); }
-        catch (error) { throw new AsanaApiError(`Attachment download network failure while reading response: ${redact(error?.message || error).slice(0, 400)}`); }
+        catch (error) { throw attachmentError(`Attachment download network failure while reading response: ${redact(error?.message || error).slice(0, 400)}`); }
         return {
           gid: attachment.gid,
           name: attachment.name || `${gid}.bin`,
@@ -122,7 +125,7 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
           bytes,
         };
       }
-      throw new AsanaApiError(`Attachment ${gid} exceeded 5 HTTPS redirects.`);
+      throw attachmentError(`Attachment ${gid} exceeded 5 HTTPS redirects.`);
     },
   };
   return client;

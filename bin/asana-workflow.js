@@ -182,10 +182,11 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (phase === "parse") { category = "USAGE"; exitCode = 64; }
     else if (error?.name === "AuthError") { category = "AUTH"; exitCode = 2; }
     else if (error?.name === "ConfigError") { category = "CONFIG"; exitCode = 3; }
-    else if (error?.name === "AsanaApiError" && [401, 403].includes(error.status)) { category = "AUTH"; exitCode = 2; }
+    else if (error?.name === "AsanaApiError" && error.kind === "api" && [401, 403].includes(error.status)) { category = "AUTH"; exitCode = 2; }
     else if (error?.name === "AsanaApiError" && error.status === 429) { category = "RATE_LIMIT"; exitCode = 4; }
     else if (error?.name === "AsanaApiError" && error.status === 404) { category = "NOT_FOUND"; exitCode = 7; }
     else if (error?.name === "AsanaApiError" && /network failure/i.test(message)) { category = "NETWORK"; exitCode = 5; }
+    else if (error?.name === "AsanaApiError" && error.kind === "attachment") { category = "ATTACHMENT"; exitCode = 9; }
     else if (error?.name === "AsanaApiError") { category = "API"; exitCode = 6; }
     else if (error?.name === "CommandError") { category = "COMMAND"; exitCode = 8; }
     err(`${category}: ${message.replace(/[\r\n]+/g, "\n").slice(0, 1200)}`);

@@ -128,6 +128,22 @@ test("rejects attachment redirects that leave HTTPS before following them", asyn
   assert.equal(downloadCalls, 1);
 });
 
+test("rejects redirect responses without Location", async () => {
+  const client = createAsanaClient({ token: "x", fetchImpl: async (url) => {
+    if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", host: "asana", download_url: "https://download.test/a1" } });
+    return new Response(null, { status: 302 });
+  } });
+  await assert.rejects(client.downloadAttachment("a1"), /redirect without a Location/);
+});
+
+test("does not treat non-redirect 3xx statuses as redirects", async () => {
+  const client = createAsanaClient({ token: "x", fetchImpl: async (url) => {
+    if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", host: "asana", download_url: "https://download.test/a1" } });
+    return new Response(null, { status: 304, headers: { location: "https://download.test/other" } });
+  } });
+  await assert.rejects(client.downloadAttachment("a1"), (error) => error.status === 304 && error.kind === "attachment");
+});
+
 test("categorizes attachment transport failures as network errors", async () => {
   const client = createAsanaClient({ token: "x", fetchImpl: async (url) => {
     if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", host: "asana", download_url: "https://download.test/a1" } });

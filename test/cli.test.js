@@ -99,13 +99,24 @@ test("main exposes stable usage and authentication error categories", async () =
 
 test("main categorizes API authentication failures", async () => {
   const output = io();
-  const unauthorized = Object.assign(new Error("unauthorized"), { name: "AsanaApiError", status: 401 });
+  const unauthorized = Object.assign(new Error("unauthorized"), { name: "AsanaApiError", status: 401, kind: "api" });
   const code = await main(["me"], {
     ...output, loadToken: async () => ({ token: "hidden" }),
     createClient: () => ({ me: async () => { throw unauthorized; } }),
   });
   assert.equal(code, 2);
   assert.deepEqual(output.stderr, ["AUTH: unauthorized"]);
+});
+
+test("main does not classify attachment-host auth failures as Asana auth failures", async () => {
+  const output = io();
+  const attachmentFailure = Object.assign(new Error("download unauthorized"), { name: "AsanaApiError", status: 401, kind: "attachment" });
+  const code = await main(["attachment", "download", "201", "--output", "/tmp/a"], {
+    ...output, loadToken: async () => ({ token: "hidden" }),
+    createClient: () => ({ downloadAttachment: async () => { throw attachmentFailure; } }),
+  });
+  assert.equal(code, 9);
+  assert.deepEqual(output.stderr, ["ATTACHMENT: download unauthorized"]);
 });
 
 test("main exposes rate-limit category", async () => {
