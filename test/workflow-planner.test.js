@@ -3,6 +3,12 @@ import { test } from "node:test";
 import { expandTemplate, normalizeTask, slugify } from "../src/workflow/naming.js";
 import { planWorkflow } from "../src/workflow/planner.js";
 
+function hasFunctionDeep(value) {
+  if (typeof value === "function") return true;
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some((item) => hasFunctionDeep(item));
+}
+
 const registry = {
   launcher: {
     worktree_root: "/tmp/worktrees",
@@ -86,6 +92,13 @@ test("sanitizes user text before branch and path expansion", () => {
   );
 });
 
+test("rejects supplied placeholders outside the allowlist", () => {
+  assert.throws(
+    () => expandTemplate("feature/{unknown}", { unknown: "safe" }),
+    /unknown placeholder|unsupported placeholder|allowlist/i,
+  );
+});
+
 test("rejects empty slugs and traversal values", () => {
   assert.throws(() => slugify("!!!"), /slug/i);
   assert.throws(() => expandTemplate("feature/{slug}", { slug: "../escape" }), /traversal|path/i);
@@ -105,6 +118,63 @@ test("plans an ordinary native Herdr worktree", () => {
   assert.ok(plan.workspace.label.length <= 32);
   assert.equal(plan.runtime.profileName, "standard");
   assert.ok(plan.operations.some((operation) => operation.phase === "runtime"));
+});
+
+test("ordinary plan is plain JSON-compatible data", () => {
+  const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const jsonRoundTrip = JSON.parse(JSON.stringify(plan));
+
+  assert.deepEqual(jsonRoundTrip, plan);
+  assert.equal(hasFunctionDeep(plan), false);
+});
+
+test("group plan is plain JSON-compatible data", () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "acme",
+    task: "ASANA-456",
+    feature: "Onboarding",
+    repositories: ["webapp", "backend"],
+  });
+  const jsonRoundTrip = JSON.parse(JSON.stringify(plan));
+
+  assert.deepEqual(jsonRoundTrip, plan);
+  assert.equal(hasFunctionDeep(plan), false);
+});
+
+test("start-phase operations exclude runtime-only operations while runtime operations are marked runtime", () => {
+  const ordinary = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const group = planWorkflow({
+    registry,
+    projectAlias: "acme",
+    task: "ASANA-456",
+    feature: "Onboarding",
+    repositories: ["backend", "panel"],
+  });
+
+  assert.deepEqual(ordinary.operations.filter((operation) => operation.phase === "start").map((operation) => operation.id), [
+    "worktree",
+    "workspace",
+    "agent-tab",
+    "agent",
+  ]);
+  assert.deepEqual(ordinary.operations.filter((operation) => operation.phase === "runtime").map((operation) => operation.id), [
+    "runtime-tab",
+    "runtime",
+  ]);
+  assert.deepEqual(group.operations.filter((operation) => operation.phase === "start").map((operation) => operation.id), [
+    "meta-worktree",
+    "child-worktree:backend",
+    "child-worktree:panel",
+    "coordinator-tab",
+    "child-tab:backend",
+    "child-tab:panel",
+    "agent",
+  ]);
+  assert.deepEqual(group.operations.filter((operation) => operation.phase === "runtime").map((operation) => operation.id), [
+    "runtime-tab",
+    "runtime",
+  ]);
 });
 
 test("bounds Herdr-visible labels", () => {

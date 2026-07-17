@@ -4,6 +4,7 @@ const MAX_LABEL_LENGTH = 32;
 const SAFE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
 const WINDOWS_ABSOLUTE_RE = /^[A-Za-z]:[\\/]/;
 const PLACEHOLDER_RE = /\{([^{}]+)\}/g;
+const ALLOWED_TEMPLATE_PLACEHOLDERS = new Set(["worktree_root", "project", "task", "slug", "repository"]);
 
 function fail(category, message, options) {
   throw new WorkflowError(category, message, options);
@@ -71,6 +72,9 @@ export function expandTemplate(template, values = {}) {
   }
 
   const expanded = source.replace(PLACEHOLDER_RE, (match, name) => {
+    if (!ALLOWED_TEMPLATE_PLACEHOLDERS.has(name)) {
+      fail("template", `Unknown placeholder {${name}} in template`);
+    }
     if (!(name in values)) {
       fail("template", `Unresolved placeholder {${name}} in template`);
     }
