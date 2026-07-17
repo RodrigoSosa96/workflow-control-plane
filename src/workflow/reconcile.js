@@ -1,8 +1,5 @@
+import { realpath as defaultRealpath } from "node:fs/promises";
 import { resolve } from "node:path";
-
-function normalizePath(value) {
-  return typeof value === "string" && value ? resolve(value) : null;
-}
 
 function normalizeBranch(value) {
   if (typeof value !== "string") return null;
@@ -18,6 +15,34 @@ function aggregateStatus(values) {
   if (values.some((value) => value === "conflict")) return "conflict";
   if (values.every((value) => value === "compatible")) return "compatible";
   return "incomplete";
+}
+
+function isMissingPathError(error) {
+  return error?.code === "ENOENT" || error?.code === "ENOTDIR";
+}
+
+function createCanonicalPath(realpathImpl = defaultRealpath) {
+  const cache = new Map();
+
+  return async function canonicalPath(value, { allowMissing = true } = {}) {
+    if (typeof value !== "string" || !value) return null;
+
+    const resolved = resolve(value);
+    const key = `${allowMissing}:${resolved}`;
+    if (cache.has(key)) return await cache.get(key);
+
+    const pending = (async () => {
+      try {
+        return await realpathImpl(resolved);
+      } catch (error) {
+        if (allowMissing && isMissingPathError(error)) return resolved;
+        throw error;
+      }
+    })();
+
+    cache.set(key, pending);
+    return await pending;
+  };
 }
 
 async function safeInspectRepository(git, cwd) {
@@ -36,30 +61,23 @@ async function safeStatus(git, cwd) {
   }
 }
 
-function worktreeKey(worktree) {
-  return `${worktree.role}:${worktree.alias ?? ""}:${worktree.path}`;
-}
-
-function workspacePath(workspace) {
-  return normalizePath(workspace?.cwd ?? workspace?.worktree?.checkout_path ?? workspace?.path);
-}
-
-function workspaceRepoKey(workspace) {
-  return normalizePath(workspace?.worktree?.repo_key ?? workspace?.repo_key);
-}
-
-function paneCwd(pane) {
-  return normalizePath(pane?.foreground_cwd ?? pane?.cwd);
+function workspaceRepoKey(workspace, canonicalPath) {
+  return canonicalPath(workspace?.worktree?.repo_key ?? workspace?.repo_key);
 }
 
 function paneCommand(pane) {
   return pane?.command ?? pane?.foreground_command ?? pane?.process?.command ?? null;
 }
 
+async function panePath(pane, canonicalPath) {
+  return await canonicalPath(pane?.foreground_cwd ?? pane?.cwd);
+}
+
 function classifyTabWhenWorkspaceUnavailable(tab, workspace) {
   if (workspace.status === "conflict") {
     return { ...tab, status: "conflict", reason: workspace.reason, actual: null };
   }
+
   return {
     ...tab,
     status: "missing",
@@ -68,38 +86,56 @@ function classifyTabWhenWorkspaceUnavailable(tab, workspace) {
   };
 }
 
-async function classifyWorktrees(plan, git) {
+async function classifyWorktrees(plan, git, canonicalPath) {
   const results = [];
-  const byKey = new Map();
+  const byCanonicalPath = new Map();
 
   for (const planned of plan.worktrees) {
     const repository = await git.inspectRepository({ cwd: planned.repositoryPath });
-    const expectedCommonDirPath = normalizePath(repository.commonDirPath);
-    const plannedPath = normalizePath(planned.path);
-    const listed = await git.listWorktrees({ cwd: planned.repositoryPath });
-    const exact = listed.find((entry) => normalizePath(entry.path) === plannedPath);
-    const sameBranch = listed.find((entry) => normalizeBranch(entry.branch) === planned.branch);
+    const expectedCommonDirPath = await canonicalPath(repository.commonDirPath);
+    const plannedCanonicalPath = await canonicalPath(planned.path);
+    const listed = await Promise.all(
+      (await git.listWorktrees({ cwd: planned.repositoryPath })).map(async (entry) => ({
+        ...entry,
+        canonicalPath: await canonicalPath(entry.path),
+        normalizedBranch: normalizeBranch(entry.branch),
+      })),
+    );
+    const exact = listed.find((entry) => entry.canonicalPath === plannedCanonicalPath);
+    const sameBranch = listed.find((entry) => entry.normalizedBranch === planned.branch && entry.canonicalPath !== plannedCanonicalPath);
     const occupant = await safeInspectRepository(git, planned.path);
-    const occupantCommonDirPath = normalizePath(occupant?.commonDirPath);
+    const occupantCommonDirPath = await canonicalPath(occupant?.commonDirPath);
+    const occupantRootPath = await canonicalPath(occupant?.rootPath);
 
     let classified;
 
     if (exact) {
-      const actualBranch = normalizeBranch(exact.branch);
       if (occupantCommonDirPath && occupantCommonDirPath !== expectedCommonDirPath) {
         classified = {
           ...planned,
           status: "conflict",
           reason: `Planned path ${planned.path} belongs to a different repository`,
-          actual: { path: exact.path, branch: actualBranch, commonDirPath: occupantCommonDirPath },
+          canonicalPath: plannedCanonicalPath,
+          actual: {
+            path: exact.path,
+            canonicalPath: exact.canonicalPath,
+            branch: exact.normalizedBranch,
+            commonDirPath: occupantCommonDirPath,
+          },
           expectedCommonDirPath,
         };
-      } else if (actualBranch !== planned.branch) {
+      } else if (exact.normalizedBranch !== planned.branch) {
         classified = {
           ...planned,
           status: "conflict",
-          reason: `Planned path ${planned.path} has branch ${actualBranch ?? "detached"} instead of ${planned.branch}`,
-          actual: { path: exact.path, branch: actualBranch, commonDirPath: expectedCommonDirPath },
+          reason: `Planned path ${planned.path} has branch ${exact.normalizedBranch ?? "detached"} instead of ${planned.branch}`,
+          canonicalPath: plannedCanonicalPath,
+          actual: {
+            path: exact.path,
+            canonicalPath: exact.canonicalPath,
+            branch: exact.normalizedBranch,
+            commonDirPath: expectedCommonDirPath,
+          },
           expectedCommonDirPath,
         };
       } else {
@@ -108,10 +144,13 @@ async function classifyWorktrees(plan, git) {
           ...planned,
           status: "compatible",
           reason: `Worktree ${planned.path} matches ${planned.branch}`,
+          canonicalPath: plannedCanonicalPath,
           actual: {
             path: exact.path,
-            branch: actualBranch,
+            canonicalPath: exact.canonicalPath,
+            branch: exact.normalizedBranch,
             commonDirPath: expectedCommonDirPath,
+            rootPath: occupantRootPath ?? exact.canonicalPath,
             dirty: Boolean(status?.dirty),
             entries: status?.entries ?? [],
           },
@@ -123,9 +162,11 @@ async function classifyWorktrees(plan, git) {
         ...planned,
         status: "conflict",
         reason: `Branch ${planned.branch} is already checked out at ${sameBranch.path}`,
+        canonicalPath: plannedCanonicalPath,
         actual: {
           path: sameBranch.path,
-          branch: normalizeBranch(sameBranch.branch),
+          canonicalPath: sameBranch.canonicalPath,
+          branch: sameBranch.normalizedBranch,
           commonDirPath: expectedCommonDirPath,
         },
         expectedCommonDirPath,
@@ -133,12 +174,14 @@ async function classifyWorktrees(plan, git) {
     } else if (occupantCommonDirPath) {
       classified = {
         ...planned,
-        status: occupantCommonDirPath === expectedCommonDirPath ? "conflict" : "conflict",
+        status: "conflict",
         reason: occupantCommonDirPath === expectedCommonDirPath
           ? `Planned path ${planned.path} is occupied by another worktree from the same repository`
           : `Planned path ${planned.path} belongs to the wrong repository`,
+        canonicalPath: plannedCanonicalPath,
         actual: {
           path: planned.path,
+          canonicalPath: occupantRootPath ?? plannedCanonicalPath,
           branch: null,
           commonDirPath: occupantCommonDirPath,
         },
@@ -149,43 +192,53 @@ async function classifyWorktrees(plan, git) {
         ...planned,
         status: "missing",
         reason: `Worktree ${planned.path} does not exist yet`,
+        canonicalPath: plannedCanonicalPath,
         actual: null,
         expectedCommonDirPath,
       };
     }
 
     results.push(classified);
-    byKey.set(worktreeKey(planned), classified);
+    byCanonicalPath.set(plannedCanonicalPath, classified);
   }
 
-  return { results, byKey };
+  return { results, byCanonicalPath };
 }
 
-async function classifyWorkspace(plan, worktrees, herdr) {
+async function classifyWorkspace(plan, worktrees, herdr, canonicalPath) {
   const allWorkspaces = listValue(await herdr.listWorkspaces(), "workspaces");
   const rootWorktree = worktrees.results.find((worktree) => worktree.role === "primary" || worktree.role === "meta")
     ?? worktrees.results[0];
-  const plannedPath = normalizePath(plan.workspace.path);
-  const matches = allWorkspaces.filter((workspace) => workspacePath(workspace) === plannedPath);
+  const plannedPath = await canonicalPath(plan.workspace.path);
+  const matches = [];
+
+  for (const workspace of allWorkspaces) {
+    const checkoutPath = await canonicalPath(workspace?.cwd ?? workspace?.worktree?.checkout_path ?? workspace?.path);
+    if (checkoutPath === plannedPath) {
+      matches.push({ ...workspace, canonicalPath: checkoutPath });
+    }
+  }
 
   if (matches.length > 1) {
     return {
       ...plan.workspace,
       status: "conflict",
       reason: `Multiple Herdr workspaces point at ${plan.workspace.path}`,
+      canonicalPath: plannedPath,
       actual: matches,
       expectedCommonDirPath: rootWorktree?.expectedCommonDirPath ?? null,
     };
   }
 
   const actual = matches[0] ?? null;
-  const actualRepoKey = workspaceRepoKey(actual);
+  const actualRepoKey = await workspaceRepoKey(actual, canonicalPath);
   if (actual) {
     if (rootWorktree?.expectedCommonDirPath && actualRepoKey && actualRepoKey !== rootWorktree.expectedCommonDirPath) {
       return {
         ...plan.workspace,
         status: "conflict",
         reason: `Herdr workspace at ${plan.workspace.path} belongs to a different repository`,
+        canonicalPath: plannedPath,
         actual,
         expectedCommonDirPath: rootWorktree.expectedCommonDirPath,
       };
@@ -196,6 +249,7 @@ async function classifyWorkspace(plan, worktrees, herdr) {
         ...plan.workspace,
         status: "conflict",
         reason: `Herdr workspace is open at ${plan.workspace.path} but the Git worktree is missing`,
+        canonicalPath: plannedPath,
         actual,
         expectedCommonDirPath: rootWorktree.expectedCommonDirPath,
       };
@@ -205,6 +259,7 @@ async function classifyWorkspace(plan, worktrees, herdr) {
       ...plan.workspace,
       status: "compatible",
       reason: `Herdr workspace is open at ${plan.workspace.path}`,
+      canonicalPath: plannedPath,
       actual,
       expectedCommonDirPath: rootWorktree?.expectedCommonDirPath ?? null,
     };
@@ -215,6 +270,7 @@ async function classifyWorkspace(plan, worktrees, herdr) {
       ...plan.workspace,
       status: "incomplete",
       reason: `Git worktree exists at ${plan.workspace.path} but the Herdr workspace is closed or not open`,
+      canonicalPath: plannedPath,
       actual: null,
       expectedCommonDirPath: rootWorktree.expectedCommonDirPath,
     };
@@ -225,6 +281,7 @@ async function classifyWorkspace(plan, worktrees, herdr) {
       ...plan.workspace,
       status: "conflict",
       reason: rootWorktree.reason,
+      canonicalPath: plannedPath,
       actual: null,
       expectedCommonDirPath: rootWorktree.expectedCommonDirPath,
     };
@@ -234,12 +291,136 @@ async function classifyWorkspace(plan, worktrees, herdr) {
     ...plan.workspace,
     status: "missing",
     reason: `Workspace ${plan.workspace.path} is missing because the Git worktree is missing`,
+    canonicalPath: plannedPath,
     actual: null,
     expectedCommonDirPath: rootWorktree?.expectedCommonDirPath ?? null,
   };
 }
 
-async function classifyTabs(plan, workspace, herdr) {
+function findWorktreeForTab(plannedTab, worktrees, expectedCanonicalPath) {
+  if (plannedTab.kind === "repository") {
+    return worktrees.results.find((worktree) => worktree.alias === plannedTab.label)
+      ?? worktrees.byCanonicalPath.get(expectedCanonicalPath)
+      ?? null;
+  }
+
+  return worktrees.byCanonicalPath.get(expectedCanonicalPath) ?? null;
+}
+
+function buildTabConflict(planned, actual, reason) {
+  return {
+    ...planned,
+    status: "conflict",
+    reason,
+    actual,
+  };
+}
+
+function buildTabIncomplete(planned, actual, reason) {
+  return {
+    ...planned,
+    status: "incomplete",
+    reason,
+    actual,
+  };
+}
+
+async function classifyTabIdentity(planned, actual, actualPanes, loadAgents, worktrees, canonicalPath, plan) {
+  const expectedCanonicalPath = await canonicalPath(planned.worktreePath ?? plan.workspace.path);
+  const relatedWorktree = findWorktreeForTab(planned, worktrees, expectedCanonicalPath);
+  const tabPanes = [];
+
+  for (const pane of actualPanes.filter((candidate) => candidate.tab_id === actual.tab_id)) {
+    tabPanes.push({
+      ...pane,
+      canonicalPath: await panePath(pane, canonicalPath),
+      liveCommand: paneCommand(pane),
+    });
+  }
+
+  if (planned.kind === "repository") {
+    if (!relatedWorktree || relatedWorktree.status === "missing") {
+      return buildTabIncomplete(planned, actual, `Repository tab ${planned.label} is waiting for its child worktree`);
+    }
+    if (relatedWorktree.status === "conflict") {
+      return buildTabConflict(planned, actual, relatedWorktree.reason);
+    }
+
+    const matchingPanes = tabPanes.filter((pane) => pane.canonicalPath === expectedCanonicalPath);
+    if (matchingPanes.length > 0) {
+      return {
+        ...planned,
+        status: "compatible",
+        reason: `Repository tab ${planned.label} matches ${planned.worktreePath}`,
+        actual,
+      };
+    }
+
+    if (tabPanes.length === 0) {
+      return buildTabIncomplete(planned, actual, `Repository tab ${planned.label} has no pane identity yet`);
+    }
+
+    return buildTabConflict(planned, actual, `Repository tab ${planned.label} points at the wrong child worktree cwd`);
+  }
+
+  if (planned.kind === "agent") {
+    const actualAgents = await loadAgents();
+    const matchingAgents = actualAgents.filter((agent) => agent.tab_id === actual.tab_id && agent.name === plan.agent.sessionName);
+    const agentMatches = [];
+    for (const agent of matchingAgents) {
+      if (await canonicalPath(agent.cwd) === expectedCanonicalPath) agentMatches.push(agent);
+    }
+    if (agentMatches.length > 1) {
+      return buildTabConflict(planned, actual, `Multiple Pi agents match agent tab ${planned.label}`);
+    }
+    if (agentMatches.length === 1) {
+      return {
+        ...planned,
+        status: "compatible",
+        reason: `Agent tab ${planned.label} matches ${planned.worktreePath}`,
+        actual,
+      };
+    }
+
+    const matchingPanes = tabPanes.filter((pane) => pane.canonicalPath === expectedCanonicalPath);
+    if (matchingPanes.length > 0) {
+      return {
+        ...planned,
+        status: "compatible",
+        reason: `Agent tab ${planned.label} matches ${planned.worktreePath}`,
+        actual,
+      };
+    }
+
+    if (tabPanes.length === 0) {
+      return buildTabIncomplete(planned, actual, `Agent tab ${planned.label} has no cwd identity yet`);
+    }
+
+    return buildTabConflict(planned, actual, `Agent tab ${planned.label} points at the wrong cwd`);
+  }
+
+  if (planned.kind === "runtime") {
+    const matchingPanes = tabPanes.filter((pane) => pane.canonicalPath === expectedCanonicalPath);
+    if (matchingPanes.length > 0) {
+      return {
+        ...planned,
+        status: "compatible",
+        reason: `Runtime tab ${planned.label} matches ${planned.worktreePath}`,
+        actual,
+      };
+    }
+
+    if (tabPanes.length === 0) {
+      return buildTabIncomplete(planned, actual, `Runtime tab ${planned.label} has no pane identity yet`);
+    }
+
+    return buildTabConflict(planned, actual, `Runtime tab ${planned.label} points at the wrong cwd`);
+  }
+
+  return buildTabConflict(planned, actual, `Unsupported tab kind ${planned.kind}`);
+}
+
+async function classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canonicalPath) {
   if (workspace.status !== "compatible") {
     const results = plan.tabs.map((tab) => classifyTabWhenWorkspaceUnavailable(tab, workspace));
     return { results, byLabel: new Map(results.map((tab) => [tab.label, tab])), panes: [] };
@@ -262,12 +443,7 @@ async function classifyTabs(plan, workspace, herdr) {
         actual: matches,
       };
     } else if (matches.length === 1) {
-      classified = {
-        ...planned,
-        status: "compatible",
-        reason: `Tab ${planned.label} exists`,
-        actual: matches[0],
-      };
+      classified = await classifyTabIdentity(planned, matches[0], actualPanes, loadAgents, worktrees, canonicalPath, plan);
     } else {
       classified = {
         ...planned,
@@ -284,8 +460,8 @@ async function classifyTabs(plan, workspace, herdr) {
   return { results, byLabel, panes: actualPanes };
 }
 
-async function classifyAgent(plan, tabs, herdr) {
-  const actualAgents = listValue(await herdr.listAgents(), "agents");
+async function classifyAgent(plan, tabs, loadAgents, canonicalPath) {
+  const actualAgents = await loadAgents();
   const tab = tabs.byLabel.get(plan.agent.tabLabel);
   if (!tab || tab.status !== "compatible") {
     return {
@@ -295,12 +471,14 @@ async function classifyAgent(plan, tabs, herdr) {
     };
   }
 
-  const matches = actualAgents.filter((agent) => {
+  const expectedCanonicalPath = await canonicalPath(plan.agent.worktreePath);
+  const matches = [];
+  for (const agent of actualAgents) {
     const sameName = agent.name === plan.agent.sessionName;
-    const sameCwd = normalizePath(agent.cwd) === normalizePath(plan.agent.worktreePath);
     const sameTab = !agent.tab_id || agent.tab_id === tab.actual.tab_id;
-    return sameName && sameCwd && sameTab;
-  });
+    if (!sameName || !sameTab) continue;
+    if (await canonicalPath(agent.cwd) === expectedCanonicalPath) matches.push(agent);
+  }
 
   if (matches.length > 1) {
     return {
@@ -325,9 +503,9 @@ async function classifyAgent(plan, tabs, herdr) {
   };
 }
 
-function classifyRuntime(plan, tabs, panes) {
+async function classifyRuntime(plan, tabs, panes, canonicalPath) {
   const runtimeTab = tabs.byLabel.get(plan.runtime.tabLabel);
-  if (!runtimeTab || runtimeTab.status === "conflict") {
+  if (!runtimeTab || runtimeTab.status !== "compatible") {
     return {
       status: runtimeTab?.status === "conflict" ? "conflict" : "incomplete",
       reason: runtimeTab?.reason ?? `Runtime tab ${plan.runtime.tabLabel} is missing`,
@@ -335,53 +513,73 @@ function classifyRuntime(plan, tabs, panes) {
       tab: runtimeTab ?? null,
       processes: plan.runtime.processes.map((process) => ({
         ...process,
-        status: "missing",
-        reason: runtimeTab?.status === "conflict" ? runtimeTab.reason : `Runtime tab ${plan.runtime.tabLabel} is missing`,
+        status: runtimeTab?.status === "conflict" ? "conflict" : "missing",
+        reason: runtimeTab?.status === "conflict" ? runtimeTab.reason : `Runtime tab ${plan.runtime.tabLabel} is missing or incomplete`,
         actual: [],
       })),
     };
   }
 
-  const processes = plan.runtime.processes.map((process) => {
-    const expectedCwd = normalizePath(resolve(plan.runtime.worktreePath, process.cwd ?? "."));
-    const matches = panes.filter((pane) => {
-      if (pane.tab_id !== runtimeTab.actual.tab_id) return false;
-      const sameCwd = paneCwd(pane) === expectedCwd;
-      const liveCommand = paneCommand(pane);
-      const sameCommand = !liveCommand || liveCommand === process.command;
-      const sameLabel = pane.label === process.id;
-      return sameCwd && (sameLabel || sameCommand);
-    });
+  const processes = [];
+  for (const process of plan.runtime.processes) {
+    const expectedCwd = await canonicalPath(resolve(plan.runtime.worktreePath, process.cwd ?? "."));
+    const processPanes = [];
 
-    if (matches.length > 1) {
-      return {
+    for (const pane of panes.filter((candidate) => candidate.tab_id === runtimeTab.actual.tab_id)) {
+      processPanes.push({
+        ...pane,
+        canonicalPath: await panePath(pane, canonicalPath),
+        liveCommand: paneCommand(pane),
+      });
+    }
+
+    const sameCwd = processPanes.filter((pane) => pane.canonicalPath === expectedCwd);
+    const exactMatches = sameCwd.filter((pane) => pane.label === process.id && pane.liveCommand === process.command);
+    const labelMatches = sameCwd.filter((pane) => pane.label === process.id);
+    const commandMatches = sameCwd.filter((pane) => pane.liveCommand === process.command);
+
+    if (exactMatches.length > 1) {
+      processes.push({
         ...process,
         status: "conflict",
         reason: `Duplicate runtime panes match process ${process.id}`,
-        actual: matches,
-      };
+        actual: exactMatches,
+      });
+      continue;
     }
 
-    if (matches.length === 1) {
-      return {
+    if (exactMatches.length === 1) {
+      processes.push({
         ...process,
         status: "compatible",
         reason: `Runtime process ${process.id} is present`,
-        actual: matches,
-      };
+        actual: exactMatches,
+      });
+      continue;
     }
 
-    return {
+    if (labelMatches.length > 0 || commandMatches.length > 0) {
+      processes.push({
+        ...process,
+        status: "conflict",
+        reason: `Runtime process ${process.id} has mismatched command or label evidence`,
+        actual: [...new Set([...labelMatches, ...commandMatches])],
+      });
+      continue;
+    }
+
+    processes.push({
       ...process,
       status: "missing",
       reason: `Runtime process ${process.id} is not running`,
       actual: [],
-    };
-  });
+    });
+  }
 
+  const status = aggregateStatus(processes.map((process) => process.status));
   return {
-    status: aggregateStatus(processes.map((process) => process.status)),
-    reason: aggregateStatus(processes.map((process) => process.status)) === "compatible"
+    status,
+    reason: status === "compatible"
       ? `Runtime tab ${plan.runtime.tabLabel} is ready`
       : `Runtime tab ${plan.runtime.tabLabel} is incomplete`,
     profileName: plan.runtime.profileName,
@@ -406,9 +604,14 @@ function collectConflicts(worktrees, workspace, tabs, agent, runtime) {
   ];
 }
 
-function classifyOperation(operation, state) {
+async function findWorktreeByOperationPath(worktrees, operationPath, canonicalPath) {
+  const expectedCanonicalPath = await canonicalPath(operationPath);
+  return worktrees.find((item) => item.canonicalPath === expectedCanonicalPath) ?? null;
+}
+
+async function classifyOperation(operation, state, canonicalPath) {
   if (operation.kind === "herdr.worktree.ensure") {
-    const worktree = state.worktrees.find((item) => normalizePath(item.path) === normalizePath(operation.path));
+    const worktree = await findWorktreeByOperationPath(state.worktrees, operation.path, canonicalPath);
     if (!worktree) return { status: "missing", reason: `Worktree ${operation.path} is not present` };
     if (worktree.status === "conflict") return { status: "conflict", reason: worktree.reason };
     if (worktree.status === "missing") return { status: "missing", reason: worktree.reason };
@@ -430,7 +633,7 @@ function classifyOperation(operation, state) {
   }
 
   if (operation.kind === "git.worktree.ensure") {
-    const worktree = state.worktrees.find((item) => normalizePath(item.path) === normalizePath(operation.path));
+    const worktree = await findWorktreeByOperationPath(state.worktrees, operation.path, canonicalPath);
     return { status: worktree?.status ?? "missing", reason: worktree?.reason ?? `Worktree ${operation.path} is missing` };
   }
 
@@ -454,34 +657,45 @@ function classifyOperation(operation, state) {
   return { status: "missing", reason: `No reconciliation rule for ${operation.kind}` };
 }
 
-export async function reconcilePlan(plan, { git, herdr }) {
-  const worktrees = await classifyWorktrees(plan, git);
-  const workspace = await classifyWorkspace(plan, worktrees, herdr);
-  const tabs = await classifyTabs(plan, workspace, herdr);
-  const agent = await classifyAgent(plan, tabs, herdr);
-  const runtime = classifyRuntime(plan, tabs, tabs.panes);
+export async function reconcilePlan(plan, { git, herdr, realpath = defaultRealpath }) {
+  const canonicalPath = createCanonicalPath(realpath);
+  const loadAgents = (() => {
+    let pending;
+    return async () => {
+      pending ??= Promise.resolve(herdr.listAgents()).then((value) => listValue(value, "agents"));
+      return await pending;
+    };
+  })();
+  const worktrees = await classifyWorktrees(plan, git, canonicalPath);
+  const workspace = await classifyWorkspace(plan, worktrees, herdr, canonicalPath);
+  const tabs = await classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canonicalPath);
+  const agent = await classifyAgent(plan, tabs, loadAgents, canonicalPath);
+  const runtime = await classifyRuntime(plan, tabs, tabs.panes, canonicalPath);
   const conflicts = collectConflicts(worktrees.results, workspace, tabs.results, agent, runtime);
   const status = conflicts.length > 0
     ? "conflict"
     : aggregateStatus([
       ...worktrees.results.map((worktree) => worktree.status === "missing" ? "incomplete" : worktree.status),
       workspace.status === "missing" ? "incomplete" : workspace.status,
-      ...tabs.results.map((tab) => tab.status === "missing" ? "incomplete" : tab.status),
+      ...tabs.results.map((tab) => ["missing", "incomplete"].includes(tab.status) ? "incomplete" : tab.status),
       agent.status === "missing" ? "incomplete" : agent.status,
       runtime.status,
     ]);
 
-  const operations = plan.operations.map((operation) => ({
-    ...operation,
-    reconciliation: classifyOperation(operation, {
-      worktrees: worktrees.results,
-      workspace,
-      tabs: tabs.results,
-      panes: tabs.panes,
-      agent,
-      runtime,
-    }),
-  }));
+  const operations = [];
+  for (const operation of plan.operations) {
+    operations.push({
+      ...operation,
+      reconciliation: await classifyOperation(operation, {
+        worktrees: worktrees.results,
+        workspace,
+        tabs: tabs.results,
+        panes: tabs.panes,
+        agent,
+        runtime,
+      }, canonicalPath),
+    });
+  }
 
   return {
     ...plan,
