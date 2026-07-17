@@ -21,6 +21,9 @@ projects:
       profiles:
         standard:
           processes:
+            - id: infrastructure
+              cwd: .
+              command: pnpm docker:dev
             - id: backend
               cwd: .
               command: pnpm dev:api

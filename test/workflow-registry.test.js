@@ -69,6 +69,19 @@ test("returns an immutable normalized registry", () => {
   }, TypeError);
 });
 
+test("preserves OCR infrastructure runtime in the migrated registry", async () => {
+  const registry = await loadRegistry(new URL("../projects.yaml", import.meta.url));
+  assert.deepEqual(
+    registry.projects.ocr.runtime.profiles.standard.processes.map(({ id, command }) => ({ id, command })),
+    [
+      { id: "infrastructure", command: "pnpm docker:dev" },
+      { id: "backend", command: "pnpm dev:api" },
+      { id: "frontend", command: "pnpm dev:front" },
+      { id: "workers", command: "pnpm --filter=@app/workers dev" },
+    ],
+  );
+});
+
 test("loads a version 2 registry with ordinary and group projects", async () => {
   const registry = await loadRegistry(await registryFile(`
 version: 2
