@@ -24,11 +24,22 @@ function addConflicts(lines, conflicts = []) {
   }
 }
 
+function addPreconditions(lines, preconditions = {}) {
+  const checks = Object.values(preconditions).filter((value) => value && typeof value === "object" && value.id && value.status);
+  if (!checks.length) return;
+  lines.push("Preconditions:");
+  for (const check of checks) {
+    lines.push(`${check.id} | ${check.status}${check.reason ? ` | ${check.reason}` : ""}`);
+  }
+}
+
 function formatDoctor(result) {
   const lines = [
     `Doctor: ${result.ok ? "ready" : "needs attention"}`,
-    `Project: ${result.project.label} [${result.project.alias}]`,
   ];
+  if (result.project) {
+    lines.push(`Project: ${result.project.label} [${result.project.alias}]`);
+  }
   for (const check of result.checks) {
     lines.push(`${check.id} | ${check.status}${check.reason ? ` | ${check.reason}` : ""}`);
   }
@@ -40,6 +51,7 @@ function formatPlanLike(result) {
     `Project: ${result.project.label} [${result.project.alias}]`,
     `Status: ${result.reconciliation.status}`,
   ];
+  addPreconditions(lines, result.preconditions);
   if (result.nextCommand) lines.push(`Next: ${result.nextCommand}`);
   addConflicts(lines, result.conflicts?.length ? result.conflicts : result.reconciliation.conflicts);
   if (result.suggestedManifest) {

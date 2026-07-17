@@ -1,5 +1,6 @@
 import { readFile as defaultReadFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
 import { parse } from "yaml";
 import { WorkflowError } from "./errors.js";
 
@@ -38,6 +39,12 @@ function expandHome(value) {
 function validateString(value, context) {
   if (typeof value !== "string" || !value.trim()) fail("schema", `${context} must be a non-empty string`);
   return value;
+}
+
+function validateAbsolutePath(value, context) {
+  const normalized = expandHome(validateString(value, context));
+  if (!isAbsolute(normalized)) fail("schema", `${context} must be absolute after ~ expansion`);
+  return normalized;
 }
 
 function validateTemplate(template, allowedPlaceholders, context) {
@@ -134,7 +141,7 @@ function validateProjectKind(project, projectName) {
 function validateOrdinaryProject(project, projectName) {
   const normalized = clone(project);
   normalized.kind = validateProjectKind(normalized, projectName);
-  normalized.path = expandHome(validateString(normalized.path, `${projectName}.path`));
+  normalized.path = validateAbsolutePath(normalized.path, `${projectName}.path`);
   normalized.repository = validateString(normalized.repository, `${projectName}.repository`);
   if (!ALLOWED_REPOSITORIES.has(normalized.repository)) {
     fail("schema", `${projectName}.repository must be one of ${[...ALLOWED_REPOSITORIES].join(", ")}`);
@@ -154,7 +161,7 @@ function validateOrdinaryProject(project, projectName) {
 function validateGroupRepository(repository, repositoryName, projectName) {
   if (!isObject(repository)) fail("schema", `${projectName}.repositories.${repositoryName} must be an object`);
   const normalized = clone(repository);
-  normalized.path = expandHome(validateString(normalized.path, `${projectName}.repositories.${repositoryName}.path`));
+  normalized.path = validateAbsolutePath(normalized.path, `${projectName}.repositories.${repositoryName}.path`);
   normalized.base_branch = validateString(normalized.base_branch, `${projectName}.repositories.${repositoryName}.base_branch`);
   normalized.branch_template = validateTemplate(normalized.branch_template, ALLOWED_CHILD_TEMPLATE_PLACEHOLDERS, `${projectName}.repositories.${repositoryName}.branch_template`);
   return normalized;
@@ -163,7 +170,7 @@ function validateGroupRepository(repository, repositoryName, projectName) {
 function validateGroupProject(project, projectName) {
   const normalized = clone(project);
   normalized.kind = validateProjectKind(normalized, projectName);
-  normalized.path = expandHome(validateString(normalized.path, `${projectName}.path`));
+  normalized.path = validateAbsolutePath(normalized.path, `${projectName}.path`);
   normalized.repository = validateString(normalized.repository, `${projectName}.repository`);
   if (normalized.repository !== "group") {
     fail("schema", `${projectName}.repository must be group`);
@@ -171,7 +178,7 @@ function validateGroupProject(project, projectName) {
   normalized.worktree = validateWorktree(normalized.worktree, projectName);
   normalized.coordination = isObject(normalized.coordination) ? {
     ...clone(normalized.coordination),
-    meta_repository: expandHome(validateString(normalized.coordination.meta_repository, `${projectName}.coordination.meta_repository`)),
+    meta_repository: validateAbsolutePath(normalized.coordination.meta_repository, `${projectName}.coordination.meta_repository`),
     repos_directory: validateString(normalized.coordination.repos_directory, `${projectName}.coordination.repos_directory`),
   } : fail("schema", `${projectName}.coordination must be an object`);
   if (!isObject(normalized.repositories) || !Object.keys(normalized.repositories).length) {
@@ -192,7 +199,7 @@ function validateGroupProject(project, projectName) {
 function validateLauncher(launcher) {
   if (!isObject(launcher)) fail("schema", "launcher must be an object");
   const normalized = clone(launcher);
-  normalized.worktree_root = expandHome(validateString(normalized.worktree_root, "launcher.worktree_root"));
+  normalized.worktree_root = validateAbsolutePath(normalized.worktree_root, "launcher.worktree_root");
   if (!isObject(normalized.agent)) fail("schema", "launcher.agent must be an object");
   normalized.agent = {
     ...clone(normalized.agent),

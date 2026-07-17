@@ -211,6 +211,41 @@ test("doctor reports registry, binaries, repositories, and Pi integration withou
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
 });
 
+test("doctor without a project reports global prerequisites without repository inspection", async () => {
+  const lookup = createLookup({
+    git: "/usr/bin/git",
+    herdr: "/usr/bin/herdr",
+    pi: "/usr/bin/pi",
+  });
+  const git = createGit();
+  const herdr = createHerdr({
+    integrations: [
+      { name: "pi", status: "current", version: 5, path: "/home/you/.pi/agent/extensions/herdr-agent-state.ts" },
+    ],
+  });
+
+  const result = await doctorCommand({
+    registryPath: "/tmp/projects.yaml",
+  }, deps({ git, herdr, lookup }));
+
+  assert.equal(result.ok, true);
+  assert.equal(result.project, null);
+  assert.deepEqual(result.checks.map((check) => check.id), [
+    "registry",
+    "binary:git",
+    "binary:herdr",
+    "binary:pi",
+    "herdr:status",
+    "herdr:integration:pi",
+  ]);
+  assert.deepEqual(git.calls, []);
+  assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
+
+  const compact = formatWorkflowResult("doctor", result, "compact");
+  assert.match(compact, /Doctor: ready/);
+  assert.doesNotMatch(compact, /Project:/);
+});
+
 test("plan stays read-only, returns ordered operations, and reports conflicts even when Pi is missing", async () => {
   const lookup = createLookup({
     git: "/usr/bin/git",
@@ -246,7 +281,50 @@ test("plan stays read-only, returns ordered operations, and reports conflicts ev
   ]);
   assert.equal(result.reconciliation.status, "conflict");
   assert.match(result.conflicts[0].reason, /already checked out|wrong path/i);
-  assert.deepEqual(herdr.calls.map((call) => call.kind), ["listWorkspaces", "listAgents"]);
+  assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus", "listWorkspaces", "listAgents"]);
+});
+
+test("plan remains read-only and reports Herdr server and Pi integration readiness", async () => {
+  const lookup = createLookup({
+    git: "/usr/bin/git",
+    herdr: "/usr/bin/herdr",
+    pi: "/usr/bin/pi",
+  });
+  const git = createGit({
+    repositories: {
+      "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+    },
+    worktrees: {
+      "/repo/ocr": [],
+    },
+  });
+  const herdr = createHerdr({
+    statusResult: {
+      client: { version: "0.7.4", protocol: 16 },
+      server: { running: false, compatible: false },
+    },
+    integrations: [],
+  });
+
+  const result = await planCommand({
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+  }, deps({ git, herdr, lookup }));
+
+  assert.equal(result.reconciliation.status, "incomplete");
+  assert.equal(result.preconditions.herdrStatus.status, "conflict");
+  assert.match(result.preconditions.herdrStatus.reason, /Herdr server is not ready/i);
+  assert.equal(result.preconditions.piIntegration.status, "missing");
+  assert.match(result.preconditions.piIntegration.reason, /Pi integration is not installed/i);
+  assert.equal(result.nextCommand, "workflow doctor ocr");
+  assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
+
+  const compact = formatWorkflowResult("plan", result, "compact");
+  assert.match(compact, /Preconditions:/);
+  assert.match(compact, /herdr:status \| conflict \| Herdr server is not ready/i);
+  assert.match(compact, /herdr:integration:pi \| missing \| Pi integration is not installed/i);
 });
 
 test("status reports actual state and the safe next command without attempting repair", async () => {
@@ -303,7 +381,7 @@ test("status reports actual state and the safe next command without attempting r
   assert.equal(result.reconciliation.status, "incomplete");
   assert.equal(result.reconciliation.tabs.find((tab) => tab.label === "runtime").status, "missing");
   assert.equal(result.nextCommand, 'workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes');
-  assert.deepEqual(herdr.calls.map((call) => call.kind), ["listWorkspaces", "listTabs", "listPanes", "listAgents"]);
+  assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus", "listWorkspaces", "listTabs", "listPanes", "listAgents"]);
 });
 
 test("plan exposes a suggested Acme coordination manifest and compact output prints it", async () => {

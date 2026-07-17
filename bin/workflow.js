@@ -157,18 +157,19 @@ function mutationCommand(command) {
 
 function requiredPreconditions(command) {
   return command === "runtime"
-    ? ["git", "herdr"]
+    ? ["git", "herdr", "herdrStatus"]
     : command === "start"
-      ? ["git", "herdr", "pi"]
+      ? ["git", "herdr", "pi", "herdrStatus", "piIntegration"]
       : [];
 }
 
 function assertPreconditions(command, preview) {
-  const missing = requiredPreconditions(command)
-    .filter((name) => preview?.preconditions?.[name]?.status !== "ready");
+  const firstFailure = requiredPreconditions(command)
+    .map((name) => preview?.preconditions?.[name])
+    .find((check) => check?.status !== "ready");
 
-  if (missing.length > 0) {
-    throw new WorkflowError("PREFLIGHT", `${command} requires ready ${missing.join(", ")} prerequisites`, { exitCode: 10 });
+  if (firstFailure) {
+    throw new WorkflowError("PREFLIGHT", firstFailure.reason ?? `${command} requires ready ${firstFailure.id ?? "preconditions"}`, { exitCode: 10 });
   }
 
   if ((preview?.conflicts?.length ?? 0) > 0 || preview?.reconciliation?.status === "conflict") {

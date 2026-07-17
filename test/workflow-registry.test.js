@@ -69,6 +69,64 @@ test("returns an immutable normalized registry", () => {
   }, TypeError);
 });
 
+test("rejects relative launcher and ordinary project paths after ~ expansion", () => {
+  const relativeLauncher = structuredClone(valid);
+  relativeLauncher.launcher.worktree_root = "relative/worktrees";
+  assert.throws(() => validateRegistry(relativeLauncher), /launcher\.worktree_root.*absolute/i);
+
+  const relativeProject = structuredClone(valid);
+  relativeProject.projects.ocr.path = "./repo/ocr";
+  assert.throws(() => validateRegistry(relativeProject), /ocr\.path.*absolute/i);
+});
+
+test("rejects relative group, meta-repository, and child repository paths after ~ expansion", () => {
+  const groupValid = structuredClone(valid);
+  groupValid.projects.acme = {
+    label: "Acme",
+    kind: "work",
+    path: "/repo/acme",
+    repository: "group",
+    worktree: {
+      branch_template: "ticket/{task}/{slug}",
+      path_template: "{worktree_root}/acme/{task}-{slug}",
+    },
+    coordination: {
+      meta_repository: "/repo/acme",
+      repos_directory: "repos",
+    },
+    repositories: {
+      backend: {
+        path: "/repo/acme/acme_backend",
+        base_branch: "dev",
+        branch_template: "feature/{task}/{slug}",
+      },
+    },
+  };
+
+  const relativeGroup = structuredClone(groupValid);
+  relativeGroup.projects.acme.path = "repo/acme";
+  assert.throws(() => validateRegistry(relativeGroup), /acme\.path.*absolute/i);
+
+  const relativeMeta = structuredClone(groupValid);
+  relativeMeta.projects.acme.coordination.meta_repository = "./repo/acme";
+  assert.throws(() => validateRegistry(relativeMeta), /acme\.coordination\.meta_repository.*absolute/i);
+
+  const relativeChild = structuredClone(groupValid);
+  relativeChild.projects.acme.repositories.backend.path = "repos/backend";
+  assert.throws(() => validateRegistry(relativeChild), /acme\.repositories\.backend\.path.*absolute/i);
+});
+
+test("accepts launcher and project paths that become absolute after ~ expansion", () => {
+  const value = structuredClone(valid);
+  value.launcher.worktree_root = "~/worktrees";
+  value.projects.ocr.path = "~/repo/ocr";
+
+  const registry = validateRegistry(value);
+
+  assert.equal(registry.launcher.worktree_root, join(homedir(), "worktrees"));
+  assert.equal(registry.projects.ocr.path, join(homedir(), "repo", "ocr"));
+});
+
 test("preserves OCR infrastructure runtime in the migrated registry", async () => {
   const registry = await loadRegistry(new URL("../projects.yaml", import.meta.url));
   assert.deepEqual(

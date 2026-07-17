@@ -29,6 +29,8 @@ function planPreview(overrides = {}) {
       git: { status: "ready", path: "/usr/bin/git" },
       herdr: { status: "ready", path: "/usr/bin/herdr" },
       pi: { status: "ready", path: "/usr/bin/pi" },
+      herdrStatus: { id: "herdr:status", status: "ready" },
+      piIntegration: { id: "herdr:integration:pi", status: "ready" },
     },
     reconciliation: {
       status: "incomplete",
@@ -218,6 +220,92 @@ test("start executes with --yes and maps partial execution to a stable exit code
   assert.equal(code, 13);
   assert.deepEqual(calls, ["plan", "incomplete"]);
   assert.deepEqual(output.stdout, ["start:compact:partial"]);
+});
+
+test("start blocks before mutation when Herdr or Pi launch preconditions are not ready", async () => {
+  const herdrOutput = io();
+  let herdrExecuted = false;
+  const herdrCode = await main(["start", "ocr", "ASANA-123", "--yes"], {
+    ...herdrOutput,
+    planCommand: async () => planPreview({
+      preconditions: {
+        ...planPreview().preconditions,
+        herdrStatus: { id: "herdr:status", status: "conflict", reason: "Herdr server is not ready" },
+      },
+    }),
+    executeStart: async () => {
+      herdrExecuted = true;
+      return executionReport();
+    },
+  });
+
+  assert.equal(herdrCode, 10);
+  assert.equal(herdrExecuted, false);
+  assert.match(herdrOutput.stderr[0], /Herdr server is not ready/);
+
+  const piOutput = io();
+  let piExecuted = false;
+  const piCode = await main(["start", "ocr", "ASANA-123", "--yes"], {
+    ...piOutput,
+    planCommand: async () => planPreview({
+      preconditions: {
+        ...planPreview().preconditions,
+        piIntegration: { id: "herdr:integration:pi", status: "missing", reason: "Pi integration is not installed" },
+      },
+    }),
+    executeStart: async () => {
+      piExecuted = true;
+      return executionReport();
+    },
+  });
+
+  assert.equal(piCode, 10);
+  assert.equal(piExecuted, false);
+  assert.match(piOutput.stderr[0], /Pi integration is not installed/);
+});
+
+test("runtime requires compatible Herdr server but not Pi integration", async () => {
+  const blocked = io();
+  let blockedExecuted = false;
+  const blockedCode = await main(["runtime", "ocr", "ASANA-123", "--yes"], {
+    ...blocked,
+    planCommand: async () => planPreview({
+      preconditions: {
+        ...planPreview().preconditions,
+        herdrStatus: { id: "herdr:status", status: "conflict", reason: "Herdr server is not ready" },
+        piIntegration: { id: "herdr:integration:pi", status: "missing", reason: "Pi integration is not installed" },
+      },
+    }),
+    executeRuntime: async () => {
+      blockedExecuted = true;
+      return executionReport();
+    },
+  });
+
+  assert.equal(blockedCode, 10);
+  assert.equal(blockedExecuted, false);
+  assert.match(blocked.stderr[0], /Herdr server is not ready/);
+
+  const allowed = io();
+  let allowedExecuted = false;
+  const allowedCode = await main(["runtime", "ocr", "ASANA-123", "--yes"], {
+    ...allowed,
+    planCommand: async () => planPreview({
+      preconditions: {
+        ...planPreview().preconditions,
+        piIntegration: { id: "herdr:integration:pi", status: "missing", reason: "Pi integration is not installed" },
+      },
+    }),
+    executeRuntime: async () => {
+      allowedExecuted = true;
+      return executionReport();
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status ?? value.reconciliation?.status}`,
+  });
+
+  assert.equal(allowedCode, 0);
+  assert.equal(allowedExecuted, true);
+  assert.deepEqual(allowed.stdout, ["runtime:compact:completed"]);
 });
 
 test("maps conflict and preflight workflow errors to stable categories", async () => {
