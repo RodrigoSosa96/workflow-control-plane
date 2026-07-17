@@ -114,6 +114,32 @@ test("creates a new branch from the requested base when the branch does not exis
   assert.deepEqual(result, { path: "/repo/.worktrees/task", branch: "feature/task", createdBranch: true });
 });
 
+test("refuses worktree creation when the requested base does not exist", async () => {
+  const fixture = fixtureRunner({
+    "git show-ref --verify --quiet refs/heads/feature/task": async () => ({ code: 1, stdout: "", stderr: "" }),
+    "git rev-parse --verify --quiet missing-base^{commit}": async () => ({ code: 1, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  await assert.rejects(
+    git.createWorktree({
+      cwd: "/repo",
+      path: "/repo/.worktrees/task",
+      branch: "feature/task",
+      base: "missing-base",
+      reconciliation: { status: "missing" },
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /missing-base/);
+      return true;
+    },
+  );
+
+  assert.equal(fixture.calls.some((call) => call.args[0] === "worktree" && call.args[1] === "add"), false);
+});
+
 test("inspects a main checkout and a linked worktree", async (t) => {
   const { repoPath } = await createDisposableRepo(t);
   const linkedPath = join(resolve(repoPath, ".."), "feature-task");
@@ -153,6 +179,20 @@ test("checks whether local refs exist", async (t) => {
   assert.equal(await git.refExists({ cwd: repoPath, ref: "main", kind: "branch" }), true);
   assert.equal(await git.refExists({ cwd: repoPath, ref: "feature/task", kind: "branch" }), false);
   assert.equal(await git.refExists({ cwd: repoPath, ref: "HEAD", kind: "commit" }), true);
+});
+
+test("parses rename porcelain entries with new path and old fromPath", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  await gitExec(repoPath, ["mv", "README.md", "docs.md"]);
+  const dirty = await git.status({ cwd: repoPath });
+
+  assert.equal(dirty.dirty, true);
+  assert.equal(dirty.entries.length, 1);
+  assert.equal(dirty.entries[0].x, "R");
+  assert.equal(dirty.entries[0].path, "docs.md");
+  assert.equal(dirty.entries[0].fromPath, "README.md");
 });
 
 test("reports whether repository status is dirty", async (t) => {

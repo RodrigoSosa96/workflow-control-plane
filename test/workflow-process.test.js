@@ -44,6 +44,21 @@ test("passes arguments without shell interpolation", async () => {
   assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
 });
 
+test("forwards cwd and env while keeping shell disabled", async () => {
+  const calls = [];
+  const runner = createProcessRunner({ spawnImpl: fakeSpawn(calls) });
+  const env = { PATH: "/tmp/bin", WORKFLOW_TEST: "1" };
+
+  await runner.run("git", ["status"], {
+    cwd: "/tmp/repo",
+    env,
+  });
+
+  assert.equal(calls[0].options.cwd, "/tmp/repo");
+  assert.equal(calls[0].options.env, env);
+  assert.equal(calls[0].options.shell, false);
+});
+
 test("bounds collected stdout and stderr to 12000 characters", async () => {
   const calls = [];
   const runner = createProcessRunner({

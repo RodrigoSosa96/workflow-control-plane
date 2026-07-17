@@ -67,8 +67,8 @@ function parseStatus(output) {
     const firstPath = value.slice(3);
 
     if (x === "R" || x === "C") {
-      const path = values[index + 1] ?? firstPath;
-      entries.push({ x, y, path, fromPath: firstPath });
+      const fromPath = values[index + 1] ?? firstPath;
+      entries.push({ x, y, path: firstPath, fromPath });
       index += 1;
       continue;
     }
