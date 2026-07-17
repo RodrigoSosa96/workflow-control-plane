@@ -272,6 +272,11 @@ function normalizeAgentResult(value) {
   return { agentId, tabId, paneId };
 }
 
+function normalizePaneProcessInfo(value) {
+  if (value === null || value === undefined) return null;
+  return value?.process ?? value?.process_info ?? value;
+}
+
 export function createHerdrAdapter({ runner, binary = "herdr" }) {
   async function run(area, command, args = [], { cwd } = {}) {
     const fullArgs = command ? [area, command, ...args] : [area, ...args];
@@ -405,6 +410,13 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
         fail("PREFLIGHT", "runInPane requires a trusted registry command string", { paneId, command }, 10);
       }
       return await invoke("pane", "run", [paneId, command]);
+    },
+
+    async getPaneProcessInfo(paneId) {
+      if (typeof paneId !== "string" || !paneId) {
+        fail("PREFLIGHT", "getPaneProcessInfo requires a pane ID string", { paneId }, 10);
+      }
+      return normalizePaneProcessInfo(await invoke("pane", "process-info", ["--pane", paneId]));
     },
 
     async startAgent({ name, cwd, workspaceId, tabId, split, argv, focus = false }) {

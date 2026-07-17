@@ -116,24 +116,23 @@ function matchesExecutable(expectedCommand, processInfo) {
   return basename(actual) === basename(expected);
 }
 
-function matchesProcessIdentity(expectedCommand, processInfo, fallbackCommand, { allowFallbackCommand = true } = {}) {
-  const liveCommand = processInfoCommand(processInfo) ?? (allowFallbackCommand ? fallbackCommand ?? null : null);
+function matchesProcessIdentity(expectedCommand, processInfo) {
+  const liveCommand = processInfoCommand(processInfo);
   if (!processInfoRunning(processInfo) && !liveCommand) return false;
   return liveCommand === expectedCommand && matchesExecutable(expectedCommand, processInfo);
 }
 
-function hasLiveIdentityEvidence(processInfo, fallbackCommand, { allowFallbackCommand = true } = {}) {
-  return processInfoRunning(processInfo) || (allowFallbackCommand && typeof fallbackCommand === "string");
+function hasLiveProcessEvidence(processInfo) {
+  return processInfoRunning(processInfo) || Boolean(processInfoCommand(processInfo) || processInfoExecutable(processInfo));
 }
 
 async function loadPaneProcessInfo(herdr, pane) {
-  const method = herdr?.getPaneProcessInfo ?? herdr?.paneProcessInfo ?? herdr?.processInfo;
-  if (typeof method !== "function") return { available: false, value: null };
+  if (typeof herdr?.getPaneProcessInfo !== "function") return { available: false, value: null };
   const id = paneId(pane);
   if (!id) return { available: true, value: null };
   return {
     available: true,
-    value: await method.call(herdr, { paneId: id }),
+    value: await herdr.getPaneProcessInfo(id),
   };
 }
 
@@ -600,16 +599,14 @@ async function classifyRuntime(plan, tabs, panes, herdr, canonicalPath) {
   for (const process of plan.runtime.processes) {
     const expectedCwd = await canonicalPath(resolve(plan.runtime.worktreePath, process.cwd ?? "."));
     const sameCwd = runtimePanes.filter((pane) => pane.canonicalPath === expectedCwd);
-    const exactMatches = sameCwd.filter((pane) => pane.label === process.id && matchesProcessIdentity(process.command, pane.processInfo, pane.liveCommand, {
-      allowFallbackCommand: !pane.processInfoAvailable,
-    }));
-    const labelMatches = sameCwd.filter((pane) => pane.label === process.id && !matchesProcessIdentity(process.command, pane.processInfo, pane.liveCommand, {
-      allowFallbackCommand: !pane.processInfoAvailable,
-    }));
-    const commandMatches = sameCwd.filter((pane) => pane.label !== process.id && matchesProcessIdentity(process.command, pane.processInfo, pane.liveCommand, {
-      allowFallbackCommand: !pane.processInfoAvailable,
-    }));
-    const evidenceMatches = [...exactMatches, ...labelMatches, ...commandMatches];
+    const exactMatches = sameCwd.filter((pane) => pane.label === process.id && pane.processInfoAvailable && matchesProcessIdentity(process.command, pane.processInfo));
+    const matchingCommandLabels = sameCwd.filter((pane) => !pane.processInfoAvailable && pane.label === process.id && typeof pane.liveCommand === "string" && pane.liveCommand === process.command);
+    const mismatchedCommandLabels = sameCwd.filter((pane) => !pane.processInfoAvailable && pane.label === process.id && typeof pane.liveCommand === "string" && pane.liveCommand !== process.command);
+    const commandMatches = sameCwd.filter((pane) => pane.label !== process.id && (
+      (pane.processInfoAvailable && matchesProcessIdentity(process.command, pane.processInfo))
+      || (!pane.processInfoAvailable && typeof pane.liveCommand === "string" && pane.liveCommand === process.command)
+    ));
+    const evidenceMatches = [...exactMatches, ...matchingCommandLabels, ...mismatchedCommandLabels, ...commandMatches];
 
     if (exactMatches.length > 1 || evidenceMatches.length > 1) {
       processes.push({
@@ -631,17 +628,23 @@ async function classifyRuntime(plan, tabs, panes, herdr, canonicalPath) {
       continue;
     }
 
-    if (labelMatches.length > 0) {
-      const liveEvidence = labelMatches.some((pane) => hasLiveIdentityEvidence(pane.processInfo, pane.liveCommand, {
-        allowFallbackCommand: !pane.processInfoAvailable,
-      }));
+    if (mismatchedCommandLabels.length > 0) {
       processes.push({
         ...process,
-        status: liveEvidence ? "conflict" : "missing",
-        reason: liveEvidence
-          ? `Runtime process ${process.id} has mismatched command or label evidence`
-          : `Runtime process ${process.id} is not running`,
-        actual: labelMatches,
+        status: "conflict",
+        reason: `Runtime process ${process.id} has mismatched command or label evidence`,
+        actual: mismatchedCommandLabels,
+      });
+      continue;
+    }
+
+    const liveLabelMatches = sameCwd.filter((pane) => pane.label === process.id && pane.processInfoAvailable && hasLiveProcessEvidence(pane.processInfo));
+    if (liveLabelMatches.length > 0) {
+      processes.push({
+        ...process,
+        status: "conflict",
+        reason: `Runtime process ${process.id} has mismatched command or label evidence`,
+        actual: liveLabelMatches,
       });
       continue;
     }
@@ -652,6 +655,16 @@ async function classifyRuntime(plan, tabs, panes, herdr, canonicalPath) {
         status: "conflict",
         reason: `Runtime process ${process.id} has mismatched command or label evidence`,
         actual: commandMatches,
+      });
+      continue;
+    }
+
+    if (matchingCommandLabels.length > 0) {
+      processes.push({
+        ...process,
+        status: "missing",
+        reason: `Runtime process ${process.id} could not be confirmed because pane process-info is unavailable`,
+        actual: matchingCommandLabels,
       });
       continue;
     }

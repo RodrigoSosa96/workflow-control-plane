@@ -730,6 +730,35 @@ test("runs trusted pane commands as a single argument and rejects untrusted shap
   );
 });
 
+test("gets pane process-info through the public cli and unwraps the live envelope", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["pane", "process-info", "--pane", "w2:p3"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({
+        type: "pane_process_info",
+        pane: { pane_id: "w2:p3", tab_id: "w2:t2" },
+        process: {
+          running: true,
+          executable: "/usr/bin/pnpm",
+          command: "pnpm dev:api",
+          pid: 4242,
+        },
+      }, "cli:pane:process-info"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(await herdr.getPaneProcessInfo("w2:p3"), {
+    running: true,
+    executable: "/usr/bin/pnpm",
+    command: "pnpm dev:api",
+    pid: 4242,
+  });
+});
+
 test("starts an agent with explicit focus flags and live argv after --", async () => {
   const fixture = fixtureRunner([
     {

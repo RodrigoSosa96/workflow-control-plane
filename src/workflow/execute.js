@@ -163,19 +163,14 @@ function matchesProcessIdentity(expectedCommand, processInfo) {
     && matchesExecutable(expectedCommand, processInfo);
 }
 
-function paneProcessInfoMethod(herdr) {
-  return herdr?.getPaneProcessInfo ?? herdr?.paneProcessInfo ?? herdr?.processInfo ?? null;
-}
-
 async function observePaneProcess(herdr, paneId, observeMs = 0) {
-  const method = paneProcessInfoMethod(herdr);
-  if (typeof method !== "function") {
+  if (typeof herdr?.getPaneProcessInfo !== "function") {
     fail("PREFLIGHT", "executeRuntime requires Herdr pane process-info inspection", { paneId }, 10);
   }
   if (observeMs > 0) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, observeMs));
   }
-  return await method.call(herdr, { paneId });
+  return await herdr.getPaneProcessInfo(paneId);
 }
 
 function runtimeProcessCwd(plan, process) {
@@ -296,7 +291,7 @@ function ensureRuntimeShape({ plan, herdr, runtimeTabOperation, runtimeOperation
     || typeof herdr.renamePane !== "function"
     || typeof herdr.splitPane !== "function"
     || typeof herdr.runInPane !== "function"
-    || typeof paneProcessInfoMethod(herdr) !== "function") {
+    || typeof herdr.getPaneProcessInfo !== "function") {
     fail("PREFLIGHT", "executeRuntime requires Herdr tab, pane, run, and process-info methods", {}, 10);
   }
   if (!runtimeTabOperation || !runtimeOperation || !plan?.runtime) {

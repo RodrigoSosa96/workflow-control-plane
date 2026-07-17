@@ -107,7 +107,7 @@ function createHerdr({ workspaces = [], tabs = {}, panes = {}, agents = [], proc
       return { agents };
     },
     ...(processInfos ? {
-      async getPaneProcessInfo({ paneId }) {
+      async getPaneProcessInfo(paneId) {
         return Object.hasOwn(processInfos, paneId) ? processInfos[paneId] : null;
       },
     } : {}),
@@ -182,6 +182,13 @@ test("classifies a compatible ordinary plan from Git and Herdr facts", async () 
             command: "pnpm dev:api",
           },
         ],
+      },
+      processInfos: {
+        "w1:p2": {
+          running: true,
+          executable: "pnpm",
+          command: "pnpm dev:api",
+        },
       },
       agents: [
         {
@@ -283,6 +290,13 @@ test("treats symlinked planned and actual worktree paths as the same canonical c
             command: "pnpm dev:api",
           },
         ],
+      },
+      processInfos: {
+        "w-symlink:p2": {
+          running: true,
+          executable: "pnpm",
+          command: "pnpm dev:api",
+        },
       },
       agents: [
         {
@@ -766,6 +780,74 @@ test("flags a Acme child worktree path that belongs to the wrong repository", as
   assert.equal(reconciled.status, "conflict");
   assert.equal(reconciled.worktrees.find((worktree) => worktree.alias === "backend").status, "conflict");
   assert.match(reconciled.worktrees.find((worktree) => worktree.alias === "backend").reason, /wrong repository|backend/i);
+});
+
+test("does not treat a runtime pane command as compatible evidence when process-info is unavailable", async () => {
+  const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const workspaceId = "w-runtime-no-process-info";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: createGit({
+      repositories: {
+        "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+        [plan.worktrees[0].path]: { rootPath: plan.worktrees[0].path, commonDirPath: "/repo/ocr/.git" },
+      },
+      worktrees: {
+        "/repo/ocr": [
+          { path: plan.worktrees[0].path, branch: branchRef(plan.worktrees[0].branch) },
+        ],
+      },
+    }),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: plan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: "w-runtime-no-process-info:t1", workspace_id: workspaceId, label: "agent" },
+          { tab_id: "w-runtime-no-process-info:t2", workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: "w-runtime-no-process-info:p1",
+            tab_id: "w-runtime-no-process-info:t1",
+            label: "agent-shell",
+            cwd: plan.agent.worktreePath,
+            foreground_cwd: plan.agent.worktreePath,
+          },
+          {
+            pane_id: "w-runtime-no-process-info:p2",
+            tab_id: "w-runtime-no-process-info:t2",
+            label: "api",
+            cwd: plan.runtime.worktreePath,
+            foreground_cwd: plan.runtime.worktreePath,
+            command: "pnpm dev:api",
+          },
+        ],
+      },
+      agents: [
+        {
+          tab_id: "w-runtime-no-process-info:t1",
+          workspace_id: workspaceId,
+          name: plan.agent.sessionName,
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.status, "incomplete");
+  assert.equal(reconciled.runtime.processes[0].status, "missing");
+  assert.doesNotMatch(reconciled.runtime.processes[0].reason, /present|ready|compatible/i);
 });
 
 test("does not treat a runtime pane with the right label but wrong command as compatible", async () => {

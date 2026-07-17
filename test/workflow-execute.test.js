@@ -2,9 +2,34 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { executeStart, executeRuntime } from "../src/workflow/execute.js";
+import { createHerdrAdapter } from "../src/workflow/herdr.js";
 
 const workspacePath = "/repo/.worktrees/ASANA-123-discovered-docs";
 const sessionName = "ocr-ASANA-123-discovered-docs";
+
+function cliResult(result, id = "cli:test") {
+  return JSON.stringify({ id, result });
+}
+
+function fixtureRunner(fixtures = []) {
+  const queue = [...fixtures];
+  return {
+    runner: {
+      async run(command, args = [], options = {}) {
+        const fixture = queue.shift();
+        if (!fixture) {
+          throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
+        }
+        fixture.assert?.({ command, args, options });
+        return {
+          code: fixture.code ?? 0,
+          stdout: fixture.stdout ?? cliResult(fixture.result ?? null),
+          stderr: fixture.stderr ?? "",
+        };
+      },
+    },
+  };
+}
 
 function buildPlan({
   status = "incomplete",
@@ -401,7 +426,7 @@ function createRuntimeHerdr(calls, {
       }
       return { accepted: true };
     },
-    async getPaneProcessInfo({ paneId }) {
+    async getPaneProcessInfo(paneId) {
       calls.push({ kind: "herdr.pane.process-info", paneId });
       return liveProcessInfos.has(paneId) ? liveProcessInfos.get(paneId) : null;
     },
@@ -758,6 +783,77 @@ test("runtime creates runtime panes from trusted registry commands", async () =>
     { id: "infrastructure", status: "created" },
     { id: "backend", status: "created" },
     { id: "frontend", status: "created" },
+  ]);
+});
+
+test("runtime works with the real Herdr adapter process-info contract", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ command, args, options }) => {
+        assert.equal(command, "herdr");
+        assert.deepEqual(args, [
+          "tab",
+          "create",
+          "--workspace",
+          "w1",
+          "--cwd",
+          workspacePath,
+          "--label",
+          "runtime",
+          "--no-focus",
+        ]);
+        assert.deepEqual(options, { allowFailure: true, cwd: workspacePath });
+      },
+      stdout: cliResult({
+        type: "tab_created",
+        tab: { tab_id: "w1:t9", workspace_id: "w1", label: "runtime" },
+        root_pane: { pane_id: "w1:p-root", tab_id: "w1:t9", workspace_id: "w1" },
+      }, "cli:tab:create"),
+    },
+    {
+      assert: ({ command, args, options }) => {
+        assert.equal(command, "herdr");
+        assert.deepEqual(args, ["pane", "rename", "w1:p-root", "api"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ pane_id: "w1:p-root", label: "api" }, "cli:pane:rename"),
+    },
+    {
+      assert: ({ command, args, options }) => {
+        assert.equal(command, "herdr");
+        assert.deepEqual(args, ["pane", "run", "w1:p-root", "pnpm dev:api"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ accepted: true }, "cli:pane:run"),
+    },
+    {
+      assert: ({ command, args, options }) => {
+        assert.equal(command, "herdr");
+        assert.deepEqual(args, ["pane", "process-info", "--pane", "w1:p-root"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({
+        type: "pane_process_info",
+        pane: { pane_id: "w1:p-root", tab_id: "w1:t9", workspace_id: "w1" },
+        process: {
+          running: true,
+          executable: "/usr/bin/pnpm",
+          command: "pnpm dev:api",
+        },
+      }, "cli:pane:process-info"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const report = await executeRuntime(buildRuntimePlan({
+    runtimeProcesses: [
+      { id: "api", command: "pnpm dev:api", cwd: "." },
+    ],
+  }), { herdr, observeMs: 0 });
+
+  assert.equal(report.status, "completed");
+  assert.deepEqual(report.processes.map(({ id, status }) => ({ id, status })), [
+    { id: "api", status: "created" },
   ]);
 });
 
