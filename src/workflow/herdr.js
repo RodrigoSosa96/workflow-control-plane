@@ -49,7 +49,7 @@ function unwrapHerdrPayload(payload, context) {
     );
   }
 
-  if (payload.ok === true && Object.hasOwn(payload, "result")) {
+  if (Object.hasOwn(payload, "result")) {
     return payload.result;
   }
 
@@ -216,34 +216,31 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
     async integrationStatus({ outdatedOnly = false } = {}) {
       const args = [];
       if (outdatedOnly) args.push("--outdated-only");
-      args.push("--json");
       return await invoke("integration", "status", args);
     },
 
     async listWorkspaces() {
-      return await invoke("workspace", "list", ["--json"]);
+      return await invoke("workspace", "list");
     },
 
     async getWorkspace({ workspaceId }) {
-      return await invoke("workspace", "get", [workspaceId, "--json"]);
+      return await invoke("workspace", "get", [workspaceId]);
     },
 
     async listTabs({ workspaceId }) {
       const args = [];
       pushOption(args, "--workspace", workspaceId);
-      args.push("--json");
       return await invoke("tab", "list", args);
     },
 
     async listPanes({ workspaceId }) {
       const args = [];
       pushOption(args, "--workspace", workspaceId);
-      args.push("--json");
       return await invoke("pane", "list", args);
     },
 
     async listAgents() {
-      return await invoke("agent", "list", ["--json"]);
+      return await invoke("agent", "list");
     },
 
     async ensureNativeWorktree(operation) {
@@ -297,16 +294,15 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       pushOption(args, "--cwd", cwd);
       pushOption(args, "--label", label);
       pushFocus(args, focus);
-      args.push("--json");
       return normalizeTabResult(await invoke("tab", "create", args, { cwd }));
     },
 
     async renameTab({ tabId, label }) {
-      return await invoke("tab", "rename", [tabId, label, "--json"]);
+      return await invoke("tab", "rename", [tabId, label]);
     },
 
     async renamePane({ paneId, label }) {
-      return await invoke("pane", "rename", [paneId, label, "--json"]);
+      return await invoke("pane", "rename", [paneId, label]);
     },
 
     async splitPane({ paneId, direction, ratio, cwd, focus = false }) {
@@ -314,7 +310,6 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       pushOption(args, "--ratio", ratio);
       pushOption(args, "--cwd", cwd);
       pushFocus(args, focus);
-      args.push("--json");
       return normalizePaneResult(await invoke("pane", "split", args, { cwd }));
     },
 

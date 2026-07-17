@@ -3,12 +3,16 @@ import { test } from "node:test";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
 
-function jsonResult(result) {
+function cliResult(result, id = "cli:test") {
+  return JSON.stringify({ id, result });
+}
+
+function apiOk(result) {
   return JSON.stringify({ ok: true, result });
 }
 
-function jsonError(error) {
-  return JSON.stringify({ ok: false, error });
+function cliError(error, id = "cli:test") {
+  return JSON.stringify({ id, error });
 }
 
 function fixtureRunner(fixtures = []) {
@@ -28,7 +32,7 @@ function fixtureRunner(fixtures = []) {
         if (fixture.error) throw fixture.error;
         return {
           code: fixture.code ?? 0,
-          stdout: fixture.stdout ?? jsonResult(fixture.result ?? null),
+          stdout: fixture.stdout ?? cliResult(fixture.result ?? null),
           stderr: fixture.stderr ?? "",
         };
       },
@@ -44,7 +48,7 @@ const planOp = {
   label: "ASANA-123 discovered-docs",
 };
 
-test("parses JSON status and integration responses with the configured binary", async () => {
+test("parses live status and integration responses with the configured binary", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ command, args, options }) => {
@@ -52,15 +56,22 @@ test("parses JSON status and integration responses with the configured binary", 
         assert.deepEqual(args, ["status", "--json"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: { server: { running: true } },
+      stdout: cliResult({
+        client: { version: "0.7.4", protocol: 16 },
+        server: { running: true, compatible: true },
+      }, "cli:status"),
     },
     {
       assert: ({ command, args, options }) => {
         assert.equal(command, "mock-herdr");
-        assert.deepEqual(args, ["integration", "status", "--json"]);
+        assert.deepEqual(args, ["integration", "status"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: { pi: { installed: true, current: true } },
+      stdout: cliResult({
+        integrations: [
+          { name: "pi", state: "current", version: 5 },
+        ],
+      }, "cli:integration:status"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner, binary: "mock-herdr" });
@@ -68,64 +79,305 @@ test("parses JSON status and integration responses with the configured binary", 
   const status = await herdr.status();
   const integrations = await herdr.integrationStatus();
 
-  assert.deepEqual(status, { server: { running: true } });
-  assert.deepEqual(integrations, { pi: { installed: true, current: true } });
+  assert.deepEqual(status, {
+    client: { version: "0.7.4", protocol: 16 },
+    server: { running: true, compatible: true },
+  });
+  assert.deepEqual(integrations, {
+    integrations: [
+      { name: "pi", state: "current", version: 5 },
+    ],
+  });
 });
 
-test("lists and gets workspaces, tabs, panes, and agents through JSON wrappers", async () => {
+test("keeps supporting legacy ok/result success envelopes", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return {
+          code: 0,
+          stdout: apiOk({ server: { running: true } }),
+          stderr: "",
+        };
+      },
+    },
+  });
+
+  assert.deepEqual(await herdr.status(), { server: { running: true } });
+});
+
+test("lists and gets workspaces, tabs, panes, and agents through live JSON-default wrappers", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["workspace", "list", "--json"]);
+        assert.deepEqual(args, ["workspace", "list"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: [{ workspace_id: "w1", cwd: "/repo/main" }],
+      stdout: cliResult({
+        type: "workspace_list",
+        workspaces: [
+          {
+            active_tab_id: "wH:t3",
+            agent_status: "done",
+            focused: false,
+            label: "workflow-launcher",
+            number: 4,
+            pane_count: 9,
+            tab_count: 3,
+            workspace_id: "wH",
+            worktree: {
+              checkout_path: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+              is_linked_worktree: true,
+              repo_key: "/home/you/projects/personal/workflows/.git",
+              repo_name: "workflows",
+              repo_root: "/home/you/projects/personal/workflows",
+            },
+          },
+        ],
+      }, "cli:workspace:list"),
     },
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["workspace", "get", "w1", "--json"]);
+        assert.deepEqual(args, ["workspace", "get", "wH"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: { workspace_id: "w1", cwd: "/repo/main" },
+      stdout: cliResult({
+        type: "workspace_info",
+        workspace: {
+          active_tab_id: "wH:t3",
+          agent_status: "done",
+          focused: false,
+          label: "workflow-launcher",
+          number: 4,
+          pane_count: 9,
+          tab_count: 3,
+          workspace_id: "wH",
+          worktree: {
+            checkout_path: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+            is_linked_worktree: true,
+            repo_key: "/home/you/projects/personal/workflows/.git",
+            repo_name: "workflows",
+            repo_root: "/home/you/projects/personal/workflows",
+          },
+        },
+      }, "cli:workspace:get"),
     },
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["tab", "list", "--workspace", "w1", "--json"]);
+        assert.deepEqual(args, ["tab", "list", "--workspace", "wH"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: [{ tab_id: "w1:t1", workspace_id: "w1" }],
+      stdout: cliResult({
+        type: "tab_list",
+        tabs: [
+          {
+            agent_status: "done",
+            focused: false,
+            label: "task-4",
+            number: 3,
+            pane_count: 3,
+            tab_id: "wH:t3",
+            workspace_id: "wH",
+          },
+        ],
+      }, "cli:tab:list"),
     },
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["pane", "list", "--workspace", "w1", "--json"]);
+        assert.deepEqual(args, ["pane", "list", "--workspace", "wH"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: [{ pane_id: "w1:p1", tab_id: "w1:t1" }],
+      stdout: cliResult({
+        type: "pane_list",
+        panes: [
+          {
+            agent: "pi",
+            agent_session: {
+              agent: "pi",
+              kind: "path",
+              source: "herdr:pi",
+              value: "/home/you/.pi/agent/sessions/session.jsonl",
+            },
+            agent_status: "working",
+            cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+            focused: false,
+            foreground_cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+            label: "workflow-task-4",
+            pane_id: "wH:p8",
+            revision: 1,
+            scroll: {
+              max_offset_from_bottom: 1088,
+              offset_from_bottom: 0,
+              viewport_rows: 28,
+            },
+            tab_id: "wH:t3",
+            terminal_id: "term_656d13f62dc871a",
+            terminal_title: "π - workflow-task-4 - workflow-launcher",
+            terminal_title_stripped: "π - workflow-task-4 - workflow-launcher",
+            workspace_id: "wH",
+          },
+        ],
+      }, "cli:pane:list"),
     },
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["agent", "list", "--json"]);
+        assert.deepEqual(args, ["agent", "list"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: [{ agent_id: "a1", name: "ocr-ASANA-123" }],
+      stdout: cliResult({
+        type: "agent_list",
+        agents: [
+          {
+            agent: "pi",
+            agent_session: {
+              agent: "pi",
+              kind: "path",
+              source: "herdr:pi",
+              value: "/home/you/.pi/agent/sessions/session.jsonl",
+            },
+            agent_status: "working",
+            cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+            focused: false,
+            foreground_cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+            name: "workflow-task-4",
+            pane_id: "wH:p8",
+            revision: 1,
+            screen_detection_skipped: true,
+            tab_id: "wH:t3",
+            terminal_id: "term_656d13f62dc871a",
+            terminal_title: "π - workflow-task-4 - workflow-launcher",
+            terminal_title_stripped: "π - workflow-task-4 - workflow-launcher",
+            workspace_id: "wH",
+          },
+        ],
+      }, "cli:agent:list"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
 
-  assert.deepEqual(await herdr.listWorkspaces(), [{ workspace_id: "w1", cwd: "/repo/main" }]);
-  assert.deepEqual(await herdr.getWorkspace({ workspaceId: "w1" }), { workspace_id: "w1", cwd: "/repo/main" });
-  assert.deepEqual(await herdr.listTabs({ workspaceId: "w1" }), [{ tab_id: "w1:t1", workspace_id: "w1" }]);
-  assert.deepEqual(await herdr.listPanes({ workspaceId: "w1" }), [{ pane_id: "w1:p1", tab_id: "w1:t1" }]);
-  assert.deepEqual(await herdr.listAgents(), [{ agent_id: "a1", name: "ocr-ASANA-123" }]);
+  assert.deepEqual(await herdr.listWorkspaces(), {
+    type: "workspace_list",
+    workspaces: [
+      {
+        active_tab_id: "wH:t3",
+        agent_status: "done",
+        focused: false,
+        label: "workflow-launcher",
+        number: 4,
+        pane_count: 9,
+        tab_count: 3,
+        workspace_id: "wH",
+        worktree: {
+          checkout_path: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+          is_linked_worktree: true,
+          repo_key: "/home/you/projects/personal/workflows/.git",
+          repo_name: "workflows",
+          repo_root: "/home/you/projects/personal/workflows",
+        },
+      },
+    ],
+  });
+  assert.deepEqual(await herdr.getWorkspace({ workspaceId: "wH" }), {
+    type: "workspace_info",
+    workspace: {
+      active_tab_id: "wH:t3",
+      agent_status: "done",
+      focused: false,
+      label: "workflow-launcher",
+      number: 4,
+      pane_count: 9,
+      tab_count: 3,
+      workspace_id: "wH",
+      worktree: {
+        checkout_path: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+        is_linked_worktree: true,
+        repo_key: "/home/you/projects/personal/workflows/.git",
+        repo_name: "workflows",
+        repo_root: "/home/you/projects/personal/workflows",
+      },
+    },
+  });
+  assert.deepEqual(await herdr.listTabs({ workspaceId: "wH" }), {
+    type: "tab_list",
+    tabs: [
+      {
+        agent_status: "done",
+        focused: false,
+        label: "task-4",
+        number: 3,
+        pane_count: 3,
+        tab_id: "wH:t3",
+        workspace_id: "wH",
+      },
+    ],
+  });
+  assert.deepEqual(await herdr.listPanes({ workspaceId: "wH" }), {
+    type: "pane_list",
+    panes: [
+      {
+        agent: "pi",
+        agent_session: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: "/home/you/.pi/agent/sessions/session.jsonl",
+        },
+        agent_status: "working",
+        cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+        focused: false,
+        foreground_cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+        label: "workflow-task-4",
+        pane_id: "wH:p8",
+        revision: 1,
+        scroll: {
+          max_offset_from_bottom: 1088,
+          offset_from_bottom: 0,
+          viewport_rows: 28,
+        },
+        tab_id: "wH:t3",
+        terminal_id: "term_656d13f62dc871a",
+        terminal_title: "π - workflow-task-4 - workflow-launcher",
+        terminal_title_stripped: "π - workflow-task-4 - workflow-launcher",
+        workspace_id: "wH",
+      },
+    ],
+  });
+  assert.deepEqual(await herdr.listAgents(), {
+    type: "agent_list",
+    agents: [
+      {
+        agent: "pi",
+        agent_session: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: "/home/you/.pi/agent/sessions/session.jsonl",
+        },
+        agent_status: "working",
+        cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+        focused: false,
+        foreground_cwd: "/home/you/projects/personal/workflows/.worktrees/workflow-launcher",
+        name: "workflow-task-4",
+        pane_id: "wH:p8",
+        revision: 1,
+        screen_detection_skipped: true,
+        tab_id: "wH:t3",
+        terminal_id: "term_656d13f62dc871a",
+        terminal_title: "π - workflow-task-4 - workflow-launcher",
+        terminal_title_stripped: "π - workflow-task-4 - workflow-launcher",
+        workspace_id: "wH",
+      },
+    ],
+  });
 });
 
-test("throws a HERDR error on API error envelopes", async () => {
+test("throws a HERDR error on live API error envelopes", async () => {
   const herdr = createHerdrAdapter({
     runner: {
       async run() {
         return {
           code: 9,
-          stdout: jsonError({ code: "not_found", message: "pane missing" }),
+          stdout: cliError({ code: "not_found", message: "pane missing" }, "cli:pane:list"),
           stderr: "backend exploded",
         };
       },
@@ -169,7 +421,7 @@ test("throws a HERDR error on malformed JSON output", async () => {
   );
 });
 
-test("returns IDs from a native worktree created response", async () => {
+test("returns IDs from a live native worktree created response", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -190,12 +442,12 @@ test("returns IDs from a native worktree created response", async () => {
         ]);
         assert.deepEqual(options, { allowFailure: true, cwd: "/repo/main" });
       },
-      result: {
+      stdout: cliResult({
         type: "worktree_created",
         workspace: { workspace_id: "w2", cwd: "/repo/.worktrees/ASANA-123-discovered-docs" },
         tab: { tab_id: "w2:t1", label: "shell" },
         root_pane: { pane_id: "w2:p1", label: "bootstrap" },
-      },
+      }, "cli:worktree:create"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
@@ -213,7 +465,7 @@ test("returns IDs from a native worktree created response", async () => {
   });
 });
 
-test("returns IDs from a native worktree opened response", async () => {
+test("returns IDs from a live native worktree opened response", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -230,12 +482,12 @@ test("returns IDs from a native worktree opened response", async () => {
         ]);
         assert.deepEqual(options, { allowFailure: true, cwd: "/repo/main" });
       },
-      result: {
+      stdout: cliResult({
         type: "worktree_opened",
         workspace: { workspace_id: "w4" },
         tab: { tab_id: "w4:t1" },
         root_pane: { pane_id: "w4:p1" },
-      },
+      }, "cli:worktree:open"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
@@ -253,15 +505,15 @@ test("returns IDs from a native worktree opened response", async () => {
   });
 });
 
-test("normalizes an already-open native worktree response without deriving IDs from labels", async () => {
+test("normalizes a live already-open native worktree response without deriving IDs from labels", async () => {
   const fixture = fixtureRunner([
     {
-      result: {
+      stdout: cliResult({
         type: "worktree_already_open",
         workspace: { workspace_id: "w7", label: "some other label" },
         tab: { tab_id: "w7:t9", label: "agent" },
         root_pane: { pane_id: "w7:p4", label: "not-an-id" },
-      },
+      }, "cli:worktree:open"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
@@ -302,7 +554,7 @@ test("reuses discovered IDs when reconciliation reports an already-open worktree
   assert.equal(fixture.calls.length, 0);
 });
 
-test("creates tabs and panes with explicit focus flags and parsed IDs", async () => {
+test("creates tabs and panes with explicit focus flags and live parsed IDs", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -314,14 +566,14 @@ test("creates tabs and panes with explicit focus flags and parsed IDs", async ()
           "--label",
           "runtime",
           "--no-focus",
-          "--json",
         ]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: {
-        tab: { tab_id: "w2:t2" },
-        root_pane: { pane_id: "w2:p2" },
-      },
+      stdout: cliResult({
+        type: "tab_created",
+        tab: { tab_id: "w2:t2", workspace_id: "w2", label: "runtime" },
+        root_pane: { pane_id: "w2:p2", tab_id: "w2:t2", workspace_id: "w2" },
+      }, "cli:tab:create"),
     },
     {
       assert: ({ args, options }) => {
@@ -336,13 +588,18 @@ test("creates tabs and panes with explicit focus flags and parsed IDs", async ()
           "--cwd",
           "/repo/.worktrees/ASANA-123-discovered-docs",
           "--focus",
-          "--json",
         ]);
         assert.deepEqual(options, { allowFailure: true, cwd: "/repo/.worktrees/ASANA-123-discovered-docs" });
       },
-      result: {
-        pane: { pane_id: "w2:p3" },
-      },
+      stdout: cliResult({
+        type: "pane_split",
+        pane: {
+          pane_id: "w2:p3",
+          tab_id: "w2:t2",
+          workspace_id: "w2",
+          cwd: "/repo/.worktrees/ASANA-123-discovered-docs",
+        },
+      }, "cli:pane:split"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
@@ -360,21 +617,21 @@ test("creates tabs and panes with explicit focus flags and parsed IDs", async ()
   assert.deepEqual(pane, { paneId: "w2:p3" });
 });
 
-test("renames tabs and panes, preserving literal labels", async () => {
+test("renames tabs and panes, preserving literal labels without unsupported json flags", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["tab", "rename", "w2:t2", "agent shell", "--json"]);
+        assert.deepEqual(args, ["tab", "rename", "w2:t2", "agent shell"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: { tab_id: "w2:t2", label: "agent shell" },
+      stdout: cliResult({ tab_id: "w2:t2", label: "agent shell" }, "cli:tab:rename"),
     },
     {
       assert: ({ args, options }) => {
-        assert.deepEqual(args, ["pane", "rename", "w2:p3", "api server", "--json"]);
+        assert.deepEqual(args, ["pane", "rename", "w2:p3", "api server"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: { pane_id: "w2:p3", label: "api server" },
+      stdout: cliResult({ pane_id: "w2:p3", label: "api server" }, "cli:pane:rename"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
@@ -396,12 +653,12 @@ test("runs trusted pane commands as a single argument and rejects untrusted shap
         assert.deepEqual(args, ["pane", "run", "w2:p3", "pnpm dev:api --filter=@app/api"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      result: { ok: true },
+      stdout: cliResult({ accepted: true }, "cli:pane:run"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
 
-  assert.deepEqual(await herdr.runInPane({ paneId: "w2:p3", command: "pnpm dev:api --filter=@app/api" }), { ok: true });
+  assert.deepEqual(await herdr.runInPane({ paneId: "w2:p3", command: "pnpm dev:api --filter=@app/api" }), { accepted: true });
 
   await assert.rejects(
     herdr.runInPane({ paneId: "w2:p3", command: ["pnpm", "dev:api"] }),
@@ -414,7 +671,7 @@ test("runs trusted pane commands as a single argument and rejects untrusted shap
   );
 });
 
-test("starts an agent with explicit focus flags and argv after --", async () => {
+test("starts an agent with explicit focus flags and live argv after --", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -434,11 +691,12 @@ test("starts an agent with explicit focus flags and argv after --", async () => 
         ]);
         assert.deepEqual(options, { allowFailure: true, cwd: "/repo/.worktrees/ASANA-123-discovered-docs" });
       },
-      result: {
+      stdout: cliResult({
+        type: "agent_started",
         agent: { agent_id: "a9", name: "ocr-ASANA-123-discovered-docs" },
         tab: { tab_id: "w2:t1" },
         pane: { pane_id: "w2:p9" },
-      },
+      }, "cli:agent:start"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
