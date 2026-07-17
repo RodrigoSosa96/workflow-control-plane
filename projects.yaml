@@ -1,5 +1,9 @@
-version: 1
-
+version: 2
+launcher:
+  worktree_root: /home/you/.herdr/worktrees
+  agent:
+    command: pi
+    session_template: "{project}-{task}-{slug}"
 projects:
   ocr:
     label: ExampleProject
@@ -9,11 +13,26 @@ projects:
     base_branch: dev
     task_source: asana
     package_manager: pnpm
+    worktree:
+      branch_template: "feature/{task}/{slug}"
+      path_template: "{worktree_root}/{project}/{task}-{slug}"
     runtime:
-      infrastructure: pnpm docker:dev
-      backend: pnpm dev:api
-      frontend: pnpm dev:front
-      workers: pnpm --filter=@app/workers dev
+      default_profile: standard
+      profiles:
+        standard:
+          processes:
+            - id: backend
+              cwd: .
+              command: pnpm dev:api
+            - id: frontend
+              cwd: .
+              command: pnpm dev:front
+              split: right
+              ratio: 0.5
+            - id: workers
+              cwd: .
+              command: pnpm --filter=@app/workers dev
+              split: right
     verify:
       - pnpm typecheck
       - pnpm biome:check
@@ -24,19 +43,25 @@ projects:
     path: /home/you/projects/work/acme
     repository: group
     task_source: asana
+    worktree:
+      branch_template: "ticket/{task}/{slug}"
+      path_template: "{worktree_root}/acme/{task}-{slug}"
+    coordination:
+      meta_repository: /home/you/projects/work/acme
+      repos_directory: repos
     repositories:
       backend:
         path: /home/you/projects/work/acme/acme_backend
-        base_branch: master
+        base_branch: dev
+        branch_template: "feature/{task}/{slug}"
       panel:
         path: /home/you/projects/work/acme/acme_panel
-        base_branch: master
+        base_branch: dev
+        branch_template: "feature/{task}/{slug}"
       webapp:
         path: /home/you/projects/work/acme/acme_webapp
-        base_branch: master
-    notes:
-      - The group root is not a git repository.
-      - Create worktrees against the individual repository being changed.
+        base_branch: dev
+        branch_template: "feature/{task}/{slug}"
 
   personalProjectD:
     label: PersonalProjectD
@@ -46,9 +71,20 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    worktree:
+      branch_template: "feature/{task}/{slug}"
+      path_template: "{worktree_root}/{project}/{task}-{slug}"
     runtime:
-      infrastructure: pnpm docker:dev
-      full: pnpm dev:full
+      default_profile: standard
+      profiles:
+        standard:
+          processes:
+            - id: infrastructure
+              cwd: .
+              command: pnpm docker:dev
+            - id: full
+              cwd: .
+              command: pnpm dev:full
     verify:
       - pnpm ci:verify
 
@@ -60,10 +96,23 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    worktree:
+      branch_template: "feature/{task}/{slug}"
+      path_template: "{worktree_root}/{project}/{task}-{slug}"
     runtime:
-      infrastructure: pnpm docker:dev
-      standard: pnpm dev
-      full: pnpm dev:full
+      default_profile: standard
+      profiles:
+        standard:
+          processes:
+            - id: infrastructure
+              cwd: .
+              command: pnpm docker:dev
+            - id: standard
+              cwd: .
+              command: pnpm dev
+            - id: full
+              cwd: .
+              command: pnpm dev:full
     verify:
       - pnpm ci:verify
 
@@ -75,8 +124,17 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    worktree:
+      branch_template: "feature/{task}/{slug}"
+      path_template: "{worktree_root}/{project}/{task}-{slug}"
     runtime:
-      development: pnpm dev
+      default_profile: standard
+      profiles:
+        standard:
+          processes:
+            - id: development
+              cwd: .
+              command: pnpm dev
     verify:
       - pnpm check
       - pnpm build
@@ -89,9 +147,22 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    worktree:
+      branch_template: "feature/{task}/{slug}"
+      path_template: "{worktree_root}/{project}/{task}-{slug}"
     runtime:
-      infrastructure: pnpm docker:dev
-      standard: pnpm dev
-      full: pnpm dev:full
+      default_profile: standard
+      profiles:
+        standard:
+          processes:
+            - id: infrastructure
+              cwd: .
+              command: pnpm docker:dev
+            - id: standard
+              cwd: .
+              command: pnpm dev
+            - id: full
+              cwd: .
+              command: pnpm dev:full
     verify:
       - pnpm ci:verify

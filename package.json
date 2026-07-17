@@ -4,12 +4,16 @@
   "private": true,
   "type": "module",
   "bin": {
-    "asana-workflow": "./bin/asana-workflow.js"
+    "asana-workflow": "./bin/asana-workflow.js",
+    "workflow": "./bin/workflow.js"
   },
   "scripts": {
     "test": "node --test"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
   }
 }
