@@ -10,6 +10,7 @@ function buildPlan({
   status = "incomplete",
   conflicts = [],
   worktreeStatus = "missing",
+  worktreeReconciliation,
   agentTabStatus = "missing",
   agentStatus = "missing",
   rootTabId = "w1:t1",
@@ -74,13 +75,13 @@ function buildPlan({
         base: "dev",
         path: workspacePath,
         label: "ASANA-123 discovered-docs",
-        reconciliation: worktreeStatus === "open"
+        reconciliation: worktreeReconciliation ?? (worktreeStatus === "open"
           ? { status: "open", workspace: rootWorkspace, tab: rootTab, root_pane: rootPane }
           : worktreeStatus === "closed"
             ? { status: "closed", reason: "workspace is closed" }
             : worktreeStatus === "compatible"
               ? { status: "compatible" }
-              : { status: worktreeStatus, reason: `worktree is ${worktreeStatus}` },
+              : { status: worktreeStatus, reason: `worktree is ${worktreeStatus}` }),
       },
       {
         id: "workspace",
@@ -116,12 +117,78 @@ function buildPlan({
   };
 }
 
+function buildWorkspaceState({
+  workspaceId = "w1",
+  tabId = "w1:t1",
+  bootstrapPaneId = "w1:p1",
+  agentPaneId = "w1:p2",
+  agentTabLabel = "agent",
+  bootstrapPane = {},
+  agentPane = {},
+  workspaces,
+  tabs,
+  panes,
+} = {}) {
+  return {
+    workspaces: workspaces ?? [
+      {
+        workspace_id: workspaceId,
+        active_tab_id: tabId,
+        label: "ASANA-123 discovered-docs",
+        worktree: {
+          checkout_path: workspacePath,
+        },
+      },
+    ],
+    tabs: tabs ?? {
+      [workspaceId]: [
+        { tab_id: tabId, workspace_id: workspaceId, label: agentTabLabel },
+      ],
+    },
+    panes: panes ?? {
+      [workspaceId]: [
+        {
+          pane_id: bootstrapPaneId,
+          tab_id: tabId,
+          workspace_id: workspaceId,
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          ...bootstrapPane,
+        },
+        {
+          pane_id: agentPaneId,
+          tab_id: tabId,
+          workspace_id: workspaceId,
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          agent: "pi",
+          agent_status: "working",
+          ...agentPane,
+        },
+      ],
+    },
+  };
+}
+
 function createHerdr(calls, {
   ensureResult = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1", disposition: "created" },
   startResult = { agentId: "a1", tabId: "w1:t1", paneId: "w1:p2" },
   failRename = null,
   failStart = null,
+  workspaces,
+  tabs,
+  panes,
 } = {}) {
+  const state = buildWorkspaceState({
+    workspaceId: ensureResult.workspaceId,
+    tabId: ensureResult.tabId,
+    bootstrapPaneId: ensureResult.paneId,
+    agentPaneId: startResult.paneId,
+    workspaces,
+    tabs,
+    panes,
+  });
+
   return {
     async ensureNativeWorktree(operation) {
       calls.push({
@@ -129,6 +196,18 @@ function createHerdr(calls, {
         operation,
       });
       return ensureResult;
+    },
+    async listWorkspaces() {
+      calls.push({ kind: "herdr.workspace.list" });
+      return { workspaces: state.workspaces };
+    },
+    async listTabs({ workspaceId }) {
+      calls.push({ kind: "herdr.tab.list", workspaceId });
+      return { tabs: state.tabs[workspaceId] ?? [] };
+    },
+    async listPanes({ workspaceId }) {
+      calls.push({ kind: "herdr.pane.list", workspaceId });
+      return { panes: state.panes[workspaceId] ?? [] };
     },
     async renameTab({ tabId, label }) {
       calls.push({ kind: "herdr.tab.rename", tabId, label });
@@ -162,6 +241,8 @@ test("creates native worktree and starts a named Pi session without a prompt", a
     "herdr.worktree.create",
     "herdr.tab.rename",
     "herdr.agent.start",
+    "herdr.tab.list",
+    "herdr.pane.list",
     "herdr.pane.close",
   ]);
   const launch = calls.find((call) => call.kind === "herdr.agent.start");
@@ -200,6 +281,8 @@ test("reopens a closed workspace before renaming the bootstrap tab and starting 
     "herdr.worktree.open",
     "herdr.tab.rename",
     "herdr.agent.start",
+    "herdr.tab.list",
+    "herdr.pane.list",
     "herdr.pane.close",
   ]);
   assert.equal(report.operations[0].status, "opened");
@@ -222,14 +305,52 @@ test("returns recovery guidance and preserves the created worktree when tab prep
   assert.match(report.guidance.join("\n"), /rerun|inspect/i);
 });
 
-test("recovers on rerun by reusing the open workspace and completing the missing agent setup", async () => {
+test("recovers a partial rerun from live Herdr workspace facts when open reconciliation lacks tab and root pane ids", async () => {
   const calls = [];
-  const report = await executeStart(buildPlan({ worktreeStatus: "open" }), fakeAdapters(calls));
+  const report = await executeStart(buildPlan({
+    worktreeStatus: "open",
+    worktreeReconciliation: {
+      status: "open",
+      workspace: { workspace_id: "w1" },
+    },
+  }), fakeAdapters(calls, {
+    workspaces: [
+      {
+        workspace_id: "w1",
+        active_tab_id: "w1:t7",
+        label: "ASANA-123 discovered-docs",
+        worktree: {
+          checkout_path: workspacePath,
+        },
+      },
+    ],
+    tabs: {
+      w1: [
+        { tab_id: "w1:t7", workspace_id: "w1", label: "bootstrap" },
+      ],
+    },
+    panes: {
+      w1: [
+        {
+          pane_id: "w1:p9",
+          tab_id: "w1:t7",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+        },
+      ],
+    },
+  }));
 
   assert.deepEqual(calls.map((call) => call.kind), [
+    "herdr.workspace.list",
+    "herdr.tab.list",
+    "herdr.pane.list",
     "herdr.tab.rename",
     "herdr.agent.start",
   ]);
+  assert.equal(calls.find((call) => call.kind === "herdr.tab.rename").tabId, "w1:t7");
+  assert.equal(calls.find((call) => call.kind === "herdr.agent.start").tabId, "w1:t7");
   assert.deepEqual(report.operations.map((operation) => operation.status), [
     "reused",
     "reused",
@@ -268,6 +389,94 @@ test("retains the bootstrap shell when the Pi pane safety condition is not met",
     "herdr.worktree.create",
     "herdr.tab.rename",
     "herdr.agent.start",
+    "herdr.tab.list",
+    "herdr.pane.list",
   ]);
   assert.match(report.notes.join("\n"), /retained|bootstrap shell|safety/i);
+});
+
+test("retains the bootstrap shell when Herdr reports the started Pi pane on the wrong tab", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
+    startResult: { agentId: "a1", tabId: "w1:t9", paneId: "w1:p2" },
+    tabs: {
+      w1: [
+        { tab_id: "w1:t1", workspace_id: "w1", label: "agent" },
+        { tab_id: "w1:t9", workspace_id: "w1", label: "other" },
+      ],
+    },
+    panes: {
+      w1: [
+        {
+          pane_id: "w1:p1",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+        },
+        {
+          pane_id: "w1:p2",
+          tab_id: "w1:t9",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          agent: "pi",
+          agent_status: "working",
+        },
+      ],
+    },
+  }));
+
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  assert.match(report.notes.join("\n"), /retained|safety/i);
+});
+
+test("retains the bootstrap shell when the started Pi pane is not confirmed in the expected workspace", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
+    panes: {
+      w1: [
+        {
+          pane_id: "w1:p1",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+        },
+      ],
+    },
+  }));
+
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  assert.match(report.notes.join("\n"), /retained|safety/i);
+});
+
+test("retains the bootstrap shell when the bootstrap root pane is no longer idle", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
+    panes: {
+      w1: [
+        {
+          pane_id: "w1:p1",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          foreground_command: "vim",
+        },
+        {
+          pane_id: "w1:p2",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          agent: "pi",
+          agent_status: "working",
+        },
+      ],
+    },
+  }));
+
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  assert.match(report.notes.join("\n"), /retained|safety/i);
 });

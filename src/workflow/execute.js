@@ -71,37 +71,48 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
 
-function canCloseBootstrapPane({ worktreeDisposition, bootstrapCreatedFromReturnedRootPane, bootstrapPaneId, agentPaneId }) {
-  if (!bootstrapCreatedFromReturnedRootPane) return false;
-  if (!isNonEmptyString(bootstrapPaneId)) return false;
-  if (!isNonEmptyString(agentPaneId)) return false;
-  if (bootstrapPaneId === agentPaneId) return false;
-  return worktreeDisposition === "created" || worktreeDisposition === "opened";
-}
-
 function agentArgv(plan) {
   return [plan.agent.command, "--name", plan.agent.sessionName];
 }
 
-function resolveReusedRootIds(worktreeOperation) {
+function listValue(value, key) {
+  if (Array.isArray(value)) return value;
+  return Array.isArray(value?.[key]) ? value[key] : [];
+}
+
+function getWorkspaceId(value) {
+  return value?.workspace_id ?? value?.workspaceId ?? null;
+}
+
+function getTabId(value) {
+  return value?.tab_id ?? value?.tabId ?? null;
+}
+
+function getPaneId(value) {
+  return value?.pane_id ?? value?.paneId ?? null;
+}
+
+function getWorkspacePath(value) {
+  return value?.worktree?.checkout_path ?? value?.cwd ?? value?.path ?? null;
+}
+
+function looksLikePiPane(pane) {
+  return pane?.agent === "pi" || Boolean(pane?.agent_session) || Boolean(pane?.agent_status);
+}
+
+function isIdleBootstrapPane(pane) {
+  if (!pane) return false;
+  if (pane.agent || pane.agent_session || pane.agent_status) return false;
+  if (pane.command || pane.foreground_command || pane?.process?.command) return false;
+  return true;
+}
+
+function readKnownOpenContext(worktreeOperation) {
   const reconciliation = worktreeOperation.reconciliation ?? {};
-  const workspaceId = reconciliation.workspace?.workspace_id ?? reconciliation.workspace?.workspaceId ?? null;
-  const tabId = reconciliation.tab?.tab_id ?? reconciliation.tab?.tabId ?? null;
-  const paneId = reconciliation.root_pane?.pane_id ?? reconciliation.root_pane?.paneId ?? null;
-
-  if (!workspaceId || !tabId || !paneId) {
-    fail("PREFLIGHT", "Open worktree reconciliation is missing required Herdr IDs", {
-      reconciliation,
-      workspaceId,
-      tabId,
-      paneId,
-    }, 10);
-  }
-
   return {
-    workspaceId,
-    tabId,
-    paneId,
+    workspaceId: getWorkspaceId(reconciliation.workspace),
+    tabId: getTabId(reconciliation.tab),
+    paneId: getPaneId(reconciliation.root_pane),
     disposition: "already_open",
   };
 }
@@ -111,7 +122,7 @@ async function ensureWorktreeStart(worktreeOperation, herdr) {
 
   if (reconciliation.status === "open") {
     return {
-      result: resolveReusedRootIds(worktreeOperation),
+      result: readKnownOpenContext(worktreeOperation),
       status: "reused",
       mutated: false,
     };
@@ -142,7 +153,7 @@ async function ensureWorktreeStart(worktreeOperation, herdr) {
 
 function resolveAgentTabId(plan, fallbackTabId) {
   const tab = plan.tabs?.find((item) => item.label === plan.agent.tabLabel);
-  const actualTabId = tab?.actual?.tab_id ?? tab?.actual?.tabId ?? null;
+  const actualTabId = getTabId(tab?.actual);
   return actualTabId ?? fallbackTabId ?? null;
 }
 
@@ -182,6 +193,106 @@ function appendSkipped(report, operations, completedIds) {
   }
 }
 
+async function resolveBootstrapContext(plan, worktreeOperation, ensured, herdr) {
+  const known = ensured.result ?? {};
+  if (isNonEmptyString(known.workspaceId) && isNonEmptyString(known.tabId) && isNonEmptyString(known.paneId)) {
+    return known;
+  }
+
+  if (typeof herdr.listWorkspaces !== "function"
+    || typeof herdr.listTabs !== "function"
+    || typeof herdr.listPanes !== "function") {
+    fail("PREFLIGHT", "Open workspace recovery requires Herdr workspace, tab, and pane inspection methods", {
+      result: known,
+    }, 10);
+  }
+
+  const workspaces = listValue(await herdr.listWorkspaces(), "workspaces");
+  const expectedPath = plan.workspace?.path ?? worktreeOperation.path;
+  const exactById = isNonEmptyString(known.workspaceId)
+    ? workspaces.find((workspace) => getWorkspaceId(workspace) === known.workspaceId)
+    : null;
+  const byPath = workspaces.filter((workspace) => getWorkspacePath(workspace) === expectedPath);
+  const workspace = exactById ?? (byPath.length === 1 ? byPath[0] : null);
+
+  if (!workspace) {
+    fail("PREFLIGHT", "Could not resolve the preserved Herdr workspace for start recovery", {
+      workspaceId: known.workspaceId,
+      expectedPath,
+      workspaces,
+    }, 10);
+  }
+
+  const workspaceId = getWorkspaceId(workspace);
+  if (!isNonEmptyString(workspaceId) || getWorkspacePath(workspace) !== expectedPath) {
+    fail("PREFLIGHT", "Recovered Herdr workspace does not match the planned worktree path", {
+      workspace,
+      expectedPath,
+    }, 10);
+  }
+
+  const tabs = listValue(await herdr.listTabs({ workspaceId }), "tabs");
+  const tabId = known.tabId
+    ?? workspace.active_tab_id
+    ?? (tabs.length === 1 ? getTabId(tabs[0]) : null);
+
+  if (!isNonEmptyString(tabId)) {
+    fail("PREFLIGHT", "Could not resolve the preserved Herdr root tab for start recovery", {
+      workspace,
+      tabs,
+    }, 10);
+  }
+
+  const panes = listValue(await herdr.listPanes({ workspaceId }), "panes");
+  const tabPanes = panes.filter((pane) => getTabId(pane) === tabId);
+  const paneId = known.paneId
+    ?? (tabPanes.length === 1 ? getPaneId(tabPanes[0]) : null);
+
+  if (!isNonEmptyString(paneId)) {
+    fail("PREFLIGHT", "Could not resolve the preserved Herdr root pane for start recovery", {
+      workspace,
+      tabs,
+      panes,
+      tabId,
+    }, 10);
+  }
+
+  return {
+    workspaceId,
+    tabId,
+    paneId,
+    disposition: known.disposition,
+  };
+}
+
+async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent }) {
+  if (typeof herdr.listTabs !== "function" || typeof herdr.listPanes !== "function") {
+    return false;
+  }
+
+  const tabs = listValue(await herdr.listTabs({ workspaceId }), "tabs");
+  const panes = listValue(await herdr.listPanes({ workspaceId }), "panes");
+
+  const startedTabExists = tabs.some((tab) => getTabId(tab) === startedAgent.tabId && getWorkspaceId(tab) === workspaceId);
+  const startedPane = panes.find((pane) => (
+    getPaneId(pane) === startedAgent.paneId
+      && getTabId(pane) === startedAgent.tabId
+      && getWorkspaceId(pane) === workspaceId
+  ));
+  const bootstrapPane = panes.find((pane) => (
+    getPaneId(pane) === bootstrapPaneId
+      && getTabId(pane) === expectedTabId
+      && getWorkspaceId(pane) === workspaceId
+  ));
+
+  if (!startedTabExists) return false;
+  if (startedAgent.tabId !== expectedTabId) return false;
+  if (!startedPane || !looksLikePiPane(startedPane)) return false;
+  if (!bootstrapPane || !isIdleBootstrapPane(bootstrapPane)) return false;
+  if (getPaneId(bootstrapPane) === getPaneId(startedPane)) return false;
+  return true;
+}
+
 async function executeOrdinaryStart(plan, { herdr }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
@@ -194,17 +305,13 @@ async function executeOrdinaryStart(plan, { herdr }) {
   ensureStartShape({ herdr, worktreeOperation, workspaceOperation, agentTabOperation, agentOperation });
 
   let ensured;
-  let bootstrapTabId = null;
-  let bootstrapPaneId = null;
+  let bootstrapContext = null;
   let bootstrapCreatedFromReturnedRootPane = false;
   let currentOperation = worktreeOperation;
 
   try {
     ensured = await ensureWorktreeStart(worktreeOperation, herdr);
-    if (ensured.result) {
-      bootstrapTabId = ensured.result.tabId;
-      bootstrapPaneId = ensured.result.paneId;
-    }
+    bootstrapContext = ensured.result ?? null;
     bootstrapCreatedFromReturnedRootPane = Boolean(ensured.mutated);
 
     report.operations.push(buildOperationReport(worktreeOperation, ensured.status));
@@ -217,15 +324,13 @@ async function executeOrdinaryStart(plan, { herdr }) {
     completedIds.add(workspaceOperation.id);
 
     let agentTabStatus = "reused";
-    let agentTabId = resolveAgentTabId(plan, bootstrapTabId);
+    let agentTabId = resolveAgentTabId(plan, bootstrapContext?.tabId ?? null);
 
     if (agentTabOperation.reconciliation?.status !== "compatible") {
       currentOperation = agentTabOperation;
       if (!agentTabId) {
-        fail("PREFLIGHT", "Agent tab cannot be prepared because no bootstrap tab ID is available", {
-          operation: agentTabOperation,
-          bootstrapTabId,
-        }, 10);
+        bootstrapContext = await resolveBootstrapContext(plan, worktreeOperation, ensured, herdr);
+        agentTabId = bootstrapContext.tabId;
       }
       await herdr.renameTab({ tabId: agentTabId, label: plan.agent.tabLabel });
       agentTabStatus = "created";
@@ -256,16 +361,29 @@ async function executeOrdinaryStart(plan, { herdr }) {
     }));
     completedIds.add(agentOperation.id);
 
-    if (typeof herdr.closePane === "function"
-      && canCloseBootstrapPane({
-        worktreeDisposition: ensured.result?.disposition,
-        bootstrapCreatedFromReturnedRootPane,
-        bootstrapPaneId,
-        agentPaneId: startedAgent.paneId,
-      })) {
-      await herdr.closePane({ paneId: bootstrapPaneId });
-    } else if (bootstrapPaneId) {
-      report.notes.push("Retained the bootstrap shell pane because the close safety conditions were not met.");
+    if (bootstrapCreatedFromReturnedRootPane && typeof herdr.closePane === "function") {
+      const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
+      const bootstrapPaneId = bootstrapContext?.paneId ?? ensured.result?.paneId ?? null;
+      const expectedTabId = agentTabId ?? bootstrapContext?.tabId ?? ensured.result?.tabId ?? null;
+      const canClose = isNonEmptyString(workspaceId)
+        && isNonEmptyString(bootstrapPaneId)
+        && isNonEmptyString(expectedTabId)
+        && isNonEmptyString(startedAgent?.paneId)
+        && await verifyCloseSafety({
+          herdr,
+          workspaceId,
+          expectedTabId,
+          bootstrapPaneId,
+          startedAgent,
+        });
+
+      if (canClose) {
+        await herdr.closePane({ paneId: bootstrapPaneId });
+      } else {
+        report.notes.push("Retained the bootstrap shell pane because the close safety checks did not pass.");
+      }
+    } else if (bootstrapContext?.paneId ?? ensured.result?.paneId) {
+      report.notes.push("Retained the bootstrap shell pane because the close safety checks did not pass.");
     }
 
     return report;
