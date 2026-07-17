@@ -72,7 +72,10 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
       const envelope = await request(next.toString());
       if (!Array.isArray(envelope.data)) throw new AsanaApiError("Asana API returned malformed response data for a list.");
       values.push(...envelope.data);
-      next = envelope.next_page?.uri ? new URL(envelope.next_page.uri) : null;
+      if (envelope.next_page?.uri) {
+        try { next = new URL(envelope.next_page.uri); }
+        catch { throw new AsanaApiError("Asana API returned a malformed pagination URI."); }
+      } else next = null;
     }
     return values;
   }
@@ -96,14 +99,30 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
       let downloadUrl;
       try { downloadUrl = new URL(attachment.download_url); } catch { throw new AsanaApiError(`Attachment ${gid} does not expose a valid HTTPS download URL.`); }
       if (downloadUrl.protocol !== "https:") throw new AsanaApiError(`Attachment ${gid} does not expose a valid HTTPS download URL.`);
-      const response = await fetchImpl(downloadUrl, { headers: {} });
-      if (!response.ok) throw new AsanaApiError(`Attachment download failed with status ${response.status}.`, { status: response.status });
-      return {
-        gid: attachment.gid,
-        name: attachment.name || `${gid}.bin`,
-        contentType: response.headers.get("content-type") || "application/octet-stream",
-        bytes: new Uint8Array(await response.arrayBuffer()),
-      };
+      for (let redirects = 0; redirects <= 5; redirects += 1) {
+        let response;
+        try { response = await fetchImpl(downloadUrl, { headers: {}, redirect: "manual" }); }
+        catch (error) { throw new AsanaApiError(`Attachment download network failure: ${redact(error?.message || error).slice(0, 400)}`); }
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get("location");
+          let redirected;
+          try { redirected = new URL(location, downloadUrl); } catch { throw new AsanaApiError(`Attachment ${gid} returned an invalid redirect.`); }
+          if (redirected.protocol !== "https:") throw new AsanaApiError(`Attachment ${gid} did not return a valid HTTPS redirect.`);
+          downloadUrl = redirected;
+          continue;
+        }
+        if (!response.ok) throw new AsanaApiError(`Attachment download failed with status ${response.status}.`, { status: response.status });
+        let bytes;
+        try { bytes = new Uint8Array(await response.arrayBuffer()); }
+        catch (error) { throw new AsanaApiError(`Attachment download network failure while reading response: ${redact(error?.message || error).slice(0, 400)}`); }
+        return {
+          gid: attachment.gid,
+          name: attachment.name || `${gid}.bin`,
+          contentType: response.headers.get("content-type") || "application/octet-stream",
+          bytes,
+        };
+      }
+      throw new AsanaApiError(`Attachment ${gid} exceeded 5 HTTPS redirects.`);
     },
   };
   return client;

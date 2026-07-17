@@ -97,6 +97,17 @@ test("main exposes stable usage and authentication error categories", async () =
   assert.deepEqual(auth.stderr, ["AUTH: authentication missing"]);
 });
 
+test("main categorizes API authentication failures", async () => {
+  const output = io();
+  const unauthorized = Object.assign(new Error("unauthorized"), { name: "AsanaApiError", status: 401 });
+  const code = await main(["me"], {
+    ...output, loadToken: async () => ({ token: "hidden" }),
+    createClient: () => ({ me: async () => { throw unauthorized; } }),
+  });
+  assert.equal(code, 2);
+  assert.deepEqual(output.stderr, ["AUTH: unauthorized"]);
+});
+
 test("main exposes rate-limit category", async () => {
   const output = io();
   const rateLimit = Object.assign(new Error("retry later"), { name: "AsanaApiError", status: 429 });

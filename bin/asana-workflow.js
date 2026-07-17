@@ -182,6 +182,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (phase === "parse") { category = "USAGE"; exitCode = 64; }
     else if (error?.name === "AuthError") { category = "AUTH"; exitCode = 2; }
     else if (error?.name === "ConfigError") { category = "CONFIG"; exitCode = 3; }
+    else if (error?.name === "AsanaApiError" && [401, 403].includes(error.status)) { category = "AUTH"; exitCode = 2; }
     else if (error?.name === "AsanaApiError" && error.status === 429) { category = "RATE_LIMIT"; exitCode = 4; }
     else if (error?.name === "AsanaApiError" && error.status === 404) { category = "NOT_FOUND"; exitCode = 7; }
     else if (error?.name === "AsanaApiError" && /network failure/i.test(message)) { category = "NETWORK"; exitCode = 5; }

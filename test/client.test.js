@@ -41,6 +41,12 @@ test("rejects cross-origin pagination before sending the bearer token", async ()
   assert.equal(calls, 1);
 });
 
+test("categorizes malformed pagination URIs", async () => {
+  const client = createAsanaClient({ token: "x", fetchImpl: async () =>
+    jsonResponse({ data: [], next_page: { uri: "not a valid URL" } }) });
+  await assert.rejects(client.workspaces(), (error) => error instanceof AsanaApiError && /malformed pagination URI/.test(error.message));
+});
+
 test("stops pagination at the configured safety limit", async () => {
   const client = createAsanaClient({ token: "x", maxPages: 1, fetchImpl: async () =>
     jsonResponse({ data: [], next_page: { uri: "https://app.asana.com/api/1.0/workspaces?offset=next" } }) });
@@ -108,6 +114,26 @@ test("downloads Asana-hosted attachment bytes from fresh metadata", async () => 
   assert.equal(result.name, "image.png");
   assert.deepEqual([...result.bytes], [1, 2, 3]);
   assert.equal(result.contentType, "image/png");
+});
+
+test("rejects attachment redirects that leave HTTPS before following them", async () => {
+  let downloadCalls = 0;
+  const client = createAsanaClient({ token: "x", fetchImpl: async (url, options) => {
+    if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", name: "image.png", host: "asana", download_url: "https://download.test/a1" } });
+    downloadCalls += 1;
+    assert.equal(options.redirect, "manual");
+    return new Response(null, { status: 302, headers: { location: "http://insecure.test/file" } });
+  } });
+  await assert.rejects(client.downloadAttachment("a1"), /valid HTTPS redirect/);
+  assert.equal(downloadCalls, 1);
+});
+
+test("categorizes attachment transport failures as network errors", async () => {
+  const client = createAsanaClient({ token: "x", fetchImpl: async (url) => {
+    if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", host: "asana", download_url: "https://download.test/a1" } });
+    throw new Error("socket closed");
+  } });
+  await assert.rejects(client.downloadAttachment("a1"), (error) => error instanceof AsanaApiError && /network failure/.test(error.message));
 });
 
 test("rejects external attachments even when metadata supplies a URL", async () => {
