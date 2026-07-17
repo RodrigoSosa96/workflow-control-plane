@@ -16,3 +16,5 @@ Do not begin implementation immediately.
 6. Propose an isolation plan: existing worktree to resume or a new worktree, using the configured base branch and repository branch conventions.
 7. Propose the Herdr layout and runtime commands needed for this task.
 8. Present the resulting design/spec for approval. Wait for explicit approval before creating a worktree or implementing.
+9. After the approved design and approved plan exist, propose the exact `workflow plan ...` dry-run command for this task.
+10. Request confirmation before running workflow start; do not auto-approve with `--yes`.

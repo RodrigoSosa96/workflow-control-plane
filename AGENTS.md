@@ -27,10 +27,11 @@ This repository coordinates Rodrigo's AI-assisted development workflows across p
 
 1. **Triage:** gather ticket or feature context and identify missing information.
 2. **Design:** use Superpowers brainstorming/spec workflow and obtain approval.
-3. **Isolation:** create or select a dedicated worktree.
-4. **Implementation:** execute the approved plan with relevant tests.
-5. **Verification:** run repository checks and review the diff.
-6. **Handoff:** summarize status, decisions, blockers, and next action.
+3. **Plan:** write and approve the implementation plan before launching work.
+4. **Isolation:** create or select a dedicated worktree.
+5. **Implementation:** execute the approved plan with relevant tests.
+6. **Verification:** run repository checks and review the diff.
+7. **Handoff:** summarize status, decisions, blockers, and next action.
 
 ## Current scope
 

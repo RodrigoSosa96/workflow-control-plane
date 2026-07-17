@@ -1,0 +1,259 @@
+import assert from "node:assert/strict";
+import { mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+import { WorkflowError } from "../src/workflow/errors.js";
+import { main, parseArgs } from "../bin/workflow.js";
+
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+const io = () => {
+  const stdout = [];
+  const stderr = [];
+  return {
+    stdout,
+    stderr,
+    out: (line) => stdout.push(line),
+    err: (line) => stderr.push(line),
+  };
+};
+
+function planPreview(overrides = {}) {
+  return {
+    command: "plan",
+    project: { alias: "ocr", label: "ExampleProject" },
+    preconditions: {
+      git: { status: "ready", path: "/usr/bin/git" },
+      herdr: { status: "ready", path: "/usr/bin/herdr" },
+      pi: { status: "ready", path: "/usr/bin/pi" },
+    },
+    reconciliation: {
+      status: "incomplete",
+      conflicts: [],
+      operations: [],
+    },
+    conflicts: [],
+    nextCommand: 'workflow start ocr ASANA-123 --feature "Discovered Docs" --yes',
+    ...overrides,
+  };
+}
+
+function executionReport(overrides = {}) {
+  return {
+    mode: "ordinary",
+    status: "completed",
+    operations: [{ id: "worktree", kind: "herdr.worktree.ensure", status: "created" }],
+    guidance: [],
+    notes: [],
+    ...overrides,
+  };
+}
+
+test("installed symlink executes the workflow entry point", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-cli-link-"));
+  const registryPath = join(dir, "projects.yaml");
+  const link = join(dir, "workflow");
+  await writeFile(registryPath, `version: 2\nlauncher:\n  worktree_root: /tmp/worktrees\n  agent:\n    command: pi\n    session_template: "{project}-{task}-{slug}"\nprojects:\n  ocr:\n    label: ExampleProject\n    kind: personal\n    path: /tmp/ocr\n    repository: monorepo\n    base_branch: main\n    worktree:\n      branch_template: "feature/{task}/{slug}"\n      path_template: "{worktree_root}/{project}/{task}-{slug}"\n`);
+  await symlink(new URL("../bin/workflow.js", import.meta.url), link);
+  const result = spawnSync(link, ["help"], {
+    encoding: "utf8",
+    env: { ...process.env, WORKFLOW_PROJECTS_FILE: registryPath },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /workflow doctor \[project\]/);
+  assert.match(result.stdout, /workflow start <project> <task>/);
+});
+
+test("parses documented workflow commands and options", () => {
+  assert.deepEqual(parseArgs(["doctor", "ocr"]), {
+    command: "doctor",
+    projectAlias: "ocr",
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["plan", "acme", "ASANA-456", "--feature", "Onboarding", "--repos", "backend,panel", "--format", "json"]), {
+    command: "plan",
+    projectAlias: "acme",
+    task: "ASANA-456",
+    feature: "Onboarding",
+    repositories: ["backend", "panel"],
+    format: "json",
+  });
+
+  assert.deepEqual(parseArgs(["runtime", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--profile", "standard", "--yes"]), {
+    command: "runtime",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    runtimeProfile: "standard",
+    yes: true,
+    format: "compact",
+  });
+});
+
+test("rejects unknown, duplicate, and disallowed options", () => {
+  assert.throws(() => parseArgs(["doctor", "ocr", "--yes"]), /does not accept --yes/i);
+  assert.throws(() => parseArgs(["status", "ocr", "ASANA-123", "--yes"]), /does not accept --yes/i);
+  assert.throws(() => parseArgs(["start", "ocr", "ASANA-123", "--profile", "standard"]), /does not accept --profile/i);
+  assert.throws(() => parseArgs(["plan", "ocr", "ASANA-123", "--format", "xml"]), /compact or json/i);
+  assert.throws(() => parseArgs(["plan", "ocr", "ASANA-123", "--feature", "One", "--feature", "Two"]), /Duplicate option/i);
+  assert.throws(() => parseArgs(["plan", "ocr", "ASANA-123", "--bogus"]), /Unknown option: --bogus/i);
+  assert.throws(() => parseArgs(["runtime", "ocr", "ASANA-123", "junk"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["doctor", "ocr", "extra"]), /unexpected argument/i);
+});
+
+test("doctor uses the package registry by default and honors WORKFLOW_PROJECTS_FILE", async () => {
+  const output = io();
+  const seen = [];
+  const doctorResult = {
+    command: "doctor",
+    project: { alias: "ocr", label: "ExampleProject" },
+    checks: [],
+    ok: true,
+  };
+
+  const baseDependencies = {
+    ...output,
+    doctorCommand: async (options) => {
+      seen.push(options.registryPath);
+      return doctorResult;
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.ok}`,
+  };
+
+  assert.equal(await main(["doctor", "ocr"], baseDependencies), 0);
+  assert.equal(seen[0], join(packageRoot, "projects.yaml"));
+
+  assert.equal(await main(["doctor", "ocr"], {
+    ...baseDependencies,
+    env: { WORKFLOW_PROJECTS_FILE: "/tmp/custom-projects.yaml" },
+  }), 0);
+  assert.equal(seen[1], "/tmp/custom-projects.yaml");
+});
+
+test("main prints compact and json output for read-only commands", async () => {
+  const output = io();
+  const calls = [];
+  const doctorResult = {
+    command: "doctor",
+    project: { alias: "ocr", label: "ExampleProject" },
+    checks: [],
+    ok: true,
+  };
+
+  const code = await main(["doctor", "ocr", "--format", "json"], {
+    ...output,
+    doctorCommand: async (options) => {
+      calls.push(options);
+      return doctorResult;
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.ok}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(output.stdout, ["doctor:json:true"]);
+  assert.deepEqual(output.stderr, []);
+  assert.equal(calls[0].command, "doctor");
+});
+
+test("requires explicit approval for mutation", async () => {
+  const output = io();
+  const code = await main(["start", "ocr", "ASANA-123", "--feature", "Discovered Docs"], {
+    ...output,
+    isInteractive: () => false,
+  });
+  assert.equal(code, 64);
+  assert.match(output.stderr[0], /--yes/);
+});
+
+test("shows the reconciled plan before an interactive confirmation and stops on decline", async () => {
+  const output = io();
+  const calls = [];
+  const code = await main(["start", "ocr", "ASANA-123", "--feature", "Discovered Docs"], {
+    ...output,
+    isInteractive: () => true,
+    planCommand: async (options) => {
+      calls.push(["plan", options]);
+      return planPreview();
+    },
+    confirm: async ({ command, previewText }) => {
+      calls.push(["confirm", command, previewText]);
+      return false;
+    },
+    executeStart: async () => {
+      calls.push(["execute"]);
+      return executionReport();
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.reconciliation?.status ?? value.status}`,
+  });
+
+  assert.equal(code, 64);
+  assert.deepEqual(calls.map((entry) => entry[0]), ["plan", "confirm"]);
+  assert.deepEqual(output.stdout, []);
+  assert.deepEqual(output.stderr, [
+    "plan:compact:incomplete",
+    "USAGE: Confirmation declined; no changes were made.",
+  ]);
+});
+
+test("start executes with --yes and maps partial execution to a stable exit code", async () => {
+  const output = io();
+  const calls = [];
+  const code = await main(["start", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--yes"], {
+    ...output,
+    planCommand: async () => {
+      calls.push("plan");
+      return planPreview();
+    },
+    executeStart: async (plan) => {
+      calls.push(plan.status ?? plan.reconciliation?.status ?? "execute");
+      return executionReport({ status: "partial" });
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status ?? value.reconciliation?.status}`,
+  });
+
+  assert.equal(code, 13);
+  assert.deepEqual(calls, ["plan", "incomplete"]);
+  assert.deepEqual(output.stdout, ["start:compact:partial"]);
+});
+
+test("maps conflict and preflight workflow errors to stable categories", async () => {
+  const conflict = io();
+  assert.equal(await main(["plan", "ocr", "ASANA-123"], {
+    ...conflict,
+    planCommand: async () => {
+      throw new WorkflowError("CONFLICT", "branch already exists", { exitCode: 11 });
+    },
+  }), 11);
+  assert.deepEqual(conflict.stderr, ["CONFLICT: branch already exists"]);
+
+  const preflight = io();
+  assert.equal(await main(["runtime", "ocr", "ASANA-123", "--yes"], {
+    ...preflight,
+    planCommand: async () => {
+      throw new WorkflowError("PREFLIGHT", "runtime workspace is not open", { exitCode: 10 });
+    },
+  }), 10);
+  assert.deepEqual(preflight.stderr, ["PREFLIGHT: runtime workspace is not open"]);
+});
+
+test("bounds formatted output before printing", async () => {
+  const output = io();
+  const code = await main(["doctor", "ocr"], {
+    ...output,
+    doctorCommand: async () => ({
+      command: "doctor",
+      project: { alias: "ocr", label: "ExampleProject" },
+      checks: [],
+      ok: true,
+    }),
+    formatWorkflowResult: () => "x".repeat(15000),
+  });
+
+  assert.equal(code, 0);
+  assert.equal(output.stdout.length, 1);
+  assert.ok(output.stdout[0].length <= 12000);
+});

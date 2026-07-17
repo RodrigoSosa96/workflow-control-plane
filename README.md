@@ -24,13 +24,42 @@ From this directory, start Pi and use:
 /resume-feature personalProjectA feature description
 ```
 
-These prompts intentionally stop before implementation. The expected flow is triage → design/spec → approval → worktree → implementation → verification.
+These prompts intentionally stop before implementation. The expected flow is triage → design/spec → approval → implementation plan → `workflow plan` → confirmation → `workflow start` → implementation → verification.
 
 ## Project layout policy
 
 Use one Herdr workspace per product. Use a dedicated git worktree for each ticket or feature when an agent will write code. Keep runtime processes in a separate tab from interactive agent sessions.
 
 Acme is a workspace grouping three independent repositories; its worktrees must be created from the specific backend, panel, or webapp repository.
+
+## Workflow launcher CLI
+
+The repository also includes a deterministic `workflow` CLI for dry-run planning, isolated worktree startup, runtime opt-in, and recovery status checks.
+
+### Launcher safety boundaries
+
+- `workflow doctor`, `workflow plan`, and `workflow status` are read-only.
+- `workflow start` and `workflow runtime` require explicit confirmation or `--yes`.
+- In other words, every mutating launcher command requires explicit confirmation or --yes.
+- `workflow start` does not submit an implementation prompt automatically.
+- Runtime processes stay opt-in through `workflow runtime`; `workflow start` prepares only the agent workspace.
+- Acme bundle planning must name the selected repositories explicitly with `--repos`.
+- Real Acme meta-repository setup remains a separate explicit checkpoint after disposable verification; the launcher branch must not initialize or modify the real work project automatically.
+
+### Launcher command flow
+
+Run these from this repository after the design and implementation plan are approved:
+
+```bash
+workflow doctor ocr
+workflow plan ocr ASANA-123 --feature "Discovered Docs"
+workflow start ocr ASANA-123 --feature "Discovered Docs" --yes
+workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes
+workflow status ocr ASANA-123 --feature "Discovered Docs"
+workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel
+```
+
+Use `workflow plan` as the dry-run checkpoint before any mutation. If a launch is interrupted or a workspace already exists, inspect `workflow status` before retrying `workflow start` or `workflow runtime`.
 
 ## Asana workflow CLI
 
@@ -43,6 +72,8 @@ After this feature branch is integrated, install the local package yourself:
 ```bash
 npm install --global /home/you/projects/personal/workflows
 ```
+
+This installs both `asana-workflow` and `workflow`.
 
 Alternatively:
 
