@@ -97,7 +97,7 @@ function getWorkspacePath(value) {
 }
 
 function looksLikePiPane(pane) {
-  return pane?.agent === "pi" || Boolean(pane?.agent_session) || Boolean(pane?.agent_status);
+  return pane?.agent === "pi" || pane?.agent_session?.agent === "pi";
 }
 
 function isIdleBootstrapPane(pane) {
@@ -365,21 +365,28 @@ async function executeOrdinaryStart(plan, { herdr }) {
       const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
       const bootstrapPaneId = bootstrapContext?.paneId ?? ensured.result?.paneId ?? null;
       const expectedTabId = agentTabId ?? bootstrapContext?.tabId ?? ensured.result?.tabId ?? null;
-      const canClose = isNonEmptyString(workspaceId)
+      let canClose = false;
+
+      if (isNonEmptyString(workspaceId)
         && isNonEmptyString(bootstrapPaneId)
         && isNonEmptyString(expectedTabId)
-        && isNonEmptyString(startedAgent?.paneId)
-        && await verifyCloseSafety({
-          herdr,
-          workspaceId,
-          expectedTabId,
-          bootstrapPaneId,
-          startedAgent,
-        });
+        && isNonEmptyString(startedAgent?.paneId)) {
+        try {
+          canClose = await verifyCloseSafety({
+            herdr,
+            workspaceId,
+            expectedTabId,
+            bootstrapPaneId,
+            startedAgent,
+          });
+        } catch (error) {
+          report.notes.push(`Retained the bootstrap shell pane because the post-start close safety inspection failed: ${error.message}`);
+        }
+      }
 
       if (canClose) {
         await herdr.closePane({ paneId: bootstrapPaneId });
-      } else {
+      } else if (report.notes.length === 0) {
         report.notes.push("Retained the bootstrap shell pane because the close safety checks did not pass.");
       }
     } else if (bootstrapContext?.paneId ?? ensured.result?.paneId) {

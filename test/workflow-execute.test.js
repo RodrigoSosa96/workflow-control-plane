@@ -175,6 +175,8 @@ function createHerdr(calls, {
   startResult = { agentId: "a1", tabId: "w1:t1", paneId: "w1:p2" },
   failRename = null,
   failStart = null,
+  failListTabs = null,
+  failListPanes = null,
   workspaces,
   tabs,
   panes,
@@ -203,10 +205,12 @@ function createHerdr(calls, {
     },
     async listTabs({ workspaceId }) {
       calls.push({ kind: "herdr.tab.list", workspaceId });
+      if (failListTabs) throw failListTabs;
       return { tabs: state.tabs[workspaceId] ?? [] };
     },
     async listPanes({ workspaceId }) {
       calls.push({ kind: "herdr.pane.list", workspaceId });
+      if (failListPanes) throw failListPanes;
       return { panes: state.panes[workspaceId] ?? [] };
     },
     async renameTab({ tabId, label }) {
@@ -449,6 +453,59 @@ test("retains the bootstrap shell when the started Pi pane is not confirmed in t
 
   assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
   assert.match(report.notes.join("\n"), /retained|safety/i);
+});
+
+test("retains the bootstrap shell when the started pane belongs to a non-Pi agent", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
+    panes: {
+      w1: [
+        {
+          pane_id: "w1:p1",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+        },
+        {
+          pane_id: "w1:p2",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          agent: "claude",
+          agent_status: "working",
+          agent_session: {
+            agent: "claude",
+            kind: "path",
+            source: "herdr:claude",
+            value: "/tmp/claude-session.jsonl",
+          },
+        },
+      ],
+    },
+  }));
+
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  assert.match(report.notes.join("\n"), /retained|bootstrap shell|safety/i);
+});
+
+test("retains the bootstrap shell and still succeeds when post-start close safety inspection fails", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
+    failListTabs: new Error("tab inspection failed"),
+  }));
+
+  assert.deepEqual(calls.map((call) => call.kind), [
+    "herdr.worktree.create",
+    "herdr.tab.rename",
+    "herdr.agent.start",
+    "herdr.tab.list",
+  ]);
+  assert.equal(report.status, "completed");
+  assert.equal(report.operations.find((operation) => operation.id === "agent").status, "created");
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  assert.match(report.notes.join("\n"), /retained|bootstrap shell|inspection|tab inspection failed/i);
 });
 
 test("retains the bootstrap shell when the bootstrap root pane is no longer idle", async () => {
