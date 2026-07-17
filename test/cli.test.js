@@ -21,6 +21,11 @@ test("parses full tasks and attachment downloads", () => {
 test("rejects unknown formats, unsafe options, and missing required options", () => {
   assert.throws(() => parseArgs(["me", "--format", "xml"]), /compact or json/);
   assert.throws(() => parseArgs(["me", "--token", "must-not-be-accepted"]), /Unknown option: --token/);
+  assert.throws(() => parseArgs(["me", "junk"]), /unexpected argument/);
+  assert.throws(() => parseArgs(["me", "--workspace", "w1"]), /does not accept --workspace/);
+  assert.throws(() => parseArgs(["task", "1", "2"]), /unexpected argument/);
+  assert.throws(() => parseArgs(["attachments", "1", "--full"]), /does not accept --full/);
+  assert.throws(() => parseArgs(["auth", "status", "junk"]), /unexpected argument/);
   assert.throws(() => parseArgs(["triage"]), /--project/);
   assert.throws(() => parseArgs(["attachment", "download", "a1"]), /--output/);
 });
@@ -82,9 +87,9 @@ test("main sanitizes failures and returns nonzero", async () => {
   const code = await main(["me"], {
     ...output,
     loadToken: async () => ({ token: "super-secret" }),
-    createClient: () => ({ me: async () => { throw new Error("request failed"); } }),
+    createClient: () => ({ me: async () => { throw new Error("request failed with super-secret"); } }),
   });
   assert.equal(code, 1);
-  assert.deepEqual(output.stderr, ["Error: request failed"]);
+  assert.deepEqual(output.stderr, ["Error: request failed with [REDACTED]"]);
   assert.doesNotMatch(output.stderr[0], /super-secret/);
 });

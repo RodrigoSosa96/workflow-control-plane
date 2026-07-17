@@ -18,9 +18,23 @@ test("resolves an exact case-insensitive project name", async () => {
   assert.deepEqual(await resolveProject(client, { projectName: "ocr platform", workspaceGid: "w1" }), { gid: "p1", name: "OCR Platform" });
 });
 
+test("resolves a project name across authenticated workspaces when workspace is omitted", async () => {
+  const requested = [];
+  const client = {
+    me: async () => ({ workspaces: [{ gid: "w1" }, { gid: "w2" }] }),
+    projects: async (workspace) => {
+      assert.ok(workspace, "workspace scope is required");
+      requested.push(workspace);
+      return workspace === "w1" ? [{ gid: "p1", name: "Other" }] : [{ gid: "p2", name: "OCR" }];
+    },
+  };
+  assert.deepEqual(await resolveProject(client, { projectName: "OCR" }), { gid: "p2", name: "OCR" });
+  assert.deepEqual(requested, ["w1", "w2"]);
+});
+
 test("reports ambiguous project names with candidate GIDs", async () => {
   const client = { projects: async () => [{ gid: "p1", name: "OCR" }, { gid: "p2", name: "ocr" }] };
-  await assert.rejects(resolveProject(client, { projectName: "OCR" }), /p1.*p2/);
+  await assert.rejects(resolveProject(client, { projectName: "OCR", workspaceGid: "w1" }), /p1.*p2/);
 });
 
 test("triage scans all project sections by default and filters to me", async () => {
@@ -82,9 +96,11 @@ test("aggregates complete task context", async () => {
 test("downloads attachment and refuses overwrite", async () => {
   const dir = await mkdtemp(join(tmpdir(), "asana-download-"));
   const output = join(dir, "nested", "image.png");
-  const client = { downloadAttachment: async () => ({ name: "image.png", bytes: new Uint8Array([4, 5]) }) };
+  let downloads = 0;
+  const client = { downloadAttachment: async () => { downloads += 1; return { name: "image.png", bytes: new Uint8Array([4, 5]) }; } };
   const result = await downloadAttachmentFile(client, "a1", output);
   assert.equal(result.path, output);
   assert.deepEqual([...await readFile(output)], [4, 5]);
   await assert.rejects(downloadAttachmentFile(client, "a1", output), /already exists/);
+  assert.equal(downloads, 1, "existing output must be rejected before downloading bytes");
 });

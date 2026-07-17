@@ -31,6 +31,16 @@ test("follows Asana pagination envelopes", async () => {
   assert.equal(urls.length, 2);
 });
 
+test("rejects cross-origin pagination before sending the bearer token", async () => {
+  let calls = 0;
+  const client = createAsanaClient({ token: "secret", fetchImpl: async () => {
+    calls += 1;
+    return jsonResponse({ data: [{ gid: "1" }], next_page: { uri: "https://attacker.example/steal" } });
+  } });
+  await assert.rejects(client.workspaces(), /outside the configured Asana API origin/);
+  assert.equal(calls, 1);
+});
+
 test("stops pagination at the configured safety limit", async () => {
   const client = createAsanaClient({ token: "x", maxPages: 1, fetchImpl: async () =>
     jsonResponse({ data: [], next_page: { uri: "https://app.asana.com/api/1.0/workspaces?offset=next" } }) });
@@ -42,9 +52,9 @@ test("rejects malformed Asana envelopes", async () => {
   await assert.rejects(client.workspaces(), /malformed response/);
 });
 
-test("sanitizes bounded API errors and reports rate limits", async () => {
+test("sanitizes bounded API errors, redacts tokens, and reports rate limits", async () => {
   const client = createAsanaClient({ token: "top-secret", fetchImpl: async () =>
-    jsonResponse({ errors: [{ message: "rate limited " + "x".repeat(1000) }] }, 429, { "retry-after": "30" }) });
+    jsonResponse({ errors: [{ message: "token top-secret rate limited " + "x".repeat(1000) }] }, 429, { "retry-after": "30" }) });
   await assert.rejects(client.me(), (error) => {
     assert.ok(error instanceof AsanaApiError);
     assert.match(error.message, /retry after 30 seconds/);
@@ -88,9 +98,9 @@ test("uses task context endpoints", async () => {
   ]);
 });
 
-test("downloads attachment bytes from fresh metadata", async () => {
+test("downloads Asana-hosted attachment bytes from fresh metadata", async () => {
   const client = createAsanaClient({ token: "x", fetchImpl: async (url, options) => {
-    if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", name: "image.png", download_url: "https://download.test/a1" } });
+    if (String(url).includes("/attachments/a1")) return jsonResponse({ data: { gid: "a1", name: "image.png", host: "asana", download_url: "https://download.test/a1" } });
     assert.equal(options.headers.authorization, undefined, "must not send Asana bearer token to a download host");
     return new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } });
   } });
@@ -100,7 +110,12 @@ test("downloads attachment bytes from fresh metadata", async () => {
   assert.equal(result.contentType, "image/png");
 });
 
-test("rejects attachments without downloadable content", async () => {
-  const client = createAsanaClient({ token: "x", fetchImpl: async () => jsonResponse({ data: { gid: "a1", host: "external" } }) });
-  await assert.rejects(client.downloadAttachment("a1"), /does not expose a download URL/);
+test("rejects external attachments even when metadata supplies a URL", async () => {
+  const client = createAsanaClient({ token: "x", fetchImpl: async () => jsonResponse({ data: { gid: "a1", host: "external", download_url: "http://127.0.0.1/private" } }) });
+  await assert.rejects(client.downloadAttachment("a1"), /not Asana-hosted/);
+});
+
+test("rejects Asana attachments without HTTPS downloadable content", async () => {
+  const client = createAsanaClient({ token: "x", fetchImpl: async () => jsonResponse({ data: { gid: "a1", host: "asana", download_url: "http://download.test/a1" } }) });
+  await assert.rejects(client.downloadAttachment("a1"), /valid HTTPS download URL/);
 });

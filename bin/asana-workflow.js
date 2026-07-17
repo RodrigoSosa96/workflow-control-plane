@@ -46,6 +46,13 @@ function consumeOptions(tokens) {
   return { options, positionals };
 }
 
+function validateShape(command, positionals, options, { positionalCount, allowedOptions = [] }) {
+  if (positionals.length > positionalCount) throw new Error(`${command} received an unexpected argument: ${positionals[positionalCount]}`);
+  for (const name of Object.keys(options)) {
+    if (name !== "format" && !allowedOptions.includes(name)) throw new Error(`${command} does not accept --${name}.`);
+  }
+}
+
 export function parseArgs(argv) {
   if (!argv.length || argv.includes("--help") || argv[0] === "help") return { command: "help", format: "compact" };
   const [first, ...rest] = argv;
@@ -53,13 +60,21 @@ export function parseArgs(argv) {
   const format = options.format ?? "compact";
   if (!["compact", "json"].includes(format)) throw new Error("--format must be compact or json.");
 
-  if (first === "auth" && positionals[0] === "status") return { command: "auth-status", format };
-  if (["me", "workspaces", "projects"].includes(first)) return { command: first, workspace: options.workspace, format };
+  if (first === "auth" && positionals[0] === "status") {
+    validateShape("auth status", positionals, options, { positionalCount: 1 });
+    return { command: "auth-status", format };
+  }
+  if (["me", "workspaces", "projects"].includes(first)) {
+    validateShape(first, positionals, options, { positionalCount: 0, allowedOptions: first === "projects" ? ["workspace"] : [] });
+    return { command: first, workspace: options.workspace, format };
+  }
   if (first === "sections") {
+    validateShape("sections", positionals, options, { positionalCount: 0, allowedOptions: ["project"] });
     if (!options.project) throw new Error("sections requires --project.");
     return { command: "sections", project: options.project, format };
   }
   if (first === "triage") {
+    validateShape("triage", positionals, options, { positionalCount: 0, allowedOptions: ["project", "sections", "assignee"] });
     if (!options.project) throw new Error("triage requires --project.");
     return {
       command: "triage", project: options.project,
@@ -68,14 +83,17 @@ export function parseArgs(argv) {
     };
   }
   if (first === "task") {
+    validateShape("task", positionals, options, { positionalCount: 1, allowedOptions: ["full"] });
     if (!positionals[0]) throw new Error("task requires a task GID.");
     return { command: "task", gid: positionals[0], full: options.full === true, format };
   }
   if (first === "attachments") {
+    validateShape("attachments", positionals, options, { positionalCount: 1 });
     if (!positionals[0]) throw new Error("attachments requires a task GID.");
     return { command: "attachments", gid: positionals[0], format };
   }
   if (first === "attachment" && positionals[0] === "download") {
+    validateShape("attachment download", positionals, options, { positionalCount: 2, allowedOptions: ["output"] });
     if (!positionals[1]) throw new Error("attachment download requires an attachment GID.");
     if (!options.output) throw new Error("attachment download requires --output.");
     return { command: "attachment-download", gid: positionals[1], output: options.output, format };
@@ -89,6 +107,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const loadToken = dependencies.loadToken ?? defaultLoadToken;
   const createClient = dependencies.createClient ?? defaultCreateClient;
   const loadConfig = dependencies.loadConfig ?? defaultLoadConfig;
+  let sensitiveToken;
   try {
     const args = parseArgs(argv);
     if (args.command === "help") { out(HELP); return 0; }
@@ -104,6 +123,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
 
     const auth = await loadToken();
+    sensitiveToken = auth.token;
     if (auth.warning) err(`Warning: ${auth.warning}`);
     const client = createClient({ token: auth.token });
     let result;
@@ -137,7 +157,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     out(formatResult(formatCommand, result, args.format));
     return 0;
   } catch (error) {
-    err(`Error: ${String(error?.message || error).replace(/[\r\n]+/g, "\n").slice(0, 1200)}`);
+    let message = String(error?.message || error);
+    if (sensitiveToken) message = message.split(sensitiveToken).join("[REDACTED]");
+    err(`Error: ${message.replace(/[\r\n]+/g, "\n").slice(0, 1200)}`);
     return 1;
   }
 }

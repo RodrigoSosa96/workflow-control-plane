@@ -24,9 +24,12 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
   if (!token) throw new AsanaApiError("An Asana token is required.");
 
   const apiHeaders = { accept: "application/json", authorization: `Bearer ${token}` };
+  const apiOrigin = new URL(baseUrl).origin;
+  const redact = (text) => String(text).split(token).join("[REDACTED]");
 
   function apiUrl(path, query = {}) {
     const url = path.startsWith("http") ? new URL(path) : new URL(`${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`);
+    if (url.origin !== apiOrigin) throw new AsanaApiError(`Refusing Asana API request outside the configured Asana API origin: ${url.origin}`);
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
     }
@@ -39,7 +42,7 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
       const body = await response.json();
       if (Array.isArray(body?.errors)) detail = body.errors.map((error) => error.message).filter(Boolean).join("; ") || detail;
     } catch {}
-    detail = detail.replace(/[\r\n]+/g, " ").slice(0, 400);
+    detail = redact(detail).replace(/[\r\n]+/g, " ").slice(0, 400);
     const retry = response.status === 429 && response.headers.get("retry-after")
       ? `; retry after ${response.headers.get("retry-after")} seconds`
       : "";
@@ -47,11 +50,17 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
   }
 
   async function request(path, query = {}) {
-    const response = await fetchImpl(apiUrl(path, query), { headers: { ...apiHeaders } });
+    let response;
+    try {
+      response = await fetchImpl(apiUrl(path, query), { headers: { ...apiHeaders } });
+    } catch (error) {
+      if (error instanceof AsanaApiError) throw error;
+      throw new AsanaApiError(`Asana API network failure: ${redact(error?.message || error).slice(0, 400)}`);
+    }
     if (!response.ok) throw await parseError(response);
     let envelope;
     try { envelope = await response.json(); } catch { throw new AsanaApiError("Asana API returned malformed response data."); }
-    if (!("data" in envelope)) throw new AsanaApiError("Asana API returned a malformed response envelope.");
+    if (!envelope || typeof envelope !== "object" || !("data" in envelope)) throw new AsanaApiError("Asana API returned a malformed response envelope.");
     return envelope;
   }
 
@@ -83,8 +92,11 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
     attachment: async (gid) => (await request(`attachments/${gid}`, { opt_fields: ATTACHMENT_FIELDS })).data,
     async downloadAttachment(gid) {
       const attachment = await client.attachment(gid);
-      if (!attachment.download_url) throw new AsanaApiError(`Attachment ${gid} does not expose a download URL.`);
-      const response = await fetchImpl(new URL(attachment.download_url), { headers: {} });
+      if (attachment.host !== "asana") throw new AsanaApiError(`Attachment ${gid} is not Asana-hosted and cannot be downloaded by this CLI.`);
+      let downloadUrl;
+      try { downloadUrl = new URL(attachment.download_url); } catch { throw new AsanaApiError(`Attachment ${gid} does not expose a valid HTTPS download URL.`); }
+      if (downloadUrl.protocol !== "https:") throw new AsanaApiError(`Attachment ${gid} does not expose a valid HTTPS download URL.`);
+      const response = await fetchImpl(downloadUrl, { headers: {} });
       if (!response.ok) throw new AsanaApiError(`Attachment download failed with status ${response.status}.`, { status: response.status });
       return {
         gid: attachment.gid,

@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export class CommandError extends Error {
@@ -10,7 +10,13 @@ export class CommandError extends Error {
 
 export async function resolveProject(client, binding) {
   if (binding.projectGid) return { gid: binding.projectGid };
-  const projects = await client.projects(binding.workspaceGid);
+  let projects;
+  if (binding.workspaceGid) projects = await client.projects(binding.workspaceGid);
+  else {
+    const user = await client.me();
+    const groups = await Promise.all((user.workspaces ?? []).map((workspace) => client.projects(workspace.gid)));
+    projects = groups.flat();
+  }
   const target = binding.projectName.toLocaleLowerCase();
   const matches = projects.filter((project) => project.name?.toLocaleLowerCase() === target);
   if (matches.length === 1) return matches[0];
@@ -67,8 +73,15 @@ export async function downloadAttachmentFile(
   client,
   gid,
   output,
-  { mkdirImpl = mkdir, writeFileImpl = writeFile } = {},
+  { accessImpl = access, mkdirImpl = mkdir, writeFileImpl = writeFile } = {},
 ) {
+  try {
+    await accessImpl(output);
+    throw new CommandError(`Output file already exists: ${output}`);
+  } catch (error) {
+    if (error instanceof CommandError) throw error;
+    if (error?.code !== "ENOENT") throw new CommandError(`Unable to inspect output path ${output}: ${error.message}`);
+  }
   const download = await client.downloadAttachment(gid);
   await mkdirImpl(dirname(output), { recursive: true });
   try {
