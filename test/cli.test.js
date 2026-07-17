@@ -14,8 +14,8 @@ test("parses documented triage options", () => {
 });
 
 test("parses full tasks and attachment downloads", () => {
-  assert.deepEqual(parseArgs(["task", "t1", "--full"]), { command: "task", gid: "t1", full: true, format: "compact" });
-  assert.deepEqual(parseArgs(["attachment", "download", "a1", "--output", "/tmp/a"]), { command: "attachment-download", gid: "a1", output: "/tmp/a", format: "compact" });
+  assert.deepEqual(parseArgs(["task", "101", "--full"]), { command: "task", gid: "101", full: true, format: "compact" });
+  assert.deepEqual(parseArgs(["attachment", "download", "201", "--output", "/tmp/a"]), { command: "attachment-download", gid: "201", output: "/tmp/a", format: "compact" });
 });
 
 test("rejects unknown formats, unsafe options, and missing required options", () => {
@@ -26,8 +26,12 @@ test("rejects unknown formats, unsafe options, and missing required options", ()
   assert.throws(() => parseArgs(["task", "1", "2"]), /unexpected argument/);
   assert.throws(() => parseArgs(["attachments", "1", "--full"]), /does not accept --full/);
   assert.throws(() => parseArgs(["auth", "status", "junk"]), /unexpected argument/);
+  assert.throws(() => parseArgs(["task", "../users/me"]), /valid Asana GID/);
+  assert.throws(() => parseArgs(["triage", "--project", "ocr", "--assignee", "not-a-gid"]), /assignee must be me, any, or an Asana GID/);
+  assert.throws(() => parseArgs(["me", "--format", "json", "--format", "compact"]), /Duplicate option/);
+  assert.throws(() => parseArgs(["me", "--token", "secret", "--help"]), /Unknown option: --token/);
   assert.throws(() => parseArgs(["triage"]), /--project/);
-  assert.throws(() => parseArgs(["attachment", "download", "a1"]), /--output/);
+  assert.throws(() => parseArgs(["attachment", "download", "201"]), /--output/);
 });
 
 test("auth status succeeds when auth is missing", async () => {
@@ -82,7 +86,29 @@ test("main dispatches flexible triage options", async () => {
   assert.match(output.stdout[0], /Mine/);
 });
 
-test("main sanitizes failures and returns nonzero", async () => {
+test("main exposes stable usage and authentication error categories", async () => {
+  const usage = io();
+  assert.equal(await main(["triage"], usage), 64);
+  assert.match(usage.stderr[0], /^USAGE:/);
+
+  const auth = io();
+  const error = Object.assign(new Error("authentication missing"), { name: "AuthError" });
+  assert.equal(await main(["me"], { ...auth, loadToken: async () => { throw error; } }), 2);
+  assert.deepEqual(auth.stderr, ["AUTH: authentication missing"]);
+});
+
+test("main exposes rate-limit category", async () => {
+  const output = io();
+  const rateLimit = Object.assign(new Error("retry later"), { name: "AsanaApiError", status: 429 });
+  const code = await main(["me"], {
+    ...output, loadToken: async () => ({ token: "hidden" }),
+    createClient: () => ({ me: async () => { throw rateLimit; } }),
+  });
+  assert.equal(code, 4);
+  assert.deepEqual(output.stderr, ["RATE_LIMIT: retry later"]);
+});
+
+test("main sanitizes internal failures and returns nonzero", async () => {
   const output = io();
   const code = await main(["me"], {
     ...output,
@@ -90,6 +116,6 @@ test("main sanitizes failures and returns nonzero", async () => {
     createClient: () => ({ me: async () => { throw new Error("request failed with super-secret"); } }),
   });
   assert.equal(code, 1);
-  assert.deepEqual(output.stderr, ["Error: request failed with [REDACTED]"]);
+  assert.deepEqual(output.stderr, ["INTERNAL: request failed with [REDACTED]"]);
   assert.doesNotMatch(output.stderr[0], /super-secret/);
 });

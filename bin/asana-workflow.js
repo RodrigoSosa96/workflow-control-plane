@@ -38,6 +38,7 @@ function consumeOptions(tokens) {
     if (!token.startsWith("--")) { positionals.push(token); continue; }
     const name = token.slice(2);
     if (!KNOWN_OPTIONS.has(name)) throw new Error(`Unknown option: --${name}`);
+    if (Object.hasOwn(options, name)) throw new Error(`Duplicate option: --${name}`);
     if (name === "full" || name === "help") { options[name] = true; continue; }
     const next = tokens[++index];
     if (next === undefined || next.startsWith("--")) throw new Error(`--${name} requires a value.`);
@@ -53,8 +54,16 @@ function validateShape(command, positionals, options, { positionalCount, allowed
   }
 }
 
+function requireGid(value, label) {
+  if (!/^\d+$/.test(value || "")) throw new Error(`${label} must be a valid Asana GID.`);
+}
+
+function requireProjectRef(value) {
+  if (!/^[\p{L}\p{N}._-]+$/u.test(value || "")) throw new Error("--project must be a valid alias or Asana GID.");
+}
+
 export function parseArgs(argv) {
-  if (!argv.length || argv.includes("--help") || argv[0] === "help") return { command: "help", format: "compact" };
+  if (!argv.length || (argv.length === 1 && ["--help", "help"].includes(argv[0]))) return { command: "help", format: "compact" };
   const [first, ...rest] = argv;
   const { options, positionals } = consumeOptions(rest);
   const format = options.format ?? "compact";
@@ -71,30 +80,37 @@ export function parseArgs(argv) {
   if (first === "sections") {
     validateShape("sections", positionals, options, { positionalCount: 0, allowedOptions: ["project"] });
     if (!options.project) throw new Error("sections requires --project.");
+    requireProjectRef(options.project);
     return { command: "sections", project: options.project, format };
   }
   if (first === "triage") {
     validateShape("triage", positionals, options, { positionalCount: 0, allowedOptions: ["project", "sections", "assignee"] });
     if (!options.project) throw new Error("triage requires --project.");
+    requireProjectRef(options.project);
+    const assignee = options.assignee ?? "me";
+    if (!["me", "any"].includes(assignee) && !/^\d+$/.test(assignee)) throw new Error("assignee must be me, any, or an Asana GID.");
     return {
       command: "triage", project: options.project,
       sections: options.sections ? options.sections.split(",").map((item) => item.trim()).filter(Boolean) : [],
-      assignee: options.assignee ?? "me", format,
+      assignee, format,
     };
   }
   if (first === "task") {
     validateShape("task", positionals, options, { positionalCount: 1, allowedOptions: ["full"] });
     if (!positionals[0]) throw new Error("task requires a task GID.");
+    requireGid(positionals[0], "task");
     return { command: "task", gid: positionals[0], full: options.full === true, format };
   }
   if (first === "attachments") {
     validateShape("attachments", positionals, options, { positionalCount: 1 });
     if (!positionals[0]) throw new Error("attachments requires a task GID.");
+    requireGid(positionals[0], "task");
     return { command: "attachments", gid: positionals[0], format };
   }
   if (first === "attachment" && positionals[0] === "download") {
     validateShape("attachment download", positionals, options, { positionalCount: 2, allowedOptions: ["output"] });
     if (!positionals[1]) throw new Error("attachment download requires an attachment GID.");
+    requireGid(positionals[1], "attachment");
     if (!options.output) throw new Error("attachment download requires --output.");
     return { command: "attachment-download", gid: positionals[1], output: options.output, format };
   }
@@ -108,8 +124,10 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const createClient = dependencies.createClient ?? defaultCreateClient;
   const loadConfig = dependencies.loadConfig ?? defaultLoadConfig;
   let sensitiveToken;
+  let phase = "parse";
   try {
     const args = parseArgs(argv);
+    phase = "runtime";
     if (args.command === "help") { out(HELP); return 0; }
     if (args.command === "auth-status") {
       try {
@@ -159,8 +177,18 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   } catch (error) {
     let message = String(error?.message || error);
     if (sensitiveToken) message = message.split(sensitiveToken).join("[REDACTED]");
-    err(`Error: ${message.replace(/[\r\n]+/g, "\n").slice(0, 1200)}`);
-    return 1;
+    let category = "INTERNAL";
+    let exitCode = 1;
+    if (phase === "parse") { category = "USAGE"; exitCode = 64; }
+    else if (error?.name === "AuthError") { category = "AUTH"; exitCode = 2; }
+    else if (error?.name === "ConfigError") { category = "CONFIG"; exitCode = 3; }
+    else if (error?.name === "AsanaApiError" && error.status === 429) { category = "RATE_LIMIT"; exitCode = 4; }
+    else if (error?.name === "AsanaApiError" && error.status === 404) { category = "NOT_FOUND"; exitCode = 7; }
+    else if (error?.name === "AsanaApiError" && /network failure/i.test(message)) { category = "NETWORK"; exitCode = 5; }
+    else if (error?.name === "AsanaApiError") { category = "API"; exitCode = 6; }
+    else if (error?.name === "CommandError") { category = "COMMAND"; exitCode = 8; }
+    err(`${category}: ${message.replace(/[\r\n]+/g, "\n").slice(0, 1200)}`);
+    return exitCode;
   }
 }
 

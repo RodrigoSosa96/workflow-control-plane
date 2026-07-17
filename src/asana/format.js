@@ -40,14 +40,16 @@ function formatTaskFull(context) {
   if (task.created_at) lines.push(`Created: ${task.created_at}`);
   if (task.modified_at) lines.push(`Modified: ${task.modified_at}`);
   if (task.notes) lines.push("", "## Description", task.notes);
+  if (task.html_notes && task.html_notes !== task.notes) lines.push("", "## HTML description and links", task.html_notes);
   addItems(lines, "Custom fields", task.custom_fields, (field) => `${value(field.name)}: ${value(field.display_value)}`);
   addItems(lines, "Comments and stories", context.stories, (story) => {
     const author = story.created_by?.name || "Asana";
-    return `${value(story.created_at)} | ${author} | ${value(story.text)}`;
+    const richText = story.html_text && story.html_text !== story.text ? ` | HTML: ${story.html_text}` : "";
+    return `${value(story.created_at)} | ${author} | ${value(story.text)}${richText}`;
   });
   addItems(lines, "Subtasks", context.subtasks, (item) => `${item.completed ? "[x]" : "[ ]"} ${value(item.name)} [${item.gid}]`);
-  addItems(lines, "Dependencies", context.dependencies, (item) => `${value(item.name)} [${item.gid}]`);
-  addItems(lines, "Dependents", context.dependents, (item) => `${value(item.name)} [${item.gid}]`);
+  addItems(lines, "Dependencies", context.dependencies, (item) => `${item.completed ? "[x]" : "[ ]"} ${value(item.name)} [${item.gid}]`);
+  addItems(lines, "Dependents", context.dependents, (item) => `${item.completed ? "[x]" : "[ ]"} ${value(item.name)} [${item.gid}]`);
   addItems(lines, "Attachments", context.attachments, attachment);
   return lines.join("\n");
 }

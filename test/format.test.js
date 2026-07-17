@@ -27,13 +27,13 @@ test("formats triage rows with section and assignee context", () => {
 test("formats complete task context while omitting empty sections", () => {
   const output = formatResult("task-full", {
     task: {
-      gid: "t1", name: "Feature", notes: "Detailed description", completed: false, due_on: "2026-07-20",
+      gid: "t1", name: "Feature", notes: "Detailed description", html_notes: '<body>Detailed <a href="https://spec.test">description</a></body>', completed: false, due_on: "2026-07-20",
       assignee: { gid: "u1", name: "Rodrigo" }, parent: { gid: "parent", name: "Parent" },
       projects: [{ gid: "p1", name: "OCR" }], memberships: [{ section: { gid: "sec", name: "Doing" }, project: { gid: "p1", name: "OCR" } }],
       permalink_url: "https://asana.test/t1", custom_fields: [{ name: "Priority", display_value: "High" }],
     },
-    stories: [{ gid: "c1", resource_subtype: "comment_added", text: "A comment", created_by: { name: "Ana" }, created_at: "2026-07-17" }],
-    subtasks: [{ gid: "s1", name: "Subtask", completed: false }], dependencies: [], dependents: [],
+    stories: [{ gid: "c1", resource_subtype: "comment_added", text: "A comment", html_text: 'A <a href="https://comment.test">comment</a>', created_by: { name: "Ana" }, created_at: "2026-07-17" }],
+    subtasks: [{ gid: "s1", name: "Subtask", completed: false }], dependencies: [{ gid: "d1", name: "Required", completed: true }], dependents: [],
     attachments: [{ gid: "a1", name: "mock.png", host: "asana", view_url: "https://asana.test/a1" }],
   });
   assert.match(output, /# Feature \[t1\]/);
@@ -44,11 +44,14 @@ test("formats complete task context while omitting empty sections", () => {
   assert.match(output, /Projects: OCR \[p1\]/);
   assert.match(output, /Sections: Doing \[sec\]/);
   assert.match(output, /Detailed description/);
+  assert.match(output, /https:\/\/spec\.test/);
+  assert.match(output, /https:\/\/comment\.test/);
+  assert.match(output, /\[x\] Required \[d1\]/);
   assert.match(output, /Priority: High/);
   assert.match(output, /Ana.*A comment/);
   assert.match(output, /Subtask \[s1\]/);
   assert.match(output, /mock.png \[a1\]/);
-  assert.doesNotMatch(output, /Dependencies/);
+  assert.match(output, /Dependencies/);
   assert.doesNotMatch(output, /undefined/);
 });
 
