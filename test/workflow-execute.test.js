@@ -857,6 +857,84 @@ test("runtime works with the real Herdr adapter process-info contract", async ()
   ]);
 });
 
+test("runtime waits for a transient shell process to hand off to the requested command", async () => {
+  const calls = [];
+  let processInfoReads = 0;
+  const herdr = {
+    async createTab({ workspaceId, cwd, label, focus }) {
+      calls.push({ kind: "herdr.tab.create", workspaceId, cwd, label, focus });
+      return { tabId: "w1:t9", paneId: "w1:p-root" };
+    },
+    async renamePane({ paneId, label }) {
+      calls.push({ kind: "herdr.pane.rename", paneId, label });
+      return { pane_id: paneId, label };
+    },
+    async splitPane() {
+      throw new Error("splitPane should not be called for a single runtime process");
+    },
+    async runInPane({ paneId, command }) {
+      calls.push({ kind: "herdr.pane.run", paneId, command });
+      return { accepted: true };
+    },
+    async getPaneProcessInfo(paneId) {
+      calls.push({ kind: "herdr.pane.process-info", paneId, read: processInfoReads + 1 });
+      processInfoReads += 1;
+      if (processInfoReads <= 5) {
+        return {
+          running: true,
+          executable: "/usr/bin/zsh",
+          command: "/usr/bin/zsh",
+          argv: ["/usr/bin/zsh"],
+          cmdline: "/usr/bin/zsh",
+          pane_id: paneId,
+          shell_pid: 111,
+          foreground_process_group_id: 111,
+          foreground_processes: [
+            {
+              argv: ["/usr/bin/zsh"],
+              cmdline: "/usr/bin/zsh",
+              cwd: workspacePath,
+              name: "zsh",
+              pid: 111,
+            },
+          ],
+        };
+      }
+      return {
+        running: true,
+        executable: "sleep",
+        command: "sleep 10000",
+        argv: ["sleep", "10000"],
+        cmdline: "sleep 10000",
+        pane_id: paneId,
+        shell_pid: 111,
+        foreground_process_group_id: 222,
+        foreground_processes: [
+          {
+            argv: ["sleep", "10000"],
+            cmdline: "sleep 10000",
+            cwd: workspacePath,
+            name: "sleep",
+            pid: 222,
+          },
+        ],
+      };
+    },
+  };
+
+  const report = await executeRuntime(buildRuntimePlan({
+    runtimeProcesses: [
+      { id: "sleeper", command: "sleep 10000", cwd: "." },
+    ],
+  }), { herdr, observeMs: 150 });
+
+  assert.equal(report.status, "completed");
+  assert.deepEqual(report.processes.map(({ id, status }) => ({ id, status })), [
+    { id: "sleeper", status: "created" },
+  ]);
+  assert.equal(calls.filter((call) => call.kind === "herdr.pane.process-info").length >= 6, true);
+});
+
 test("runtime reuses existing expected processes without duplicate launches", async () => {
   const calls = [];
   const report = await executeRuntime(buildRuntimePlan({

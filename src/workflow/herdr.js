@@ -256,11 +256,14 @@ function normalizePaneResult(value) {
 
 function normalizeAgentResult(value) {
   const agentId = extractId(value, ["agentId", "agent_id"])
-    ?? extractId(value?.agent, ["agentId", "agent_id"]);
-  const tabId = extractTabId(value);
-  const paneId = extractPaneId(value);
+    ?? extractId(value?.agent, ["agentId", "agent_id"])
+    ?? null;
+  const tabId = extractTabId(value)
+    ?? extractTabId(value?.agent);
+  const paneId = extractPaneId(value)
+    ?? extractPaneId(value?.agent);
 
-  if (!agentId || !tabId || !paneId) {
+  if (!tabId || !paneId) {
     fail("HERDR", "Herdr agent response is missing required IDs", {
       value,
       agentId,
@@ -274,7 +277,31 @@ function normalizeAgentResult(value) {
 
 function normalizePaneProcessInfo(value) {
   if (value === null || value === undefined) return null;
-  return value?.process ?? value?.process_info ?? value;
+
+  const processInfo = value?.process ?? value?.process_info ?? value;
+  const foregroundProcess = Array.isArray(processInfo?.foreground_processes) && processInfo.foreground_processes.length > 0
+    ? processInfo.foreground_processes[0]
+    : null;
+
+  if (!foregroundProcess) return processInfo;
+
+  const argv = Array.isArray(foregroundProcess.argv) ? foregroundProcess.argv : undefined;
+  const command = foregroundProcess.command
+    ?? foregroundProcess.command_line
+    ?? foregroundProcess.cmdline
+    ?? (argv?.length ? argv.join(" ") : undefined);
+  const executable = foregroundProcess.executable
+    ?? foregroundProcess.exe
+    ?? foregroundProcess.binary
+    ?? (argv?.length ? argv[0] : undefined);
+
+  return {
+    ...processInfo,
+    ...foregroundProcess,
+    running: processInfo.running ?? foregroundProcess.running ?? true,
+    ...(executable ? { executable } : {}),
+    ...(command ? { command } : {}),
+  };
 }
 
 export function createHerdrAdapter({ runner, binary = "herdr" }) {
@@ -343,19 +370,13 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       }
 
       if (reconciliation.status === "missing") {
-        const args = [
-          "--cwd",
-          operation.cwd,
-          "--branch",
-          operation.branch,
-          "--base",
-          operation.base,
-          "--path",
-          operation.path,
-          "--label",
-          operation.label,
-          "--json",
-        ];
+        const args = [];
+        pushOption(args, "--cwd", operation.cwd);
+        pushOption(args, "--branch", operation.branch);
+        pushOption(args, "--base", operation.base);
+        pushOption(args, "--path", operation.path);
+        pushOption(args, "--label", operation.label);
+        args.push("--json");
         const value = await invoke("worktree", "create", args, { cwd: operation.cwd });
         return normalizeWorktreeResult(value);
       }

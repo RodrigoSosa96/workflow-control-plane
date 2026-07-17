@@ -524,6 +524,49 @@ test("returns IDs from a live native worktree created response", async () => {
   });
 });
 
+test("omits --base when creating a live native worktree without a base branch", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "worktree",
+          "create",
+          "--cwd",
+          "/repo/main",
+          "--branch",
+          "feature/ASANA-123/discovered-docs",
+          "--path",
+          "/repo/.worktrees/ASANA-123-discovered-docs",
+          "--label",
+          "ASANA-123 discovered-docs",
+          "--json",
+        ]);
+        assert.deepEqual(options, { allowFailure: true, cwd: "/repo/main" });
+      },
+      stdout: cliResult({
+        type: "worktree_created",
+        workspace: { workspace_id: "w2", cwd: "/repo/.worktrees/ASANA-123-discovered-docs" },
+        tab: { tab_id: "w2:t1", label: "shell" },
+        root_pane: { pane_id: "w2:p1", label: "bootstrap" },
+      }, "cli:worktree:create"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.ensureNativeWorktree({
+    ...planOp,
+    base: undefined,
+    reconciliation: { status: "missing" },
+  });
+
+  assert.deepEqual(result, {
+    workspaceId: "w2",
+    tabId: "w2:t1",
+    paneId: "w2:p1",
+    disposition: "created",
+  });
+});
+
 test("returns IDs from a live native worktree opened response", async () => {
   const fixture = fixtureRunner([
     {
@@ -759,6 +802,59 @@ test("gets pane process-info through the public cli and unwraps the live envelop
   });
 });
 
+test("gets pane process-info from live foreground_processes contract", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["pane", "process-info", "--pane", "w2:p3"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({
+        type: "pane_process_info",
+        pane: { pane_id: "w2:p3", tab_id: "w2:t2" },
+        process_info: {
+          pane_id: "w2:p3",
+          shell_pid: 100,
+          foreground_process_group_id: 4242,
+          foreground_processes: [
+            {
+              argv: ["node", "server.js"],
+              cmdline: "node server.js",
+              cwd: "/repo",
+              name: "node",
+              pid: 4242,
+            },
+          ],
+        },
+      }, "cli:pane:process-info"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(await herdr.getPaneProcessInfo("w2:p3"), {
+    pane_id: "w2:p3",
+    shell_pid: 100,
+    foreground_process_group_id: 4242,
+    foreground_processes: [
+      {
+        argv: ["node", "server.js"],
+        cmdline: "node server.js",
+        cwd: "/repo",
+        name: "node",
+        pid: 4242,
+      },
+    ],
+    argv: ["node", "server.js"],
+    cmdline: "node server.js",
+    cwd: "/repo",
+    name: "node",
+    pid: 4242,
+    running: true,
+    executable: "node",
+    command: "node server.js",
+  });
+});
+
 test("starts an agent with explicit focus flags and live argv after --", async () => {
   const fixture = fixtureRunner([
     {
@@ -799,6 +895,55 @@ test("starts an agent with explicit focus flags and live argv after --", async (
 
   assert.deepEqual(result, {
     agentId: "a9",
+    tabId: "w2:t1",
+    paneId: "w2:p9",
+  });
+});
+
+test("starts an agent when the live contract omits agent_id", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "agent",
+          "start",
+          "ocr-ASANA-123-discovered-docs",
+          "--cwd",
+          "/repo/.worktrees/ASANA-123-discovered-docs",
+          "--tab",
+          "w2:t1",
+          "--no-focus",
+          "--",
+          "pi",
+          "--name",
+          "ocr-ASANA-123-discovered-docs",
+        ]);
+        assert.deepEqual(options, { allowFailure: true, cwd: "/repo/.worktrees/ASANA-123-discovered-docs" });
+      },
+      stdout: cliResult({
+        type: "agent_started",
+        agent: {
+          name: "ocr-ASANA-123-discovered-docs",
+          workspace_id: "w2",
+          tab_id: "w2:t1",
+          pane_id: "w2:p9",
+        },
+        argv: ["pi", "--name", "ocr-ASANA-123-discovered-docs"],
+      }, "cli:agent:start"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.startAgent({
+    name: "ocr-ASANA-123-discovered-docs",
+    cwd: "/repo/.worktrees/ASANA-123-discovered-docs",
+    tabId: "w2:t1",
+    argv: ["pi", "--name", "ocr-ASANA-123-discovered-docs"],
+    focus: false,
+  });
+
+  assert.deepEqual(result, {
+    agentId: null,
     tabId: "w2:t1",
     paneId: "w2:p9",
   });

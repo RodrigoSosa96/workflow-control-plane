@@ -163,14 +163,29 @@ function matchesProcessIdentity(expectedCommand, processInfo) {
     && matchesExecutable(expectedCommand, processInfo);
 }
 
-async function observePaneProcess(herdr, paneId, observeMs = 0) {
+const DEFAULT_RUNTIME_OBSERVE_MS = 1000;
+const RUNTIME_OBSERVE_INTERVAL_MS = 25;
+
+async function observePaneProcess(herdr, paneId, expectedCommand, observeMs = 0) {
   if (typeof herdr?.getPaneProcessInfo !== "function") {
     fail("PREFLIGHT", "executeRuntime requires Herdr pane process-info inspection", { paneId }, 10);
   }
-  if (observeMs > 0) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, observeMs));
+
+  const windowMs = Math.max(0, Number.isFinite(observeMs) ? observeMs : 0);
+  const deadline = Date.now() + windowMs;
+  let lastProcessInfo = null;
+
+  while (true) {
+    lastProcessInfo = await herdr.getPaneProcessInfo(paneId);
+    if (!expectedCommand || matchesProcessIdentity(expectedCommand, lastProcessInfo)) {
+      return lastProcessInfo;
+    }
+    if (Date.now() >= deadline) {
+      return lastProcessInfo;
+    }
+    const remainingMs = deadline - Date.now();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(RUNTIME_OBSERVE_INTERVAL_MS, remainingMs)));
   }
-  return await herdr.getPaneProcessInfo(paneId);
 }
 
 function runtimeProcessCwd(plan, process) {
@@ -806,7 +821,7 @@ async function executeGroupStart(plan, { git, herdr }) {
   }
 }
 
-async function executeRuntimePhase(plan, { herdr, observeMs = 0 }) {
+async function executeRuntimePhase(plan, { herdr, observeMs = DEFAULT_RUNTIME_OBSERVE_MS }) {
   const report = buildInitialReport(plan);
   const runtimeOperations = plan.operations.filter((operation) => operation.phase === "runtime");
   const completedIds = new Set();
@@ -884,7 +899,7 @@ async function executeRuntimePhase(plan, { herdr, observeMs = 0 }) {
 
       await herdr.renamePane({ paneId, label: process.id });
       await herdr.runInPane({ paneId, command: process.command });
-      const processInfo = await observePaneProcess(herdr, paneId, observeMs);
+      const processInfo = await observePaneProcess(herdr, paneId, process.command, observeMs);
 
       if (!matchesProcessIdentity(process.command, processInfo)) {
         const reason = runtimeFailureReason(process, processInfo);
