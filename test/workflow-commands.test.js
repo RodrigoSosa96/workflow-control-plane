@@ -306,6 +306,51 @@ test("status reports actual state and the safe next command without attempting r
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["listWorkspaces", "listTabs", "listPanes", "listAgents"]);
 });
 
+test("plan exposes a suggested Acme coordination manifest and compact output prints it", async () => {
+  const lookup = createLookup({
+    git: "/usr/bin/git",
+    herdr: "/usr/bin/herdr",
+    pi: "/usr/bin/pi",
+  });
+  const result = await planCommand({
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "acme",
+    task: "ASANA-456",
+    feature: "Onboarding",
+    repositories: ["panel", "backend"],
+  }, deps({
+    git: createGit({
+      repositories: {
+        "/repo/acme": { rootPath: "/repo/acme", commonDirPath: "/repo/acme/.git" },
+        "/repo/acme/acme_backend": { rootPath: "/repo/acme/acme_backend", commonDirPath: "/repo/acme/acme_backend/.git" },
+        "/repo/acme/acme_panel": { rootPath: "/repo/acme/acme_panel", commonDirPath: "/repo/acme/acme_panel/.git" },
+      },
+      worktrees: {
+        "/repo/acme": [],
+        "/repo/acme/acme_backend": [],
+        "/repo/acme/acme_panel": [],
+      },
+    }),
+    herdr: createHerdr(),
+    lookup,
+  }));
+
+  assert.equal(result.suggestedManifest.path, "/tmp/worktrees/acme/ASANA-456-onboarding/coordination-manifest.json");
+  assert.equal(result.suggestedManifest.payload.ticket, "ASANA-456");
+  assert.deepEqual(result.suggestedManifest.payload.selectedRepositories, ["backend", "panel"]);
+  assert.deepEqual(result.suggestedManifest.payload.integrationOrder, ["backend", "panel"]);
+  assert.deepEqual(result.suggestedManifest.payload.branches, {
+    backend: "feature/ASANA-456/onboarding",
+    panel: "feature/ASANA-456/onboarding",
+  });
+  assert.match(result.suggestedManifest.payload.verificationCommands[0], /workflow status acme ASANA-456/);
+
+  const compact = formatWorkflowResult("plan", result, "compact");
+  assert.match(compact, /Suggested manifest/i);
+  assert.match(compact, /coordination-manifest\.json/);
+  assert.match(compact, /integrationOrder/);
+});
+
 test("formats bounded compact output and normalized JSON", () => {
   const compact = formatWorkflowResult("status", {
     project: { alias: "ocr", label: "ExampleProject" },

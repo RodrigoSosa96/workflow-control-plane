@@ -42,6 +42,10 @@ function formatPlanLike(result) {
   ];
   if (result.nextCommand) lines.push(`Next: ${result.nextCommand}`);
   addConflicts(lines, result.conflicts?.length ? result.conflicts : result.reconciliation.conflicts);
+  if (result.suggestedManifest) {
+    lines.push(`Suggested manifest: ${result.suggestedManifest.path}`);
+    lines.push(JSON.stringify(normalizeJson(result.suggestedManifest.payload), null, 2));
+  }
   return bound(lines.join("\n"));
 }
 

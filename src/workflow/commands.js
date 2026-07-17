@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { planWorkflow } from "./planner.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
@@ -83,6 +84,34 @@ function runtimePhaseReady(reconciliation) {
   return reconciliation.operations
     .filter((operation) => operation.phase === "runtime")
     .every((operation) => operation.reconciliation.status === "compatible");
+}
+
+function suggestedManifestFor(options, reconciliation) {
+  if (reconciliation?.mode !== "group") return null;
+
+  const selectedRepositories = reconciliation.repositories.map((repository) => repository.alias);
+  const branches = Object.fromEntries(reconciliation.repositories.map((repository) => [repository.alias, repository.branch]));
+
+  return {
+    path: join(reconciliation.workspace.path, "coordination-manifest.json"),
+    payload: {
+      ticket: options.task,
+      feature: options.feature ?? null,
+      selectedRepositories,
+      branches,
+      integrationOrder: selectedRepositories,
+      verificationCommands: [
+        buildCommand("status", {
+          projectAlias: options.projectAlias,
+          task: options.task,
+          feature: options.feature,
+          repositories: selectedRepositories,
+          runtimeProfile: options.runtimeProfile,
+        }),
+        ...selectedRepositories.map((alias) => `git -C repos/${alias} status --short`),
+      ],
+    },
+  };
 }
 
 function nextCommandFor(options, preconditions, reconciliation) {
@@ -188,6 +217,7 @@ export async function planCommand(options = {}, {
     reconciliation,
     conflicts: reconciliation.conflicts,
     nextCommand: nextCommandFor(options, preconditions, reconciliation),
+    suggestedManifest: suggestedManifestFor(options, reconciliation),
   };
 }
 
@@ -222,5 +252,6 @@ export async function statusCommand(options = {}, {
     reconciliation,
     conflicts: reconciliation.conflicts,
     nextCommand: nextCommandFor(options, preconditions, reconciliation),
+    suggestedManifest: suggestedManifestFor(options, reconciliation),
   };
 }

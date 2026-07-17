@@ -71,9 +71,9 @@ function buildOperationReport(operation, status, extra = {}) {
   };
 }
 
-function ensureOrdinaryPlan(plan) {
-  if (plan?.mode !== "ordinary") {
-    fail("PREFLIGHT", "Task 6 only supports ordinary workflow execution", { mode: plan?.mode }, 10);
+function ensureStartablePlan(plan) {
+  if (plan?.mode !== "ordinary" && plan?.mode !== "group") {
+    fail("PREFLIGHT", "executeStart only supports ordinary and group workflow execution", { mode: plan?.mode }, 10);
   }
 }
 
@@ -316,6 +316,7 @@ function buildInitialReport(plan) {
     guidance: [],
     notes: [],
     processes: [],
+    repositories: [],
   };
 }
 
@@ -424,6 +425,77 @@ async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapP
   if (!bootstrapPane || !isIdleBootstrapPane(bootstrapPane)) return false;
   if (getPaneId(bootstrapPane) === getPaneId(startedPane)) return false;
   return true;
+}
+
+function childAliasFromOperation(operation) {
+  if (operation?.id?.startsWith("child-worktree:")) return operation.id.slice("child-worktree:".length);
+  if (operation?.id?.startsWith("child-tab:")) return operation.id.slice("child-tab:".length);
+  return null;
+}
+
+function findRepository(plan, alias) {
+  return plan.repositories?.find((repository) => repository.alias === alias) ?? null;
+}
+
+function repositoryReport(repository, status, extra = {}) {
+  return {
+    alias: repository.alias,
+    branch: repository.branch,
+    worktreePath: repository.worktreePath,
+    status,
+    ...extra,
+  };
+}
+
+function resolveTabId(plan, label, fallbackTabId = null) {
+  const tab = plan.tabs?.find((item) => item.label === label);
+  return getTabId(tab?.actual) ?? fallbackTabId ?? null;
+}
+
+async function ensureMetaRepositoryReady(metaWorktreeOperation, git) {
+  if (typeof git?.inspectRepository !== "function") {
+    fail("PREFLIGHT", "executeStart requires Git repository inspection for group workflows", {}, 10);
+  }
+
+  try {
+    await git.inspectRepository({ cwd: metaWorktreeOperation.cwd });
+  } catch (error) {
+    fail("PREFLIGHT", `Acme meta repository is missing or invalid at ${metaWorktreeOperation.cwd}`, {
+      cwd: metaWorktreeOperation.cwd,
+      reason: error.message,
+      guidance: [
+        `Clone or restore the meta repository at ${metaWorktreeOperation.cwd}.`,
+        "Then rerun the same workflow start command.",
+      ],
+    }, 10);
+  }
+}
+
+function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorTabOperation, childWorktreeOperations, childTabOperations, agentOperation }) {
+  if (!git) {
+    fail("PREFLIGHT", "executeStart requires a Git adapter for group workflows", {}, 10);
+  }
+  if (!herdr) {
+    fail("PREFLIGHT", "executeStart requires a Herdr adapter", {}, 10);
+  }
+  if (typeof git.createWorktree !== "function" || typeof git.inspectRepository !== "function") {
+    fail("PREFLIGHT", "executeStart requires Git worktree creation and repository inspection for group workflows", {}, 10);
+  }
+  if (typeof herdr.ensureNativeWorktree !== "function"
+    || typeof herdr.renameTab !== "function"
+    || typeof herdr.createTab !== "function"
+    || typeof herdr.startAgent !== "function") {
+    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, and agent methods", {}, 10);
+  }
+  if (!metaWorktreeOperation || !coordinatorTabOperation || !agentOperation || childWorktreeOperations.length === 0 || childTabOperations.length === 0) {
+    fail("PREFLIGHT", "executeStart requires group start operations for meta worktree, child worktrees, coordinator tab, child tabs, and agent", {
+      metaWorktreeOperation,
+      coordinatorTabOperation,
+      childWorktreeOperations,
+      childTabOperations,
+      agentOperation,
+    }, 10);
+  }
 }
 
 async function executeOrdinaryStart(plan, { herdr }) {
@@ -539,6 +611,189 @@ async function executeOrdinaryStart(plan, { herdr }) {
     if (failedOperation) {
       report.operations.push(buildOperationReport(failedOperation, "failed", { error: error.message }));
       completedIds.add(failedOperation.id);
+    }
+
+    appendSkipped(report, startOperations, completedIds);
+    report.guidance = recoveryGuidance(plan, error);
+    report.error = {
+      name: error.name,
+      message: error.message,
+    };
+    return report;
+  }
+}
+
+async function executeGroupStart(plan, { git, herdr }) {
+  const report = buildInitialReport(plan);
+  const startOperations = plan.operations.filter((operation) => operation.phase === "start");
+  const completedIds = new Set();
+  const metaWorktreeOperation = findOperation(plan, "meta-worktree");
+  const coordinatorTabOperation = findOperation(plan, "coordinator-tab");
+  const agentOperation = findOperation(plan, "agent");
+  const childWorktreeOperations = startOperations.filter((operation) => operation.id.startsWith("child-worktree:"));
+  const childTabOperations = startOperations.filter((operation) => operation.id.startsWith("child-tab:"));
+
+  ensureGroupStartShape({
+    git,
+    herdr,
+    metaWorktreeOperation,
+    coordinatorTabOperation,
+    childWorktreeOperations,
+    childTabOperations,
+    agentOperation,
+  });
+
+  let ensured;
+  let bootstrapContext = null;
+  let bootstrapCreatedFromReturnedRootPane = false;
+  let currentOperation = metaWorktreeOperation;
+
+  try {
+    await ensureMetaRepositoryReady(metaWorktreeOperation, git);
+
+    ensured = await ensureWorktreeStart(metaWorktreeOperation, herdr);
+    bootstrapContext = ensured.result ?? null;
+    bootstrapCreatedFromReturnedRootPane = Boolean(ensured.mutated);
+
+    report.operations.push(buildOperationReport(metaWorktreeOperation, ensured.status));
+    completedIds.add(metaWorktreeOperation.id);
+
+    for (const operation of childWorktreeOperations) {
+      currentOperation = operation;
+      const alias = childAliasFromOperation(operation);
+      const repository = findRepository(plan, alias);
+      if (!repository) {
+        fail("PREFLIGHT", `Unknown Acme repository for operation ${operation.id}`, { operation }, 10);
+      }
+
+      if (operation.reconciliation?.status === "compatible") {
+        report.operations.push(buildOperationReport(operation, "reused"));
+        report.repositories.push(repositoryReport(repository, "reused"));
+        completedIds.add(operation.id);
+        continue;
+      }
+
+      if (operation.reconciliation?.status !== "missing") {
+        fail("PREFLIGHT", `Unsupported child worktree reconciliation state for ${alias}`, {
+          operation,
+          status: operation.reconciliation?.status,
+        }, 10);
+      }
+
+      await git.createWorktree({
+        cwd: operation.cwd,
+        path: operation.path,
+        branch: operation.branch,
+        base: operation.base,
+        reconciliation: operation.reconciliation,
+      });
+
+      report.operations.push(buildOperationReport(operation, "created"));
+      report.repositories.push(repositoryReport(repository, "created"));
+      completedIds.add(operation.id);
+    }
+
+    let coordinatorTabId = resolveTabId(plan, plan.agent.tabLabel, bootstrapContext?.tabId ?? null);
+    let coordinatorTabStatus = "reused";
+
+    if (coordinatorTabOperation.reconciliation?.status !== "compatible") {
+      currentOperation = coordinatorTabOperation;
+      if (!coordinatorTabId) {
+        bootstrapContext = await resolveBootstrapContext(plan, metaWorktreeOperation, ensured, herdr);
+        coordinatorTabId = bootstrapContext.tabId;
+      }
+      await herdr.renameTab({ tabId: coordinatorTabId, label: plan.agent.tabLabel });
+      coordinatorTabStatus = "created";
+    }
+
+    report.operations.push(buildOperationReport(coordinatorTabOperation, coordinatorTabStatus, { tabId: coordinatorTabId }));
+    completedIds.add(coordinatorTabOperation.id);
+
+    let workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? getWorkspaceId(plan.workspace?.actual);
+    if (!isNonEmptyString(workspaceId) || !isNonEmptyString(coordinatorTabId)) {
+      bootstrapContext = await resolveBootstrapContext(plan, metaWorktreeOperation, ensured, herdr);
+      workspaceId = bootstrapContext.workspaceId;
+      coordinatorTabId ??= bootstrapContext.tabId;
+    }
+
+    for (const operation of childTabOperations) {
+      currentOperation = operation;
+      const alias = childAliasFromOperation(operation);
+      const repository = findRepository(plan, alias);
+      if (!repository) {
+        fail("PREFLIGHT", `Unknown Acme repository for operation ${operation.id}`, { operation }, 10);
+      }
+
+      if (operation.reconciliation?.status === "compatible") {
+        report.operations.push(buildOperationReport(operation, "reused", { tabId: resolveTabId(plan, alias) }));
+        completedIds.add(operation.id);
+        continue;
+      }
+
+      const createdTab = await herdr.createTab({
+        workspaceId,
+        cwd: repository.worktreePath,
+        label: alias,
+        focus: false,
+      });
+
+      report.operations.push(buildOperationReport(operation, "created", {
+        tabId: createdTab.tabId,
+        paneId: createdTab.paneId,
+      }));
+      completedIds.add(operation.id);
+    }
+
+    if (agentOperation.reconciliation?.status === "compatible") {
+      report.operations.push(buildOperationReport(agentOperation, "reused"));
+      completedIds.add(agentOperation.id);
+      return report;
+    }
+
+    currentOperation = agentOperation;
+    const startedAgent = await herdr.startAgent({
+      name: plan.agent.sessionName,
+      cwd: plan.agent.worktreePath,
+      tabId: coordinatorTabId,
+      argv: agentArgv(plan),
+      focus: false,
+    });
+
+    report.operations.push(buildOperationReport(agentOperation, "created", {
+      agentId: startedAgent.agentId,
+      tabId: startedAgent.tabId,
+      paneId: startedAgent.paneId,
+    }));
+    completedIds.add(agentOperation.id);
+
+    if (bootstrapCreatedFromReturnedRootPane || bootstrapContext?.paneId || ensured.result?.paneId) {
+      report.notes.push("Retained the coordinator bootstrap shell pane for manual cross-repository coordination.");
+    }
+
+    return report;
+  } catch (error) {
+    report.status = report.operations.length > 0 ? "partial" : "failed";
+    if (error instanceof WorkflowError && (error.category === "CONFLICT" || (error.category === "PREFLIGHT" && report.operations.length === 0))) throw error;
+
+    const failedOperation = currentOperation && !completedIds.has(currentOperation.id)
+      ? currentOperation
+      : [
+          agentOperation,
+          ...childTabOperations.slice().reverse(),
+          coordinatorTabOperation,
+          ...childWorktreeOperations.slice().reverse(),
+          metaWorktreeOperation,
+        ].find((operation) => operation && !completedIds.has(operation.id));
+
+    if (failedOperation) {
+      report.operations.push(buildOperationReport(failedOperation, "failed", { error: error.message }));
+      completedIds.add(failedOperation.id);
+
+      const alias = childAliasFromOperation(failedOperation);
+      const repository = alias ? findRepository(plan, alias) : null;
+      if (repository && !report.repositories.some((item) => item.alias === repository.alias)) {
+        report.repositories.push(repositoryReport(repository, "failed", { error: error.message }));
+      }
     }
 
     appendSkipped(report, startOperations, completedIds);
@@ -691,10 +946,12 @@ async function executeRuntimePhase(plan, { herdr, observeMs = 0 }) {
   }
 }
 
-export async function executeStart(reconciledPlan, { git: _git, herdr } = {}) {
-  ensureOrdinaryPlan(reconciledPlan);
+export async function executeStart(reconciledPlan, { git, herdr } = {}) {
+  ensureStartablePlan(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
-  return await executeOrdinaryStart(reconciledPlan, { herdr });
+  return reconciledPlan.mode === "group"
+    ? await executeGroupStart(reconciledPlan, { git, herdr })
+    : await executeOrdinaryStart(reconciledPlan, { herdr });
 }
 
 export async function executeRuntime(reconciledPlan, { herdr, observeMs } = {}) {

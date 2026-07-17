@@ -770,8 +770,14 @@ export async function reconcilePlan(plan, { git, herdr, realpath = defaultRealpa
   const worktrees = await classifyWorktrees(plan, git, canonicalPath);
   const workspace = await classifyWorkspace(plan, worktrees, herdr, canonicalPath);
   const tabs = await classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canonicalPath);
-  const agent = await classifyAgent(plan, tabs, loadAgents, canonicalPath);
-  const runtime = await classifyRuntime(plan, tabs, tabs.panes, herdr, canonicalPath);
+  const agent = {
+    ...plan.agent,
+    ...await classifyAgent(plan, tabs, loadAgents, canonicalPath),
+  };
+  const runtime = {
+    ...plan.runtime,
+    ...await classifyRuntime(plan, tabs, tabs.panes, herdr, canonicalPath),
+  };
   const conflicts = collectConflicts(worktrees.results, workspace, tabs.results, agent, runtime);
   const status = conflicts.length > 0
     ? "conflict"
