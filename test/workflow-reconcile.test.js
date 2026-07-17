@@ -92,7 +92,7 @@ function createGit({ repositories = {}, worktrees = {}, statuses = {} } = {}) {
   };
 }
 
-function createHerdr({ workspaces = [], tabs = {}, panes = {}, agents = [] } = {}) {
+function createHerdr({ workspaces = [], tabs = {}, panes = {}, agents = [], processInfos = null } = {}) {
   return {
     async listWorkspaces() {
       return { workspaces };
@@ -106,6 +106,11 @@ function createHerdr({ workspaces = [], tabs = {}, panes = {}, agents = [] } = {
     async listAgents() {
       return { agents };
     },
+    ...(processInfos ? {
+      async getPaneProcessInfo({ paneId }) {
+        return Object.hasOwn(processInfos, paneId) ? processInfos[paneId] : null;
+      },
+    } : {}),
   };
 }
 
@@ -829,4 +834,235 @@ test("does not treat a runtime pane with the right label but wrong command as co
   assert.equal(reconciled.status, "conflict");
   assert.equal(reconciled.runtime.processes[0].status, "conflict");
   assert.match(reconciled.runtime.processes[0].reason, /command|process|api/i);
+});
+
+test("classifies runtime processes from pane process-info instead of stale pane command metadata", async () => {
+  const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const workspaceId = "w-runtime-process-info";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: createGit({
+      repositories: {
+        "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+        [plan.worktrees[0].path]: { rootPath: plan.worktrees[0].path, commonDirPath: "/repo/ocr/.git" },
+      },
+      worktrees: {
+        "/repo/ocr": [
+          { path: plan.worktrees[0].path, branch: branchRef(plan.worktrees[0].branch) },
+        ],
+      },
+    }),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: plan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: "w-runtime-process-info:t1", workspace_id: workspaceId, label: "agent" },
+          { tab_id: "w-runtime-process-info:t2", workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: "w-runtime-process-info:p1",
+            tab_id: "w-runtime-process-info:t1",
+            label: "agent-shell",
+            cwd: plan.agent.worktreePath,
+            foreground_cwd: plan.agent.worktreePath,
+          },
+          {
+            pane_id: "w-runtime-process-info:p2",
+            tab_id: "w-runtime-process-info:t2",
+            label: "api",
+            cwd: plan.runtime.worktreePath,
+            foreground_cwd: plan.runtime.worktreePath,
+            command: "pnpm stale",
+          },
+        ],
+      },
+      processInfos: {
+        "w-runtime-process-info:p2": {
+          running: true,
+          executable: "pnpm",
+          command: "pnpm dev:api",
+        },
+      },
+      agents: [
+        {
+          tab_id: "w-runtime-process-info:t1",
+          workspace_id: workspaceId,
+          name: plan.agent.sessionName,
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.status, "compatible");
+  assert.equal(reconciled.runtime.processes[0].status, "compatible");
+});
+
+test("does not treat a runtime pane as compatible when process-info executable mismatches", async () => {
+  const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const workspaceId = "w-runtime-executable-mismatch";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: createGit({
+      repositories: {
+        "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+        [plan.worktrees[0].path]: { rootPath: plan.worktrees[0].path, commonDirPath: "/repo/ocr/.git" },
+      },
+      worktrees: {
+        "/repo/ocr": [
+          { path: plan.worktrees[0].path, branch: branchRef(plan.worktrees[0].branch) },
+        ],
+      },
+    }),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: plan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: "w-runtime-executable-mismatch:t1", workspace_id: workspaceId, label: "agent" },
+          { tab_id: "w-runtime-executable-mismatch:t2", workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: "w-runtime-executable-mismatch:p1",
+            tab_id: "w-runtime-executable-mismatch:t1",
+            label: "agent-shell",
+            cwd: plan.agent.worktreePath,
+            foreground_cwd: plan.agent.worktreePath,
+          },
+          {
+            pane_id: "w-runtime-executable-mismatch:p2",
+            tab_id: "w-runtime-executable-mismatch:t2",
+            label: "api",
+            cwd: plan.runtime.worktreePath,
+            foreground_cwd: plan.runtime.worktreePath,
+            command: "pnpm dev:api",
+          },
+        ],
+      },
+      processInfos: {
+        "w-runtime-executable-mismatch:p2": {
+          running: true,
+          executable: "bash",
+          command: "pnpm dev:api",
+        },
+      },
+      agents: [
+        {
+          tab_id: "w-runtime-executable-mismatch:t1",
+          workspace_id: workspaceId,
+          name: plan.agent.sessionName,
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.status, "conflict");
+  assert.equal(reconciled.runtime.processes[0].status, "conflict");
+  assert.match(reconciled.runtime.processes[0].reason, /executable|command|process/i);
+});
+
+test("preserves compatible runtime siblings while only missing processes remain incomplete", async () => {
+  const runtimeRegistry = structuredClone(registry);
+  runtimeRegistry.projects.ocr.runtime.profiles.standard.processes = [
+    { id: "api", command: "pnpm dev:api", cwd: "." },
+    { id: "frontend", command: "pnpm dev:front", cwd: "apps/front", split: "right", ratio: 0.35 },
+  ];
+  const plan = planWorkflow({ registry: runtimeRegistry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const workspaceId = "w-runtime-siblings";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: createGit({
+      repositories: {
+        "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+        [plan.worktrees[0].path]: { rootPath: plan.worktrees[0].path, commonDirPath: "/repo/ocr/.git" },
+      },
+      worktrees: {
+        "/repo/ocr": [
+          { path: plan.worktrees[0].path, branch: branchRef(plan.worktrees[0].branch) },
+        ],
+      },
+    }),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: plan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: "w-runtime-siblings:t1", workspace_id: workspaceId, label: "agent" },
+          { tab_id: "w-runtime-siblings:t2", workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: "w-runtime-siblings:p1",
+            tab_id: "w-runtime-siblings:t1",
+            label: "agent-shell",
+            cwd: plan.agent.worktreePath,
+            foreground_cwd: plan.agent.worktreePath,
+          },
+          {
+            pane_id: "w-runtime-siblings:p2",
+            tab_id: "w-runtime-siblings:t2",
+            label: "api",
+            cwd: plan.runtime.worktreePath,
+            foreground_cwd: plan.runtime.worktreePath,
+            command: "pnpm stale",
+          },
+        ],
+      },
+      processInfos: {
+        "w-runtime-siblings:p2": {
+          running: true,
+          executable: "pnpm",
+          command: "pnpm dev:api",
+        },
+      },
+      agents: [
+        {
+          tab_id: "w-runtime-siblings:t1",
+          workspace_id: workspaceId,
+          name: plan.agent.sessionName,
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.status, "incomplete");
+  assert.deepEqual(reconciled.runtime.processes.map(({ id, status }) => ({ id, status })), [
+    { id: "api", status: "compatible" },
+    { id: "frontend", status: "missing" },
+  ]);
 });

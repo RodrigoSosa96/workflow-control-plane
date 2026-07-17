@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { executeStart } from "../src/workflow/execute.js";
+import { executeStart, executeRuntime } from "../src/workflow/execute.js";
 
 const workspacePath = "/repo/.worktrees/ASANA-123-discovered-docs";
 const sessionName = "ocr-ASANA-123-discovered-docs";
@@ -234,6 +234,183 @@ function fakeAdapters(calls, options = {}) {
   return {
     git: {},
     herdr: createHerdr(calls, options),
+  };
+}
+
+function runtimeProcessDefaults() {
+  return [
+    { id: "infrastructure", command: "pnpm docker:dev", cwd: "." },
+    { id: "backend", command: "pnpm dev:api", cwd: ".", split: "right", ratio: 0.35 },
+    { id: "frontend", command: "pnpm dev:front", cwd: "apps/front", split: "down", ratio: 0.5 },
+  ];
+}
+
+function processCwd(process) {
+  return process.cwd === "." ? workspacePath : `${workspacePath}/${process.cwd}`;
+}
+
+function buildRuntimePlan({
+  status,
+  conflicts = [],
+  workspaceStatus = "compatible",
+  workspaceId = "w1",
+  runtimeTabStatus = "missing",
+  runtimeTabActual,
+  runtimeProcesses = runtimeProcessDefaults(),
+  runtimeProcessStates = {},
+} = {}) {
+  const actualTab = runtimeTabActual ?? (runtimeTabStatus === "compatible"
+    ? { tab_id: "w1:t9", workspace_id: workspaceId, label: "runtime" }
+    : null);
+  const processes = runtimeProcesses.map((process, index) => {
+    const state = runtimeProcessStates[process.id] ?? {};
+    const processStatus = state.status ?? "missing";
+    return {
+      ...process,
+      status: processStatus,
+      reason: state.reason ?? `runtime process ${process.id} is ${processStatus}`,
+      actual: state.actual ?? (processStatus === "compatible"
+        ? [{
+            pane_id: `w1:rp${index + 1}`,
+            tab_id: actualTab?.tab_id ?? "w1:t9",
+            workspace_id: workspaceId,
+            label: process.id,
+            cwd: processCwd(process),
+            foreground_cwd: processCwd(process),
+          }]
+        : []),
+    };
+  });
+  const runtimeStatus = processes.some((process) => process.status === "conflict")
+    ? "conflict"
+    : processes.every((process) => process.status === "compatible")
+      ? "compatible"
+      : "incomplete";
+  const planStatus = status ?? (runtimeStatus === "compatible" ? "compatible" : runtimeStatus);
+
+  return {
+    mode: "ordinary",
+    status: planStatus,
+    conflicts,
+    identity: {
+      projectAlias: "ocr",
+      projectLabel: "ExampleProject",
+      projectKind: "work",
+      task: "ASANA-123",
+      feature: "Discovered Docs",
+      slug: "discovered-docs",
+    },
+    workspace: {
+      kind: "ordinary",
+      label: "ASANA-123 discovered-docs",
+      path: workspacePath,
+      status: workspaceStatus,
+      actual: workspaceStatus === "compatible"
+        ? {
+            workspace_id: workspaceId,
+            worktree: {
+              checkout_path: workspacePath,
+            },
+          }
+        : null,
+    },
+    tabs: [
+      {
+        label: "runtime",
+        kind: "runtime",
+        phase: "runtime",
+        worktreePath: workspacePath,
+        profileName: "standard",
+        processes,
+        status: runtimeTabStatus,
+        actual: actualTab,
+      },
+    ],
+    agent: {
+      command: "pi",
+      sessionName,
+      tabLabel: "agent",
+      worktreePath: workspacePath,
+      status: "compatible",
+      actual: { agent_id: "a1", tab_id: "w1:t1", workspace_id: workspaceId, name: sessionName },
+    },
+    runtime: {
+      profileName: "standard",
+      processes,
+      worktreePath: workspacePath,
+      tabLabel: "runtime",
+      status: runtimeStatus,
+      tab: actualTab ? { status: runtimeTabStatus, actual: actualTab } : null,
+    },
+    operations: [
+      {
+        id: "runtime-tab",
+        kind: "herdr.tab.ensure",
+        phase: "runtime",
+        cwd: workspacePath,
+        label: "runtime",
+        reconciliation: runtimeTabStatus === "compatible"
+          ? { status: "compatible", actual: actualTab }
+          : { status: runtimeTabStatus, reason: `runtime tab is ${runtimeTabStatus}` },
+      },
+      {
+        id: "runtime",
+        kind: "workflow.runtime.start",
+        phase: "runtime",
+        cwd: workspacePath,
+        profileName: "standard",
+        processes,
+        reconciliation: {
+          status: runtimeStatus,
+          reason: `runtime is ${runtimeStatus}`,
+        },
+      },
+    ],
+  };
+}
+
+function createRuntimeHerdr(calls, {
+  createTabResult = { tabId: "w1:t9", paneId: "w1:p-root" },
+  splitResults = [{ paneId: "w1:p2" }, { paneId: "w1:p3" }],
+  processInfos = {},
+} = {}) {
+  const liveProcessInfos = new Map(Object.entries(processInfos));
+  const queuedSplits = [...splitResults];
+
+  return {
+    async createTab({ workspaceId, cwd, label, focus }) {
+      calls.push({ kind: "herdr.tab.create", workspaceId, cwd, label, focus });
+      return createTabResult;
+    },
+    async renamePane({ paneId, label }) {
+      calls.push({ kind: "herdr.pane.rename", paneId, label });
+      return { pane_id: paneId, label };
+    },
+    async splitPane({ paneId, direction, ratio, cwd, focus }) {
+      calls.push({ kind: "herdr.pane.split", paneId, direction, ratio, cwd, focus });
+      return queuedSplits.shift() ?? { paneId: `generated:${calls.length}` };
+    },
+    async runInPane({ paneId, command }) {
+      calls.push({ kind: "herdr.pane.run", paneId, command });
+      if (!liveProcessInfos.has(paneId)) {
+        liveProcessInfos.set(paneId, {
+          running: true,
+          executable: command.split(/\s+/u)[0],
+          command,
+        });
+      }
+      return { accepted: true };
+    },
+    async getPaneProcessInfo({ paneId }) {
+      calls.push({ kind: "herdr.pane.process-info", paneId });
+      return liveProcessInfos.has(paneId) ? liveProcessInfos.get(paneId) : null;
+    },
+  };
+}
+
+function fakeRuntimeAdapters(calls, options = {}) {
+  return {
+    herdr: createRuntimeHerdr(calls, options),
   };
 }
 
@@ -536,4 +713,137 @@ test("retains the bootstrap shell when the bootstrap root pane is no longer idle
 
   assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
   assert.match(report.notes.join("\n"), /retained|safety/i);
+});
+
+test("runtime creates runtime panes from trusted registry commands", async () => {
+  const calls = [];
+  const report = await executeRuntime(buildRuntimePlan(), { ...fakeRuntimeAdapters(calls), observeMs: 0 });
+
+  assert.deepEqual(calls.map((call) => call.kind), [
+    "herdr.tab.create",
+    "herdr.pane.rename",
+    "herdr.pane.run",
+    "herdr.pane.process-info",
+    "herdr.pane.split",
+    "herdr.pane.rename",
+    "herdr.pane.run",
+    "herdr.pane.process-info",
+    "herdr.pane.split",
+    "herdr.pane.rename",
+    "herdr.pane.run",
+    "herdr.pane.process-info",
+  ]);
+  assert.equal(calls.find((call) => call.kind === "herdr.tab.create").cwd, workspacePath);
+  assert.deepEqual(calls.filter((call) => call.kind === "herdr.pane.rename").map((call) => ({ paneId: call.paneId, label: call.label })), [
+    { paneId: "w1:p-root", label: "infrastructure" },
+    { paneId: "w1:p2", label: "backend" },
+    { paneId: "w1:p3", label: "frontend" },
+  ]);
+  assert.deepEqual(calls.filter((call) => call.kind === "herdr.pane.split").map((call) => ({
+    paneId: call.paneId,
+    direction: call.direction,
+    ratio: call.ratio,
+    cwd: call.cwd,
+  })), [
+    { paneId: "w1:p-root", direction: "right", ratio: 0.35, cwd: workspacePath },
+    { paneId: "w1:p2", direction: "down", ratio: 0.5, cwd: `${workspacePath}/apps/front` },
+  ]);
+  assert.deepEqual(calls.filter((call) => call.kind === "herdr.pane.run").map((call) => call.command), [
+    "pnpm docker:dev",
+    "pnpm dev:api",
+    "pnpm dev:front",
+  ]);
+  assert.equal(report.status, "completed");
+  assert.deepEqual(report.processes.map(({ id, status }) => ({ id, status })), [
+    { id: "infrastructure", status: "created" },
+    { id: "backend", status: "created" },
+    { id: "frontend", status: "created" },
+  ]);
+});
+
+test("runtime reuses existing expected processes without duplicate launches", async () => {
+  const calls = [];
+  const report = await executeRuntime(buildRuntimePlan({
+    runtimeTabStatus: "compatible",
+    status: "compatible",
+    runtimeProcessStates: {
+      infrastructure: { status: "compatible" },
+      backend: { status: "compatible" },
+      frontend: { status: "compatible" },
+    },
+  }), { ...fakeRuntimeAdapters(calls), observeMs: 0 });
+
+  assert.deepEqual(calls, []);
+  assert.equal(report.status, "completed");
+  assert.deepEqual(report.processes.map(({ id, status }) => ({ id, status })), [
+    { id: "infrastructure", status: "reused" },
+    { id: "backend", status: "reused" },
+    { id: "frontend", status: "reused" },
+  ]);
+});
+
+test("runtime rejects mismatched live process conflicts before any mutation", async () => {
+  const calls = [];
+
+  await assert.rejects(
+    executeRuntime(buildRuntimePlan({
+      status: "conflict",
+      conflicts: [{ resource: "runtime:backend", reason: "runtime process backend has mismatched command evidence" }],
+      runtimeTabStatus: "compatible",
+      runtimeProcessStates: {
+        infrastructure: { status: "compatible" },
+        backend: { status: "conflict", reason: "runtime process backend has mismatched command evidence" },
+      },
+    }), { ...fakeRuntimeAdapters(calls), observeMs: 0 }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "CONFLICT");
+      assert.match(error.message, /conflict/i);
+      return true;
+    },
+  );
+
+  assert.deepEqual(calls, []);
+});
+
+test("runtime reports a stopped pane when the observed process never becomes live", async () => {
+  const calls = [];
+  const report = await executeRuntime(buildRuntimePlan({
+    runtimeProcesses: [
+      { id: "api", command: "pnpm dev:api", cwd: "." },
+    ],
+  }), {
+    ...fakeRuntimeAdapters(calls, {
+      processInfos: {
+        "w1:p-root": null,
+      },
+    }),
+    observeMs: 0,
+  });
+
+  assert.equal(report.status, "failed");
+  assert.equal(report.processes[0].status, "failed");
+  assert.match(report.processes[0].reason, /stopped|not running|process-info/i);
+  assert.match(report.guidance.join("\n"), /workflow runtime|rerun/i);
+});
+
+test("runtime preserves successful siblings when a later process exits immediately", async () => {
+  const calls = [];
+  const report = await executeRuntime(buildRuntimePlan(), {
+    ...fakeRuntimeAdapters(calls, {
+      processInfos: {
+        "w1:p-root": { running: true, executable: "pnpm", command: "pnpm docker:dev" },
+        "w1:p2": { state: "exited", exitCode: 1, executable: "pnpm", command: "pnpm dev:api" },
+      },
+    }),
+    observeMs: 0,
+  });
+
+  assert.equal(report.status, "partial");
+  assert.deepEqual(report.processes.map(({ id, status }) => ({ id, status })), [
+    { id: "infrastructure", status: "created" },
+    { id: "backend", status: "failed" },
+    { id: "frontend", status: "skipped" },
+  ]);
+  assert.match(report.processes[1].reason, /exit|stopped/i);
 });

@@ -1,5 +1,5 @@
 import { realpath as defaultRealpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 
 function normalizeBranch(value) {
   if (typeof value !== "string") return null;
@@ -71,6 +71,70 @@ function paneCommand(pane) {
 
 async function panePath(pane, canonicalPath) {
   return await canonicalPath(pane?.foreground_cwd ?? pane?.cwd);
+}
+
+function paneId(pane) {
+  return pane?.pane_id ?? pane?.paneId ?? null;
+}
+
+function commandExecutable(command) {
+  if (typeof command !== "string") return null;
+  return command.trim().split(/\s+/u)[0] ?? null;
+}
+
+function processInfoCommand(processInfo) {
+  if (typeof processInfo?.command === "string" && processInfo.command) return processInfo.command;
+  if (typeof processInfo?.command_line === "string" && processInfo.command_line) return processInfo.command_line;
+  if (typeof processInfo?.cmdline === "string" && processInfo.cmdline) return processInfo.cmdline;
+  if (Array.isArray(processInfo?.argv) && processInfo.argv.length > 0) return processInfo.argv.join(" ");
+  if (Array.isArray(processInfo?.command_argv) && processInfo.command_argv.length > 0) return processInfo.command_argv.join(" ");
+  return null;
+}
+
+function processInfoExecutable(processInfo) {
+  if (typeof processInfo?.executable === "string" && processInfo.executable) return processInfo.executable;
+  if (typeof processInfo?.exe === "string" && processInfo.exe) return processInfo.exe;
+  if (typeof processInfo?.binary === "string" && processInfo.binary) return processInfo.binary;
+  if (Array.isArray(processInfo?.argv) && processInfo.argv.length > 0) return processInfo.argv[0];
+  if (Array.isArray(processInfo?.command_argv) && processInfo.command_argv.length > 0) return processInfo.command_argv[0];
+  return null;
+}
+
+function processInfoRunning(processInfo) {
+  if (!processInfo) return false;
+  if (processInfo.running === false) return false;
+  if (typeof processInfo.state === "string" && ["stopped", "exited", "dead"].includes(processInfo.state)) return false;
+  if (processInfo.exitCode !== undefined || processInfo.exit_code !== undefined) return false;
+  return Boolean(processInfo.running === true || processInfoCommand(processInfo) || processInfoExecutable(processInfo));
+}
+
+function matchesExecutable(expectedCommand, processInfo) {
+  const actual = processInfoExecutable(processInfo);
+  if (!actual) return true;
+  const expected = commandExecutable(expectedCommand);
+  if (!expected) return false;
+  return basename(actual) === basename(expected);
+}
+
+function matchesProcessIdentity(expectedCommand, processInfo, fallbackCommand, { allowFallbackCommand = true } = {}) {
+  const liveCommand = processInfoCommand(processInfo) ?? (allowFallbackCommand ? fallbackCommand ?? null : null);
+  if (!processInfoRunning(processInfo) && !liveCommand) return false;
+  return liveCommand === expectedCommand && matchesExecutable(expectedCommand, processInfo);
+}
+
+function hasLiveIdentityEvidence(processInfo, fallbackCommand, { allowFallbackCommand = true } = {}) {
+  return processInfoRunning(processInfo) || (allowFallbackCommand && typeof fallbackCommand === "string");
+}
+
+async function loadPaneProcessInfo(herdr, pane) {
+  const method = herdr?.getPaneProcessInfo ?? herdr?.paneProcessInfo ?? herdr?.processInfo;
+  if (typeof method !== "function") return { available: false, value: null };
+  const id = paneId(pane);
+  if (!id) return { available: true, value: null };
+  return {
+    available: true,
+    value: await method.call(herdr, { paneId: id }),
+  };
 }
 
 function classifyTabWhenWorkspaceUnavailable(tab, workspace) {
@@ -503,7 +567,7 @@ async function classifyAgent(plan, tabs, loadAgents, canonicalPath) {
   };
 }
 
-async function classifyRuntime(plan, tabs, panes, canonicalPath) {
+async function classifyRuntime(plan, tabs, panes, herdr, canonicalPath) {
   const runtimeTab = tabs.byLabel.get(plan.runtime.tabLabel);
   if (!runtimeTab || runtimeTab.status !== "compatible") {
     return {
@@ -520,30 +584,39 @@ async function classifyRuntime(plan, tabs, panes, canonicalPath) {
     };
   }
 
+  const runtimePanes = [];
+  for (const pane of panes.filter((candidate) => candidate.tab_id === runtimeTab.actual.tab_id)) {
+    const loadedProcessInfo = await loadPaneProcessInfo(herdr, pane);
+    runtimePanes.push({
+      ...pane,
+      canonicalPath: await panePath(pane, canonicalPath),
+      liveCommand: paneCommand(pane),
+      processInfo: loadedProcessInfo.value,
+      processInfoAvailable: loadedProcessInfo.available,
+    });
+  }
+
   const processes = [];
   for (const process of plan.runtime.processes) {
     const expectedCwd = await canonicalPath(resolve(plan.runtime.worktreePath, process.cwd ?? "."));
-    const processPanes = [];
+    const sameCwd = runtimePanes.filter((pane) => pane.canonicalPath === expectedCwd);
+    const exactMatches = sameCwd.filter((pane) => pane.label === process.id && matchesProcessIdentity(process.command, pane.processInfo, pane.liveCommand, {
+      allowFallbackCommand: !pane.processInfoAvailable,
+    }));
+    const labelMatches = sameCwd.filter((pane) => pane.label === process.id && !matchesProcessIdentity(process.command, pane.processInfo, pane.liveCommand, {
+      allowFallbackCommand: !pane.processInfoAvailable,
+    }));
+    const commandMatches = sameCwd.filter((pane) => pane.label !== process.id && matchesProcessIdentity(process.command, pane.processInfo, pane.liveCommand, {
+      allowFallbackCommand: !pane.processInfoAvailable,
+    }));
+    const evidenceMatches = [...exactMatches, ...labelMatches, ...commandMatches];
 
-    for (const pane of panes.filter((candidate) => candidate.tab_id === runtimeTab.actual.tab_id)) {
-      processPanes.push({
-        ...pane,
-        canonicalPath: await panePath(pane, canonicalPath),
-        liveCommand: paneCommand(pane),
-      });
-    }
-
-    const sameCwd = processPanes.filter((pane) => pane.canonicalPath === expectedCwd);
-    const exactMatches = sameCwd.filter((pane) => pane.label === process.id && pane.liveCommand === process.command);
-    const labelMatches = sameCwd.filter((pane) => pane.label === process.id);
-    const commandMatches = sameCwd.filter((pane) => pane.liveCommand === process.command);
-
-    if (exactMatches.length > 1) {
+    if (exactMatches.length > 1 || evidenceMatches.length > 1) {
       processes.push({
         ...process,
         status: "conflict",
         reason: `Duplicate runtime panes match process ${process.id}`,
-        actual: exactMatches,
+        actual: evidenceMatches,
       });
       continue;
     }
@@ -558,12 +631,27 @@ async function classifyRuntime(plan, tabs, panes, canonicalPath) {
       continue;
     }
 
-    if (labelMatches.length > 0 || commandMatches.length > 0) {
+    if (labelMatches.length > 0) {
+      const liveEvidence = labelMatches.some((pane) => hasLiveIdentityEvidence(pane.processInfo, pane.liveCommand, {
+        allowFallbackCommand: !pane.processInfoAvailable,
+      }));
+      processes.push({
+        ...process,
+        status: liveEvidence ? "conflict" : "missing",
+        reason: liveEvidence
+          ? `Runtime process ${process.id} has mismatched command or label evidence`
+          : `Runtime process ${process.id} is not running`,
+        actual: labelMatches,
+      });
+      continue;
+    }
+
+    if (commandMatches.length > 0) {
       processes.push({
         ...process,
         status: "conflict",
         reason: `Runtime process ${process.id} has mismatched command or label evidence`,
-        actual: [...new Set([...labelMatches, ...commandMatches])],
+        actual: commandMatches,
       });
       continue;
     }
@@ -670,7 +758,7 @@ export async function reconcilePlan(plan, { git, herdr, realpath = defaultRealpa
   const workspace = await classifyWorkspace(plan, worktrees, herdr, canonicalPath);
   const tabs = await classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canonicalPath);
   const agent = await classifyAgent(plan, tabs, loadAgents, canonicalPath);
-  const runtime = await classifyRuntime(plan, tabs, tabs.panes, canonicalPath);
+  const runtime = await classifyRuntime(plan, tabs, tabs.panes, herdr, canonicalPath);
   const conflicts = collectConflicts(worktrees.results, workspace, tabs.results, agent, runtime);
   const status = conflicts.length > 0
     ? "conflict"

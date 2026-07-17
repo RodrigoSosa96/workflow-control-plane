@@ -1,3 +1,4 @@
+import { basename, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
 
 function fail(category, message, details, exitCode = 1) {
@@ -8,7 +9,7 @@ function findOperation(plan, id) {
   return plan.operations.find((operation) => operation.id === id) ?? null;
 }
 
-function commandHint(plan) {
+function startCommandHint(plan) {
   const feature = plan.identity?.feature;
   return [
     "workflow start",
@@ -19,11 +20,32 @@ function commandHint(plan) {
   ].filter(Boolean).join(" ");
 }
 
+function runtimeCommandHint(plan) {
+  const feature = plan.identity?.feature;
+  return [
+    "workflow runtime",
+    plan.identity?.projectAlias,
+    plan.identity?.task,
+    feature ? `--feature ${JSON.stringify(feature)}` : null,
+    plan.runtime?.profileName ? `--profile ${plan.runtime.profileName}` : null,
+    "--yes",
+  ].filter(Boolean).join(" ");
+}
+
 function recoveryGuidance(plan, error) {
-  const rerun = commandHint(plan);
+  const rerun = startCommandHint(plan);
   return [
     `Inspect the preserved workspace at ${plan.workspace?.path} before rerunning.`,
     `Rerun the same start flow after fixing the issue: ${rerun}`,
+    `Failure detail: ${error.message}`,
+  ];
+}
+
+function runtimeRecoveryGuidance(plan, error) {
+  const rerun = runtimeCommandHint(plan);
+  return [
+    `Inspect the preserved workspace at ${plan.workspace?.path} before rerunning runtime processes.`,
+    `Rerun the same runtime flow after fixing the issue: ${rerun}`,
     `Failure detail: ${error.message}`,
   ];
 }
@@ -94,6 +116,96 @@ function getPaneId(value) {
 
 function getWorkspacePath(value) {
   return value?.worktree?.checkout_path ?? value?.cwd ?? value?.path ?? null;
+}
+
+function commandExecutable(command) {
+  if (typeof command !== "string") return null;
+  return command.trim().split(/\s+/u)[0] ?? null;
+}
+
+function processInfoCommand(processInfo) {
+  if (typeof processInfo?.command === "string" && processInfo.command) return processInfo.command;
+  if (typeof processInfo?.command_line === "string" && processInfo.command_line) return processInfo.command_line;
+  if (typeof processInfo?.cmdline === "string" && processInfo.cmdline) return processInfo.cmdline;
+  if (Array.isArray(processInfo?.argv) && processInfo.argv.length > 0) return processInfo.argv.join(" ");
+  if (Array.isArray(processInfo?.command_argv) && processInfo.command_argv.length > 0) return processInfo.command_argv.join(" ");
+  return null;
+}
+
+function processInfoExecutable(processInfo) {
+  if (typeof processInfo?.executable === "string" && processInfo.executable) return processInfo.executable;
+  if (typeof processInfo?.exe === "string" && processInfo.exe) return processInfo.exe;
+  if (typeof processInfo?.binary === "string" && processInfo.binary) return processInfo.binary;
+  if (Array.isArray(processInfo?.argv) && processInfo.argv.length > 0) return processInfo.argv[0];
+  if (Array.isArray(processInfo?.command_argv) && processInfo.command_argv.length > 0) return processInfo.command_argv[0];
+  return null;
+}
+
+function processInfoRunning(processInfo) {
+  if (!processInfo) return false;
+  if (processInfo.running === false) return false;
+  if (typeof processInfo.state === "string" && ["stopped", "exited", "dead"].includes(processInfo.state)) return false;
+  if (processInfo.exitCode !== undefined || processInfo.exit_code !== undefined) return false;
+  return Boolean(processInfo.running === true || processInfoCommand(processInfo) || processInfoExecutable(processInfo));
+}
+
+function matchesExecutable(expectedCommand, processInfo) {
+  const actual = processInfoExecutable(processInfo);
+  if (!actual) return true;
+  const expected = commandExecutable(expectedCommand);
+  if (!expected) return false;
+  return basename(actual) === basename(expected);
+}
+
+function matchesProcessIdentity(expectedCommand, processInfo) {
+  return processInfoRunning(processInfo)
+    && processInfoCommand(processInfo) === expectedCommand
+    && matchesExecutable(expectedCommand, processInfo);
+}
+
+function paneProcessInfoMethod(herdr) {
+  return herdr?.getPaneProcessInfo ?? herdr?.paneProcessInfo ?? herdr?.processInfo ?? null;
+}
+
+async function observePaneProcess(herdr, paneId, observeMs = 0) {
+  const method = paneProcessInfoMethod(herdr);
+  if (typeof method !== "function") {
+    fail("PREFLIGHT", "executeRuntime requires Herdr pane process-info inspection", { paneId }, 10);
+  }
+  if (observeMs > 0) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, observeMs));
+  }
+  return await method.call(herdr, { paneId });
+}
+
+function runtimeProcessCwd(plan, process) {
+  return resolve(plan.runtime.worktreePath, process.cwd ?? ".");
+}
+
+function runtimeTab(plan) {
+  return plan.tabs?.find((item) => item.label === plan.runtime?.tabLabel) ?? null;
+}
+
+function runtimeTabId(plan) {
+  return getTabId(runtimeTab(plan)?.actual) ?? null;
+}
+
+function runtimePaneId(process) {
+  return getPaneId(process?.actual?.[0]) ?? null;
+}
+
+function runtimeFailureReason(process, processInfo) {
+  if (!processInfo) {
+    return `Runtime process ${process.id} stopped before process-info could confirm it`;
+  }
+  const exitCode = processInfo.exitCode ?? processInfo.exit_code;
+  if (exitCode !== undefined || processInfo.state === "exited") {
+    return `Runtime process ${process.id} exited immediately${exitCode === undefined ? "" : ` with exit code ${exitCode}`}`;
+  }
+  if (!processInfoRunning(processInfo)) {
+    return `Runtime process ${process.id} is not running`;
+  }
+  return `Runtime process ${process.id} has mismatched executable or command evidence`;
 }
 
 function looksLikePiPane(pane) {
@@ -176,6 +288,31 @@ function ensureStartShape({ herdr, worktreeOperation, workspaceOperation, agentT
   }
 }
 
+function ensureRuntimeShape({ plan, herdr, runtimeTabOperation, runtimeOperation }) {
+  if (!herdr) {
+    fail("PREFLIGHT", "executeRuntime requires a Herdr adapter", {}, 10);
+  }
+  if (typeof herdr.createTab !== "function"
+    || typeof herdr.renamePane !== "function"
+    || typeof herdr.splitPane !== "function"
+    || typeof herdr.runInPane !== "function"
+    || typeof paneProcessInfoMethod(herdr) !== "function") {
+    fail("PREFLIGHT", "executeRuntime requires Herdr tab, pane, run, and process-info methods", {}, 10);
+  }
+  if (!runtimeTabOperation || !runtimeOperation || !plan?.runtime) {
+    fail("PREFLIGHT", "executeRuntime requires runtime tab and runtime operations", {
+      runtimeTabOperation,
+      runtimeOperation,
+      runtime: plan?.runtime,
+    }, 10);
+  }
+  if (plan.workspace?.status !== "compatible" || !isNonEmptyString(getWorkspaceId(plan.workspace?.actual))) {
+    fail("PREFLIGHT", "executeRuntime requires an open compatible Herdr workspace", {
+      workspace: plan.workspace,
+    }, 10);
+  }
+}
+
 function buildInitialReport(plan) {
   return {
     mode: plan.mode,
@@ -183,6 +320,7 @@ function buildInitialReport(plan) {
     operations: [],
     guidance: [],
     notes: [],
+    processes: [],
   };
 }
 
@@ -418,8 +556,153 @@ async function executeOrdinaryStart(plan, { herdr }) {
   }
 }
 
+async function executeRuntimePhase(plan, { herdr, observeMs = 0 }) {
+  const report = buildInitialReport(plan);
+  const runtimeOperations = plan.operations.filter((operation) => operation.phase === "runtime");
+  const completedIds = new Set();
+  const runtimeTabOperation = findOperation(plan, "runtime-tab");
+  const runtimeOperation = findOperation(plan, "runtime");
+
+  ensureRuntimeShape({ plan, herdr, runtimeTabOperation, runtimeOperation });
+
+  let currentOperation = runtimeTabOperation;
+  let currentProcessIndex = -1;
+  let currentProcess = null;
+  let createdRootPaneId = null;
+  let anchorPaneId = null;
+  let runtimeMutated = false;
+
+  const appendSkippedProcesses = () => {
+    const completed = new Set(report.processes.map((process) => process.id));
+    for (const process of plan.runtime.processes) {
+      if (completed.has(process.id)) continue;
+      report.processes.push({ id: process.id, status: "skipped" });
+    }
+  };
+
+  try {
+    let tabId = runtimeTabId(plan);
+    if (runtimeTabOperation.reconciliation?.status === "compatible") {
+      report.operations.push(buildOperationReport(runtimeTabOperation, "reused", { tabId }));
+      completedIds.add(runtimeTabOperation.id);
+    } else {
+      currentOperation = runtimeTabOperation;
+      const createdTab = await herdr.createTab({
+        workspaceId: getWorkspaceId(plan.workspace.actual),
+        cwd: plan.runtime.worktreePath,
+        label: plan.runtime.tabLabel,
+        focus: false,
+      });
+      tabId = createdTab.tabId;
+      createdRootPaneId = createdTab.paneId;
+      runtimeMutated = true;
+      report.operations.push(buildOperationReport(runtimeTabOperation, "created", { tabId, paneId: createdRootPaneId }));
+      completedIds.add(runtimeTabOperation.id);
+    }
+
+    currentOperation = runtimeOperation;
+    for (const [index, process] of plan.runtime.processes.entries()) {
+      currentProcessIndex = index;
+      currentProcess = process;
+
+      if (process.status === "compatible") {
+        const paneId = runtimePaneId(process);
+        report.processes.push({ id: process.id, status: "reused", paneId });
+        if (isNonEmptyString(paneId)) anchorPaneId = paneId;
+        continue;
+      }
+
+      let paneId = createdRootPaneId;
+      if (createdRootPaneId) {
+        createdRootPaneId = null;
+      } else {
+        if (!isNonEmptyString(anchorPaneId)) {
+          fail("PREFLIGHT", `Cannot deterministically place runtime process ${process.id} without a preceding planned pane`, {
+            process,
+            processes: plan.runtime.processes,
+          }, 10);
+        }
+        const split = await herdr.splitPane({
+          paneId: anchorPaneId,
+          direction: process.split ?? "right",
+          ratio: process.ratio,
+          cwd: runtimeProcessCwd(plan, process),
+          focus: false,
+        });
+        paneId = split.paneId;
+      }
+
+      await herdr.renamePane({ paneId, label: process.id });
+      await herdr.runInPane({ paneId, command: process.command });
+      const processInfo = await observePaneProcess(herdr, paneId, observeMs);
+
+      if (!matchesProcessIdentity(process.command, processInfo)) {
+        const reason = runtimeFailureReason(process, processInfo);
+        report.processes.push({ id: process.id, status: "failed", paneId, reason });
+        appendSkippedProcesses();
+        report.status = report.processes.some((item) => item.status === "created" || item.status === "reused") ? "partial" : "failed";
+        report.operations.push(buildOperationReport(runtimeOperation, "failed", { processes: report.processes }));
+        completedIds.add(runtimeOperation.id);
+        report.guidance = runtimeRecoveryGuidance(plan, new Error(reason));
+        report.error = { name: "RuntimeObservationError", message: reason };
+        return report;
+      }
+
+      report.processes.push({ id: process.id, status: "created", paneId });
+      anchorPaneId = paneId;
+      runtimeMutated = true;
+    }
+
+    report.operations.push(buildOperationReport(runtimeOperation, runtimeMutated ? "created" : "reused", {
+      processes: report.processes,
+      tabId,
+    }));
+    completedIds.add(runtimeOperation.id);
+    return report;
+  } catch (error) {
+    report.status = report.operations.length > 0 || report.processes.length > 0 ? "partial" : "failed";
+    if (error instanceof WorkflowError && error.category === "CONFLICT") throw error;
+
+    if (currentProcess && !report.processes.some((process) => process.id === currentProcess.id)) {
+      report.processes.push({
+        id: currentProcess.id,
+        status: "failed",
+        paneId: null,
+        reason: error.message,
+      });
+    }
+    appendSkippedProcesses();
+
+    const failedOperation = currentOperation && !completedIds.has(currentOperation.id)
+      ? currentOperation
+      : [runtimeOperation, runtimeTabOperation].find((operation) => operation && !completedIds.has(operation.id));
+
+    if (failedOperation) {
+      report.operations.push(buildOperationReport(failedOperation, "failed", {
+        error: error.message,
+        ...(failedOperation.id === "runtime" ? { processes: report.processes } : {}),
+      }));
+      completedIds.add(failedOperation.id);
+    }
+
+    appendSkipped(report, runtimeOperations, completedIds);
+    report.guidance = runtimeRecoveryGuidance(plan, error);
+    report.error = {
+      name: error.name,
+      message: error.message,
+      ...(currentProcessIndex >= 0 ? { processId: currentProcess?.id } : {}),
+    };
+    return report;
+  }
+}
+
 export async function executeStart(reconciledPlan, { git: _git, herdr } = {}) {
   ensureOrdinaryPlan(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
   return await executeOrdinaryStart(reconciledPlan, { herdr });
+}
+
+export async function executeRuntime(reconciledPlan, { herdr, observeMs } = {}) {
+  ensureNoConflicts(reconciledPlan);
+  return await executeRuntimePhase(reconciledPlan, { herdr, observeMs });
 }
