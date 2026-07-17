@@ -1,0 +1,98 @@
+const DEFAULT_BASE_URL = "https://app.asana.com/api/1.0";
+const USER_FIELDS = "gid,name,email,workspaces.gid,workspaces.name";
+const PROJECT_FIELDS = "gid,name,archived,permalink_url,workspace.gid,workspace.name";
+const SECTION_FIELDS = "gid,name,project.gid";
+const TASK_FIELDS = [
+  "gid", "name", "notes", "html_notes", "completed", "completed_at", "due_on", "due_at",
+  "created_at", "modified_at", "permalink_url", "resource_subtype", "num_subtasks",
+  "assignee.gid", "assignee.name", "parent.gid", "parent.name", "projects.gid", "projects.name",
+  "memberships.project.gid", "memberships.project.name", "memberships.section.gid", "memberships.section.name",
+  "custom_fields.gid", "custom_fields.name", "custom_fields.type", "custom_fields.display_value",
+].join(",");
+const STORY_FIELDS = "gid,type,resource_subtype,text,html_text,created_at,created_by.gid,created_by.name";
+const ATTACHMENT_FIELDS = "gid,name,resource_subtype,host,created_at,download_url,permanent_url,view_url,parent.gid";
+
+export class AsanaApiError extends Error {
+  constructor(message, { status } = {}) {
+    super(message);
+    this.name = "AsanaApiError";
+    this.status = status;
+  }
+}
+
+export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_BASE_URL, maxPages = 100 }) {
+  if (!token) throw new AsanaApiError("An Asana token is required.");
+
+  const apiHeaders = { accept: "application/json", authorization: `Bearer ${token}` };
+
+  function apiUrl(path, query = {}) {
+    const url = path.startsWith("http") ? new URL(path) : new URL(`${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`);
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+    }
+    return url;
+  }
+
+  async function parseError(response) {
+    let detail = response.statusText || "request failed";
+    try {
+      const body = await response.json();
+      if (Array.isArray(body?.errors)) detail = body.errors.map((error) => error.message).filter(Boolean).join("; ") || detail;
+    } catch {}
+    detail = detail.replace(/[\r\n]+/g, " ").slice(0, 400);
+    const retry = response.status === 429 && response.headers.get("retry-after")
+      ? `; retry after ${response.headers.get("retry-after")} seconds`
+      : "";
+    return new AsanaApiError(`Asana API ${response.status}: ${detail}${retry}`, { status: response.status });
+  }
+
+  async function request(path, query = {}) {
+    const response = await fetchImpl(apiUrl(path, query), { headers: { ...apiHeaders } });
+    if (!response.ok) throw await parseError(response);
+    let envelope;
+    try { envelope = await response.json(); } catch { throw new AsanaApiError("Asana API returned malformed response data."); }
+    if (!("data" in envelope)) throw new AsanaApiError("Asana API returned a malformed response envelope.");
+    return envelope;
+  }
+
+  async function list(path, query = {}) {
+    const values = [];
+    let next = apiUrl(path, query);
+    for (let page = 0; next; page += 1) {
+      if (page >= maxPages) throw new AsanaApiError(`Asana pagination exceeded ${maxPages} pages.`);
+      const envelope = await request(next.toString());
+      if (!Array.isArray(envelope.data)) throw new AsanaApiError("Asana API returned malformed response data for a list.");
+      values.push(...envelope.data);
+      next = envelope.next_page?.uri ? new URL(envelope.next_page.uri) : null;
+    }
+    return values;
+  }
+
+  const client = {
+    me: async () => (await request("users/me", { opt_fields: USER_FIELDS })).data,
+    workspaces: () => list("workspaces", { opt_fields: "gid,name,is_organization" }),
+    projects: (workspace) => list("projects", { workspace, archived: false, opt_fields: PROJECT_FIELDS }),
+    sections: (projectGid) => list(`projects/${projectGid}/sections`, { opt_fields: SECTION_FIELDS }),
+    sectionTasks: (sectionGid) => list(`sections/${sectionGid}/tasks`, { opt_fields: TASK_FIELDS }),
+    task: async (gid) => (await request(`tasks/${gid}`, { opt_fields: TASK_FIELDS })).data,
+    stories: (gid) => list(`tasks/${gid}/stories`, { opt_fields: STORY_FIELDS }),
+    subtasks: (gid) => list(`tasks/${gid}/subtasks`, { opt_fields: TASK_FIELDS }),
+    dependencies: (gid) => list(`tasks/${gid}/dependencies`, { opt_fields: TASK_FIELDS }),
+    dependents: (gid) => list(`tasks/${gid}/dependents`, { opt_fields: TASK_FIELDS }),
+    attachments: (gid) => list(`tasks/${gid}/attachments`, { opt_fields: ATTACHMENT_FIELDS }),
+    attachment: async (gid) => (await request(`attachments/${gid}`, { opt_fields: ATTACHMENT_FIELDS })).data,
+    async downloadAttachment(gid) {
+      const attachment = await client.attachment(gid);
+      if (!attachment.download_url) throw new AsanaApiError(`Attachment ${gid} does not expose a download URL.`);
+      const response = await fetchImpl(new URL(attachment.download_url), { headers: {} });
+      if (!response.ok) throw new AsanaApiError(`Attachment download failed with status ${response.status}.`, { status: response.status });
+      return {
+        gid: attachment.gid,
+        name: attachment.name || `${gid}.bin`,
+        contentType: response.headers.get("content-type") || "application/octet-stream",
+        bytes: new Uint8Array(await response.arrayBuffer()),
+      };
+    },
+  };
+  return client;
+}
