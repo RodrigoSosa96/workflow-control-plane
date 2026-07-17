@@ -10,7 +10,7 @@ Done
 - Ran: `node --test test/workflow-herdr.test.js`
 - Result: 9 failures.
 - Verified failures:
-  - argv mismatches because unsupported `--json` flags were appended to JSON-default `integration`, `workspace`, `tab`, `pane`, and `agent` commands
+  - argv mismatches because unsupported `--json` flags were appended to JSON-default `workspace`, `tab`, `pane`, and `agent` commands
   - live `{ id, result }` worktree and agent fixtures failed normalization with missing IDs
   - `runInPane` returned the raw envelope instead of the unwrapped `result`
 
@@ -31,7 +31,7 @@ Done
 - `src/workflow/herdr.js`
   - unwraps live Herdr `{ id, result }` envelopes and legacy `{ ok: true, result }`
   - preserves explicit API error envelope handling for `{ id, error }`
-  - removes unsupported `--json` from JSON-default `integration`, `workspace`, `tab`, `pane`, and `agent` wrappers
+  - removes unsupported `--json` from JSON-default `workspace`, `tab`, `pane`, and `agent` wrappers
   - keeps `--json` on supported commands such as `status` and `worktree create/open`
 - `test/workflow-herdr.test.js`
   - live-shaped fixtures for workspace, tab, pane, agent, and worktree responses

@@ -48,7 +48,7 @@ const planOp = {
   label: "ASANA-123 discovered-docs",
 };
 
-test("parses live status and integration responses with the configured binary", async () => {
+test("parses live status responses with the configured binary", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ command, args, options }) => {
@@ -61,33 +61,92 @@ test("parses live status and integration responses with the configured binary", 
         server: { running: true, compatible: true },
       }, "cli:status"),
     },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner, binary: "mock-herdr" });
+
+  const status = await herdr.status();
+
+  assert.deepEqual(status, {
+    client: { version: "0.7.4", protocol: 16 },
+    server: { running: true, compatible: true },
+  });
+});
+
+
+test("parses live plain-text integration status lines into stable structured entries", async () => {
+  const fixture = fixtureRunner([
     {
       assert: ({ command, args, options }) => {
         assert.equal(command, "mock-herdr");
         assert.deepEqual(args, ["integration", "status"]);
         assert.deepEqual(options, { allowFailure: true });
       },
-      stdout: cliResult({
-        integrations: [
-          { name: "pi", state: "current", version: 5 },
-        ],
-      }, "cli:integration:status"),
+      stdout: [
+        "pi: current (v5) (/home/you/.pi/agent/extensions/herdr-agent-state.ts)",
+        "copilot: not installed (/home/you/.copilot/hooks/herdr-agent-state.sh)",
+      ].join("\n"),
     },
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner, binary: "mock-herdr" });
 
-  const status = await herdr.status();
   const integrations = await herdr.integrationStatus();
 
-  assert.deepEqual(status, {
-    client: { version: "0.7.4", protocol: 16 },
-    server: { running: true, compatible: true },
+  assert.deepEqual(integrations, [
+    {
+      name: "pi",
+      status: "current",
+      version: 5,
+      path: "/home/you/.pi/agent/extensions/herdr-agent-state.ts",
+    },
+    {
+      name: "copilot",
+      status: "not installed",
+      path: "/home/you/.copilot/hooks/herdr-agent-state.sh",
+    },
+  ]);
+});
+
+
+test("returns an empty list when integration status output is empty", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return {
+          code: 0,
+          stdout: "\n",
+          stderr: "",
+        };
+      },
+    },
   });
-  assert.deepEqual(integrations, {
-    integrations: [
-      { name: "pi", state: "current", version: 5 },
-    ],
+
+  assert.deepEqual(await herdr.integrationStatus(), []);
+});
+
+
+test("rejects malformed nonempty integration status lines", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return {
+          code: 0,
+          stdout: "pi current missing colon",
+          stderr: "",
+        };
+      },
+    },
   });
+
+  await assert.rejects(
+    herdr.integrationStatus(),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "HERDR");
+      assert.match(error.message, /integration status|malformed/i);
+      assert.match(String(error.details.line), /missing colon/i);
+      return true;
+    },
+  );
 });
 
 test("keeps supporting legacy ok/result success envelopes", async () => {

@@ -120,6 +120,84 @@ function parseJsonResult(result, context) {
   return value;
 }
 
+function parseIntegrationStatusResult(result, context) {
+  const stdout = result.stdout ?? "";
+  const trimmed = stdout.trim();
+
+  if (!trimmed) {
+    if (result.code && result.code !== 0) {
+      fail(
+        "HERDR",
+        `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
+        {
+          stdout: result.stdout,
+          stderr: result.stderr,
+          command: context.binary,
+          args: [context.area, context.command, ...context.args],
+          cwd: context.cwd,
+        },
+        result.code,
+      );
+    }
+    return [];
+  }
+
+  if (result.code && result.code !== 0) {
+    fail(
+      "HERDR",
+      `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
+      {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        command: context.binary,
+        args: [context.area, context.command, ...context.args],
+        cwd: context.cwd,
+      },
+      result.code,
+    );
+  }
+
+  return trimmed.split(/\r?\n/).filter(Boolean).map((rawLine) => {
+    const line = rawLine.trim();
+    const separator = line.indexOf(":");
+    if (separator <= 0) {
+      fail("HERDR", "Malformed Herdr integration status line", { line, stdout: result.stdout });
+    }
+
+    const name = line.slice(0, separator).trim();
+    let rest = line.slice(separator + 1).trim();
+    if (!name || !rest) {
+      fail("HERDR", "Malformed Herdr integration status line", { line, stdout: result.stdout });
+    }
+
+    let path;
+    const pathMatch = rest.match(/\(([^()]*)\)$/);
+    if (pathMatch) {
+      path = pathMatch[1];
+      rest = rest.slice(0, pathMatch.index).trim();
+    }
+
+    let version;
+    const versionMatch = rest.match(/\(v(\d+)\)$/);
+    if (versionMatch) {
+      version = Number.parseInt(versionMatch[1], 10);
+      rest = rest.slice(0, versionMatch.index).trim();
+    }
+
+    const status = rest.trim();
+    if (!status) {
+      fail("HERDR", "Malformed Herdr integration status line", { line, stdout: result.stdout });
+    }
+
+    return {
+      name,
+      status,
+      ...(version === undefined ? {} : { version }),
+      ...(path ? { path } : {}),
+    };
+  });
+}
+
 function pushOption(args, flag, value) {
   if (value === undefined || value === null || value === "") return;
   args.push(flag, String(value));
@@ -195,14 +273,22 @@ function normalizeAgentResult(value) {
 }
 
 export function createHerdrAdapter({ runner, binary = "herdr" }) {
-  async function invoke(area, command, args = [], { cwd } = {}) {
+  async function run(area, command, args = [], { cwd } = {}) {
     const fullArgs = command ? [area, command, ...args] : [area, ...args];
     const result = await runner.run(binary, fullArgs, {
       allowFailure: true,
       ...(cwd ? { cwd } : {}),
     });
 
-    return parseJsonResult(result, { binary, area, command, args, cwd });
+    return {
+      result,
+      context: { binary, area, command, args, cwd },
+    };
+  }
+
+  async function invoke(area, command, args = [], options) {
+    const { result, context } = await run(area, command, args, options);
+    return parseJsonResult(result, context);
   }
 
   return {
@@ -216,7 +302,8 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
     async integrationStatus({ outdatedOnly = false } = {}) {
       const args = [];
       if (outdatedOnly) args.push("--outdated-only");
-      return await invoke("integration", "status", args);
+      const { result, context } = await run("integration", "status", args);
+      return parseIntegrationStatusResult(result, context);
     },
 
     async listWorkspaces() {
