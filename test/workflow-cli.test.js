@@ -222,6 +222,76 @@ test("start executes with --yes and maps partial execution to a stable exit code
   assert.deepEqual(output.stdout, ["start:compact:partial"]);
 });
 
+test("start fails closed before mutation when any required preview precondition is missing", async () => {
+  for (const missing of ["git", "herdr", "pi", "herdrStatus", "piIntegration"]) {
+    const output = io();
+    let executed = false;
+    const preview = planPreview();
+    delete preview.preconditions[missing];
+
+    const code = await main(["start", "ocr", "ASANA-123", "--yes"], {
+      ...output,
+      planCommand: async () => preview,
+      executeStart: async () => {
+        executed = true;
+        return executionReport();
+      },
+    });
+
+    assert.equal(code, 10, `expected missing ${missing} to fail preflight`);
+    assert.equal(executed, false, `expected missing ${missing} to block executor`);
+    assert.match(output.stderr[0], new RegExp(`missing or malformed required precondition: ${missing}`, "i"));
+  }
+});
+
+test("runtime fails closed before mutation when any required preview precondition is missing", async () => {
+  for (const missing of ["git", "herdr", "herdrStatus"]) {
+    const output = io();
+    let executed = false;
+    const preview = planPreview();
+    delete preview.preconditions[missing];
+
+    const code = await main(["runtime", "ocr", "ASANA-123", "--yes"], {
+      ...output,
+      planCommand: async () => preview,
+      executeRuntime: async () => {
+        executed = true;
+        return executionReport();
+      },
+    });
+
+    assert.equal(code, 10, `expected missing ${missing} to fail preflight`);
+    assert.equal(executed, false, `expected missing ${missing} to block executor`);
+    assert.match(output.stderr[0], new RegExp(`missing or malformed required precondition: ${missing}`, "i"));
+  }
+});
+
+test("start fails closed on malformed required preconditions without leaking oversized payloads", async () => {
+  const output = io();
+  let executed = false;
+  const preview = planPreview({
+    preconditions: {
+      ...planPreview().preconditions,
+      herdrStatus: { id: "herdr:status", detail: "x".repeat(20000) },
+    },
+  });
+
+  const code = await main(["start", "ocr", "ASANA-123", "--yes"], {
+    ...output,
+    planCommand: async () => preview,
+    executeStart: async () => {
+      executed = true;
+      return executionReport();
+    },
+  });
+
+  assert.equal(code, 10);
+  assert.equal(executed, false);
+  assert.match(output.stderr[0], /missing or malformed required precondition: herdrStatus/i);
+  assert.doesNotMatch(output.stderr[0], /x{100}/i);
+  assert.ok(output.stderr[0].length < 200);
+});
+
 test("start blocks before mutation when Herdr or Pi launch preconditions are not ready", async () => {
   const herdrOutput = io();
   let herdrExecuted = false;

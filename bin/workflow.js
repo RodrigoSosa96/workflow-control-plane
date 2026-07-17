@@ -164,12 +164,14 @@ function requiredPreconditions(command) {
 }
 
 function assertPreconditions(command, preview) {
-  const firstFailure = requiredPreconditions(command)
-    .map((name) => preview?.preconditions?.[name])
-    .find((check) => check?.status !== "ready");
-
-  if (firstFailure) {
-    throw new WorkflowError("PREFLIGHT", firstFailure.reason ?? `${command} requires ready ${firstFailure.id ?? "preconditions"}`, { exitCode: 10 });
+  for (const name of requiredPreconditions(command)) {
+    const check = preview?.preconditions?.[name];
+    if (!check || typeof check !== "object" || typeof check.status !== "string") {
+      throw new WorkflowError("PREFLIGHT", `Missing or malformed required precondition: ${name}`, { exitCode: 10 });
+    }
+    if (check.status !== "ready") {
+      throw new WorkflowError("PREFLIGHT", check.reason ?? `${command} requires ready ${check.id ?? name}`, { exitCode: 10 });
+    }
   }
 
   if ((preview?.conflicts?.length ?? 0) > 0 || preview?.reconciliation?.status === "conflict") {
