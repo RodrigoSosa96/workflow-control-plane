@@ -1,0 +1,97 @@
+version: 1
+
+projects:
+  ocr:
+    label: ExampleProject
+    kind: work
+    path: /home/you/projects/work/example_project
+    repository: monorepo
+    base_branch: dev
+    task_source: asana
+    package_manager: pnpm
+    runtime:
+      infrastructure: pnpm docker:dev
+      backend: pnpm dev:api
+      frontend: pnpm dev:front
+      workers: pnpm --filter=@app/workers dev
+    verify:
+      - pnpm typecheck
+      - pnpm biome:check
+
+  acme:
+    label: Acme
+    kind: work
+    path: /home/you/projects/work/acme
+    repository: group
+    task_source: asana
+    repositories:
+      backend:
+        path: /home/you/projects/work/acme/acme_backend
+        base_branch: master
+      panel:
+        path: /home/you/projects/work/acme/acme_panel
+        base_branch: master
+      webapp:
+        path: /home/you/projects/work/acme/acme_webapp
+        base_branch: master
+    notes:
+      - The group root is not a git repository.
+      - Create worktrees against the individual repository being changed.
+
+  personalProjectD:
+    label: PersonalProjectD
+    kind: personal
+    path: /home/you/projects/personal/personalProjectD
+    repository: monorepo
+    base_branch: main
+    task_source: local
+    package_manager: pnpm
+    runtime:
+      infrastructure: pnpm docker:dev
+      full: pnpm dev:full
+    verify:
+      - pnpm ci:verify
+
+  personalProjectB:
+    label: PersonalProjectB
+    kind: personal
+    path: /home/you/projects/personal/personalProjectB
+    repository: monorepo
+    base_branch: main
+    task_source: local
+    package_manager: pnpm
+    runtime:
+      infrastructure: pnpm docker:dev
+      standard: pnpm dev
+      full: pnpm dev:full
+    verify:
+      - pnpm ci:verify
+
+  personalProjectC:
+    label: PersonalProjectC
+    kind: personal
+    path: /home/you/projects/personal/personalProjectC
+    repository: single
+    base_branch: main
+    task_source: local
+    package_manager: pnpm
+    runtime:
+      development: pnpm dev
+    verify:
+      - pnpm check
+      - pnpm build
+
+  personalProjectA:
+    label: PersonalProjectA
+    kind: personal
+    path: /home/you/projects/personal/personalProjectA
+    repository: monorepo
+    base_branch: main
+    task_source: local
+    package_manager: pnpm
+    runtime:
+      infrastructure: pnpm docker:dev
+      standard: pnpm dev
+      full: pnpm dev:full
+    verify:
+      - pnpm ci:verify
