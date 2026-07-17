@@ -20,6 +20,8 @@ test("README documents local installation and secure token setup", async () => {
   const readme = await read("README.md");
   assert.match(readme, /npm install --global \/home\/you\/projects\/personal\/workflows/);
   assert.match(readme, /~\/\.config\/workflows\/asana-token/);
+  assert.match(readme, /read -r -s "ASANA_TOKEN\?Asana token: "/, "README must use zsh-compatible hidden input");
+  assert.doesNotMatch(readme, /read -rsp/, "README must not use bash-only read flags");
   assert.match(readme, /chmod 600/);
   assert.match(readme, /asana-workflow projects/);
   assert.match(readme, /ASANA_PROJECTS_FILE/);

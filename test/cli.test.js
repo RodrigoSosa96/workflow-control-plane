@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtemp, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { main, parseArgs } from "../bin/asana-workflow.js";
 
@@ -6,6 +10,18 @@ const io = () => {
   const stdout = [], stderr = [];
   return { stdout, stderr, out: (line) => stdout.push(line), err: (line) => stderr.push(line) };
 };
+
+test("installed symlink executes the CLI entry point", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "asana-cli-link-"));
+  const link = join(dir, "asana-workflow");
+  await symlink(new URL("../bin/asana-workflow.js", import.meta.url), link);
+  const result = spawnSync(link, ["auth", "status"], {
+    encoding: "utf8",
+    env: { ...process.env, ASANA_ACCESS_TOKEN: "test-token" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "Asana auth: configured (environment)");
+});
 
 test("parses documented triage options", () => {
   assert.deepEqual(parseArgs(["triage", "--project", "ocr", "--sections", "Doing,Next", "--assignee", "any", "--format", "json"]), {

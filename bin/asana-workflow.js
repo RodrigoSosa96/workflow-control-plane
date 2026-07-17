@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { loadToken as defaultLoadToken } from "../src/asana/auth.js";
 import { createAsanaClient as defaultCreateClient } from "../src/asana/client.js";
@@ -194,6 +195,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   }
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+let invokedPath;
+try { invokedPath = process.argv[1] ? realpathSync(resolve(process.argv[1])) : undefined; }
+catch { invokedPath = undefined; }
+if (invokedPath === fileURLToPath(import.meta.url)) {
   process.exitCode = await main();
 }

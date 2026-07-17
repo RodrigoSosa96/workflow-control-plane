@@ -56,13 +56,21 @@ The implementation agent intentionally does not perform the global installation.
 
 Create the token file directly from your terminal. Do not paste the token into Pi, Claude, or another agent transcript:
 
-```bash
+For zsh (Rodrigo's default shell):
+
+```zsh
 mkdir -p ~/.config/workflows
 chmod 700 ~/.config/workflows
-read -rsp 'Asana token: ' ASANA_TOKEN; echo
+read -r -s "ASANA_TOKEN?Asana token: "; echo
 printf '%s' "$ASANA_TOKEN" > ~/.config/workflows/asana-token
 unset ASANA_TOKEN
 chmod 600 ~/.config/workflows/asana-token
+```
+
+For bash, the hidden-input line is instead:
+
+```bash
+read -r -s -p 'Asana token: ' ASANA_TOKEN; echo
 ```
 
 Verify without displaying the token:
