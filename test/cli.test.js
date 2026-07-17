@@ -18,8 +18,9 @@ test("parses full tasks and attachment downloads", () => {
   assert.deepEqual(parseArgs(["attachment", "download", "a1", "--output", "/tmp/a"]), { command: "attachment-download", gid: "a1", output: "/tmp/a", format: "compact" });
 });
 
-test("rejects unknown formats and missing required options", () => {
+test("rejects unknown formats, unsafe options, and missing required options", () => {
   assert.throws(() => parseArgs(["me", "--format", "xml"]), /compact or json/);
+  assert.throws(() => parseArgs(["me", "--token", "must-not-be-accepted"]), /Unknown option: --token/);
   assert.throws(() => parseArgs(["triage"]), /--project/);
   assert.throws(() => parseArgs(["attachment", "download", "a1"]), /--output/);
 });

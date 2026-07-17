@@ -2,12 +2,12 @@
 description: Triage assigned Asana tickets and assess implementation readiness
 argument-hint: "[project]"
 ---
-Triage my pending Asana work for `${1:-the current work project}`.
+Triage my pending Asana work for `${1:-the current work project}` using the `asana-triage` skill and the local `asana-workflow` CLI.
 
 Do not implement or modify project files during this triage.
 
-1. Identify the correct Asana workspace/project and my identity. If Asana access is unavailable, stop and explain exactly what integration or credential is missing.
-2. Find tickets assigned to me in relevant active sections, including in progress and next sprint/planned work.
+1. Identify the correct Asana workspace/project and my identity. If Asana access is unavailable, stop and explain exactly what credential setup is missing.
+2. Discover the project's current sections instead of assuming fixed names. Find tickets assigned to me across those sections unless I request a section or assignee filter.
 3. For every candidate, inspect the full description, comments, subtasks, dependencies, links, attachments, and images. Do not classify a ticket from its title alone.
 4. Correlate ticket details with existing repository docs, specs, branches, worktrees, and local changes when useful. Do not assume stale local work is authoritative.
 5. Classify each ticket as:

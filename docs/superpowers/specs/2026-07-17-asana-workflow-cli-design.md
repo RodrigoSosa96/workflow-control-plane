@@ -15,7 +15,8 @@ The first version supports discovery and triage only:
 - Read the authenticated user and their workspaces.
 - List active projects and sections.
 - Resolve a configured local project alias such as `ocr` to an Asana project.
-- Find tasks assigned to the authenticated user in configured active sections.
+- Discover every current section in a project and optionally filter by changing section names.
+- Filter tasks by the authenticated user, any assignee, or an explicit assignee GID while keeping ownership visible.
 - Retrieve complete task context: description, custom fields, comments, subtasks, dependencies, dependents, project memberships, links, and attachment metadata.
 - Download an attachment only when explicitly requested.
 - Emit compact human-readable output by default and JSON when requested.
@@ -94,7 +95,7 @@ asana-workflow me [--format compact|json]
 asana-workflow workspaces [--format compact|json]
 asana-workflow projects [--workspace <gid>] [--format compact|json]
 asana-workflow sections --project <alias-or-gid> [--format compact|json]
-asana-workflow triage --project <alias-or-gid> [--sections <csv>] [--format compact|json]
+asana-workflow triage --project <alias-or-gid> [--sections <csv>] [--assignee me|any|<gid>] [--format compact|json]
 asana-workflow task <gid> [--full] [--format compact|json]
 asana-workflow attachments <task-gid> [--format compact|json]
 asana-workflow attachment download <attachment-gid> --output <path>
@@ -109,7 +110,7 @@ asana-workflow attachment download <attachment-gid> --output <path>
 - Asana project GID, when known.
 - Workspace GID, when known.
 - Exact Asana project name as a discovery fallback.
-- Active section names such as `In Progress` and `Next Sprint`.
+- Optional active section names when a project has a stable subset Rodrigo wants as its default.
 
 The initial `ocr` entry will be intentionally unbound: it will contain the desired active section names but no guessed project GID or name. `asana-workflow projects` provides the exact names and GIDs; Rodrigo then binds `ocr` by adding either value. Running `triage --project ocr` while it is unbound returns that precise setup instruction. Ambiguous project-name matches cause a clear error listing candidate names and GIDs.
 
@@ -144,8 +145,8 @@ This command should be entered by Rodrigo directly. The token must not be pasted
 
 ## Data flow and token control
 
-1. `triage` resolves the project and configured sections.
-2. It requests only compact task fields and filters assignment to the authenticated user.
+1. `triage` resolves the project and discovers its current sections. An explicit CLI filter takes precedence over optional alias defaults; with neither, it scans all sections.
+2. It requests only compact task fields and applies `--assignee me` (default), `any`, or an explicit GID.
 3. Compact output includes GID, title, section, completion/due state, modified date, assignee, and permalink.
 4. Pi invokes `task <gid> --full` for each candidate it must classify.
 5. Full output keeps descriptions and comments intact but omits redundant raw Asana metadata.
@@ -185,7 +186,7 @@ The `asana-triage` skill will require this sequence:
 
 1. Run `auth status` and stop with setup instructions if unavailable.
 2. Confirm identity with `me`.
-3. Run compact `triage` for the requested alias.
+3. Discover current section names and run compact `triage` for the requested alias, using the appropriate assignee filter.
 4. Retrieve `task --full` for every candidate before classifying it.
 5. List attachment metadata and download images only when their content is required.
 6. Correlate with the target repository read-only.

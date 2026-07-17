@@ -28,6 +28,8 @@ Environment:
   ASANA_TOKEN_FILE     Alternate token file
   ASANA_PROJECTS_FILE  Alternate project-alias JSON file`;
 
+const KNOWN_OPTIONS = new Set(["full", "help", "format", "workspace", "project", "sections", "assignee", "output"]);
+
 function consumeOptions(tokens) {
   const options = {};
   const positionals = [];
@@ -35,6 +37,7 @@ function consumeOptions(tokens) {
     const token = tokens[index];
     if (!token.startsWith("--")) { positionals.push(token); continue; }
     const name = token.slice(2);
+    if (!KNOWN_OPTIONS.has(name)) throw new Error(`Unknown option: --${name}`);
     if (name === "full" || name === "help") { options[name] = true; continue; }
     const next = tokens[++index];
     if (next === undefined || next.startsWith("--")) throw new Error(`--${name} requires a value.`);
