@@ -1,19 +1,7 @@
 {
   "version": 1,
   "projects": {
-    "ocr": {
-      "activeSections": [
-        "In Progress",
-        "Next Sprint",
-        "Planned"
-      ]
-    },
-    "acme": {
-      "activeSections": [
-        "In Progress",
-        "Next Sprint",
-        "Planned"
-      ]
-    }
+    "ocr": {},
+    "acme": {}
   }
 }
