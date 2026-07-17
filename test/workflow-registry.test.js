@@ -21,6 +21,7 @@ const valid = {
   projects: {
     ocr: {
       label: "OCR",
+      kind: "work",
       path: "/repo/ocr",
       repository: "monorepo",
       base_branch: "dev",
@@ -44,6 +45,28 @@ test("validates a version 2 ordinary project", () => {
   const registry = validateRegistry(valid);
   assert.equal(registry.projects.ocr.base_branch, "dev");
   assert.equal(registry.projects.ocr.runtime.profiles.standard.processes[0].split, "right");
+});
+
+test("rejects missing project kind", () => {
+  const value = structuredClone(valid);
+  delete value.projects.ocr.kind;
+  assert.throws(() => validateRegistry(value), /kind.*work.*personal/i);
+});
+
+test("rejects unsupported project kind", () => {
+  const value = structuredClone(valid);
+  value.projects.ocr.kind = "infra";
+  assert.throws(() => validateRegistry(value), /kind.*work.*personal/i);
+});
+
+test("returns an immutable normalized registry", () => {
+  const registry = validateRegistry(valid);
+  assert.throws(() => {
+    registry.projects.ocr.label = "Changed";
+  }, TypeError);
+  assert.throws(() => {
+    registry.projects.ocr.runtime.profiles.standard.processes[0].command = "changed";
+  }, TypeError);
 });
 
 test("loads a version 2 registry with ordinary and group projects", async () => {
@@ -77,6 +100,7 @@ projects:
               command: pnpm dev:api
   acme:
     label: Acme
+    kind: work
     path: "~/repos/acme"
     repository: group
     task_source: asana
@@ -122,6 +146,7 @@ launcher:
 projects:
   ocr:
     label: OCR
+    kind: work
     path: /repo/ocr
     repository: monorepo
     base_branch: dev
@@ -140,6 +165,7 @@ version: 1
 projects:
   ocr:
     label: OCR
+    kind: work
     path: /repo/ocr
     repository: monorepo
     base_branch: dev
@@ -163,6 +189,7 @@ launcher:
 projects:
   ocr:
     label: OCR
+    kind: work
     path: /repo/ocr
     repository: monorepo
     base_branch: dev
@@ -195,6 +222,7 @@ launcher:
 projects:
   ocr:
     label: OCR
+    kind: work
     path: /repo/ocr
     repository: monorepo
     base_branch: dev
@@ -226,6 +254,7 @@ launcher:
 projects:
   ocr:
     label: OCR
+    kind: work
     path: /repo/ocr
     repository: monorepo
     base_branch: dev
@@ -258,6 +287,7 @@ launcher:
 projects:
   acme:
     label: Acme
+    kind: work
     path: /repo/acme
     repository: group
     worktree:

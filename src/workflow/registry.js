@@ -121,8 +121,19 @@ function validateWorktree(worktree, projectName) {
   return normalized;
 }
 
+function validateProjectKind(project, projectName) {
+  if (typeof project.kind !== "string" || !project.kind.trim()) {
+    fail("schema", `${projectName}.kind must be one of work or personal`);
+  }
+  if (project.kind !== "work" && project.kind !== "personal") {
+    fail("schema", `${projectName}.kind must be one of work or personal`);
+  }
+  return project.kind;
+}
+
 function validateOrdinaryProject(project, projectName) {
   const normalized = clone(project);
+  normalized.kind = validateProjectKind(normalized, projectName);
   normalized.path = expandHome(validateString(normalized.path, `${projectName}.path`));
   normalized.repository = validateString(normalized.repository, `${projectName}.repository`);
   if (!ALLOWED_REPOSITORIES.has(normalized.repository)) {
@@ -151,6 +162,7 @@ function validateGroupRepository(repository, repositoryName, projectName) {
 
 function validateGroupProject(project, projectName) {
   const normalized = clone(project);
+  normalized.kind = validateProjectKind(normalized, projectName);
   normalized.path = expandHome(validateString(normalized.path, `${projectName}.path`));
   normalized.repository = validateString(normalized.repository, `${projectName}.repository`);
   if (normalized.repository !== "group") {
