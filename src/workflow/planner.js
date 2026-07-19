@@ -1,7 +1,9 @@
 import { join } from "node:path";
 import { WorkflowError } from "./errors.js";
-import { expandTemplate, normalizeTask, slugify, boundLabel } from "./naming.js";
+import { expandTemplate, slugify, boundLabel } from "./naming.js";
+import { resolveAgentProfile } from "./profiles.js";
 import { resolveProject } from "./registry.js";
+import { normalizeTicketBundle } from "./tickets.js";
 
 function fail(category, message, options) {
   throw new WorkflowError(category, message, options);
@@ -31,7 +33,54 @@ function selectRuntime(projectAlias, project, runtimeProfile) {
   };
 }
 
-function buildOrdinaryPlan({ registry, projectAlias, project, taskId, slug, feature, runtimeProfile }) {
+function sanitizeAgentProfile(profile) {
+  const snapshot = {
+    mode: profile.mode,
+    model: profile.model,
+    arguments: clone(profile.arguments ?? []),
+  };
+
+  if (profile.harness === "claude") {
+    snapshot.permission_mode = profile.permission_mode;
+  }
+
+  if (profile.harness === "codex") {
+    snapshot.sandbox = profile.sandbox;
+    snapshot.approval_policy = profile.approval_policy;
+  }
+
+  return snapshot;
+}
+
+function buildIdentity({ projectAlias, project, bundle, feature, slug }) {
+  return {
+    projectAlias,
+    projectLabel: project.label,
+    projectKind: project.kind,
+    task: bundle.primary,
+    primaryTicket: bundle.primary,
+    relatedTickets: bundle.related,
+    tickets: bundle.all,
+    feature: feature ?? null,
+    slug,
+  };
+}
+
+function buildAgent({ selectedAgent, sessionName, worktreePath, tabLabel }) {
+  return {
+    command: selectedAgent.profile.command,
+    sessionName,
+    tabLabel,
+    worktreePath,
+    profileName: selectedAgent.name,
+    harness: selectedAgent.profile.harness,
+    roles: clone(selectedAgent.profile.roles),
+    profile: sanitizeAgentProfile(selectedAgent.profile),
+  };
+}
+
+function buildOrdinaryPlan({ registry, projectAlias, project, bundle, slug, feature, runtimeProfile, selectedAgent }) {
+  const taskId = bundle.primary;
   const worktreePath = expandTemplate(project.worktree.path_template, {
     worktree_root: registry.launcher.worktree_root,
     project: projectAlias,
@@ -44,23 +93,23 @@ function buildOrdinaryPlan({ registry, projectAlias, project, taskId, slug, feat
     slug,
   });
   const workspaceLabel = boundLabel(`${taskId} ${slug}`);
-  const sessionName = expandTemplate(registry.launcher.agent.session_template, {
+  const sessionName = expandTemplate(registry.launcher.session_template, {
     project: projectAlias,
     task: taskId,
     slug,
   });
   const runtime = selectRuntime(projectAlias, project, runtimeProfile);
+  const identity = buildIdentity({ projectAlias, project, bundle, feature, slug });
+  const agent = buildAgent({
+    selectedAgent,
+    sessionName,
+    worktreePath,
+    tabLabel: "agent",
+  });
 
   return {
     mode: "ordinary",
-    identity: {
-      projectAlias,
-      projectLabel: project.label,
-      projectKind: project.kind,
-      task: taskId,
-      feature: feature ?? null,
-      slug,
-    },
+    identity,
     repositories: [],
     worktrees: [
       {
@@ -94,12 +143,7 @@ function buildOrdinaryPlan({ registry, projectAlias, project, taskId, slug, feat
         processes: runtime.processes,
       },
     ],
-    agent: {
-      command: registry.launcher.agent.command,
-      sessionName,
-      tabLabel: "agent",
-      worktreePath,
-    },
+    agent,
     runtime: {
       profileName: runtime.profileName,
       processes: runtime.processes,
@@ -136,7 +180,7 @@ function buildOrdinaryPlan({ registry, projectAlias, project, taskId, slug, feat
         kind: "pi.session.start",
         phase: "start",
         cwd: worktreePath,
-        command: registry.launcher.agent.command,
+        command: agent.command,
         sessionName,
         tabLabel: "agent",
       },
@@ -172,7 +216,8 @@ function selectRepositories(projectAlias, project, repositories) {
   });
 }
 
-function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature, repositories, runtimeProfile }) {
+function buildGroupPlan({ registry, projectAlias, project, bundle, slug, feature, repositories, runtimeProfile, selectedAgent }) {
+  const taskId = bundle.primary;
   const workspacePath = expandTemplate(project.worktree.path_template, {
     worktree_root: registry.launcher.worktree_root,
     project: projectAlias,
@@ -185,7 +230,7 @@ function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature
     slug,
   });
   const workspaceLabel = boundLabel(`${taskId} ${slug}`);
-  const sessionName = expandTemplate(registry.launcher.agent.session_template, {
+  const sessionName = expandTemplate(registry.launcher.session_template, {
     project: projectAlias,
     task: taskId,
     slug,
@@ -194,7 +239,7 @@ function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature
   const selectedRepositories = selectRepositories(projectAlias, project, repositories);
   const childWorktrees = selectedRepositories.map((repository) => {
     const worktreePath = join(workspacePath, project.coordination.repos_directory, repository.alias);
-    const branch = expandTemplate(repository.branch_template, {
+    const childBranch = expandTemplate(repository.branch_template, {
       project: projectAlias,
       repository: repository.alias,
       task: taskId,
@@ -204,21 +249,21 @@ function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature
       alias: repository.alias,
       path: repository.path,
       baseBranch: repository.base_branch,
-      branch,
+      branch: childBranch,
       worktreePath,
     };
+  });
+  const identity = buildIdentity({ projectAlias, project, bundle, feature, slug });
+  const agent = buildAgent({
+    selectedAgent,
+    sessionName,
+    worktreePath: workspacePath,
+    tabLabel: "coordinator",
   });
 
   return {
     mode: "group",
-    identity: {
-      projectAlias,
-      projectLabel: project.label,
-      projectKind: project.kind,
-      task: taskId,
-      feature: feature ?? null,
-      slug,
-    },
+    identity,
     repositories: childWorktrees,
     worktrees: [
       {
@@ -265,12 +310,7 @@ function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature
         processes: runtime.processes,
       },
     ],
-    agent: {
-      command: registry.launcher.agent.command,
-      sessionName,
-      tabLabel: "coordinator",
-      worktreePath: workspacePath,
-    },
+    agent,
     runtime: {
       profileName: runtime.profileName,
       processes: runtime.processes,
@@ -316,7 +356,7 @@ function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature
         kind: "pi.session.start",
         phase: "start",
         cwd: workspacePath,
-        command: registry.launcher.agent.command,
+        command: agent.command,
         sessionName,
         tabLabel: "coordinator",
       },
@@ -339,12 +379,40 @@ function buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature
   };
 }
 
-export function planWorkflow({ registry, projectAlias, task, feature, repositories, runtimeProfile } = {}) {
+export function planWorkflow({ registry, projectAlias, task, tickets, feature, repositories, runtimeProfile, agentProfile } = {}) {
   const project = resolveProject(registry, projectAlias);
-  const taskId = normalizeTask(task);
-  const slug = feature ? slugify(feature) : slugify(task);
+  const bundle = normalizeTicketBundle({
+    primary: task,
+    related: tickets,
+    maxTickets: registry.launcher.max_bundle_tickets,
+  });
+  const slug = feature ? slugify(feature) : slugify(bundle.primary);
+  const selectedAgent = resolveAgentProfile({
+    registry,
+    project,
+    requestedProfile: agentProfile,
+  });
 
   return project.repository === "group"
-    ? buildGroupPlan({ registry, projectAlias, project, taskId, slug, feature, repositories, runtimeProfile })
-    : buildOrdinaryPlan({ registry, projectAlias, project, taskId, slug, feature, runtimeProfile });
+    ? buildGroupPlan({
+      registry,
+      projectAlias,
+      project,
+      bundle,
+      slug,
+      feature,
+      repositories,
+      runtimeProfile,
+      selectedAgent,
+    })
+    : buildOrdinaryPlan({
+      registry,
+      projectAlias,
+      project,
+      bundle,
+      slug,
+      feature,
+      runtimeProfile,
+      selectedAgent,
+    });
 }

@@ -12,9 +12,29 @@ function hasFunctionDeep(value) {
 const registry = {
   launcher: {
     worktree_root: "/tmp/worktrees",
-    agent: {
-      command: "pi",
-      session_template: "{project}-{task}-{slug}",
+    state_root: "/tmp/workflow-state",
+    session_template: "{project}-{task}-{slug}",
+    default_agent_profile: "pi-worker",
+    max_bundle_tickets: 10,
+    agent_profiles: {
+      "pi-worker": {
+        harness: "pi",
+        command: "pi",
+        mode: "interactive",
+        roles: ["coordinator", "implementer"],
+        model: null,
+        arguments: [],
+      },
+      "codex-worker": {
+        harness: "codex",
+        command: "codex",
+        mode: "interactive",
+        roles: ["implementer", "reviewer"],
+        model: "gpt-5-codex",
+        arguments: ["--config", "ui=false"],
+        sandbox: "workspace-write",
+        approval_policy: "on-request",
+      },
     },
   },
   projects: {
@@ -24,6 +44,8 @@ const registry = {
       path: "/repo/ocr",
       repository: "monorepo",
       base_branch: "dev",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker", "codex-worker"],
       worktree: {
         branch_template: "feature/{task}/{slug}",
         path_template: "{worktree_root}/{project}/{task}-{slug}",
@@ -49,6 +71,8 @@ const registry = {
       kind: "work",
       path: "/repo/acme",
       repository: "group",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker", "codex-worker"],
       worktree: {
         branch_template: "ticket/{task}/{slug}",
         path_template: "{worktree_root}/acme/{task}-{slug}",
@@ -109,11 +133,30 @@ test("rejects empty slugs and traversal values", () => {
 });
 
 test("plans an ordinary native Herdr worktree", () => {
-  const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-152", "ASANA-140", "ASANA-140"],
+    feature: "Discovered Docs",
+  });
 
   assert.equal(plan.mode, "ordinary");
+  assert.equal(plan.identity.task, "ASANA-123");
+  assert.equal(plan.identity.primaryTicket, "ASANA-123");
+  assert.deepEqual(plan.identity.relatedTickets, ["ASANA-140", "ASANA-152"]);
+  assert.deepEqual(plan.identity.tickets, ["ASANA-123", "ASANA-140", "ASANA-152"]);
   assert.equal(plan.worktrees[0].branch, "feature/ASANA-123/discovered-docs");
+  assert.equal(plan.agent.command, "pi");
   assert.equal(plan.agent.sessionName, "ocr-ASANA-123-discovered-docs");
+  assert.equal(plan.agent.profileName, "pi-worker");
+  assert.equal(plan.agent.harness, "pi");
+  assert.deepEqual(plan.agent.roles, ["coordinator", "implementer"]);
+  assert.deepEqual(plan.agent.profile, {
+    mode: "interactive",
+    model: null,
+    arguments: [],
+  });
   assert.deepEqual(plan.tabs.map((tab) => tab.label), ["agent", "runtime"]);
   assert.ok(plan.workspace.label.length <= 32);
   assert.equal(plan.runtime.profileName, "standard");
@@ -205,6 +248,32 @@ test("resolves a requested runtime profile without rewriting trusted commands", 
   assert.doesNotMatch(JSON.stringify(runtimeTab.processes), /ASANA-123|Discovered Docs/);
 });
 
+test("resolves an explicit allowed agent profile without changing primary worktree identity", () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-150"],
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+
+  assert.equal(plan.agent.command, "codex");
+  assert.equal(plan.agent.profileName, "codex-worker");
+  assert.equal(plan.agent.harness, "codex");
+  assert.deepEqual(plan.agent.roles, ["implementer", "reviewer"]);
+  assert.deepEqual(plan.agent.profile, {
+    mode: "interactive",
+    model: "gpt-5-codex",
+    arguments: ["--config", "ui=false"],
+    sandbox: "workspace-write",
+    approval_policy: "on-request",
+  });
+  assert.equal(plan.identity.task, "ASANA-123");
+  assert.equal(plan.worktrees[0].branch, "feature/ASANA-123/discovered-docs");
+  assert.equal(plan.agent.sessionName, "ocr-ASANA-123-discovered-docs");
+});
+
 test("rejects missing Acme repository selection", () => {
   assert.throws(
     () => planWorkflow({ registry, projectAlias: "acme", task: "ASANA-456", feature: "Onboarding" }),
@@ -257,6 +326,25 @@ test("plans three selected Acme repositories with repository-specific branches",
   assert.equal(plan.repositories[2].baseBranch, "release");
   assert.equal(plan.repositories[2].branch, "feature/acme/webapp/onboarding");
   assert.match(plan.worktrees[3].path, /repos\/webapp$/);
+});
+
+test("related tickets do not change Acme worktree naming", () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "acme",
+    task: "ASANA-456",
+    tickets: ["ASANA-499", "ASANA-460", "ASANA-460"],
+    feature: "Onboarding",
+    repositories: ["panel", "backend"],
+  });
+
+  assert.equal(plan.identity.task, "ASANA-456");
+  assert.equal(plan.identity.primaryTicket, "ASANA-456");
+  assert.deepEqual(plan.identity.relatedTickets, ["ASANA-460", "ASANA-499"]);
+  assert.deepEqual(plan.identity.tickets, ["ASANA-456", "ASANA-460", "ASANA-499"]);
+  assert.equal(plan.worktrees[0].branch, "ticket/ASANA-456/onboarding");
+  assert.match(plan.workspace.path, /ASANA-456-onboarding$/);
+  assert.deepEqual(plan.repositories.map((repo) => repo.alias), ["backend", "panel"]);
 });
 
 test("rejects unknown Acme repository aliases", () => {

@@ -20,14 +20,14 @@ const HELP = `workflow — deterministic launcher for isolated development envir
 
 Commands:
   workflow doctor [project] [--format compact|json]
-  workflow plan <project> <task> [--feature <text>] [--repos <csv>] [--profile <name>] [--format compact|json]
-  workflow start <project> <task> [--feature <text>] [--repos <csv>] [--format compact|json] [--yes]
-  workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--profile <name>] [--format compact|json] [--yes]
-  workflow status <project> <task> [--feature <text>] [--repos <csv>] [--profile <name>] [--format compact|json]
+  workflow plan <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json]
+  workflow start <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--format compact|json] [--yes]
+  workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
+  workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json]
 
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path`;
-const KNOWN_OPTIONS = new Set(["feature", "repos", "profile", "format", "yes", "help"]);
+const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "format", "yes", "help"]);
 
 function bound(text) {
   const value = String(text ?? "").replace(/\r\n?/g, "\n");
@@ -73,7 +73,7 @@ function validateShape(command, positionals, options, { min = 0, max = min, allo
   }
 }
 
-function parseRepositories(value) {
+function parseCsvList(value) {
   return String(value)
     .split(",")
     .map((item) => item.trim())
@@ -100,26 +100,27 @@ export function parseArgs(argv) {
     projectAlias: positionals[0],
     task: positionals[1],
     ...(options.feature ? { feature: options.feature } : {}),
-    ...(options.repos ? { repositories: parseRepositories(options.repos) } : {}),
+    ...(options.repos ? { repositories: parseCsvList(options.repos) } : {}),
+    ...(options.tickets ? { tickets: parseCsvList(options.tickets) } : {}),
     ...(options.profile ? { runtimeProfile: options.profile } : {}),
     ...(options.yes ? { yes: true } : {}),
     format,
   };
 
   if (command === "plan") {
-    validateShape("plan", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "profile"] });
+    validateShape("plan", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile"] });
     return baseOptions;
   }
   if (command === "start") {
-    validateShape("start", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "yes"] });
+    validateShape("start", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "yes"] });
     return baseOptions;
   }
   if (command === "runtime") {
-    validateShape("runtime", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "profile", "yes"] });
+    validateShape("runtime", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile", "yes"] });
     return baseOptions;
   }
   if (command === "status") {
-    validateShape("status", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "profile"] });
+    validateShape("status", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile"] });
     return baseOptions;
   }
 

@@ -66,7 +66,12 @@ test("installed symlink executes the workflow entry point", async () => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /workflow doctor \[project\]/);
-  assert.match(result.stdout, /workflow start <project> <task>/);
+  assert.match(result.stdout, /workflow plan <project> <task> .*--tickets <csv>/);
+  assert.match(result.stdout, /workflow start <project> <task> .*--tickets <csv>/);
+  assert.match(result.stdout, /workflow runtime <project> <task> .*--tickets <csv>/);
+  assert.match(result.stdout, /workflow status <project> <task> .*--tickets <csv>/);
+  const doctorLine = result.stdout.split(/\r?\n/u).find((line) => line.includes("workflow doctor"));
+  assert.doesNotMatch(doctorLine, /--tickets/);
 });
 
 test("parses documented workflow commands and options", () => {
@@ -76,28 +81,49 @@ test("parses documented workflow commands and options", () => {
     format: "compact",
   });
 
-  assert.deepEqual(parseArgs(["plan", "acme", "ASANA-456", "--feature", "Onboarding", "--repos", "backend,panel", "--format", "json"]), {
+  assert.deepEqual(parseArgs(["plan", "acme", "ASANA-456", "--feature", "Onboarding", "--repos", "backend,panel", "--tickets", "ASANA-499,ASANA-460,ASANA-460", "--format", "json"]), {
     command: "plan",
     projectAlias: "acme",
     task: "ASANA-456",
     feature: "Onboarding",
     repositories: ["backend", "panel"],
+    tickets: ["ASANA-499", "ASANA-460", "ASANA-460"],
     format: "json",
   });
 
-  assert.deepEqual(parseArgs(["runtime", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--profile", "standard", "--yes"]), {
+  assert.deepEqual(parseArgs(["start", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--tickets", "ASANA-150,ASANA-140", "--yes"]), {
+    command: "start",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    tickets: ["ASANA-150", "ASANA-140"],
+    yes: true,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["runtime", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--tickets", "ASANA-150,ASANA-140", "--profile", "standard", "--yes"]), {
     command: "runtime",
     projectAlias: "ocr",
     task: "ASANA-123",
     feature: "Discovered Docs",
+    tickets: ["ASANA-150", "ASANA-140"],
     runtimeProfile: "standard",
     yes: true,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["status", "ocr", "ASANA-123", "--tickets", "ASANA-150,ASANA-140"]), {
+    command: "status",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-150", "ASANA-140"],
     format: "compact",
   });
 });
 
 test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["doctor", "ocr", "--yes"]), /does not accept --yes/i);
+  assert.throws(() => parseArgs(["doctor", "ocr", "--tickets", "ASANA-150"]), /does not accept --tickets/i);
   assert.throws(() => parseArgs(["status", "ocr", "ASANA-123", "--yes"]), /does not accept --yes/i);
   assert.throws(() => parseArgs(["start", "ocr", "ASANA-123", "--profile", "standard"]), /does not accept --profile/i);
   assert.throws(() => parseArgs(["plan", "ocr", "ASANA-123", "--format", "xml"]), /compact or json/i);

@@ -155,10 +155,40 @@ function buildCommand(name, options, extras = {}) {
   if (options.task) parts.push(options.task);
   if (options.feature) parts.push("--feature", quote(options.feature));
   if (options.repositories?.length) parts.push("--repos", options.repositories.join(","));
+  if (name !== "doctor" && options.tickets?.length) parts.push("--tickets", options.tickets.join(","));
   const profile = extras.profile ?? options.runtimeProfile;
   if (profile) parts.push("--profile", profile);
   if (extras.yes) parts.push("--yes");
   return parts.join(" ");
+}
+
+function selectedRepositoriesForRequest(options, plan) {
+  if (Array.isArray(plan?.repositories) && plan.repositories.length > 0) {
+    return plan.repositories.map((repository) => repository.alias);
+  }
+  return options.repositories ?? [];
+}
+
+function requestFromPlan(options, plan) {
+  return {
+    task: plan.identity.task,
+    tickets: plan.identity.tickets,
+    relatedTickets: plan.identity.relatedTickets,
+    feature: options.feature ?? null,
+    repositories: selectedRepositoriesForRequest(options, plan),
+    runtimeProfile: options.runtimeProfile ?? null,
+  };
+}
+
+function cliRequestFromPlan(options, plan) {
+  return {
+    projectAlias: options.projectAlias,
+    task: plan.identity.task,
+    feature: options.feature,
+    repositories: selectedRepositoriesForRequest(options, plan),
+    tickets: plan.identity.relatedTickets,
+    runtimeProfile: options.runtimeProfile,
+  };
 }
 
 function startPhaseReady(reconciliation) {
@@ -196,7 +226,9 @@ function suggestedManifestFor(options, reconciliation) {
   return {
     path: join(reconciliation.workspace.path, "coordination-manifest.json"),
     payload: {
-      ticket: options.task,
+      ticket: reconciliation.identity.primaryTicket,
+      tickets: reconciliation.identity.tickets,
+      relatedTickets: reconciliation.identity.relatedTickets,
       feature: options.feature ?? null,
       selectedRepositories,
       branches,
@@ -204,9 +236,10 @@ function suggestedManifestFor(options, reconciliation) {
       verificationCommands: [
         buildCommand("status", {
           projectAlias: options.projectAlias,
-          task: options.task,
+          task: reconciliation.identity.task,
           feature: options.feature,
           repositories: selectedRepositories,
+          tickets: reconciliation.identity.relatedTickets,
           runtimeProfile: options.runtimeProfile,
         }),
         ...selectedRepositories.map((alias) => `git -C repos/${alias} status --short`),
@@ -283,26 +316,24 @@ export async function planCommand(options = {}, {
     registry,
     projectAlias: options.projectAlias,
     task: options.task,
+    tickets: options.tickets,
     feature: options.feature,
     repositories: options.repositories,
     runtimeProfile: options.runtimeProfile,
   });
   const reconciliation = await reconcilePlan(plan, { git, herdr: herdrReadModel(preconditions, herdr) });
+  const request = requestFromPlan(options, plan);
+  const cliRequest = cliRequestFromPlan(options, plan);
 
   return {
     command: "plan",
     project: projectDescriptor(options.projectAlias, project),
-    request: {
-      task: options.task,
-      feature: options.feature ?? null,
-      repositories: options.repositories ?? [],
-      runtimeProfile: options.runtimeProfile ?? null,
-    },
+    request,
     preconditions,
     reconciliation,
     conflicts: reconciliation.conflicts,
-    nextCommand: nextCommandFor(options, preconditions, reconciliation),
-    suggestedManifest: suggestedManifestFor(options, reconciliation),
+    nextCommand: nextCommandFor(cliRequest, preconditions, reconciliation),
+    suggestedManifest: suggestedManifestFor(cliRequest, reconciliation),
   };
 }
 
@@ -318,25 +349,23 @@ export async function statusCommand(options = {}, {
     registry,
     projectAlias: options.projectAlias,
     task: options.task,
+    tickets: options.tickets,
     feature: options.feature,
     repositories: options.repositories,
     runtimeProfile: options.runtimeProfile,
   });
   const reconciliation = await reconcilePlan(plan, { git, herdr: herdrReadModel(preconditions, herdr) });
+  const request = requestFromPlan(options, plan);
+  const cliRequest = cliRequestFromPlan(options, plan);
 
   return {
     command: "status",
     project: projectDescriptor(options.projectAlias, project),
-    request: {
-      task: options.task,
-      feature: options.feature ?? null,
-      repositories: options.repositories ?? [],
-      runtimeProfile: options.runtimeProfile ?? null,
-    },
+    request,
     preconditions,
     reconciliation,
     conflicts: reconciliation.conflicts,
-    nextCommand: nextCommandFor(options, preconditions, reconciliation),
-    suggestedManifest: suggestedManifestFor(options, reconciliation),
+    nextCommand: nextCommandFor(cliRequest, preconditions, reconciliation),
+    suggestedManifest: suggestedManifestFor(cliRequest, reconciliation),
   };
 }

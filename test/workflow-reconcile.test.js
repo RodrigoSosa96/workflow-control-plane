@@ -6,9 +6,19 @@ import { reconcilePlan } from "../src/workflow/reconcile.js";
 const registry = {
   launcher: {
     worktree_root: "/tmp/worktrees",
-    agent: {
-      command: "pi",
-      session_template: "{project}-{task}-{slug}",
+    state_root: "/tmp/workflow-state",
+    session_template: "{project}-{task}-{slug}",
+    default_agent_profile: "pi-worker",
+    max_bundle_tickets: 10,
+    agent_profiles: {
+      "pi-worker": {
+        harness: "pi",
+        command: "pi",
+        mode: "interactive",
+        roles: ["coordinator", "implementer"],
+        model: null,
+        arguments: [],
+      },
     },
   },
   projects: {
@@ -18,6 +28,8 @@ const registry = {
       path: "/repo/ocr",
       repository: "monorepo",
       base_branch: "dev",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker"],
       worktree: {
         branch_template: "feature/{task}/{slug}",
         path_template: "{worktree_root}/{project}/{task}-{slug}",
@@ -38,6 +50,8 @@ const registry = {
       kind: "work",
       path: "/repo/acme",
       repository: "group",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker"],
       worktree: {
         branch_template: "ticket/{task}/{slug}",
         path_template: "{worktree_root}/acme/{task}-{slug}",

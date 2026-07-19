@@ -6,9 +6,19 @@ import { formatWorkflowResult } from "../src/workflow/format.js";
 const registry = {
   launcher: {
     worktree_root: "/tmp/worktrees",
-    agent: {
-      command: "pi",
-      session_template: "{project}-{task}-{slug}",
+    state_root: "/tmp/workflow-state",
+    session_template: "{project}-{task}-{slug}",
+    default_agent_profile: "pi-worker",
+    max_bundle_tickets: 10,
+    agent_profiles: {
+      "pi-worker": {
+        harness: "pi",
+        command: "pi",
+        mode: "interactive",
+        roles: ["coordinator", "implementer"],
+        model: null,
+        arguments: [],
+      },
     },
   },
   projects: {
@@ -18,6 +28,8 @@ const registry = {
       path: "/repo/ocr",
       repository: "monorepo",
       base_branch: "dev",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker"],
       worktree: {
         branch_template: "feature/{task}/{slug}",
         path_template: "{worktree_root}/{project}/{task}-{slug}",
@@ -38,6 +50,8 @@ const registry = {
       kind: "work",
       path: "/repo/acme",
       repository: "group",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker"],
       worktree: {
         branch_template: "ticket/{task}/{slug}",
         path_template: "{worktree_root}/acme/{task}-{slug}",
@@ -284,6 +298,46 @@ test("plan stays read-only, returns ordered operations, and reports conflicts ev
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus", "listWorkspaces", "listAgents"]);
 });
 
+test("plan request and next command include normalized ticket bundles", async () => {
+  const lookup = createLookup({
+    git: "/usr/bin/git",
+    herdr: "/usr/bin/herdr",
+    pi: "/usr/bin/pi",
+  });
+  const git = createGit({
+    repositories: {
+      "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+    },
+    worktrees: {
+      "/repo/ocr": [],
+    },
+  });
+  const herdr = createHerdr({
+    integrations: [
+      { name: "pi", status: "current", version: 5, path: "/home/you/.pi/agent/extensions/herdr-agent-state.ts" },
+    ],
+  });
+
+  const result = await planCommand({
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-150", "ASANA-140", "ASANA-140"],
+    feature: "Discovered Docs",
+  }, deps({ git, herdr, lookup }));
+
+  assert.equal(result.reconciliation.status, "incomplete");
+  assert.deepEqual(result.request, {
+    task: "ASANA-123",
+    tickets: ["ASANA-123", "ASANA-140", "ASANA-150"],
+    relatedTickets: ["ASANA-140", "ASANA-150"],
+    feature: "Discovered Docs",
+    repositories: [],
+    runtimeProfile: null,
+  });
+  assert.equal(result.nextCommand, 'workflow start ocr ASANA-123 --feature "Discovered Docs" --tickets ASANA-140,ASANA-150 --yes');
+});
+
 test("plan remains read-only and reports Herdr server and Pi integration readiness", async () => {
   const lookup = createLookup({
     git: "/usr/bin/git",
@@ -310,6 +364,7 @@ test("plan remains read-only and reports Herdr server and Pi integration readine
     registryPath: "/tmp/projects.yaml",
     projectAlias: "ocr",
     task: "ASANA-123",
+    tickets: ["ASANA-150", "ASANA-140"],
     feature: "Discovered Docs",
   }, deps({ git, herdr, lookup }));
 
@@ -319,6 +374,14 @@ test("plan remains read-only and reports Herdr server and Pi integration readine
   assert.equal(result.preconditions.piIntegration.status, "missing");
   assert.match(result.preconditions.piIntegration.reason, /Pi integration is not installed/i);
   assert.equal(result.nextCommand, "workflow doctor ocr");
+  assert.deepEqual(result.request, {
+    task: "ASANA-123",
+    tickets: ["ASANA-123", "ASANA-140", "ASANA-150"],
+    relatedTickets: ["ASANA-140", "ASANA-150"],
+    feature: "Discovered Docs",
+    repositories: [],
+    runtimeProfile: null,
+  });
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
 
   const compact = formatWorkflowResult("plan", result, "compact");
@@ -375,12 +438,13 @@ test("status reports actual state and the safe next command without attempting r
     registryPath: "/tmp/projects.yaml",
     projectAlias: "ocr",
     task: "ASANA-123",
+    tickets: ["ASANA-150", "ASANA-140", "ASANA-140"],
     feature: "Discovered Docs",
   }, deps({ git, herdr, lookup }));
 
   assert.equal(result.reconciliation.status, "incomplete");
   assert.equal(result.reconciliation.tabs.find((tab) => tab.label === "runtime").status, "missing");
-  assert.equal(result.nextCommand, 'workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes');
+  assert.equal(result.nextCommand, 'workflow runtime ocr ASANA-123 --feature "Discovered Docs" --tickets ASANA-140,ASANA-150 --profile standard --yes');
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus", "listWorkspaces", "listTabs", "listPanes", "listAgents"]);
 });
 
@@ -394,6 +458,7 @@ test("plan exposes a suggested Acme coordination manifest and compact output pri
     registryPath: "/tmp/projects.yaml",
     projectAlias: "acme",
     task: "ASANA-456",
+    tickets: ["ASANA-499", "ASANA-460", "ASANA-460"],
     feature: "Onboarding",
     repositories: ["panel", "backend"],
   }, deps({
@@ -409,19 +474,29 @@ test("plan exposes a suggested Acme coordination manifest and compact output pri
         "/repo/acme/acme_panel": [],
       },
     }),
-    herdr: createHerdr(),
+    herdr: createHerdr({
+      integrations: [
+        { name: "pi", status: "current", version: 5, path: "/home/you/.pi/agent/extensions/herdr-agent-state.ts" },
+      ],
+    }),
     lookup,
   }));
 
   assert.equal(result.suggestedManifest.path, "/tmp/worktrees/acme/ASANA-456-onboarding/coordination-manifest.json");
   assert.equal(result.suggestedManifest.payload.ticket, "ASANA-456");
+  assert.deepEqual(result.suggestedManifest.payload.tickets, ["ASANA-456", "ASANA-460", "ASANA-499"]);
+  assert.deepEqual(result.suggestedManifest.payload.relatedTickets, ["ASANA-460", "ASANA-499"]);
   assert.deepEqual(result.suggestedManifest.payload.selectedRepositories, ["backend", "panel"]);
   assert.deepEqual(result.suggestedManifest.payload.integrationOrder, ["backend", "panel"]);
   assert.deepEqual(result.suggestedManifest.payload.branches, {
     backend: "feature/ASANA-456/onboarding",
     panel: "feature/ASANA-456/onboarding",
   });
-  assert.match(result.suggestedManifest.payload.verificationCommands[0], /workflow status acme ASANA-456/);
+  assert.equal(result.nextCommand, 'workflow start acme ASANA-456 --feature Onboarding --repos backend,panel --tickets ASANA-460,ASANA-499 --yes');
+  assert.equal(
+    result.suggestedManifest.payload.verificationCommands[0],
+    'workflow status acme ASANA-456 --feature Onboarding --repos backend,panel --tickets ASANA-460,ASANA-499',
+  );
 
   const compact = formatWorkflowResult("plan", result, "compact");
   assert.match(compact, /Suggested manifest/i);
