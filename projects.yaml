@@ -1,9 +1,44 @@
-version: 2
+version: 3
 launcher:
   worktree_root: /home/you/.herdr/worktrees
-  agent:
-    command: pi
-    session_template: "{project}-{task}-{slug}"
+  state_root: /home/you/.local/state/workflow-launcher
+  session_template: "{project}-{task}-{slug}"
+  default_agent_profile: pi-worker
+  max_bundle_tickets: 10
+  agent_profiles:
+    pi-worker:
+      harness: pi
+      command: pi
+      mode: interactive
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      arguments: []
+    claude-worker:
+      harness: claude
+      command: claude
+      mode: interactive
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      permission_mode: manual
+      arguments: []
+    codex-worker:
+      harness: codex
+      command: codex
+      mode: interactive
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      sandbox: workspace-write
+      approval_policy: on-request
+      arguments: []
 projects:
   ocr:
     label: ExampleProject
@@ -13,6 +48,7 @@ projects:
     base_branch: dev
     task_source: asana
     package_manager: pnpm
+    default_agent_profile: pi-worker
     worktree:
       branch_template: "feature/{task}/{slug}"
       path_template: "{worktree_root}/{project}/{task}-{slug}"
@@ -46,6 +82,7 @@ projects:
     path: /home/you/projects/work/acme
     repository: group
     task_source: asana
+    default_agent_profile: pi-worker
     worktree:
       branch_template: "ticket/{task}/{slug}"
       path_template: "{worktree_root}/acme/{task}-{slug}"
@@ -74,6 +111,7 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    default_agent_profile: pi-worker
     worktree:
       branch_template: "feature/{task}/{slug}"
       path_template: "{worktree_root}/{project}/{task}-{slug}"
@@ -99,6 +137,7 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    default_agent_profile: pi-worker
     worktree:
       branch_template: "feature/{task}/{slug}"
       path_template: "{worktree_root}/{project}/{task}-{slug}"
@@ -127,6 +166,7 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    default_agent_profile: pi-worker
     worktree:
       branch_template: "feature/{task}/{slug}"
       path_template: "{worktree_root}/{project}/{task}-{slug}"
@@ -150,6 +190,7 @@ projects:
     base_branch: main
     task_source: local
     package_manager: pnpm
+    default_agent_profile: pi-worker
     worktree:
       branch_template: "feature/{task}/{slug}"
       path_template: "{worktree_root}/{project}/{task}-{slug}"

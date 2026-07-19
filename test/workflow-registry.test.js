@@ -41,10 +41,75 @@ const valid = {
   },
 };
 
-test("validates a version 2 ordinary project", () => {
+function validV3() {
+  return {
+    version: 3,
+    launcher: {
+      worktree_root: "/tmp/worktrees",
+      state_root: "/tmp/workflow-state",
+      session_template: "{project}-{task}-{slug}",
+      default_agent_profile: "pi-worker",
+      max_bundle_tickets: 10,
+      agent_profiles: {
+        "pi-worker": {
+          harness: "pi",
+          command: "pi",
+          mode: "interactive",
+          roles: ["coordinator", "implementer", "reviewer"],
+          arguments: [],
+        },
+      },
+    },
+    projects: {
+      ocr: {
+        label: "OCR",
+        kind: "work",
+        path: "/repo/ocr",
+        repository: "monorepo",
+        base_branch: "dev",
+        default_agent_profile: "pi-worker",
+        worktree: {
+          branch_template: "feature/{task}/{slug}",
+          path_template: "{worktree_root}/{project}/{task}-{slug}",
+        },
+        runtime: {
+          default_profile: "standard",
+          profiles: {
+            standard: {
+              processes: [{ id: "api", cwd: ".", command: "pnpm dev:api" }],
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+test("normalizes a version 2 ordinary project into version 3", () => {
   const registry = validateRegistry(valid);
-  assert.equal(registry.projects.ocr.base_branch, "dev");
+  assert.equal(registry.version, 3);
+  assert.equal(registry.launcher.state_root, join(homedir(), ".local", "state", "workflow-launcher"));
+  assert.equal(registry.launcher.session_template, "{project}-{task}-{slug}");
+  assert.equal(registry.launcher.default_agent_profile, "pi-worker");
+  assert.deepEqual(registry.launcher.agent_profiles["pi-worker"], {
+    harness: "pi",
+    command: "pi",
+    mode: "interactive",
+    roles: ["coordinator", "implementer", "reviewer"],
+    model: null,
+    arguments: [],
+  });
+  assert.equal(registry.launcher.agent.command, "pi");
+  assert.equal(registry.launcher.agent.session_template, "{project}-{task}-{slug}");
   assert.equal(registry.projects.ocr.runtime.profiles.standard.processes[0].split, "right");
+});
+
+test("validates a version 3 ordinary project", () => {
+  const registry = validateRegistry(validV3());
+  assert.equal(registry.version, 3);
+  assert.equal(registry.launcher.state_root, "/tmp/workflow-state");
+  assert.equal(registry.launcher.agent.command, "pi");
+  assert.equal(registry.projects.ocr.default_agent_profile, "pi-worker");
 });
 
 test("rejects missing project kind", () => {
@@ -66,6 +131,9 @@ test("returns an immutable normalized registry", () => {
   }, TypeError);
   assert.throws(() => {
     registry.projects.ocr.runtime.profiles.standard.processes[0].command = "changed";
+  }, TypeError);
+  assert.throws(() => {
+    registry.launcher.agent_profiles["pi-worker"].command = "changed";
   }, TypeError);
 });
 
@@ -127,8 +195,11 @@ test("accepts launcher and project paths that become absolute after ~ expansion"
   assert.equal(registry.projects.ocr.path, join(homedir(), "repo", "ocr"));
 });
 
-test("preserves OCR infrastructure runtime in the migrated registry", async () => {
+test("preserves OCR infrastructure runtime in the canonical v3 registry", async () => {
   const registry = await loadRegistry(new URL("../projects.yaml", import.meta.url));
+  assert.equal(registry.version, 3);
+  assert.equal(registry.launcher.default_agent_profile, "pi-worker");
+  assert.equal(registry.launcher.agent.command, "pi");
   assert.deepEqual(
     registry.projects.ocr.runtime.profiles.standard.processes.map(({ id, command }) => ({ id, command })),
     [
@@ -140,7 +211,7 @@ test("preserves OCR infrastructure runtime in the migrated registry", async () =
   );
 });
 
-test("loads a version 2 registry with ordinary and group projects", async () => {
+test("loads a version 2 registry with ordinary and group projects through migration", async () => {
   const registry = await loadRegistry(await registryFile(`
 version: 2
 launcher:
@@ -196,8 +267,10 @@ projects:
         branch_template: "feature/{task}/{slug}"
 `));
 
-  assert.equal(registry.version, 2);
+  assert.equal(registry.version, 3);
   assert.equal(registry.launcher.worktree_root, join(homedir(), "worktrees"));
+  assert.equal(registry.launcher.state_root, join(homedir(), ".local", "state", "workflow-launcher"));
+  assert.equal(registry.launcher.agent.command, "pi");
   assert.equal(registry.projects.ocr.path, join(homedir(), "repos", "ocr"));
   assert.equal(registry.projects.ocr.runtime.profiles.standard.processes[0].cwd, ".");
   assert.equal(registry.projects.ocr.runtime.profiles.standard.processes[0].split, "right");
@@ -229,7 +302,7 @@ projects:
   );
 });
 
-test("rejects an unsupported registry version", async () => {
+test("rejects registry version 1", async () => {
   await assert.rejects(
     loadRegistry(await registryFile(`
 version: 1
@@ -244,7 +317,7 @@ projects:
       branch_template: "feature/{task}/{slug}"
       path_template: "{worktree_root}/{project}/{task}-{slug}"
 `)),
-    /version 2/i,
+    /version 1/i,
   );
 });
 
