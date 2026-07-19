@@ -66,9 +66,13 @@ function buildIdentity({ projectAlias, project, bundle, feature, slug }) {
   };
 }
 
-function buildAgent({ selectedAgent, sessionName, worktreePath, tabLabel }) {
+function legacyAgentCommand(registry) {
+  return registry.launcher.agent?.command ?? registry.launcher.agent_profiles?.[registry.launcher.default_agent_profile]?.command;
+}
+
+function buildAgent({ registry, selectedAgent, sessionName, worktreePath, tabLabel }) {
   return {
-    command: selectedAgent.profile.command,
+    command: legacyAgentCommand(registry),
     sessionName,
     tabLabel,
     worktreePath,
@@ -101,6 +105,7 @@ function buildOrdinaryPlan({ registry, projectAlias, project, bundle, slug, feat
   const runtime = selectRuntime(projectAlias, project, runtimeProfile);
   const identity = buildIdentity({ projectAlias, project, bundle, feature, slug });
   const agent = buildAgent({
+    registry,
     selectedAgent,
     sessionName,
     worktreePath,
@@ -255,6 +260,7 @@ function buildGroupPlan({ registry, projectAlias, project, bundle, slug, feature
   });
   const identity = buildIdentity({ projectAlias, project, bundle, feature, slug });
   const agent = buildAgent({
+    registry,
     selectedAgent,
     sessionName,
     worktreePath: workspacePath,
