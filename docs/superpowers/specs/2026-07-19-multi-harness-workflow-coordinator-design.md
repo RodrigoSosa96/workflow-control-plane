@@ -126,7 +126,7 @@ launcher:
       mode: interactive
       roles: [implementer, reviewer]
       model: null
-      permission_mode: default
+      permission_mode: manual
       arguments: []
     codex-worker:
       harness: codex
@@ -276,7 +276,7 @@ The adapter passes a named session, optional model/thinking configuration, the t
 
 ### Claude Code
 
-The adapter passes the checkout, optional model, normal permission mode, the per-run directory as the only extra directory, and generated lifecycle settings. It records Claude's native session ID from hooks or Herdr integration. No permission bypass is allowed.
+The adapter passes the checkout, optional model, `manual` permission mode by default, the per-run directory as the only extra directory, and generated lifecycle settings. It records Claude's native session ID from hooks or Herdr integration. No permission bypass is allowed.
 
 ### Codex
 
@@ -294,6 +294,7 @@ Run state lives outside the repository:
 ├── run.json
 ├── current-generation.json
 ├── events.jsonl
+├── handoff-input.json
 ├── result.json
 ├── results/
 │   └── generation-<n>.json
@@ -302,7 +303,7 @@ Run state lives outside the repository:
     └── codex-profile metadata
 ```
 
-Directories are created with mode `0700`; control-plane-created files use `0600`. Result files created by workers are normalized to `0600` after validation. Run identifiers are unguessable and path-safe. State writes use temporary files and atomic rename; concurrent updates use an explicit lock with bounded waiting and stale-lock detection.
+Directories are created with mode `0700`; control-plane-created files use `0600`. A worker writes its semantic handoff to `handoff-input.json`; the fixed control-plane handoff command validates it, computes authoritative run/generation/Git data, and atomically writes canonical `result.json` with mode `0600`. Run identifiers are unguessable and path-safe. State writes use temporary files and atomic rename; concurrent updates use an explicit lock with bounded waiting and stale-lock detection.
 
 `run.json` records:
 
@@ -379,7 +380,7 @@ A process kill, Herdr closure, host restart, or crash may skip native hooks. Lat
 
 ## Handoff contract
 
-A worker writes a temporary file and atomically renames it to `result.json`. The schema is versioned and bounded:
+A worker writes a bounded semantic handoff input, then invokes the exact command embedded in its assignment: `node "$WORKFLOW_CONTROL_PLANE_BIN" handoff "$WORKFLOW_RUN_ID" --input "$WORKFLOW_RUN_DIR/handoff-input.json"`. The control plane validates that input, adds authoritative identity and Git fingerprints, and atomically renames the canonical output to `result.json`. The canonical schema is versioned and bounded:
 
 ```json
 {
@@ -418,7 +419,7 @@ A worker writes a temporary file and atomically renames it to `result.json`. The
 
 Validation requires:
 
-- Exact schema version, run ID, and generation.
+- Exact schema version, run ID, and generation after control-plane canonicalization.
 - A known terminal or pause status.
 - Exactly the expected primary and related tickets, each with status and evidence.
 - Known selected repository IDs only.
