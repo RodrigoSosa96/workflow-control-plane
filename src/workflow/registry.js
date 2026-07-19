@@ -114,7 +114,9 @@ function validateOptionalStringList(values, context) {
 }
 
 function matchesRawOption(argument, option) {
-  return argument === option || argument.startsWith(`${option}=`);
+  return argument === option
+    || argument.startsWith(`${option}=`)
+    || (/^-[^-]$/.test(option) && argument.startsWith(option) && argument.length > option.length);
 }
 
 function validateArguments(values, profileName, harness) {

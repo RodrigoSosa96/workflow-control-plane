@@ -147,13 +147,29 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   shortApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-a", "never"];
   assert.throws(() => validateRegistry(shortApprovalOverride), /approval|never/i);
 
+  const attachedShortApprovalOverride = registryValue();
+  attachedShortApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-anever"];
+  assert.throws(() => validateRegistry(attachedShortApprovalOverride), /approval|never/i);
+
   const shortProfileOverride = registryValue();
   shortProfileOverride.launcher.agent_profiles["codex-worker"].arguments = ["-p", "unsafe-profile"];
   assert.throws(() => validateRegistry(shortProfileOverride), /profile|unsafe-profile/i);
 
+  const attachedShortProfileOverride = registryValue();
+  attachedShortProfileOverride.launcher.agent_profiles["codex-worker"].arguments = ["-punsafe-profile"];
+  assert.throws(() => validateRegistry(attachedShortProfileOverride), /profile|unsafe-profile/i);
+
   const profileEqualsOverride = registryValue();
   profileEqualsOverride.launcher.agent_profiles["codex-worker"].arguments = ["--profile=unsafe-profile"];
   assert.throws(() => validateRegistry(profileEqualsOverride), /profile|unsafe-profile/i);
+
+  const attachedShortSandboxOverride = registryValue();
+  attachedShortSandboxOverride.launcher.agent_profiles["codex-worker"].arguments = ["-sdanger-full-access"];
+  assert.throws(() => validateRegistry(attachedShortSandboxOverride), /sandbox|danger-full-access/i);
+
+  const attachedShortConfigSandboxOverride = registryValue();
+  attachedShortConfigSandboxOverride.launcher.agent_profiles["codex-worker"].arguments = ['-csandbox = "danger-full-access"'];
+  assert.throws(() => validateRegistry(attachedShortConfigSandboxOverride), /config|sandbox|danger-full-access/i);
 
   const configApprovalOverride = registryValue();
   configApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-c", 'approval_policy = "never"'];
