@@ -143,6 +143,18 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   approvalOverride.launcher.agent_profiles["codex-worker"].arguments = ["--ask-for-approval=never"];
   assert.throws(() => validateRegistry(approvalOverride), /ask-for-approval|approval|never/i);
 
+  const shortApprovalOverride = registryValue();
+  shortApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-a", "never"];
+  assert.throws(() => validateRegistry(shortApprovalOverride), /approval|never/i);
+
+  const shortProfileOverride = registryValue();
+  shortProfileOverride.launcher.agent_profiles["codex-worker"].arguments = ["-p", "unsafe-profile"];
+  assert.throws(() => validateRegistry(shortProfileOverride), /profile|unsafe-profile/i);
+
+  const profileEqualsOverride = registryValue();
+  profileEqualsOverride.launcher.agent_profiles["codex-worker"].arguments = ["--profile=unsafe-profile"];
+  assert.throws(() => validateRegistry(profileEqualsOverride), /profile|unsafe-profile/i);
+
   const configApprovalOverride = registryValue();
   configApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-c", 'approval_policy = "never"'];
   assert.throws(() => validateRegistry(configApprovalOverride), /config|approval|never/i);

@@ -29,7 +29,8 @@ const RAW_CONTROL_ARGUMENTS = {
   claude: [{ field: "permission_mode", options: ["--permission-mode"] }],
   codex: [
     { field: "sandbox", options: ["--sandbox", "-s"] },
-    { field: "approval_policy", options: ["--ask-for-approval"] },
+    { field: "approval_policy", options: ["--ask-for-approval", "-a"] },
+    { field: "profile", options: ["--profile", "-p"] },
     { field: "config", options: ["--config", "-c"] },
   ],
 };
