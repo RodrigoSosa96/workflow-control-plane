@@ -25,6 +25,14 @@ const FORBIDDEN_ARGUMENTS = [
   "--dangerously-bypass-approvals-and-sandbox",
   "--dangerously-bypass-hook-trust",
 ];
+const RAW_CONTROL_ARGUMENTS = {
+  claude: [{ field: "permission_mode", options: ["--permission-mode"] }],
+  codex: [
+    { field: "sandbox", options: ["--sandbox", "-s"] },
+    { field: "approval_policy", options: ["--ask-for-approval"] },
+    { field: "config", options: ["--config", "-c"] },
+  ],
+};
 const LEGACY_STATE_ROOT = join(homedir(), ".local", "state", "workflow-launcher");
 
 function fail(category, message, options) {
@@ -104,19 +112,32 @@ function validateOptionalStringList(values, context) {
   return normalized;
 }
 
-function validateArguments(values, profileName) {
+function matchesRawOption(argument, option) {
+  return argument === option || argument.startsWith(`${option}=`);
+}
+
+function validateArguments(values, profileName, harness) {
   if (values === undefined) return [];
   if (!Array.isArray(values)) fail("schema", `agent profile ${profileName}.arguments must be an array`);
-  return values.map((value, index) => {
-    const argument = validateString(value, `agent profile ${profileName}.arguments[${index}]`);
+
+  const argumentsList = values.map((value, index) => validateString(value, `agent profile ${profileName}.arguments[${index}]`));
+
+  for (const argument of argumentsList) {
     const lower = argument.toLowerCase();
     for (const forbidden of FORBIDDEN_ARGUMENTS) {
-      if (lower === forbidden || lower.startsWith(`${forbidden}=`)) {
+      if (matchesRawOption(lower, forbidden)) {
         fail("schema", `agent profile ${profileName} must not include dangerous argument ${argument}`);
       }
     }
-    return argument;
-  });
+
+    for (const control of RAW_CONTROL_ARGUMENTS[harness] ?? []) {
+      if (control.options.some((option) => matchesRawOption(lower, option))) {
+        fail("schema", `agent profile ${profileName} must not override structured ${control.field} via raw argument ${argument}`);
+      }
+    }
+  }
+
+  return argumentsList;
 }
 
 function validateRuntimeProcess(process, index, profileName) {
@@ -440,7 +461,7 @@ export function validateAgentProfile(name, value) {
   }
   normalized.roles = validateNonEmptyStringList(normalized.roles, `agent profile ${name}.roles`);
   normalized.model = validateOptionalString(normalized.model, `agent profile ${name}.model`);
-  normalized.arguments = validateArguments(normalized.arguments, name);
+  normalized.arguments = validateArguments(normalized.arguments, name, normalized.harness);
 
   if (normalized.harness === "claude") {
     normalized.permission_mode = validateString(normalized.permission_mode, `agent profile ${name}.permission_mode`);

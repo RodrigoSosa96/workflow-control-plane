@@ -123,6 +123,30 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   allowSkip.launcher.agent_profiles["claude-worker"].arguments = ["--allow-dangerously-skip-permissions"];
   assert.throws(() => validateRegistry(allowSkip), /allow-dangerously-skip-permissions/i);
 
+  const permissionModeOverride = registryValue();
+  permissionModeOverride.launcher.agent_profiles["claude-worker"].arguments = ["--permission-mode=bypassPermissions"];
+  assert.throws(() => validateRegistry(permissionModeOverride), /permission-mode|bypasspermissions/i);
+
+  const sandboxEqualsOverride = registryValue();
+  sandboxEqualsOverride.launcher.agent_profiles["codex-worker"].arguments = ["--sandbox=danger-full-access"];
+  assert.throws(() => validateRegistry(sandboxEqualsOverride), /sandbox|danger-full-access/i);
+
+  const sandboxShortOverride = registryValue();
+  sandboxShortOverride.launcher.agent_profiles["codex-worker"].arguments = ["-s", "danger-full-access"];
+  assert.throws(() => validateRegistry(sandboxShortOverride), /sandbox|danger-full-access/i);
+
+  const configSandboxOverride = registryValue();
+  configSandboxOverride.launcher.agent_profiles["codex-worker"].arguments = ["-c", 'sandbox = "danger-full-access"'];
+  assert.throws(() => validateRegistry(configSandboxOverride), /config|sandbox|danger-full-access/i);
+
+  const approvalOverride = registryValue();
+  approvalOverride.launcher.agent_profiles["codex-worker"].arguments = ["--ask-for-approval=never"];
+  assert.throws(() => validateRegistry(approvalOverride), /ask-for-approval|approval|never/i);
+
+  const configApprovalOverride = registryValue();
+  configApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-c", 'approval_policy = "never"'];
+  assert.throws(() => validateRegistry(configApprovalOverride), /config|approval|never/i);
+
   const never = registryValue();
   never.launcher.agent_profiles["codex-worker"].approval_policy = "never";
   assert.throws(() => validateRegistry(never), /approval_policy.*never|never.*approval/i);
@@ -134,6 +158,16 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   const bypassHookTrust = registryValue();
   bypassHookTrust.launcher.agent_profiles["codex-worker"].arguments = ["--dangerously-bypass-hook-trust"];
   assert.throws(() => validateRegistry(bypassHookTrust), /dangerously-bypass-hook-trust/i);
+});
+
+test("preserves non-security profile arguments", () => {
+  assert.deepEqual(validateAgentProfile("pi-worker", {
+    harness: "pi",
+    command: "pi",
+    mode: "interactive",
+    roles: ["implementer"],
+    arguments: ["--plain-output", "session"],
+  }).arguments, ["--plain-output", "session"]);
 });
 
 test("rejects project allowlist violations and invalid defaults", () => {
