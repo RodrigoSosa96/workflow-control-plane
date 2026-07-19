@@ -43,7 +43,7 @@ This design does not add:
 
 ### 1. Deterministic CLI, thin Pi extension, and `pi-subagents` — selected
 
-The `workflow` CLI owns registry validation, planning, Git and Herdr reconciliation, run state, harness adapters, and handoff validation. A project-local Pi extension provides natural coordinator tools, user confirmation, background notifications, and result adoption. `pi-subagents` supplies internal Pi scouts, implementers, and reviewers through its public delegation and background-work APIs.
+The `workflow` CLI owns registry validation, planning, Git and Herdr reconciliation, run state, harness adapters, and handoff validation. A project-local Pi extension provides natural coordinator tools, user confirmation, its own run watcher, background notifications, and result adoption. `pi-subagents` supplies internal Pi scouts, implementers, and reviewers through its packaged tool and commands.
 
 Advantages:
 
@@ -438,7 +438,7 @@ An artifact whose generation or Git fingerprint is no longer current is archived
 - Workspace, tab, and agent references.
 - Result and status commands.
 
-The Pi coordinator extension registers the run as background work. When a current valid result appears, it:
+The Pi coordinator extension starts a session-scoped, bounded polling watcher for runs owned by that exact Pi session. The watcher is independent of `pi-subagents` because the pinned `0.34.0` release does not export its later background-work provider API. When a current valid result appears, the extension:
 
 1. Appends a consumption event atomically.
 2. Associates the result only with the originating Pi session.
@@ -544,9 +544,9 @@ Initial roles are:
 - `spec-reviewer`
 - `code-reviewer`
 
-The Workflow Launcher owns external Pi/Claude/Codex processes and their worktrees. `pi-subagents` is used for bounded internal delegation and independent reviews through public APIs. `pi-dynamic-workflows` is not installed in this phase.
+The Workflow Launcher owns external Pi/Claude/Codex processes and their worktrees. `pi-subagents` is used for bounded internal foreground delegation and independent reviews through its normal `subagent` tool and slash commands. Version `0.34.0` does not export the delegation or background-work extension APIs introduced by `0.35.1`, so the coordinator must not import package internals or emulate those later APIs. Adopting a later version requires a separate compatibility and security review. `pi-dynamic-workflows` is not installed in this phase.
 
-Package installation and any user-level hook trust are explicit implementation checkpoints. No installer may silently use dangerous hook-trust flags.
+The coordinator extension enforces the local policy by blocking `subagent` calls that request async mode, internal worktrees, or concurrency above 3. The default watchdog remains disabled. Package installation and any user-level hook trust are explicit implementation checkpoints. No installer may silently use dangerous hook-trust flags.
 
 ## Native hook integrations
 
@@ -680,7 +680,7 @@ No fixture or test reads production credentials, modifies Asana, or touches a re
 Because the design spans three dependent subsystems, implementation is divided into three sequential plans, each ending in working, reviewed software:
 
 1. **Multi-harness launch core:** registry v3, agent profiles, multi-ticket identity, run store, result schema, harness adapters, `launch`, `result`, and baseline reconciliation.
-2. **Supervised lifecycle and Pi coordinator:** native hooks, generations, resume/adoption, coordinator extension, pinned `pi-subagents`, background result delivery, and explicit close behavior.
+2. **Supervised lifecycle and Pi coordinator:** native hooks, generations, resume/adoption, coordinator extension with its own run watcher, pinned `pi-subagents`, result delivery, and explicit close behavior.
 3. **Generated fixture and canaries:** fixture generator, local ticket provider, fake harness, real-Herdr smoke, opt-in Pi/Claude/Codex canaries, and final documentation.
 
 Each stage uses TDD, one fresh implementation agent per task, specification review, code-quality review, repository checks, and a clean final diff review before proceeding.
