@@ -33,6 +33,10 @@ function clockSequence(...values) {
   };
 }
 
+async function fileMode(path) {
+  return (await stat(path)).mode & 0o777;
+}
+
 function tracingFs(operations) {
   return {
     ...realFs,
@@ -278,6 +282,135 @@ test("reports bounded lock contention and stale locks without deleting them", as
     },
   );
   assert.equal(await readFile(lockPath, "utf8"), "held by another writer");
+});
+
+test("read and list tighten preexisting private modes without recreating runs", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const runPath = join(run.directory, "run.json");
+
+  await chmod(stateRoot, 0o755);
+  await chmod(run.directory, 0o755);
+  await chmod(runPath, 0o644);
+
+  await store.read(RUN_ID_1);
+
+  assert.equal(await fileMode(stateRoot), 0o700);
+  assert.equal(await fileMode(run.directory), 0o700);
+  assert.equal(await fileMode(runPath), 0o600);
+
+  await chmod(stateRoot, 0o755);
+  await chmod(run.directory, 0o755);
+  await chmod(runPath, 0o644);
+
+  const listed = await store.list({});
+
+  assert.deepEqual(listed.map((listedRun) => listedRun.id), [RUN_ID_1]);
+  assert.equal(await fileMode(stateRoot), 0o700);
+  assert.equal(await fileMode(run.directory), 0o700);
+  assert.equal(await fileMode(runPath), 0o600);
+});
+
+test("update tightens preexisting private modes and a reused temporary run file", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const runPath = join(run.directory, "run.json");
+  const reusedTempPath = join(run.directory, `.run.json.${process.pid}.2.tmp`);
+  await writeFile(reusedTempPath, "stale temporary content", { mode: 0o600 });
+  await chmod(stateRoot, 0o755);
+  await chmod(run.directory, 0o755);
+  await chmod(runPath, 0o644);
+  await chmod(reusedTempPath, 0o666);
+
+  await store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING }));
+
+  assert.equal(await fileMode(stateRoot), 0o700);
+  assert.equal(await fileMode(run.directory), 0o700);
+  assert.equal(await fileMode(runPath), 0o600);
+});
+
+test("appendEvent tightens a permissive preexisting events file", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: uuidSequence(RUN_ID_1, EVENT_ID_1),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const eventsPath = join(run.directory, "events.jsonl");
+  await writeFile(eventsPath, "", { mode: 0o600 });
+  await chmod(eventsPath, 0o666);
+
+  await store.appendEvent(RUN_ID_1, { type: "launch.output" });
+
+  assert.equal(await fileMode(eventsPath), 0o600);
+});
+
+test("lock contention tightens an existing lock and uses the injected clock for stale age", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const lockPath = join(run.directory, "run.lock");
+  await writeFile(lockPath, "held by another writer", { mode: 0o600 });
+  await chmod(lockPath, 0o666);
+  const staleTime = new Date("2025-01-01T00:00:00.000Z");
+  await utimes(lockPath, staleTime, staleTime);
+
+  await assert.rejects(
+    () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
+    (error) => {
+      assert.match(error.message, /stale/i);
+      assert.match(error.message, /10m/);
+      assert.equal(error.details?.ageMs, 10 * 60 * 1000);
+      assert.equal(error.details?.stale, true);
+      assert.doesNotMatch(error.message, /held by another writer/);
+      return true;
+    },
+  );
+  assert.equal(await readFile(lockPath, "utf8"), "held by another writer");
+  assert.equal(await fileMode(lockPath), 0o600);
+});
+
+test("update does not unlink a replacement lock after losing ownership", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const lockPath = join(run.directory, "run.lock");
+  const replacementLock = "replacement owner DO-NOT-LEAK";
+
+  await assert.rejects(
+    () => store.update(RUN_ID_1, async (current) => {
+      await realFs.unlink(join(current.directory, "run.lock"));
+      await writeFile(join(current.directory, "run.lock"), replacementLock, { mode: 0o600 });
+      throw new Error("updater exploded");
+    }),
+    (error) => {
+      assert.match(error.message, /lock ownership/i);
+      assert.ok(error.message.length < 500);
+      assert.doesNotMatch(error.message, /DO-NOT-LEAK|replacement owner/);
+      return true;
+    },
+  );
+  assert.equal(await readFile(lockPath, "utf8"), replacementLock);
+  assert.equal(await fileMode(lockPath), 0o600);
 });
 
 test("appendEvent appends private JSONL entries with store-assigned unique IDs", async (t) => {

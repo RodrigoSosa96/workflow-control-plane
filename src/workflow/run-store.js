@@ -127,6 +127,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
   const now = createClock(clock);
   let tempCounter = 0;
   let eventCounter = 0;
+  let lockCounter = 0;
 
   function runDirectoryFor(runId) {
     const id = ensureRunId(runId);
@@ -152,12 +153,22 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     return `${eventCounter}-${nextRandom("event ID")}`;
   }
 
-  async function chmodPrivateDirectory(directory, context) {
+  async function chmodPath(path, mode, context, { missingOk = false } = {}) {
     try {
-      await fs.chmod(directory, PRIVATE_DIR_MODE);
+      await fs.chmod(path, mode);
+      return true;
     } catch (error) {
-      throwFs(`set private mode on ${context}`, directory, error);
+      if (missingOk && error?.code === "ENOENT") return false;
+      throwFs(`set private mode on ${context}`, path, error);
     }
+  }
+
+  async function chmodPrivateDirectory(directory, context, options) {
+    return chmodPath(directory, PRIVATE_DIR_MODE, context, options);
+  }
+
+  async function chmodPrivateFile(path, context, options) {
+    return chmodPath(path, PRIVATE_FILE_MODE, context, options);
   }
 
   async function ensureStateRootDirectory() {
@@ -178,6 +189,14 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     await chmodPrivateDirectory(directory, "run directory");
   }
 
+  async function tightenExistingStateRootDirectory() {
+    return chmodPrivateDirectory(root, "state root", { missingOk: true });
+  }
+
+  async function tightenExistingRunDirectory(directory) {
+    return chmodPrivateDirectory(directory, "run directory", { missingOk: true });
+  }
+
   async function pathExists(path) {
     try {
       await fs.stat(path);
@@ -190,6 +209,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
 
   async function readRunInternal(runId, directory) {
     const path = join(directory, RUN_FILE);
+    await chmodPrivateFile(path, "run file", { missingOk: true });
     let text;
     try {
       text = await fs.readFile(path, "utf8");
@@ -206,6 +226,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     tempCounter += 1;
     const destination = join(directory, filename);
     const tempPath = join(directory, `.${filename}.${process.pid}.${tempCounter}.tmp`);
+    await chmodPrivateFile(tempPath, "temporary file", { missingOk: true });
     let handle;
     try {
       handle = await fs.open(tempPath, "w", PRIVATE_FILE_MODE);
@@ -215,6 +236,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
 
     let writeError;
     try {
+      await chmodPrivateFile(tempPath, "temporary file");
       await handle.writeFile(text, "utf8");
       await handle.sync();
     } catch (error) {
@@ -236,6 +258,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     } catch (error) {
       throwFs("rename temporary file", destination, error);
     }
+    await chmodPrivateFile(destination, filename);
   }
 
   async function writeRun(directory, run) {
@@ -245,6 +268,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
   }
 
   async function appendSynced(path, text) {
+    await chmodPrivateFile(path, "append file", { missingOk: true });
     let handle;
     try {
       handle = await fs.open(path, "a", PRIVATE_FILE_MODE);
@@ -254,6 +278,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
 
     let appendError;
     try {
+      await chmodPrivateFile(path, "append file");
       await handle.appendFile(text, "utf8");
       await handle.sync();
     } catch (error) {
@@ -269,13 +294,14 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     if (appendError) {
       throwFs("append file", path, appendError);
     }
+    await chmodPrivateFile(path, "append file");
   }
 
   async function lockContentionError(lockPath) {
     let ageMs = Number.NaN;
     try {
       const lockStat = await fs.stat(lockPath);
-      ageMs = Math.max(0, Date.now() - lockStat.mtimeMs);
+      ageMs = Math.max(0, Date.parse(now()) - lockStat.mtimeMs);
     } catch (_error) {
       // Keep the recovery message bounded and avoid deleting or inspecting further.
     }
@@ -288,42 +314,106 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     );
   }
 
+  function nextLockOwnerToken() {
+    lockCounter += 1;
+    return `${process.pid}:${lockCounter}:${defaultRandomUUID()}`;
+  }
+
+  function lockOwnershipError(lockPath, reason) {
+    return new WorkflowError(
+      "run-lock",
+      `Run lock ownership could not be verified at ${lockPath}; ${reason}. Manual inspection required; lock was not removed.`,
+      { details: { lockPath, reason } },
+    );
+  }
+
+  function parseLockOwnership(text) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (_error) {
+      return null;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (parsed.version !== 1) return null;
+    if (typeof parsed.token !== "string" || !parsed.token.trim()) return null;
+    return parsed;
+  }
+
   async function acquireLock(directory) {
     const lockPath = join(directory, LOCK_FILE);
+    const ownership = { path: lockPath, token: nextLockOwnerToken() };
     let handle;
     try {
       handle = await fs.open(lockPath, "wx", PRIVATE_FILE_MODE);
     } catch (error) {
       if (error?.code === "EEXIST") {
+        await chmodPrivateFile(lockPath, "lock file", { missingOk: true });
         throw await lockContentionError(lockPath);
       }
       throwFs("create lock", lockPath, error);
     }
 
+    let lockError;
+    try {
+      await handle.writeFile(`${JSON.stringify({ version: 1, token: ownership.token })}\n`, "utf8");
+      await handle.sync();
+    } catch (error) {
+      lockError = error;
+    }
+
     try {
       await handle.close();
     } catch (error) {
-      try {
-        await fs.unlink(lockPath);
-      } catch (_unlinkError) {
-        // This is our just-created lock; do not attempt broader cleanup.
-      }
-      throwFs("close lock", lockPath, error);
+      if (!lockError) lockError = error;
     }
 
-    return lockPath;
+    if (lockError) {
+      try {
+        await releaseLock(ownership);
+      } catch (_releaseError) {
+        // Release is ownership-checked and may fail closed; preserve the lock write failure.
+      }
+      throwFs("write lock", lockPath, lockError);
+    }
+
+    await chmodPrivateFile(lockPath, "lock file");
+    return ownership;
   }
 
-  async function releaseLock(lockPath) {
+  async function releaseLock(ownership) {
+    const lockPath = ownership.path;
+    await chmodPrivateFile(lockPath, "lock file", { missingOk: true });
+    let text;
+    try {
+      text = await fs.readFile(lockPath, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw lockOwnershipError(lockPath, "lock file is missing");
+      }
+      throw error;
+    }
+
+    const current = parseLockOwnership(text);
+    if (!current) {
+      throw lockOwnershipError(lockPath, "lock file is malformed");
+    }
+    if (current.token !== ownership.token) {
+      throw lockOwnershipError(lockPath, "lock token mismatch");
+    }
+
     try {
       await fs.unlink(lockPath);
     } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      if (error?.code === "ENOENT") {
+        throw lockOwnershipError(lockPath, "lock file disappeared before release");
+      }
+      throw error;
     }
   }
 
   async function withLock(directory, callback) {
-    const lockPath = await acquireLock(directory);
+    const ownership = await acquireLock(directory);
     let result;
     let callbackError;
     try {
@@ -334,13 +424,17 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
 
     let releaseError;
     try {
-      await releaseLock(lockPath);
+      await releaseLock(ownership);
     } catch (error) {
       releaseError = error;
     }
 
+    if (releaseError) {
+      if (callbackError) releaseError.cause = callbackError;
+      if (releaseError instanceof WorkflowError) throw releaseError;
+      throwFs("release lock", ownership.path, releaseError);
+    }
     if (callbackError) throw callbackError;
-    if (releaseError) throwFs("release lock", lockPath, releaseError);
     return result;
   }
 
@@ -428,6 +522,8 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
   async function read(runId) {
     const id = ensureRunId(runId);
     const directory = runDirectoryFor(id);
+    await tightenExistingStateRootDirectory();
+    await tightenExistingRunDirectory(directory);
     return attachDirectory(await readRunInternal(id, directory), directory);
   }
 
@@ -437,6 +533,8 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     }
     const id = ensureRunId(runId);
     const directory = runDirectoryFor(id);
+    await tightenExistingStateRootDirectory();
+    await tightenExistingRunDirectory(directory);
 
     return withLock(directory, async () => {
       const current = await readRunInternal(id, directory);
@@ -453,6 +551,8 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     }
     const id = ensureRunId(runId);
     const directory = runDirectoryFor(id);
+    await tightenExistingStateRootDirectory();
+    await tightenExistingRunDirectory(directory);
 
     return withLock(directory, async () => {
       await readRunInternal(id, directory);
@@ -479,6 +579,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
 
   async function list(filters = {}) {
     assertObject(filters, "list filters");
+    if (!await tightenExistingStateRootDirectory()) return [];
     let entries;
     try {
       entries = await fs.readdir(root, { withFileTypes: true });
@@ -492,6 +593,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
       if (!entry.isDirectory() || !RUN_ID_RE.test(entry.name)) continue;
       const runId = entry.name.toLowerCase();
       const directory = runDirectoryFor(runId);
+      await tightenExistingRunDirectory(directory);
       const run = attachDirectory(await readRunInternal(runId, directory), directory);
       if (filters.projectAlias !== undefined && run.projectAlias !== filters.projectAlias) continue;
       if (filters.originSessionId !== undefined && run.originSessionId !== filters.originSessionId) continue;
@@ -509,6 +611,8 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     }
     const id = ensureRunId(runId);
     const directory = runDirectoryFor(id);
+    await tightenExistingStateRootDirectory();
+    await tightenExistingRunDirectory(directory);
 
     return withLock(directory, async () => {
       const current = await readRunInternal(id, directory);
