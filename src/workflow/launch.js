@@ -75,6 +75,7 @@ function executionInputFor(options = {}, deps = {}) {
   return {
     version: EXECUTION_INPUT_VERSION,
     options: cloneData(canonicalize(safe)),
+    ...(options.originSession !== undefined ? { originSession: cloneData(options.originSession) } : {}),
   };
 }
 
@@ -94,7 +95,7 @@ function selectedPermissions(profile = {}) {
   };
 }
 
-function selectedProfile(plan = {}) {
+function selectedProfile(plan = {}, { selectionReason } = {}) {
   const agent = plan.agent ?? {};
   const profile = agent.profile ?? {};
   return {
@@ -105,7 +106,7 @@ function selectedProfile(plan = {}) {
     model: profile.model ?? null,
     arguments: list(profile.arguments),
     permissions: selectedPermissions(profile),
-    reason: `selected workflow agent profile ${agent.profileName ?? "unspecified"}`,
+    reason: selectionReason ?? `selected workflow agent profile ${agent.profileName ?? "unspecified"}`,
   };
 }
 
@@ -145,10 +146,15 @@ function identityForDigest(plan = {}) {
   };
 }
 
+function executionInputForDigest(executionInput = {}) {
+  const { originSession: _originSession, ...stable } = executionInput;
+  return stable;
+}
+
 function digestPayload({ project, request, executionInput, selection, preconditions, reconciliation, assignment, assignmentDigest, conflicts, operations }) {
   return {
     version: 2,
-    executionInput,
+    executionInput: executionInputForDigest(executionInput),
     project,
     request,
     preconditions,
@@ -220,7 +226,7 @@ export async function createLaunchPreview(options = {}, deps = {}) {
 
   const planPreview = await planCommand(planCommandOptions(executionOptions), deps);
   const reconciliation = cloneData(planPreview.reconciliation);
-  const selection = selectedProfile(reconciliation);
+  const selection = selectedProfile(reconciliation, { selectionReason: executionOptions.selectionReason });
   const assignment = buildAssignmentTemplate({
     request: executionOptions.request,
     context: {
@@ -279,7 +285,9 @@ function executionOptionsFromPreview(preview) {
   if (!executionInput || executionInput.version !== EXECUTION_INPUT_VERSION || !executionInput.options || typeof executionInput.options !== "object" || Array.isArray(executionInput.options)) {
     fail("PREFLIGHT", "Launch preview is missing nonvolatile execution input; rerun launch preview before executing");
   }
-  return cloneData(executionInput.options);
+  const options = cloneData(executionInput.options);
+  if (Object.hasOwn(executionInput, "originSession")) options.originSession = cloneData(executionInput.originSession);
+  return options;
 }
 
 async function recomputeApprovedPreview(preview, deps) {
@@ -363,8 +371,8 @@ function runInput(preview, { stateRoot, controlPlaneBin, originSession } = {}) {
     controlPlaneBin,
     assignmentDigest: preview.assignmentDigest,
     approvalDigest: preview.approvalDigest,
-    originSessionId: originSession?.sessionId ?? originSession?.id ?? null,
-    originHarness: originSession?.harness ?? null,
+    originSessionId: typeof originSession === "string" ? originSession : originSession?.sessionId ?? originSession?.id ?? null,
+    originHarness: typeof originSession === "string" ? null : originSession?.harness ?? null,
   };
 }
 
@@ -483,7 +491,7 @@ export async function executeLaunch(preview, deps = {}) {
   const created = await store.create(runInput(fresh, {
     stateRoot,
     controlPlaneBin,
-    originSession: deps.originSession,
+    originSession: executionOptions.originSession ?? deps.originSession,
   }));
   const run = runForHarness(created, { stateRoot, controlPlaneBin });
   await store.writeAssignment(run.id, assignmentWithExecutionHeader(run, fresh.assignment));

@@ -464,6 +464,36 @@ test("dry launch preview is data-only, mutates nothing, and keeps the raw reques
   assert.doesNotMatch(JSON.stringify(preview.request), /touch \/tmp\/no|Do not paraphrase/);
 });
 
+test("launch preview carries an explicit selection reason into the approved assignment", async () => {
+  const reason = "selected after ticket triage";
+  const preview = await previewFor({ selectionReason: reason });
+
+  assert.equal(preview.selection.reason, reason);
+  assert.match(preview.assignment, new RegExp(`Reason: ${reason}`));
+  assert.match(preview.approvalDigest, /^sha256:[0-9a-f]{64}$/);
+});
+
+test("launch persists the supplied origin session identifier as run metadata", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({ originSession: "pi-origin-session-42" }, { calls, planCommand });
+  const store = createStore(calls);
+
+  await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [{ id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1" }],
+      notes: [],
+    }),
+  });
+
+  assert.equal(store.snapshot().originSessionId, "pi-origin-session-42");
+});
+
 test("launch preview resolves approved execution environment from injected defaults and binds it to the digest", async () => {
   const calls = [];
   const preview = await createLaunchPreview(launchOptionsWithoutExecutionEnv(), {

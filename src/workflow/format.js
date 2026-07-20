@@ -233,9 +233,24 @@ function valueForJson(command, value) {
   };
 }
 
+function boundedJson(command, value) {
+  const text = JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
+  const limit = command === "launch" ? ASSIGNMENT_OUTPUT_LIMIT + OUTPUT_LIMIT : OUTPUT_LIMIT;
+  if (text.length <= limit) return text;
+
+  const source = value && typeof value === "object" ? value : {};
+  return JSON.stringify(normalizeJson({
+    command: source.command ?? command,
+    ...(source.runId ? { runId: source.runId } : {}),
+    ...(source.status ? { status: source.status } : {}),
+    truncated: true,
+    truncationMarker: `JSON output truncated at ${limit} characters; rerun with a narrower result query.`,
+  }), null, 2);
+}
+
 export function formatWorkflowResult(command, value, format = "compact") {
   if (format === "json") {
-    return JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
+    return boundedJson(command, value);
   }
 
   switch (command) {

@@ -107,6 +107,23 @@ test("launch run output includes run IDs, state, harness locations, exact comman
   }
 });
 
+test("oversized ordinary JSON output remains parseable with an explicit bounded envelope", () => {
+  const formatted = formatWorkflowResult("result", {
+    command: "result",
+    runId: RUN_ID,
+    status: "completed",
+    result: { summary: "x".repeat(20_000) },
+  }, "json");
+
+  assert.ok(formatted.length <= 12_000);
+  const parsed = JSON.parse(formatted);
+  assert.equal(parsed.command, "result");
+  assert.equal(parsed.runId, RUN_ID);
+  assert.equal(parsed.status, "completed");
+  assert.equal(parsed.truncated, true);
+  assert.match(parsed.truncationMarker, /truncated/i);
+});
+
 test("result and reconcile compact output are bounded and machine JSON stays deterministic", () => {
   const result = formatWorkflowResult("result", {
     command: "result",
