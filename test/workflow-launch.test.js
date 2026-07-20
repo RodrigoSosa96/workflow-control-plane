@@ -1,0 +1,690 @@
+import assert from "node:assert/strict";
+import { join } from "node:path";
+import { test } from "node:test";
+import { buildHarnessLaunch, WORKFLOW_ENV_KEYS } from "../src/workflow/harnesses.js";
+import { RUN_STATES } from "../src/workflow/run-state.js";
+import { buildAssignmentTemplate } from "../src/workflow/assignment.js";
+import { createLaunchPreview, executeLaunch, launchCommand } from "../src/workflow/launch.js";
+import { handoffCommand } from "../src/workflow/commands.js";
+
+const RAW_REQUEST = "Fix `mail` exactly.\n\n$(touch /tmp/no)\nDo not paraphrase this.";
+const RUN_ID = "55555555-5555-4555-8555-555555555555";
+const STATE_ROOT = "/state/workflow";
+const CONTROL_PLANE_BIN = "/repo/bin/workflow.js";
+
+function profileFor(name = "pi-worker", overrides = {}) {
+  if (name === "codex-worker") {
+    return {
+      name,
+      harness: "codex",
+      command: "codex",
+      roles: ["implementer"],
+      profile: {
+        mode: "interactive",
+        model: "gpt-5-codex",
+        arguments: [],
+        sandbox: "workspace-write",
+        approval_policy: "on-request",
+        ...overrides.profile,
+      },
+      ...overrides,
+    };
+  }
+  if (name === "claude-worker") {
+    return {
+      name,
+      harness: "claude",
+      command: "claude",
+      roles: ["implementer"],
+      profile: {
+        mode: "interactive",
+        model: null,
+        arguments: [],
+        permission_mode: "manual",
+        ...overrides.profile,
+      },
+      ...overrides,
+    };
+  }
+  return {
+    name,
+    harness: "pi",
+    command: "pi",
+    roles: ["coordinator", "implementer"],
+    profile: {
+      mode: "interactive",
+      model: null,
+      arguments: [],
+      ...overrides.profile,
+    },
+    ...overrides,
+  };
+}
+
+function buildReconciliation({
+  task = "ASANA-123",
+  relatedTickets = ["ASANA-140"],
+  repositories = ["app"],
+  branchSuffix = "mail-fix",
+  profileName = "codex-worker",
+  profileOverrides = {},
+  status = "incomplete",
+  conflicts = [],
+  agentStatus = "missing",
+  agentReconciliation,
+} = {}) {
+  const selected = profileFor(profileName, profileOverrides);
+  const tickets = [task, ...relatedTickets];
+  const worktrees = repositories.map((alias, index) => ({
+    role: index === 0 ? "primary" : "child",
+    alias,
+    path: `/worktrees/ocr/${task}-${alias}`,
+    branch: `feature/${task}/${alias}-${branchSuffix}`,
+    baseBranch: "dev",
+    repositoryPath: `/repo/${alias}`,
+    label: `${task} ${alias}`,
+  }));
+  const primaryPath = worktrees[0].path;
+  const runtimeProcesses = [
+    { id: "api", command: "npm run dev:api", cwd: "." },
+    { id: "worker", command: "npm run worker", cwd: "services/worker" },
+  ];
+
+  return {
+    mode: repositories.length > 1 ? "group" : "ordinary",
+    status,
+    conflicts,
+    identity: {
+      projectAlias: "ocr",
+      projectLabel: "ExampleProject",
+      projectKind: "work",
+      task,
+      primaryTicket: task,
+      relatedTickets,
+      tickets,
+      feature: "Mail Fix",
+      slug: branchSuffix,
+    },
+    repositories: repositories.map((alias, index) => ({
+      alias,
+      path: `/repo/${alias}`,
+      baseBranch: "dev",
+      branch: worktrees[index].branch,
+      worktreePath: worktrees[index].path,
+    })),
+    worktrees,
+    workspace: {
+      kind: repositories.length > 1 ? "group" : "ordinary",
+      label: `${task} ${branchSuffix}`,
+      path: primaryPath,
+    },
+    tabs: [
+      {
+        label: repositories.length > 1 ? "coordinator" : "agent",
+        kind: "agent",
+        phase: "start",
+        worktreePath: primaryPath,
+        sessionName: `ocr-${task}-${branchSuffix}`,
+        status: "missing",
+      },
+      {
+        label: "runtime",
+        kind: "runtime",
+        phase: "runtime",
+        worktreePath: primaryPath,
+        profileName: "standard",
+        processes: runtimeProcesses,
+        status: "missing",
+      },
+    ],
+    agent: {
+      command: selected.command,
+      sessionName: `ocr-${task}-${branchSuffix}`,
+      tabLabel: repositories.length > 1 ? "coordinator" : "agent",
+      worktreePath: primaryPath,
+      profileName: selected.name,
+      harness: selected.harness,
+      roles: selected.roles,
+      profile: selected.profile,
+      status: agentStatus,
+      actual: null,
+    },
+    runtime: {
+      profileName: "standard",
+      processes: runtimeProcesses,
+      worktreePath: primaryPath,
+      tabLabel: "runtime",
+      status: "incomplete",
+    },
+    operations: [
+      {
+        id: repositories.length > 1 ? "meta-worktree" : "worktree",
+        kind: "herdr.worktree.ensure",
+        phase: "start",
+        cwd: "/repo/ocr",
+        branch: worktrees[0].branch,
+        base: "dev",
+        path: primaryPath,
+        label: `${task} ${branchSuffix}`,
+        reconciliation: { status: "missing", reason: "worktree is missing" },
+      },
+      {
+        id: repositories.length > 1 ? "coordinator-tab" : "agent-tab",
+        kind: "herdr.tab.ensure",
+        phase: "start",
+        cwd: primaryPath,
+        label: repositories.length > 1 ? "coordinator" : "agent",
+        reconciliation: { status: "missing", reason: "agent tab is missing" },
+      },
+      {
+        id: "agent",
+        kind: "agent.session.start",
+        phase: "start",
+        cwd: primaryPath,
+        command: selected.command,
+        sessionName: `ocr-${task}-${branchSuffix}`,
+        tabLabel: repositories.length > 1 ? "coordinator" : "agent",
+        reconciliation: agentReconciliation ?? { status: agentStatus, reason: `agent is ${agentStatus}` },
+      },
+      {
+        id: "runtime",
+        kind: "workflow.runtime.start",
+        phase: "runtime",
+        cwd: primaryPath,
+        profileName: "standard",
+        processes: runtimeProcesses,
+        reconciliation: { status: "incomplete", reason: "runtime is incomplete" },
+      },
+    ],
+  };
+}
+
+function planCommandFactory(calls, planOverrides = {}) {
+  return async function fakePlanCommand(options) {
+    calls.push({ kind: "planCommand", options: { ...options } });
+    const reconciliation = buildReconciliation({
+      task: options.task ?? planOverrides.task,
+      relatedTickets: options.tickets ?? planOverrides.relatedTickets,
+      repositories: options.repositories ?? planOverrides.repositories,
+      branchSuffix: planOverrides.branchSuffix,
+      profileName: options.agentProfile ?? planOverrides.profileName,
+      profileOverrides: planOverrides.profileOverrides,
+      status: planOverrides.status,
+      conflicts: planOverrides.conflicts,
+      agentStatus: planOverrides.agentStatus,
+      agentReconciliation: planOverrides.agentReconciliation,
+    });
+    return {
+      command: "plan",
+      project: { alias: "ocr", label: "ExampleProject", kind: "work", repository: "monorepo" },
+      request: {
+        task: reconciliation.identity.task,
+        tickets: reconciliation.identity.tickets,
+        relatedTickets: reconciliation.identity.relatedTickets,
+        feature: reconciliation.identity.feature,
+        repositories: reconciliation.repositories.map((repository) => repository.alias),
+        runtimeProfile: "standard",
+      },
+      preconditions: {
+        git: { id: "binary:git", status: "ready", path: "/usr/bin/git" },
+        herdr: { id: "binary:herdr", status: "ready", path: "/usr/bin/herdr" },
+        herdrStatus: { id: "herdr:status", status: "ready" },
+        agent: { id: `binary:${reconciliation.agent.harness}`, status: "ready", harness: reconciliation.agent.harness, profileName: reconciliation.agent.profileName },
+        agentIntegration: { id: `herdr:integration:${reconciliation.agent.harness}`, status: "ready", harness: reconciliation.agent.harness, profileName: reconciliation.agent.profileName },
+      },
+      reconciliation,
+      conflicts: reconciliation.conflicts,
+      nextCommand: "workflow launch ocr ASANA-123 --yes",
+    };
+  };
+}
+
+function assertNoFunctions(value, path = "preview") {
+  if (typeof value === "function") assert.fail(`${path} must not contain functions`);
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    assertNoFunctions(child, `${path}.${key}`);
+  }
+}
+
+function createStore(calls, { failUpdateToRunning = null } = {}) {
+  let run = null;
+  const directory = join(STATE_ROOT, RUN_ID);
+  return {
+    async create(input) {
+      calls.push({ kind: "store.create", input });
+      assert.equal(run, null, "test store only creates one run");
+      run = {
+        version: 1,
+        ...input,
+        id: RUN_ID,
+        directory,
+        state: RUN_STATES.PLANNED,
+        generation: input.generation ?? 1,
+        stateHistory: [{ from: null, to: RUN_STATES.PLANNED, at: "2026-01-01T00:00:00.000Z" }],
+      };
+      return { ...run };
+    },
+    async writeAssignment(runId, text) {
+      calls.push({ kind: "store.writeAssignment", runId, text });
+      assert.equal(runId, RUN_ID);
+      assert.ok(run, "run must exist before assignment write");
+      run.assignmentPath = join(directory, "assignment.md");
+      run.assignmentText = text;
+      return { runId, path: run.assignmentPath, writtenAt: "2026-01-01T00:00:01.000Z" };
+    },
+    async update(runId, updater) {
+      calls.push({ kind: "store.update", runId });
+      assert.equal(runId, RUN_ID);
+      assert.ok(run, "run must exist before update");
+      const patch = await updater({ ...run });
+      if (patch.state === RUN_STATES.RUNNING && failUpdateToRunning) throw failUpdateToRunning;
+      const previous = run.state;
+      run = {
+        ...run,
+        ...patch,
+        stateHistory: patch.state && patch.state !== previous
+          ? [...run.stateHistory, { from: previous, to: patch.state, at: `test:${patch.state}` }]
+          : run.stateHistory,
+      };
+      return { ...run };
+    },
+    async read(runId) {
+      calls.push({ kind: "store.read", runId });
+      assert.equal(runId, RUN_ID);
+      if (!run) throw new Error("run not found");
+      return { ...run };
+    },
+    snapshot() {
+      return run ? { ...run } : null;
+    },
+  };
+}
+
+async function previewFor(options = {}, deps = {}) {
+  const calls = deps.calls ?? [];
+  return await createLaunchPreview({
+    request: RAW_REQUEST,
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-140"],
+    repositories: ["app"],
+    agentProfile: "codex-worker",
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    ...options,
+  }, {
+    planCommand: deps.planCommand ?? planCommandFactory(calls, deps.planOverrides),
+    ...deps,
+  });
+}
+
+test("assignment preserves the original request byte-for-byte exactly once inside explicit markers", () => {
+  const request = RAW_REQUEST;
+  const plan = buildReconciliation({ repositories: ["app", "worker"], relatedTickets: ["ASANA-140", "ASANA-150"] });
+  const selection = {
+    profileName: "codex-worker",
+    harness: "codex",
+    reason: "selected by explicit --agent codex-worker",
+    permissions: { sandbox: "workspace-write", approvalPolicy: "on-request" },
+  };
+  const assignment = buildAssignmentTemplate({
+    request,
+    context: {
+      stage: "implementation",
+      project: { alias: "ocr", label: "ExampleProject" },
+      verificationCommands: ["node --test test/workflow-launch.test.js", "npm test"],
+    },
+    plan,
+    selection,
+  });
+
+  assert.equal(assignment.split(request).length - 1, 1);
+  assert.match(assignment, /BEGIN ORIGINAL REQUEST/);
+  assert.match(assignment, /END ORIGINAL REQUEST/);
+  assert.match(assignment, /Primary ticket:\s*ASANA-123/i);
+  assert.match(assignment, /Related tickets:[\s\S]*ASANA-140[\s\S]*ASANA-150/i);
+  assert.match(assignment, /Repositories:[\s\S]*app[\s\S]*worker/i);
+  assert.match(assignment, /Stage:\s*implementation/i);
+  assert.match(assignment, /Selected harness:[\s\S]*codex/i);
+  assert.match(assignment, /selected by explicit --agent codex-worker/i);
+  assert.match(assignment, /Verification commands:[\s\S]*node --test test\/workflow-launch\.test\.js[\s\S]*npm test/i);
+  assert.match(assignment, /node "\$WORKFLOW_CONTROL_PLANE_BIN" handoff "\$WORKFLOW_RUN_ID" --input "\$WORKFLOW_RUN_DIR\/handoff-input\.json"/);
+  assert.match(assignment, /Do not deploy|Do not mutate production data|Do not expose secrets|Do not launch additional agents/i);
+});
+
+test("assignment rejects invalid untrusted requests without echoing them", () => {
+  assert.throws(
+    () => buildAssignmentTemplate({ request: "", context: {}, plan: buildReconciliation(), selection: profileFor("pi-worker") }),
+    /request|required|empty/i,
+  );
+  assert.throws(
+    () => buildAssignmentTemplate({ request: "safe prefix\0SECRET-DO-NOT-LEAK", context: {}, plan: buildReconciliation(), selection: profileFor("pi-worker") }),
+    (error) => {
+      assert.match(error.message, /request|invalid|NUL/i);
+      assert.doesNotMatch(error.message, /SECRET-DO-NOT-LEAK/);
+      return true;
+    },
+  );
+  assert.throws(
+    () => buildAssignmentTemplate({ request: `SECRET-DO-NOT-LEAK-${"x".repeat(80_000)}`, context: {}, plan: buildReconciliation(), selection: profileFor("pi-worker") }),
+    (error) => {
+      assert.match(error.message, /request|limit|large|bytes/i);
+      assert.doesNotMatch(error.message, /SECRET-DO-NOT-LEAK/);
+      assert.ok(error.message.length < 300);
+      return true;
+    },
+  );
+});
+
+test("dry launch preview is data-only, mutates nothing, and keeps the raw request out of operations", async () => {
+  const calls = [];
+  const store = createStore(calls);
+  const preview = await previewFor({}, {
+    calls,
+    store,
+    async executeStart() {
+      calls.push({ kind: "executeStart" });
+      throw new Error("preview must not execute");
+    },
+    herdr: {
+      async startAgent() {
+        calls.push({ kind: "herdr.startAgent" });
+      },
+    },
+    git: {
+      async createWorktree() {
+        calls.push({ kind: "git.createWorktree" });
+      },
+    },
+  });
+
+  assert.equal(preview.command, "launch");
+  assert.match(preview.approvalDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(preview.assignment.split(RAW_REQUEST).length - 1, 1);
+  assertNoFunctions(preview);
+  assert.deepEqual(calls.map((call) => call.kind), ["planCommand"]);
+  assert.doesNotMatch(JSON.stringify(preview.operations), /touch \/tmp\/no|Do not paraphrase/);
+  assert.doesNotMatch(JSON.stringify(preview.reconciliation.runtime.processes), /touch \/tmp\/no|Do not paraphrase/);
+  assert.doesNotMatch(JSON.stringify(preview.request), /touch \/tmp\/no|Do not paraphrase/);
+});
+
+test("approval digest binds request, selected profile permissions, tickets, repositories, branches, and assignment but excludes volatile run data", async () => {
+  const base = await previewFor();
+  const changedRequest = await previewFor({ request: `${RAW_REQUEST}\nOne more requirement.` });
+  const changedProfile = await previewFor({ agentProfile: "claude-worker" });
+  const changedPermissions = await previewFor({}, {
+    planOverrides: {
+      profileName: "codex-worker",
+      profileOverrides: { profile: { sandbox: "read-only", approval_policy: "never" } },
+    },
+  });
+  const changedTickets = await previewFor({ tickets: ["ASANA-140", "ASANA-150"] });
+  const changedRepositories = await previewFor({ repositories: ["app", "worker"] });
+  const changedBranches = await previewFor({}, { planOverrides: { branchSuffix: "other-branch" } });
+  const volatileOnly = await previewFor({ runId: "not-bound", createdAt: "2099-01-01T00:00:00.000Z" });
+
+  for (const other of [changedRequest, changedProfile, changedPermissions, changedTickets, changedRepositories, changedBranches]) {
+    assert.notEqual(other.approvalDigest, base.approvalDigest);
+  }
+  assert.equal(volatileOnly.approvalDigest, base.approvalDigest);
+});
+
+test("missing or stale approval digests fail before any mutation", async () => {
+  const preview = await previewFor();
+
+  for (const approvalDigest of [undefined, "sha256:0000000000000000000000000000000000000000000000000000000000000000"]) {
+    const calls = [];
+    const store = createStore(calls);
+    await assert.rejects(
+      () => executeLaunch({ ...preview, approvalDigest }, {
+        store,
+        stateRoot: STATE_ROOT,
+        controlPlaneBin: CONTROL_PLANE_BIN,
+        executeStart: async () => {
+          calls.push({ kind: "executeStart" });
+          return { status: "completed", operations: [] };
+        },
+      }),
+      /approval digest|stale|missing/i,
+    );
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("confirmed launch writes the run and assignment, starts exactly one selected harness with run env, persists session ids, and stops at running", async () => {
+  const preview = await previewFor();
+  const calls = [];
+  const store = createStore(calls);
+  let launchSpec;
+
+  const report = await executeLaunch(preview, {
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    originSession: { harness: "pi", sessionId: "origin-pi-session" },
+    executeStart: async (plan, adapters, options) => {
+      calls.push({ kind: "executeStart", plan, adapters });
+      launchSpec = options.buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { harness: plan.agent.harness, command: plan.agent.command, roles: plan.agent.roles, ...plan.agent.profile },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      calls.push({ kind: "buildHarnessLaunch", launchSpec });
+      assert.deepEqual(Object.keys(launchSpec.env), WORKFLOW_ENV_KEYS);
+      assert.equal(launchSpec.env.WORKFLOW_RUN_ID, RUN_ID);
+      assert.equal(launchSpec.env.WORKFLOW_RUN_DIR, join(STATE_ROOT, RUN_ID));
+      assert.equal(launchSpec.env.WORKFLOW_GENERATION, "1");
+      assert.equal(launchSpec.env.WORKFLOW_HARNESS, "codex");
+      assert.equal(launchSpec.env.WORKFLOW_STATE_ROOT, STATE_ROOT);
+      assert.equal(launchSpec.env.WORKFLOW_CONTROL_PLANE_BIN, CONTROL_PLANE_BIN);
+      assert.doesNotMatch(JSON.stringify(launchSpec.argv), /touch \/tmp\/no|Do not paraphrase/);
+      assert.equal(launchSpec.expected.harness, "codex");
+      return {
+        status: "completed",
+        operations: [
+          { id: "worktree", kind: "herdr.worktree.ensure", status: "created" },
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+        ],
+        result: { status: "completed", summary: "must not be interpreted during launch" },
+        guidance: [],
+        notes: [],
+      };
+    },
+    submitHandoff: async () => {
+      calls.push({ kind: "submitHandoff" });
+      throw new Error("launch must not submit handoff");
+    },
+    readCurrentResult: async () => {
+      calls.push({ kind: "readCurrentResult" });
+      throw new Error("launch must not inspect results");
+    },
+  });
+
+  assert.equal(report.status, "running");
+  assert.equal(report.runId, RUN_ID);
+  assert.equal(report.recoveryCommand, `workflow reconcile --run ${RUN_ID}`);
+  assert.equal(calls.filter((call) => call.kind === "executeStart").length, 1);
+  assert.equal(calls.filter((call) => call.kind === "buildHarnessLaunch").length, 1);
+  assert.equal(calls.some((call) => call.kind === "submitHandoff" || call.kind === "readCurrentResult"), false);
+
+  const createCall = calls.find((call) => call.kind === "store.create");
+  assert.equal(createCall.input.assignmentDigest, preview.assignmentDigest);
+  assert.equal(createCall.input.approvalDigest, preview.approvalDigest);
+  assert.equal(createCall.input.originalRequest, undefined);
+  assert.equal(createCall.input.originSessionId, "origin-pi-session");
+
+  const assignmentWrite = calls.find((call) => call.kind === "store.writeAssignment");
+  assert.match(assignmentWrite.text, new RegExp(`Workflow Run: ${RUN_ID}`));
+  assert.equal(assignmentWrite.text.split(RAW_REQUEST).length - 1, 1);
+
+  const storedRun = store.snapshot();
+  assert.deepEqual(storedRun.stateHistory.map((entry) => entry.to), [
+    RUN_STATES.PLANNED,
+    RUN_STATES.LAUNCHING,
+    RUN_STATES.RUNNING,
+  ]);
+  assert.equal(storedRun.state, RUN_STATES.RUNNING);
+  assert.equal(storedRun.harness, "codex");
+  assert.equal(storedRun.profileName, "codex-worker");
+  assert.equal(storedRun.agentId, "agent-1");
+  assert.equal(storedRun.tabId, "tab-1");
+  assert.equal(storedRun.paneId, "pane-1");
+  assert.equal(storedRun.nativeSessionId, launchSpec.expected.nativeSessionId);
+});
+
+test("partial environment or agent startup failures preserve the run and return exact reconcile recovery", async () => {
+  const preview = await previewFor();
+  const calls = [];
+  const store = createStore(calls);
+
+  const report = await executeLaunch(preview, {
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => {
+      calls.push({ kind: "executeStart" });
+      return {
+        status: "partial",
+        operations: [
+          { id: "worktree", kind: "herdr.worktree.ensure", status: "created" },
+          { id: "agent", kind: "agent.session.start", status: "failed", error: "agent failed to start" },
+        ],
+        guidance: ["old recovery guidance must not replace reconcile"],
+        notes: [],
+        error: { name: "AgentStartError", message: "agent failed to start" },
+      };
+    },
+  });
+
+  assert.equal(report.status, "partial");
+  assert.equal(report.runId, RUN_ID);
+  assert.equal(report.recoveryCommand, `workflow reconcile --run ${RUN_ID}`);
+  assert.deepEqual(report.guidance, [`workflow reconcile --run ${RUN_ID}`]);
+  assert.equal(calls.some((call) => call.kind === "store.delete" || call.kind === "git.removeWorktree"), false);
+  assert.ok(store.snapshot(), "run should remain available for reconciliation");
+  assert.equal(calls.some((call) => call.kind === "store.writeAssignment"), true);
+});
+
+test("incompatible live writers block launch before prompt delivery or agent start", async () => {
+  const preview = await previewFor({}, {
+    planOverrides: {
+      status: "conflict",
+      conflicts: [{ resource: "agent", reason: "Distinct live writer owns checkout /worktrees/ocr/ASANA-123-app" }],
+      agentStatus: "conflict",
+      agentReconciliation: { status: "conflict", reason: "Distinct live writer owns checkout" },
+    },
+  });
+  const calls = [];
+  const store = createStore(calls);
+
+  await assert.rejects(
+    () => executeLaunch(preview, {
+      store,
+      stateRoot: STATE_ROOT,
+      controlPlaneBin: CONTROL_PLANE_BIN,
+      executeStart: async () => {
+        calls.push({ kind: "executeStart" });
+        return { status: "completed", operations: [] };
+      },
+    }),
+    /conflict|live writer|agent/i,
+  );
+
+  assert.deepEqual(calls, []);
+});
+
+test("launchCommand recomputes immediately before execute and rejects stale approved digests before mutation", async () => {
+  const calls = [];
+  let planOverrides = { branchSuffix: "mail-fix" };
+  const planCommand = async (options) => planCommandFactory(calls, planOverrides)(options);
+  const command = await launchCommand({
+    request: RAW_REQUEST,
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-140"],
+    repositories: ["app"],
+    agentProfile: "codex-worker",
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    approvalDigest: null,
+  }, { planCommand });
+  const approvedDigest = command.preview.approvalDigest;
+
+  planOverrides = { branchSuffix: "changed-after-approval" };
+  const store = createStore(calls);
+  await assert.rejects(
+    () => command.execute({ approvalDigest: approvedDigest, store, stateRoot: STATE_ROOT, controlPlaneBin: CONTROL_PLANE_BIN }),
+    /approval digest|stale/i,
+  );
+  assert.equal(calls.some((call) => call.kind === "store.create" || call.kind === "executeStart"), false);
+});
+
+test("handoff command reads only run-dir handoff-input.json, verifies WORKFLOW_RUN_ID, delegates submitHandoff, and rejects arbitrary paths", async () => {
+  const calls = [];
+  const runDirectory = join(STATE_ROOT, RUN_ID);
+  const canonicalInput = join(runDirectory, "handoff-input.json");
+  const handoffInput = {
+    version: 1,
+    status: "completed",
+    summary: "Implemented.",
+    tickets: [{ id: "ASANA-123", status: "completed", evidence: ["node --test"] }],
+    changedFiles: ["src/workflow/launch.js"],
+    verification: [{ command: "node --test", status: "passed", summary: "ok" }],
+    decisions: [],
+    concerns: [],
+    nextAction: "Review",
+  };
+  const store = {
+    async read(runId) {
+      calls.push({ kind: "store.read", runId });
+      return { id: RUN_ID, directory: runDirectory, generation: 2 };
+    },
+  };
+  const fs = {
+    async readFile(path, encoding) {
+      calls.push({ kind: "fs.readFile", path, encoding });
+      assert.equal(path, canonicalInput);
+      assert.equal(encoding, "utf8");
+      return JSON.stringify(handoffInput);
+    },
+  };
+  const expectedResult = { version: 1, runId: RUN_ID, generation: 2, status: "completed" };
+
+  const result = await handoffCommand({
+    runId: RUN_ID,
+    input: canonicalInput,
+    env: { WORKFLOW_RUN_ID: RUN_ID },
+  }, {
+    store,
+    git: { fingerprint: async () => ({}) },
+    fs,
+    submitHandoff: async (payload) => {
+      calls.push({ kind: "submitHandoff", payload });
+      assert.equal(payload.runId, RUN_ID);
+      assert.equal(payload.generation, 2);
+      assert.deepEqual(payload.input, handoffInput);
+      return expectedResult;
+    },
+  });
+
+  assert.deepEqual(result, expectedResult);
+  assert.deepEqual(calls.map((call) => call.kind), ["store.read", "fs.readFile", "submitHandoff"]);
+
+  await assert.rejects(
+    () => handoffCommand({ runId: RUN_ID, input: "/tmp/attacker.json", env: { WORKFLOW_RUN_ID: RUN_ID } }, { store, fs, submitHandoff: async () => expectedResult }),
+    /handoff-input\.json|arbitrary|canonical/i,
+  );
+  await assert.rejects(
+    () => handoffCommand({ runId: RUN_ID, input: canonicalInput, output: "/tmp/result.json", env: { WORKFLOW_RUN_ID: RUN_ID } }, { store, fs, submitHandoff: async () => expectedResult }),
+    /output|not accepted|canonical/i,
+  );
+  await assert.rejects(
+    () => handoffCommand({ runId: RUN_ID, input: canonicalInput, env: { WORKFLOW_RUN_ID: "other-run" } }, { store, fs, submitHandoff: async () => expectedResult }),
+    /WORKFLOW_RUN_ID|mismatch/i,
+  );
+});

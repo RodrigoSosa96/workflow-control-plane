@@ -8,8 +8,9 @@ import { createProcessRunner } from "../src/workflow/process.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { doctorCommand as defaultDoctorCommand, planCommand as defaultPlanCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
+import { doctorCommand as defaultDoctorCommand, handoffCommand as defaultHandoffCommand, planCommand as defaultPlanCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
+import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
 import { loadRegistry as defaultLoadRegistry } from "../src/workflow/registry.js";
 
@@ -24,10 +25,12 @@ Commands:
   workflow start <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--agent <profile>] [--format compact|json] [--yes]
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
   workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
+  workflow handoff <run-id> --input <run-dir>/handoff-input.json [--format compact|json]
 
 Environment:
-  WORKFLOW_PROJECTS_FILE   Alternate workflow registry path`;
-const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help"]);
+  WORKFLOW_PROJECTS_FILE   Alternate workflow registry path
+  WORKFLOW_STATE_ROOT      Workflow run-state root for handoff`;
+const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help", "input"]);
 
 function bound(text) {
   const value = String(text ?? "").replace(/\r\n?/g, "\n");
@@ -100,6 +103,16 @@ export function parseArgs(argv) {
     };
   }
 
+  if (command === "handoff") {
+    validateShape("handoff", positionals, options, { min: 1, max: 1, allowedOptions: ["input"] });
+    return {
+      command,
+      runId: positionals[0],
+      ...(options.input ? { input: options.input } : {}),
+      format,
+    };
+  }
+
   const baseOptions = {
     command,
     projectAlias: positionals[0],
@@ -150,11 +163,13 @@ async function lookupExecutable(name, env = process.env) {
 function createLiveDependencies(dependencies) {
   const env = dependencies.env ?? process.env;
   const runner = dependencies.runner ?? createProcessRunner();
+  const stateRoot = dependencies.stateRoot ?? env.WORKFLOW_STATE_ROOT;
   return {
     loadRegistry: dependencies.loadRegistry ?? defaultLoadRegistry,
     lookupExecutable: dependencies.lookupExecutable ?? ((name) => lookupExecutable(name, env)),
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
+    store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot }) : undefined),
   };
 }
 
@@ -205,6 +220,7 @@ function categorizeError(error) {
   if (error instanceof WorkflowError) {
     if (error.category === "CONFLICT") return { category: "CONFLICT", exitCode: 11 };
     if (error.category === "PREFLIGHT") return { category: "PREFLIGHT", exitCode: 10 };
+    if (error.category === "HANDOFF") return { category: "HANDOFF", exitCode: 10 };
     if (error.category === "PROCESS" || error.category === "HERDR") return { category: "PROCESS", exitCode: 12 };
     return { category: "CONFIG", exitCode: 3 };
   }
@@ -219,6 +235,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const doctorCommand = dependencies.doctorCommand ?? defaultDoctorCommand;
   const planCommand = dependencies.planCommand ?? defaultPlanCommand;
   const statusCommand = dependencies.statusCommand ?? defaultStatusCommand;
+  const handoffCommand = dependencies.handoffCommand ?? defaultHandoffCommand;
   const executeStart = dependencies.executeStart ?? defaultExecuteStart;
   const executeRuntime = dependencies.executeRuntime ?? defaultExecuteRuntime;
   const confirm = dependencies.confirm ?? defaultConfirm;
@@ -253,6 +270,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const result = await statusCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("status", result, args.format));
       return result.reconciliation?.status === "conflict" ? 11 : 0;
+    }
+
+    if (args.command === "handoff") {
+      const result = await handoffCommand({ ...options, env }, liveDependencies);
+      emit(out, formatWorkflowResult("handoff", result, args.format));
+      return 0;
     }
 
     if (!args.yes && !isInteractive()) {

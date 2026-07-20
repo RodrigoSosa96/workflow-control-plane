@@ -121,6 +121,13 @@ test("parses documented workflow commands and options", () => {
     tickets: ["ASANA-150", "ASANA-140"],
     format: "compact",
   });
+
+  assert.deepEqual(parseArgs(["handoff", "55555555-5555-4555-8555-555555555555", "--input", "/state/run/handoff-input.json"]), {
+    command: "handoff",
+    runId: "55555555-5555-4555-8555-555555555555",
+    input: "/state/run/handoff-input.json",
+    format: "compact",
+  });
 });
 
 test("rejects unknown, duplicate, and disallowed options", () => {
@@ -162,6 +169,41 @@ test("doctor uses the package registry by default and honors WORKFLOW_PROJECTS_F
     env: { WORKFLOW_PROJECTS_FILE: "/tmp/custom-projects.yaml" },
   }), 0);
   assert.equal(seen[1], "/tmp/custom-projects.yaml");
+});
+
+test("main runs the canonical handoff command without mutation confirmation", async () => {
+  const output = io();
+  const calls = [];
+  const runId = "55555555-5555-4555-8555-555555555555";
+  const code = await main(["handoff", runId, "--input", "/state/run/handoff-input.json"], {
+    ...output,
+    env: {
+      WORKFLOW_RUN_ID: runId,
+      WORKFLOW_RUN_DIR: "/state/run",
+      WORKFLOW_STATE_ROOT: "/state",
+    },
+    handoffCommand: async (options) => {
+      calls.push(options);
+      return { version: 1, runId, generation: 1, status: "completed" };
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{
+    command: "handoff",
+    runId,
+    input: "/state/run/handoff-input.json",
+    format: "compact",
+    registryPath: join(packageRoot, "projects.yaml"),
+    env: {
+      WORKFLOW_RUN_ID: runId,
+      WORKFLOW_RUN_DIR: "/state/run",
+      WORKFLOW_STATE_ROOT: "/state",
+    },
+  }]);
+  assert.deepEqual(output.stdout, ["handoff:compact:completed"]);
+  assert.deepEqual(output.stderr, []);
 });
 
 test("main prints compact and json output for read-only commands", async () => {

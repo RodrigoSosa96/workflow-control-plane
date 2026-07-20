@@ -1,4 +1,8 @@
-import { join } from "node:path";
+import * as defaultFs from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { WorkflowError } from "./errors.js";
+import { submitHandoff as defaultSubmitHandoff } from "./handoff.js";
+import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
@@ -424,4 +428,85 @@ export async function statusCommand(options = {}, {
     nextCommand: nextCommandFor(cliRequest, preconditions, reconciliation),
     suggestedManifest: suggestedManifestFor(cliRequest, reconciliation),
   };
+}
+
+function failHandoff(message, details) {
+  throw new WorkflowError("HANDOFF", message, { details, exitCode: 10 });
+}
+
+function assertRunId(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    failHandoff("run ID is required");
+  }
+  return value.trim();
+}
+
+function canonicalHandoffInputPath(run) {
+  return join(run.directory, "handoff-input.json");
+}
+
+function assertCanonicalHandoffInput(inputPath, expectedPath) {
+  if (inputPath !== undefined && resolve(inputPath) !== resolve(expectedPath)) {
+    failHandoff("Handoff input must be the canonical run-directory handoff-input.json path; arbitrary input paths are not accepted");
+  }
+}
+
+function assertNoHandoffOutputPath(options) {
+  if (options.output !== undefined || options.outputPath !== undefined || options.resultPath !== undefined) {
+    failHandoff("Handoff output paths are not accepted; submitHandoff creates the canonical run-directory result.json");
+  }
+}
+
+function assertWorkflowRunEnv(runId, env = {}) {
+  if (env.WORKFLOW_RUN_ID !== undefined && env.WORKFLOW_RUN_ID !== runId) {
+    failHandoff("WORKFLOW_RUN_ID does not match the handoff run ID");
+  }
+}
+
+function parseHandoffJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    failHandoff("Handoff input JSON could not be parsed");
+  }
+}
+
+export async function handoffCommand(options = {}, {
+  store,
+  git,
+  fs = defaultFs,
+  env = process.env,
+  submitHandoff = defaultSubmitHandoff,
+} = {}) {
+  assertNoHandoffOutputPath(options);
+  const runId = assertRunId(options.runId);
+  assertWorkflowRunEnv(runId, options.env ?? env);
+  if (!store || typeof store.read !== "function") {
+    failHandoff("Run store interface is required");
+  }
+  if (typeof fs?.readFile !== "function") {
+    failHandoff("Filesystem read interface is required");
+  }
+  if (typeof submitHandoff !== "function") {
+    failHandoff("submitHandoff interface is required");
+  }
+
+  const run = await store.read(runId);
+  const inputPath = canonicalHandoffInputPath(run);
+  assertCanonicalHandoffInput(options.input, inputPath);
+  const input = parseHandoffJson(await fs.readFile(inputPath, "utf8"));
+  return await submitHandoff({
+    store,
+    git,
+    runId,
+    generation: run.generation ?? 1,
+    input,
+  });
+}
+
+export async function launchCommand(options = {}, deps = {}) {
+  return await createWorkflowLaunchCommand(options, {
+    ...deps,
+    planCommand: deps.planCommand ?? planCommand,
+  });
 }
