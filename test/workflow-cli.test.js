@@ -344,15 +344,18 @@ test("launch rejects absent, empty, NUL, and oversized prompt-file input before 
   const dir = await mkdtemp(join(tmpdir(), "workflow-launch-invalid-"));
   const emptyFile = join(dir, "empty.md");
   const nulFile = join(dir, "nul.md");
+  const invalidUtf8File = join(dir, "invalid-utf8.md");
   const largeFile = join(dir, "large.md");
   await writeFile(emptyFile, "");
   await writeFile(nulFile, "safe prefix\0SECRET-DO-NOT-LEAK");
+  await writeFile(invalidUtf8File, Buffer.from([0x66, 0xff, 0x67]));
   await writeFile(largeFile, `SECRET-DO-NOT-LEAK-${"x".repeat(70 * 1024)}`);
 
   for (const argv of [
     ["launch", "ocr", "ASANA-123", "--dry-run"],
     ["launch", "ocr", "ASANA-123", "--prompt-file", emptyFile, "--dry-run"],
     ["launch", "ocr", "ASANA-123", "--prompt-file", nulFile, "--dry-run"],
+    ["launch", "ocr", "ASANA-123", "--prompt-file", invalidUtf8File, "--dry-run"],
     ["launch", "ocr", "ASANA-123", "--prompt-file", largeFile, "--dry-run"],
   ]) {
     const output = io();
@@ -367,7 +370,7 @@ test("launch rejects absent, empty, NUL, and oversized prompt-file input before 
 
     assert.equal(code, 64, argv.join(" "));
     assert.equal(called, false, argv.join(" "));
-    assert.match(output.stderr[0], /prompt-file|request|empty|NUL|limit|required/i);
+    assert.match(output.stderr[0], /prompt-file|request|empty|NUL|UTF-8|limit|required/i);
     assert.doesNotMatch(output.stderr[0], /SECRET-DO-NOT-LEAK/);
   }
 });

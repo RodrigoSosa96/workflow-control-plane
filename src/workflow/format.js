@@ -135,6 +135,7 @@ function formatLaunchPreview(value) {
     `Permission mode: ${permissionLine(value.selection)}`,
     `Writable roots: ${writableRootsFor(value).join(", ") || "none"}`,
     `Approval digest: ${text(value.approvalDigest)}`,
+    `Launch argv: ${Array.isArray(value.launchSpec?.argv) ? JSON.stringify(value.launchSpec.argv) : "unavailable"}`,
     "Assignment:",
     formatAssignmentText(value.assignment, assignmentPathFor(value)),
   ];
@@ -226,8 +227,20 @@ function valueForJson(command, value) {
   if (command !== "launch" || !value || typeof value !== "object" || !Object.hasOwn(value, "assignment")) {
     return value;
   }
+  const executionInput = value.executionInput && typeof value.executionInput === "object"
+    ? {
+      ...value.executionInput,
+      options: value.executionInput.options && typeof value.executionInput.options === "object"
+        ? {
+          ...value.executionInput.options,
+          ...(Object.hasOwn(value.executionInput.options, "request") ? { request: "[redacted; preserved in assignment]" } : {}),
+        }
+        : value.executionInput.options,
+    }
+    : value.executionInput;
   return {
     ...value,
+    executionInput,
     assignment: formatAssignmentText(value.assignment, assignmentPathFor(value)),
     assignmentTruncated: String(value.assignment ?? "").length > ASSIGNMENT_OUTPUT_LIMIT,
   };

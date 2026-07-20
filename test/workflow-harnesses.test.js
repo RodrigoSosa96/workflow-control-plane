@@ -91,7 +91,8 @@ test("builds exact safe argv arrays and run env for Pi, Claude, and Codex profil
   assert.ok(claudeSpec.argv.includes("--permission-mode"));
   assert.ok(claudeSpec.argv.includes("manual"));
   assert.ok(claudeSpec.argv.includes("--add-dir"));
-  assert.ok(claudeSpec.argv.includes(CWD));
+  assert.equal(claudeSpec.argv[claudeSpec.argv.indexOf("--add-dir") + 1], RUN.directory);
+  assert.equal(claudeSpec.argv.includes(CWD), false);
   assert.ok(claudeSpec.argv.includes("--model"));
   assert.ok(claudeSpec.argv.includes("claude-3-5-sonnet-latest"));
   assert.equal(claudeSpec.argv.at(-2), "--verbose");
@@ -115,6 +116,8 @@ test("builds exact safe argv arrays and run env for Pi, Claude, and Codex profil
   assert.deepEqual(codexSpec.argv.slice(0, 3), ["codex", "-C", "/wt/ocr/A-1-fix"]);
   assert.ok(codexSpec.argv.includes("workspace-write"));
   assert.ok(codexSpec.argv.includes("on-request"));
+  assert.ok(codexSpec.argv.includes("--add-dir"));
+  assert.equal(codexSpec.argv[codexSpec.argv.indexOf("--add-dir") + 1], RUN.directory);
   assert.ok(codexSpec.argv.includes("--model"));
   assert.ok(codexSpec.argv.includes("gpt-5-codex"));
   assert.equal(codexSpec.argv.at(-3), "--config");

@@ -73,6 +73,7 @@ function buildAgent({ selectedAgent, sessionName, worktreePath, tabLabel }) {
     tabLabel,
     worktreePath,
     profileName: selectedAgent.name,
+    selectionSource: selectedAgent.source,
     harness: selectedAgent.profile.harness,
     roles: clone(selectedAgent.profile.roles),
     profile: sanitizeAgentProfile(selectedAgent.profile),

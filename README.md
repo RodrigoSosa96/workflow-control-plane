@@ -45,6 +45,7 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 - `workflow start` does not submit an implementation prompt automatically.
 - Runtime processes stay opt-in through `workflow runtime`; `workflow start` prepares only the agent workspace.
 - `workflow launch` reads the untrusted request only from `--prompt-file`; there is no `--prompt` option, and the file is read as bytes rather than shell-interpreted text.
+- Launch previews show the selected shell-free argv; run and native session values generated after approval are displayed as explicit placeholders, never guessed or passed from request text.
 - Private state lives under `projects.yaml` `launcher.state_root` (or `WORKFLOW_STATE_ROOT` for worker handoff) with private run directories, `assignment.md`, `handoff-input.json`, and canonical `result.json` artifacts.
 - The launcher follows a no-cleanup policy: failed or partial launches preserve worktrees, Herdr tabs/panes, run directories, and the fallback workspace for manual recovery.
 - Acme bundle planning must name the selected repositories explicitly with `--repos`.

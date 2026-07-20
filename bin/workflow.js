@@ -116,6 +116,9 @@ async function readPromptFile(path) {
     usageError("Prompt file request contains invalid NUL characters.");
   }
   const request = bytes.toString("utf8");
+  if (!Buffer.from(request, "utf8").equals(bytes)) {
+    usageError("Prompt file request must be valid UTF-8 text.");
+  }
   if (request.trim().length === 0) {
     usageError("Prompt file request is empty.");
   }

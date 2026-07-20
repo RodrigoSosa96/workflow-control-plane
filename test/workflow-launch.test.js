@@ -13,6 +13,7 @@ const STATE_ROOT = "/state/workflow";
 const CONTROL_PLANE_BIN = "/repo/bin/workflow.js";
 
 function profileFor(name = "pi-worker", overrides = {}) {
+  const { profile: profileOptions = {}, ...agentOptions } = overrides;
   if (name === "codex-worker") {
     return {
       name,
@@ -25,9 +26,9 @@ function profileFor(name = "pi-worker", overrides = {}) {
         arguments: [],
         sandbox: "workspace-write",
         approval_policy: "on-request",
-        ...overrides.profile,
+        ...profileOptions,
       },
-      ...overrides,
+      ...agentOptions,
     };
   }
   if (name === "claude-worker") {
@@ -41,9 +42,9 @@ function profileFor(name = "pi-worker", overrides = {}) {
         model: null,
         arguments: [],
         permission_mode: "manual",
-        ...overrides.profile,
+        ...profileOptions,
       },
-      ...overrides,
+      ...agentOptions,
     };
   }
   return {
@@ -55,9 +56,9 @@ function profileFor(name = "pi-worker", overrides = {}) {
       mode: "interactive",
       model: null,
       arguments: [],
-      ...overrides.profile,
+      ...profileOptions,
     },
-    ...overrides,
+    ...agentOptions,
   };
 }
 
@@ -144,6 +145,7 @@ function buildReconciliation({
       tabLabel: repositories.length > 1 ? "coordinator" : "agent",
       worktreePath: primaryPath,
       profileName: selected.name,
+      selectionSource: "explicit",
       harness: selected.harness,
       roles: selected.roles,
       profile: selected.profile,
@@ -464,19 +466,44 @@ test("dry launch preview is data-only, mutates nothing, and keeps the raw reques
   assert.doesNotMatch(JSON.stringify(preview.request), /touch \/tmp\/no|Do not paraphrase/);
 });
 
+test("launch preview exposes selected harness argv with generated values marked and no request text", async () => {
+  const preview = await previewFor();
+
+  assert.deepEqual(preview.launchSpec.argv.slice(0, 10), [
+    "codex",
+    "-C",
+    "/worktrees/ocr/ASANA-123-app",
+    "--add-dir",
+    "/state/workflow/<generated-run-id>",
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "on-request",
+    "--model",
+  ]);
+  assert.equal(preview.launchSpec.expected.nativeSessionId, null);
+  assert.match(preview.launchSpec.argv.at(-1), /\$WORKFLOW_RUN_DIR\/handoff-input\.json/);
+  assert.doesNotMatch(JSON.stringify(preview.launchSpec), /touch \/tmp\/no|Do not paraphrase/);
+});
+
 test("launch preview carries an explicit selection reason into the approved assignment", async () => {
   const reason = "selected after ticket triage";
   const preview = await previewFor({ selectionReason: reason });
 
+  assert.equal(preview.selection.source, "explicit");
   assert.equal(preview.selection.reason, reason);
+  assert.match(preview.assignment, /Selection source: explicit/);
   assert.match(preview.assignment, new RegExp(`Reason: ${reason}`));
   assert.match(preview.approvalDigest, /^sha256:[0-9a-f]{64}$/);
 });
 
-test("launch persists the supplied origin session identifier as run metadata", async () => {
+test("launch persists selection and supplied origin session metadata", async () => {
   const calls = [];
   const planCommand = planCommandFactory(calls);
-  const preview = await previewFor({ originSession: "pi-origin-session-42" }, { calls, planCommand });
+  const preview = await previewFor({
+    originSession: "pi-origin-session-42",
+    selectionReason: "selected after ticket triage",
+  }, { calls, planCommand });
   const store = createStore(calls);
 
   await executeLaunch(preview, {
@@ -492,6 +519,10 @@ test("launch persists the supplied origin session identifier as run metadata", a
   });
 
   assert.equal(store.snapshot().originSessionId, "pi-origin-session-42");
+  assert.equal(store.snapshot().selectionSource, "explicit");
+  assert.equal(store.snapshot().selectionReason, "selected after ticket triage");
+  assert.deepEqual(store.snapshot().launchArgv.slice(0, 3), ["codex", "-C", "/worktrees/ocr/ASANA-123-app"]);
+  assert.doesNotMatch(JSON.stringify(store.snapshot().launchArgv), /touch \/tmp\/no|Do not paraphrase/);
 });
 
 test("launch preview resolves approved execution environment from injected defaults and binds it to the digest", async () => {

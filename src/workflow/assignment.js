@@ -104,6 +104,7 @@ function selectionSummary(selection = {}, plan = {}) {
   return {
     profileName: selection.profileName ?? selection.name ?? agent.profileName ?? "unspecified",
     harness: selection.harness ?? agent.harness ?? profile.harness ?? "unspecified",
+    source: selection.source ?? agent.selectionSource ?? "unspecified",
     reason: selection.reason ?? "selected by workflow launch coordinator",
     permissions,
   };
@@ -156,6 +157,7 @@ export function buildAssignmentTemplate({ request, context = {}, plan = {}, sele
     "## Selected Harness",
     `Selected harness: ${selected.harness}`,
     `Profile: ${selected.profileName}`,
+    `Selection source: ${selected.source}`,
     `Reason: ${selected.reason}`,
     "Permissions:",
     permissionsLine(selected.permissions),

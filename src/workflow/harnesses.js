@@ -82,7 +82,7 @@ function claudeArgv({ profile, cwd, run, nativeSessionId }) {
   const argv = [profile.command];
   if (run) argv.push("--session-id", nativeSessionId);
   argv.push("--permission-mode", assertString(profile.permission_mode, "profile.permission_mode"));
-  argv.push("--add-dir", cwd);
+  argv.push("--add-dir", run ? assertString(run.directory, "run.directory") : cwd);
   appendModel(argv, profile.model);
   argv.push(...profile.arguments);
   const bootstrap = runBootstrapPrompt(run);
@@ -92,6 +92,7 @@ function claudeArgv({ profile, cwd, run, nativeSessionId }) {
 
 function codexArgv({ profile, cwd, run }) {
   const argv = [profile.command, "-C", cwd];
+  if (run) argv.push("--add-dir", assertString(run.directory, "run.directory"));
   argv.push("--sandbox", assertString(profile.sandbox, "profile.sandbox"));
   argv.push("--ask-for-approval", assertString(profile.approval_policy, "profile.approval_policy"));
   appendModel(argv, profile.model);
@@ -101,14 +102,16 @@ function codexArgv({ profile, cwd, run }) {
   return argv;
 }
 
-export function buildHarnessLaunch({ profileName, profile, sessionName, cwd, run } = {}) {
+export function buildHarnessLaunch({ profileName, profile, sessionName, cwd, run, nativeSessionId: requestedNativeSessionId } = {}) {
   assertString(profileName, "profileName");
   assertProfile(profile);
   assertString(sessionName, "sessionName");
   assertString(cwd, "cwd");
 
   const nativeSessionId = run && (profile.harness === "pi" || profile.harness === "claude")
-    ? randomUUID()
+    ? requestedNativeSessionId === undefined
+      ? randomUUID()
+      : assertString(requestedNativeSessionId, "nativeSessionId")
     : null;
   let argv;
   if (profile.harness === "pi") {

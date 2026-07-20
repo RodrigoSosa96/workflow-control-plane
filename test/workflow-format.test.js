@@ -36,6 +36,7 @@ function launchPreview(overrides = {}) {
     runDirectory: "/absolute/run-directory/path",
     assignmentPath: "/absolute/run-directory/path/assignment.md",
     approvalDigest: DIGEST,
+    launchSpec: { argv: ["claude", "--permission-mode", "manual", "<bootstrap>"] },
     assignment: "# Approved assignment\n\nWorker instructions stay here.",
     ...overrides,
   };
@@ -53,11 +54,24 @@ test("compact launch preview prints the required deterministic header and comple
     "Permission mode: manual",
     "Writable roots: /absolute/worktree/path, /absolute/run-directory/path",
     `Approval digest: ${DIGEST}`,
+    'Launch argv: ["claude","--permission-mode","manual","<bootstrap>"]',
     "Assignment:",
     "# Approved assignment",
     "",
     "Worker instructions stay here.",
   ].join("\n"));
+});
+
+test("launch JSON keeps the original request only inside the assignment", () => {
+  const request = "Fix this exactly: $(do-not-run)";
+  const formatted = formatWorkflowResult("launch", launchPreview({
+    assignment: `BEGIN ORIGINAL REQUEST\n${request}\nEND ORIGINAL REQUEST`,
+    executionInput: { options: { request } },
+  }), "json");
+
+  assert.equal(formatted.split(request).length - 1, 1);
+  const parsed = JSON.parse(formatted);
+  assert.equal(parsed.executionInput.options.request, "[redacted; preserved in assignment]");
 });
 
 test("assignment formatting has its own explicit truncation marker and saved path", () => {

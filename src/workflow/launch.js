@@ -100,6 +100,7 @@ function selectedProfile(plan = {}, { selectionReason } = {}) {
   const profile = agent.profile ?? {};
   return {
     profileName: agent.profileName ?? "unspecified",
+    source: agent.selectionSource ?? "unspecified",
     harness: agent.harness ?? profile.harness ?? "unspecified",
     command: agent.command ?? profile.command ?? agent.harness ?? "unspecified",
     roles: list(agent.roles),
@@ -108,6 +109,39 @@ function selectedProfile(plan = {}, { selectionReason } = {}) {
     permissions: selectedPermissions(profile),
     reason: selectionReason ?? `selected workflow agent profile ${agent.profileName ?? "unspecified"}`,
   };
+}
+
+function previewHarnessProfile(plan = {}) {
+  const agent = plan.agent ?? {};
+  const profile = agent.profile ?? {};
+  return {
+    harness: agent.harness,
+    command: agent.command,
+    mode: profile.mode ?? "interactive",
+    model: profile.model ?? null,
+    arguments: list(profile.arguments),
+    ...(profile.permission_mode !== undefined ? { permission_mode: profile.permission_mode } : {}),
+    ...(profile.sandbox !== undefined ? { sandbox: profile.sandbox } : {}),
+    ...(profile.approval_policy !== undefined ? { approval_policy: profile.approval_policy } : {}),
+  };
+}
+
+function previewLaunchSpec(plan = {}, selection = {}, executionOptions = {}) {
+  const runId = "<generated-run-id>";
+  return buildHarnessLaunch({
+    profileName: selection.profileName,
+    profile: previewHarnessProfile(plan),
+    sessionName: plan.agent?.sessionName,
+    cwd: plan.agent?.worktreePath,
+    run: {
+      id: runId,
+      directory: join(executionOptions.stateRoot, runId),
+      generation: 1,
+      stateRoot: executionOptions.stateRoot,
+      controlPlaneBin: executionOptions.controlPlaneBin,
+    },
+    nativeSessionId: "<generated-native-session-id>",
+  });
 }
 
 function repositoriesForDigest(plan = {}) {
@@ -151,7 +185,7 @@ function executionInputForDigest(executionInput = {}) {
   return stable;
 }
 
-function digestPayload({ project, request, executionInput, selection, preconditions, reconciliation, assignment, assignmentDigest, conflicts, operations }) {
+function digestPayload({ project, request, executionInput, selection, preconditions, reconciliation, launchSpec, assignment, assignmentDigest, conflicts, operations }) {
   return {
     version: 2,
     executionInput: executionInputForDigest(executionInput),
@@ -159,10 +193,12 @@ function digestPayload({ project, request, executionInput, selection, preconditi
     request,
     preconditions,
     reconciliation,
+    launchSpec,
     conflicts,
     operations,
     selection: {
       profileName: selection?.profileName,
+      source: selection?.source,
       harness: selection?.harness,
       command: selection?.command,
       roles: selection?.roles,
@@ -227,6 +263,7 @@ export async function createLaunchPreview(options = {}, deps = {}) {
   const planPreview = await planCommand(planCommandOptions(executionOptions), deps);
   const reconciliation = cloneData(planPreview.reconciliation);
   const selection = selectedProfile(reconciliation, { selectionReason: executionOptions.selectionReason });
+  const launchSpec = previewLaunchSpec(reconciliation, selection, executionOptions);
   const assignment = buildAssignmentTemplate({
     request: executionOptions.request,
     context: {
@@ -244,6 +281,7 @@ export async function createLaunchPreview(options = {}, deps = {}) {
     project: cloneData(planPreview.project),
     request: previewRequest(planPreview, executionOptions),
     selection,
+    launchSpec: cloneData(launchSpec),
     preconditions: cloneData(planPreview.preconditions ?? {}),
     reconciliation,
     assignment,
@@ -366,11 +404,14 @@ function runInput(preview, { stateRoot, controlPlaneBin, originSession } = {}) {
     repositories: runRepositories(preview.reconciliation),
     request: cloneData(preview.request),
     profileName: preview.selection.profileName,
+    selectionSource: preview.selection.source,
+    selectionReason: preview.selection.reason,
     harness: preview.selection.harness,
     stateRoot,
     controlPlaneBin,
     assignmentDigest: preview.assignmentDigest,
     approvalDigest: preview.approvalDigest,
+    launchArgv: cloneData(preview.launchSpec?.argv ?? []),
     originSessionId: typeof originSession === "string" ? originSession : originSession?.sessionId ?? originSession?.id ?? null,
     originHarness: typeof originSession === "string" ? null : originSession?.harness ?? null,
   };

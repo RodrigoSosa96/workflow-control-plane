@@ -154,6 +154,7 @@ test("plans an ordinary native Herdr worktree", () => {
   assert.equal(plan.agent.command, "pi");
   assert.equal(plan.agent.sessionName, "ocr-ASANA-123-discovered-docs");
   assert.equal(plan.agent.profileName, "pi-worker");
+  assert.equal(plan.agent.selectionSource, "project");
   assert.equal(plan.agent.harness, "pi");
   assert.deepEqual(plan.agent.roles, ["coordinator", "implementer"]);
   assert.deepEqual(plan.agent.profile, {
