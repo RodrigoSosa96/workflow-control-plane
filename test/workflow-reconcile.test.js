@@ -410,6 +410,154 @@ test("treats same-harness same-run live ownership as compatible even before nati
   assert.match(reconciled.agent.reason, /same run|codex/i);
 });
 
+test("treats split agent identity and pane cwd as the same compatible planned run", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "55555555-5555-4555-8555-555555555555";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-split-evidence";
+  const paneId = `${workspaceId}:agent-pane`;
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: runPlan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: `${workspaceId}:t1`, workspace_id: workspaceId, label: "agent" },
+          { tab_id: `${workspaceId}:t2`, workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: paneId,
+            tab_id: `${workspaceId}:t1`,
+            workspace_id: workspaceId,
+            cwd: runPlan.agent.worktreePath,
+            foreground_cwd: runPlan.agent.worktreePath,
+          },
+        ],
+      },
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          pane_id: paneId,
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: "codex-lifecycle-name-not-yet-captured",
+          agent_status: "working",
+          workflow_run_id: runId,
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.tabs.find((tab) => tab.label === "agent").status, "compatible");
+  assert.equal(reconciled.agent.status, "compatible");
+  assert.match(reconciled.agent.reason, /same run|codex/i);
+  assert.equal(reconciled.agent.actual.source, "agent");
+  assert.equal(reconciled.agent.actual.runId, runId);
+  assert.equal(reconciled.agent.actual.canonicalPath, runPlan.agent.worktreePath);
+});
+
+test("reports a conflict when the missing planned agent tab has the same expected run live off-tab", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "66666666-6666-4666-8666-666666666666";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-missing-same-run";
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: runPlan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: `${workspaceId}:other`, workspace_id: workspaceId, label: "other" },
+          { tab_id: `${workspaceId}:runtime`, workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: `${workspaceId}:writer-pane`,
+            tab_id: `${workspaceId}:other`,
+            workspace_id: workspaceId,
+            cwd: runPlan.agent.worktreePath,
+            foreground_cwd: runPlan.agent.worktreePath,
+            agent: "codex",
+            agent_status: "working",
+          },
+        ],
+      },
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          pane_id: `${workspaceId}:writer-pane`,
+          tab_id: `${workspaceId}:other`,
+          workspace_id: workspaceId,
+          name: "codex-lifecycle-name-not-yet-captured",
+          cwd: runPlan.agent.worktreePath,
+          agent_status: "working",
+          workflow_run_id: runId,
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.tabs.find((tab) => tab.label === "agent").status, "missing");
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout|agent tab/i);
+  assert.match(reconciled.agent.reason, /codex/i);
+  assert.equal(reconciled.agent.actual[0].runId, runId);
+  assert.equal(reconciled.operations.find((operation) => operation.id === "agent").reconciliation.status, "conflict");
+});
+
 test("reports a conflict when the agent tab is missing but an off-tab writer owns the checkout", async () => {
   const plan = planWorkflow({
     registry,

@@ -549,6 +549,26 @@ test("rejects a generic Codex start operation without an explicit harness before
   assert.deepEqual(calls, []);
 });
 
+test("rejects an unsupported agent operation kind before any Herdr mutation", async () => {
+  const calls = [];
+  const plan = buildPlan();
+  plan.operations = plan.operations.map((operation) => operation.id === "agent"
+    ? { ...operation, kind: "agent.session.attach", command: "pi" }
+    : operation);
+
+  await assert.rejects(
+    executeStart(plan, fakeAdapters(calls)),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /unsupported|agent|kind/i);
+      return true;
+    },
+  );
+
+  assert.deepEqual(calls, []);
+});
+
 test("rejects a generic start operation whose harness and command disagree before mutation", async () => {
   const calls = [];
   const plan = buildPlan({

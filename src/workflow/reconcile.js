@@ -242,28 +242,53 @@ function summarizeWriter(writer) {
   ].filter(Boolean).join(" ");
 }
 
+function mergeDefinedFields(base, overlay) {
+  const merged = { ...(base ?? {}) };
+  for (const [key, value] of Object.entries(overlay ?? {})) {
+    if (value !== undefined && value !== null) merged[key] = value;
+  }
+  return merged;
+}
+
+function mergeAgentPaneEvidence(agent, pane) {
+  const merged = mergeDefinedFields(pane, agent);
+  for (const key of ["cwd", "foreground_cwd", "foregroundCwd"]) {
+    if (pane?.[key] !== undefined && pane?.[key] !== null) merged[key] = pane[key];
+  }
+  return merged;
+}
+
+async function writerCanonicalPath(value, canonicalPath) {
+  return await canonicalPath(value?.foreground_cwd ?? value?.foregroundCwd ?? value?.cwd);
+}
+
 async function collectLiveWritersInCheckout(plan, panes, actualAgents, canonicalPath) {
   const expectedCanonicalPath = await canonicalPath(plan.agent.worktreePath);
   const writers = new Map();
-  const agentsByPaneId = new Map(actualAgents
-    .filter((agent) => agent?.pane_id || agent?.paneId)
-    .map((agent) => [agent.pane_id ?? agent.paneId, agent]));
+  const panesByPaneId = new Map(panes
+    .filter((pane) => paneId(pane))
+    .map((pane) => [paneId(pane), pane]));
+  const mergedPaneIds = new Set();
 
   for (const agent of actualAgents) {
-    if (!isLiveAgentWriter(agent)) continue;
-    const canonical = await canonicalPath(agent.cwd ?? agent.foreground_cwd ?? agent.foregroundCwd);
+    const id = paneId(agent);
+    const relatedPane = id ? panesByPaneId.get(id) : null;
+    const evidence = relatedPane ? mergeAgentPaneEvidence(agent, relatedPane) : agent;
+    if (relatedPane) mergedPaneIds.add(id);
+    if (!isLiveAgentWriter(evidence)) continue;
+    const canonical = await writerCanonicalPath(evidence, canonicalPath);
     if (canonical !== expectedCanonicalPath) continue;
-    const writer = writerEvidence(agent, "agent", canonical);
+    const writer = writerEvidence(evidence, "agent", canonical);
     writers.set(writerDedupKey(writer), writer);
   }
 
   for (const pane of panes) {
+    const id = paneId(pane);
+    if (id && mergedPaneIds.has(id)) continue;
     if (!isLiveAgentWriter(pane)) continue;
-    const canonical = await panePath(pane, canonicalPath);
+    const canonical = await writerCanonicalPath(pane, canonicalPath);
     if (canonical !== expectedCanonicalPath) continue;
-    const relatedAgent = agentsByPaneId.get(paneId(pane));
-    const merged = relatedAgent ? { ...pane, ...relatedAgent, agent: pane.agent ?? relatedAgent.agent } : pane;
-    const writer = writerEvidence(merged, relatedAgent ? "agent" : "pane", canonical);
+    const writer = writerEvidence(pane, "pane", canonical);
     writers.set(writerDedupKey(writer), writer);
   }
 
@@ -692,6 +717,15 @@ async function classifyAgent(plan, tabs, panes, loadAgents, canonicalPath) {
 
   const tab = tabs.byLabel.get(plan.agent.tabLabel);
   if (!tab || tab.status !== "compatible") {
+    if (liveWriters.length > 0) {
+      const evidence = liveWriters.map(summarizeWriter).filter(Boolean).join("; ");
+      return {
+        status: "conflict",
+        reason: boundedReason(`Live writer owns checkout ${plan.agent.worktreePath} while agent tab ${plan.agent.tabLabel} is not ready: ${evidence}; expected ${expectedHarness} profile ${plan.agent.profileName ?? "unknown"}`),
+        actual: liveWriters,
+      };
+    }
+
     return {
       status: tab?.status === "conflict" ? "conflict" : "missing",
       reason: tab?.status === "conflict" ? tab.reason : `Agent tab ${plan.agent.tabLabel} is not ready`,

@@ -167,7 +167,13 @@ function agentStartOperation(plan) {
 
 function validateAgentStartIdentity(plan) {
   const operation = agentStartOperation(plan);
-  if (!operation || !AGENT_START_KINDS.has(operation.kind)) return;
+  if (!operation) return;
+  if (!AGENT_START_KINDS.has(operation.kind)) {
+    fail("PREFLIGHT", `Unsupported agent operation kind ${operation.kind}`, {
+      operationId: operation.id ?? null,
+      operationKind: operation.kind ?? null,
+    }, 10);
+  }
 
   const agent = plan.agent ?? {};
   const profile = agent.profile && typeof agent.profile === "object" ? agent.profile : {};
