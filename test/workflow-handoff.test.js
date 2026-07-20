@@ -483,3 +483,48 @@ test("readCurrentResult fails closed when stale state cannot be persisted", asyn
   );
   assert.equal((await store.read(run.id)).state, RUN_STATES.COMPLETED);
 });
+
+test("readCurrentResult fails closed when stale marking observes newer result metadata", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const { store, run } = await createRunningRun(t, {
+    repositories: [{ id: "app", path: repoPath }],
+  });
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  await submitHandoff({ store, git, runId: run.id, generation: 1, input: validInput() });
+  await writeFile(join(repoPath, "src", "example.js"), "export const value = 4;\n");
+
+  let injectedNewerResult = false;
+  const racingStore = {
+    read: (...args) => store.read(...args),
+    async update(updateRunId, updater) {
+      if (!injectedNewerResult) {
+        injectedNewerResult = true;
+        await store.update(updateRunId, () => ({
+          state: RUN_STATES.RUNNING,
+          generation: 2,
+        }));
+        await submitHandoff({
+          store,
+          git,
+          runId: updateRunId,
+          generation: 2,
+          input: validInput({
+            summary: "A newer result completed after the stale reader snapshot.",
+            nextAction: "Keep the newer result current",
+          }),
+        });
+      }
+      return store.update(updateRunId, updater);
+    },
+  };
+
+  await assert.rejects(
+    () => readCurrentResult({ store: racingStore, git, runId: run.id }),
+    /changed|concurrent|stale/i,
+  );
+  const storedRun = await store.read(run.id);
+  assert.equal(storedRun.state, RUN_STATES.COMPLETED);
+  assert.equal(storedRun.resultGeneration, 2);
+  assert.equal(storedRun.resultStatus, "completed");
+  assert.equal((await readJson(join(run.directory, "result.json"))).generation, 2);
+});

@@ -578,7 +578,7 @@ function collectResultShapeErrors(result, expected, run, artifactDigest) {
   }
 
   const registeredFingerprints = run.resultFingerprints;
-  const registeredArtifactDigest = typeof run.resultArtifactDigest === "string" ? run.resultArtifactDigest.trim() : "";
+  const registeredArtifactDigest = normalizeResultArtifactDigest(run);
   const registered = run.resultGeneration === result.generation
     && run.resultStatus === result.status
     && registeredArtifactDigest
@@ -604,12 +604,38 @@ function collectResultShapeErrors(result, expected, run, artifactDigest) {
   return errors;
 }
 
-async function markResultStale(store, runId) {
+function normalizeResultArtifactDigest(run) {
+  return typeof run.resultArtifactDigest === "string" ? run.resultArtifactDigest.trim() : "";
+}
+
+function observedResultMetadata(run) {
+  return {
+    generation: run.generation,
+    resultGeneration: run.resultGeneration,
+    resultArtifactDigest: normalizeResultArtifactDigest(run),
+    resultStatus: typeof run.resultStatus === "string" ? run.resultStatus : undefined,
+  };
+}
+
+function assertObservedResultMetadata(current, observed) {
+  const latest = observedResultMetadata(current);
+  if (
+    !Object.is(latest.generation, observed.generation)
+    || !Object.is(latest.resultGeneration, observed.resultGeneration)
+    || latest.resultArtifactDigest !== observed.resultArtifactDigest
+    || latest.resultStatus !== observed.resultStatus
+  ) {
+    fail("Current result metadata changed before result-stale persistence; retry the result read");
+  }
+}
+
+async function markResultStale(store, runId, observed) {
   if (!store || typeof store.update !== "function") {
     fail("Run store update interface is required to mark stale results");
   }
   const resultStaleAt = new Date().toISOString();
   await store.update(runId, (current) => {
+    assertObservedResultMetadata(current, observed);
     if (current.state === RUN_STATES.RESULT_STALE) {
       return { resultStaleAt };
     }
@@ -620,8 +646,8 @@ async function markResultStale(store, runId) {
   });
 }
 
-async function returnResultStale(store, runId, result, errors) {
-  await markResultStale(store, runId);
+async function returnResultStale(store, runId, result, errors, observed) {
+  await markResultStale(store, runId, observed);
   const response = { status: RUN_STATES.RESULT_STALE, errors };
   if (result !== undefined) response.result = result;
   return response;
@@ -633,12 +659,13 @@ export async function readCurrentResult({ store, git, runId } = {}) {
   }
 
   const run = await store.read(runId);
+  const observed = observedResultMetadata(run);
   const current = await readResultFile(run.directory);
   if (current.missing) {
-    return returnResultStale(store, runId, undefined, ["No current result"]);
+    return returnResultStale(store, runId, undefined, ["No current result"], observed);
   }
   if (current.invalid) {
-    return returnResultStale(store, runId, undefined, ["Current result is invalid"]);
+    return returnResultStale(store, runId, undefined, ["Current result is invalid"], observed);
   }
 
   const expected = expectedFromRun(run);
@@ -662,7 +689,7 @@ export async function readCurrentResult({ store, git, runId } = {}) {
   }
 
   if (errors.length > 0) {
-    return returnResultStale(store, runId, result, errors);
+    return returnResultStale(store, runId, result, errors, observed);
   }
 
   return { status: result.status, result };
