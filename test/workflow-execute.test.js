@@ -135,10 +135,10 @@ function buildPlan({
       },
       {
         id: "agent",
-        kind: "pi.session.start",
+        kind: agentHarness === "pi" ? "pi.session.start" : "agent.session.start",
         phase: "start",
         cwd: workspacePath,
-        command: "pi",
+        command: agentHarness === "pi" ? "pi" : agentHarness,
         sessionName,
         tabLabel: "agent",
         reconciliation: agentStatus === "compatible"
@@ -516,6 +516,68 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   const launch = calls.find((call) => call.kind === "herdr.agent.start");
   assert.deepEqual(launch.argv, launchSpec.argv);
   assert.deepEqual(launch.env, launchSpec.env);
+});
+
+test("rejects a generic Codex start operation without an explicit harness before mutation", async () => {
+  const calls = [];
+  const plan = buildPlan({
+    agentHarness: "codex",
+    agentProfileName: "codex-worker",
+    agentProfile: {
+      mode: "interactive",
+      model: "gpt-5-codex",
+      arguments: [],
+      sandbox: "workspace-write",
+      approval_policy: "on-request",
+    },
+  });
+  delete plan.agent.harness;
+  plan.operations = plan.operations.map((operation) => operation.id === "agent"
+    ? { ...operation, kind: "agent.session.start", command: "codex" }
+    : operation);
+
+  await assert.rejects(
+    executeStart(plan, fakeAdapters(calls)),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /agent\.session\.start|harness|codex/i);
+      return true;
+    },
+  );
+
+  assert.deepEqual(calls, []);
+});
+
+test("rejects a generic start operation whose harness and command disagree before mutation", async () => {
+  const calls = [];
+  const plan = buildPlan({
+    agentHarness: "codex",
+    agentProfileName: "codex-worker",
+    agentProfile: {
+      mode: "interactive",
+      model: "gpt-5-codex",
+      arguments: [],
+      sandbox: "workspace-write",
+      approval_policy: "on-request",
+    },
+  });
+  plan.agent.command = "claude";
+  plan.operations = plan.operations.map((operation) => operation.id === "agent"
+    ? { ...operation, kind: "agent.session.start", command: "claude" }
+    : operation);
+
+  await assert.rejects(
+    executeStart(plan, fakeAdapters(calls)),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /harness|command|codex|claude/i);
+      return true;
+    },
+  );
+
+  assert.deepEqual(calls, []);
 });
 
 test("closes the bootstrap shell when the started pane matches the selected non-Pi harness", async () => {

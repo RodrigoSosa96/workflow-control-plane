@@ -227,9 +227,9 @@ function writerMatchesPlannedAgent(writer, plan) {
   const expectedHarness = plan.agent?.harness ?? "pi";
   if (writer.harness !== expectedHarness) return false;
   const expectedRunId = plannedAgentRunId(plan);
-  if (expectedRunId && writer.runId === expectedRunId) return true;
+  if (expectedRunId) return writer.runId === expectedRunId;
   const expectedNativeSessionId = plannedNativeSessionId(plan);
-  if (expectedNativeSessionId && writer.nativeSessionId === expectedNativeSessionId) return true;
+  if (expectedNativeSessionId) return writer.nativeSessionId === expectedNativeSessionId;
   return writer.name === plan.agent?.sessionName;
 }
 
@@ -674,17 +674,10 @@ async function classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canon
 
 async function classifyAgent(plan, tabs, panes, loadAgents, canonicalPath) {
   const actualAgents = await loadAgents();
-  const tab = tabs.byLabel.get(plan.agent.tabLabel);
-  if (!tab || tab.status !== "compatible") {
-    return {
-      status: tab?.status === "conflict" ? "conflict" : "missing",
-      reason: tab?.status === "conflict" ? tab.reason : `Agent tab ${plan.agent.tabLabel} is not ready`,
-      actual: null,
-    };
-  }
-
   const expectedHarness = plan.agent?.harness ?? "pi";
-  const liveWriters = await collectLiveWritersInCheckout(plan, panes, actualAgents, canonicalPath);
+  const liveWriters = plan.agent?.worktreePath
+    ? await collectLiveWritersInCheckout(plan, panes, actualAgents, canonicalPath)
+    : [];
   const matches = liveWriters.filter((writer) => writerMatchesPlannedAgent(writer, plan));
   const distinctWriters = liveWriters.filter((writer) => !writerMatchesPlannedAgent(writer, plan));
 
@@ -694,6 +687,15 @@ async function classifyAgent(plan, tabs, panes, loadAgents, canonicalPath) {
       status: "conflict",
       reason: boundedReason(`Distinct live writer owns checkout ${plan.agent.worktreePath}: ${evidence}; expected ${expectedHarness} profile ${plan.agent.profileName ?? "unknown"}`),
       actual: liveWriters,
+    };
+  }
+
+  const tab = tabs.byLabel.get(plan.agent.tabLabel);
+  if (!tab || tab.status !== "compatible") {
+    return {
+      status: tab?.status === "conflict" ? "conflict" : "missing",
+      reason: tab?.status === "conflict" ? tab.reason : `Agent tab ${plan.agent.tabLabel} is not ready`,
+      actual: null,
     };
   }
 

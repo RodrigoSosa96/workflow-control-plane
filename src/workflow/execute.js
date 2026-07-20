@@ -97,16 +97,17 @@ function isNonEmptyString(value) {
 function hydrateAgentProfile(plan) {
   const agent = plan.agent ?? {};
   const profile = agent.profile && typeof agent.profile === "object" ? agent.profile : {};
+  const harness = agent.harness ?? profile.harness ?? "pi";
   return {
-    harness: agent.harness ?? "pi",
-    command: agent.command ?? "pi",
+    harness,
+    command: agent.command ?? profile.command ?? harness,
     mode: profile.mode ?? "interactive",
     roles: Array.isArray(agent.roles) ? agent.roles : ["implementer"],
     model: profile.model ?? null,
     arguments: Array.isArray(profile.arguments) ? profile.arguments : [],
-    ...(agent.harness === "claude" || profile.permission_mode !== undefined ? { permission_mode: profile.permission_mode ?? "manual" } : {}),
-    ...(agent.harness === "codex" || profile.sandbox !== undefined ? { sandbox: profile.sandbox ?? "workspace-write" } : {}),
-    ...(agent.harness === "codex" || profile.approval_policy !== undefined ? { approval_policy: profile.approval_policy ?? "on-request" } : {}),
+    ...(harness === "claude" || profile.permission_mode !== undefined ? { permission_mode: profile.permission_mode ?? "manual" } : {}),
+    ...(harness === "codex" || profile.sandbox !== undefined ? { sandbox: profile.sandbox ?? "workspace-write" } : {}),
+    ...(harness === "codex" || profile.approval_policy !== undefined ? { approval_policy: profile.approval_policy ?? "on-request" } : {}),
   };
 }
 
@@ -134,6 +135,104 @@ function getWorkspacePath(value) {
 function commandExecutable(command) {
   if (typeof command !== "string") return null;
   return command.trim().split(/\s+/u)[0] ?? null;
+}
+
+const AGENT_START_KINDS = new Set(["agent.session.start", "pi.session.start"]);
+const AGENT_HARNESSES = new Set(["pi", "claude", "codex"]);
+
+function normalizeAgentHarness(value, context) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length === 0) {
+    fail("PREFLIGHT", `${context} must be one of pi, claude, or codex`, { [context]: value }, 10);
+  }
+  const normalized = value.toLowerCase();
+  if (!AGENT_HARNESSES.has(normalized)) {
+    fail("PREFLIGHT", `Unsupported agent harness ${value}`, { [context]: value }, 10);
+  }
+  return normalized;
+}
+
+function commandAgentHarness(command) {
+  const executable = commandExecutable(command);
+  if (!executable) return null;
+  const harness = basename(executable).toLowerCase();
+  return AGENT_HARNESSES.has(harness) ? harness : null;
+}
+
+function agentStartOperation(plan) {
+  return findOperation(plan, "agent")
+    ?? plan.operations?.find((operation) => AGENT_START_KINDS.has(operation.kind))
+    ?? null;
+}
+
+function validateAgentStartIdentity(plan) {
+  const operation = agentStartOperation(plan);
+  if (!operation || !AGENT_START_KINDS.has(operation.kind)) return;
+
+  const agent = plan.agent ?? {};
+  const profile = agent.profile && typeof agent.profile === "object" ? agent.profile : {};
+  const agentHarness = normalizeAgentHarness(agent.harness, "agent.harness");
+  const profileHarness = normalizeAgentHarness(profile.harness, "agent.profile.harness");
+  if (agentHarness && profileHarness && agentHarness !== profileHarness) {
+    fail("PREFLIGHT", "Agent harness and profile harness disagree", {
+      agentHarness,
+      profileHarness,
+      operationKind: operation.kind,
+    }, 10);
+  }
+
+  const expectedHarness = agentHarness ?? profileHarness;
+  const commandHarnesses = [
+    commandAgentHarness(agent.command),
+    commandAgentHarness(profile.command),
+    commandAgentHarness(operation.command),
+  ].filter(Boolean);
+  const distinctCommandHarnesses = [...new Set(commandHarnesses)];
+  if (distinctCommandHarnesses.length > 1) {
+    fail("PREFLIGHT", "Agent command identities disagree", {
+      agentCommand: agent.command ?? null,
+      profileCommand: profile.command ?? null,
+      operationCommand: operation.command ?? null,
+      commandHarnesses: distinctCommandHarnesses,
+    }, 10);
+  }
+
+  const commandHarness = distinctCommandHarnesses[0] ?? null;
+  if (!expectedHarness) {
+    if (operation.kind === "pi.session.start") {
+      if (commandHarness && commandHarness !== "pi") {
+        fail("PREFLIGHT", "Legacy Pi session start cannot use a non-Pi command without an explicit harness", {
+          operationKind: operation.kind,
+          command: operation.command ?? agent.command ?? profile.command ?? null,
+          commandHarness,
+        }, 10);
+      }
+      return;
+    }
+
+    fail("PREFLIGHT", "agent.session.start requires an explicit agent harness", {
+      operationKind: operation.kind,
+      command: operation.command ?? agent.command ?? profile.command ?? null,
+      commandHarness,
+    }, 10);
+  }
+
+  if (operation.kind === "pi.session.start" && expectedHarness !== "pi") {
+    fail("PREFLIGHT", "Legacy pi.session.start operations must use the Pi harness", {
+      operationKind: operation.kind,
+      expectedHarness,
+    }, 10);
+  }
+
+  if (commandHarness && commandHarness !== expectedHarness) {
+    fail("PREFLIGHT", "Agent harness and command disagree", {
+      expectedHarness,
+      commandHarness,
+      agentCommand: agent.command ?? null,
+      profileCommand: profile.command ?? null,
+      operationCommand: operation.command ?? null,
+    }, 10);
+  }
 }
 
 function processInfoCommand(processInfo) {
@@ -1004,6 +1103,7 @@ async function executeRuntimePhase(plan, { herdr, observeMs = DEFAULT_RUNTIME_OB
 
 export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch } = {}) {
   ensureStartablePlan(reconciledPlan);
+  validateAgentStartIdentity(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
   return reconciledPlan.mode === "group"
     ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch })
