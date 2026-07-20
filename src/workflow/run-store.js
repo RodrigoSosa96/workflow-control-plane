@@ -10,6 +10,7 @@ const RUN_FILE = "run.json";
 const EVENTS_FILE = "events.jsonl";
 const ASSIGNMENT_FILE = "assignment.md";
 const LOCK_FILE = "run.lock";
+const ACTIVE_LOCK_DIR = "active";
 const STALE_LOCK_MS = 5 * 60 * 1000;
 const RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INITIAL_STATES = new Set([RUN_STATES.PLANNED]);
@@ -226,6 +227,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     tempCounter += 1;
     const destination = join(directory, filename);
     const tempPath = join(directory, `.${filename}.${process.pid}.${tempCounter}.tmp`);
+    await chmodPrivateFile(destination, filename, { missingOk: true });
     await chmodPrivateFile(tempPath, "temporary file", { missingOk: true });
     let handle;
     try {
@@ -297,116 +299,186 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     await chmodPrivateFile(path, "append file");
   }
 
-  async function lockContentionError(lockPath) {
+  async function activeLockContentionError(activePath) {
     let ageMs = Number.NaN;
     try {
-      const lockStat = await fs.stat(lockPath);
-      ageMs = Math.max(0, Date.parse(now()) - lockStat.mtimeMs);
+      const activeStat = await fs.stat(activePath);
+      ageMs = Math.max(0, Date.parse(now()) - activeStat.mtimeMs);
     } catch (_error) {
       // Keep the recovery message bounded and avoid deleting or inspecting further.
     }
     const stale = Number.isFinite(ageMs) && ageMs >= STALE_LOCK_MS;
-    const prefix = stale ? "Stale run lock" : "Run is locked";
+    const prefix = stale ? "Stale active run lock" : "Run is locked by an active lock";
     return new WorkflowError(
       "run-lock",
-      `${prefix} at ${lockPath}; age ${formatAge(ageMs)}. Manual inspection required; lock was not removed.`,
-      { details: { lockPath, ageMs: Number.isFinite(ageMs) ? ageMs : null, stale } },
+      `${prefix} at ${activePath}; age ${formatAge(ageMs)}. Manual inspection required; active lock was not removed.`,
+      { details: { lockPath: activePath, activePath, ageMs: Number.isFinite(ageMs) ? ageMs : null, stale } },
+    );
+  }
+
+  async function legacyLockContainerError(lockContainer) {
+    await chmodPrivateFile(lockContainer, "legacy lock file", { missingOk: true });
+    return new WorkflowError(
+      "run-lock",
+      `Legacy fixed-file run lock at ${lockContainer}; manual recovery required. It was not migrated or removed.`,
+      { details: { lockPath: lockContainer, legacy: true } },
     );
   }
 
   function nextLockOwnerToken() {
     lockCounter += 1;
-    return `${process.pid}:${lockCounter}:${defaultRandomUUID()}`;
+    return `${process.pid}-${lockCounter}-${defaultRandomUUID()}`;
   }
 
   function lockOwnershipError(lockPath, reason) {
     return new WorkflowError(
       "run-lock",
-      `Run lock ownership could not be verified at ${lockPath}; ${reason}. Manual inspection required; lock was not removed.`,
+      `Run lock ownership could not be verified at ${lockPath}; ${reason}. Manual inspection required; active lock was not removed.`,
       { details: { lockPath, reason } },
     );
   }
 
-  function parseLockOwnership(text) {
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (_error) {
-      return null;
+  function sameActiveDirectory(left, right) {
+    if (
+      Number.isFinite(left?.dev) && Number.isFinite(left?.ino)
+      && Number.isFinite(right?.dev) && Number.isFinite(right?.ino)
+    ) {
+      return left.dev === right.dev && left.ino === right.ino;
     }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    if (parsed.version !== 1) return null;
-    if (typeof parsed.token !== "string" || !parsed.token.trim()) return null;
-    return parsed;
+    return left?.ctimeMs === right?.ctimeMs && left?.mtimeMs === right?.mtimeMs;
+  }
+
+  async function ensureLockContainer(directory) {
+    const lockContainer = join(directory, LOCK_FILE);
+    try {
+      await fs.mkdir(lockContainer, { mode: PRIVATE_DIR_MODE });
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throwFs("create lock container", lockContainer, error);
+      }
+      let lockStat;
+      try {
+        lockStat = await fs.stat(lockContainer);
+      } catch (statError) {
+        throwFs("stat lock container", lockContainer, statError);
+      }
+      if (!lockStat.isDirectory()) {
+        throw await legacyLockContainerError(lockContainer);
+      }
+    }
+    await chmodPrivateDirectory(lockContainer, "lock container");
+    return lockContainer;
+  }
+
+  async function statOwnedActive(ownership, phase) {
+    let activeStat;
+    try {
+      activeStat = await fs.stat(ownership.activePath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        throw lockOwnershipError(ownership.activePath, `active lock directory is missing during ${phase}`);
+      }
+      throw error;
+    }
+    if (!activeStat.isDirectory()) {
+      throw lockOwnershipError(ownership.activePath, `active lock path is not a directory during ${phase}`);
+    }
+    if (!sameActiveDirectory(activeStat, ownership.activeStat)) {
+      throw lockOwnershipError(ownership.activePath, `active lock directory was replaced during ${phase}`);
+    }
+    return activeStat;
+  }
+
+  async function cleanupFailedAcquisition(ownership) {
+    try {
+      await fs.unlink(ownership.markerPath);
+    } catch (_error) {
+      // Cleanup best-effort only; the original acquisition error is more useful.
+    }
+    try {
+      await fs.rmdir(ownership.activePath);
+    } catch (_error) {
+      // Leave any incomplete active lock for manual recovery rather than deleting unknown state.
+    }
   }
 
   async function acquireLock(directory) {
-    const lockPath = join(directory, LOCK_FILE);
-    const ownership = { path: lockPath, token: nextLockOwnerToken() };
-    let handle;
+    const lockContainer = await ensureLockContainer(directory);
+    const activePath = join(lockContainer, ACTIVE_LOCK_DIR);
     try {
-      handle = await fs.open(lockPath, "wx", PRIVATE_FILE_MODE);
+      await fs.mkdir(activePath, { mode: PRIVATE_DIR_MODE });
     } catch (error) {
       if (error?.code === "EEXIST") {
-        await chmodPrivateFile(lockPath, "lock file", { missingOk: true });
-        throw await lockContentionError(lockPath);
+        await chmodPrivateDirectory(activePath, "active lock", { missingOk: true });
+        throw await activeLockContentionError(activePath);
       }
-      throwFs("create lock", lockPath, error);
+      if (error?.code === "ENOTDIR") {
+        throw await legacyLockContainerError(lockContainer);
+      }
+      throwFs("create active lock", activePath, error);
     }
 
-    let lockError;
+    await chmodPrivateDirectory(activePath, "active lock");
+    const activeStat = await fs.stat(activePath);
+    if (!activeStat.isDirectory()) {
+      throw lockOwnershipError(activePath, "active lock path is not a directory after acquisition");
+    }
+
+    const token = nextLockOwnerToken();
+    const markerName = `owner-${token}.json`;
+    const markerPath = join(activePath, markerName);
+    const ownership = { path: activePath, lockContainer, activePath, activeStat, markerPath, token };
+    let handle;
     try {
-      await handle.writeFile(`${JSON.stringify({ version: 1, token: ownership.token })}\n`, "utf8");
+      handle = await fs.open(markerPath, "wx", PRIVATE_FILE_MODE);
+    } catch (error) {
+      await cleanupFailedAcquisition(ownership);
+      throwFs("create lock owner marker", markerPath, error);
+    }
+
+    let markerError;
+    try {
+      await handle.writeFile(`${JSON.stringify({ version: 1, token })}\n`, "utf8");
       await handle.sync();
     } catch (error) {
-      lockError = error;
+      markerError = error;
     }
 
     try {
       await handle.close();
     } catch (error) {
-      if (!lockError) lockError = error;
+      if (!markerError) markerError = error;
     }
 
-    if (lockError) {
-      try {
-        await releaseLock(ownership);
-      } catch (_releaseError) {
-        // Release is ownership-checked and may fail closed; preserve the lock write failure.
-      }
-      throwFs("write lock", lockPath, lockError);
+    if (markerError) {
+      await cleanupFailedAcquisition(ownership);
+      throwFs("write lock owner marker", markerPath, markerError);
     }
 
-    await chmodPrivateFile(lockPath, "lock file");
+    await chmodPrivateFile(markerPath, "lock owner marker");
     return ownership;
   }
 
   async function releaseLock(ownership) {
-    const lockPath = ownership.path;
-    await chmodPrivateFile(lockPath, "lock file", { missingOk: true });
-    let text;
+    await statOwnedActive(ownership, "release");
     try {
-      text = await fs.readFile(lockPath, "utf8");
+      await fs.unlink(ownership.markerPath);
     } catch (error) {
-      if (error?.code === "ENOENT") {
-        throw lockOwnershipError(lockPath, "lock file is missing");
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        throw lockOwnershipError(ownership.activePath, "owner marker is missing");
       }
       throw error;
     }
 
-    const current = parseLockOwnership(text);
-    if (!current) {
-      throw lockOwnershipError(lockPath, "lock file is malformed");
-    }
-    if (current.token !== ownership.token) {
-      throw lockOwnershipError(lockPath, "lock token mismatch");
-    }
-
+    await statOwnedActive(ownership, "active removal");
     try {
-      await fs.unlink(lockPath);
+      await fs.rmdir(ownership.activePath);
     } catch (error) {
-      if (error?.code === "ENOENT") {
-        throw lockOwnershipError(lockPath, "lock file disappeared before release");
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        throw lockOwnershipError(ownership.activePath, "active lock directory disappeared before removal");
+      }
+      if (error?.code === "ENOTEMPTY" || error?.code === "EEXIST") {
+        throw lockOwnershipError(ownership.activePath, "active lock directory is nonempty");
       }
       throw error;
     }

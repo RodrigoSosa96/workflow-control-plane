@@ -12,6 +12,7 @@ const RUN_ID_2 = "22222222-2222-4222-8222-222222222222";
 const RUN_ID_3 = "33333333-3333-4333-8333-333333333333";
 const EVENT_ID_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const EVENT_ID_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const LOCK_OWNER_TOKEN_RE = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
 
 async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-run-store-"));
@@ -35,6 +36,13 @@ function clockSequence(...values) {
 
 async function fileMode(path) {
   return (await stat(path)).mode & 0o777;
+}
+
+async function assertNoPath(path) {
+  await assert.rejects(
+    () => stat(path),
+    (error) => error?.code === "ENOENT" || error?.code === "ENOTDIR",
+  );
 }
 
 function tracingFs(operations) {
@@ -260,28 +268,112 @@ test("persists run updates through a sibling temp file that is fsynced before re
   assert.equal((await stat(destination)).mode & 0o777, 0o600);
 });
 
-test("reports bounded lock contention and stale locks without deleting them", async (t) => {
+test("creates a permanent private lock container and scoped active owner marker", async (t) => {
   const stateRoot = await tempStateRoot(t);
-  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+
   const run = await store.create(plannedInput());
-  const lockPath = join(run.directory, "run.lock");
-  await writeFile(lockPath, "held by another writer", { mode: 0o600 });
-  const staleTime = new Date(Date.now() - 10 * 60 * 1000);
-  await utimes(lockPath, staleTime, staleTime);
+  const lockContainer = join(run.directory, "run.lock");
+  const lockContainerStat = await stat(lockContainer);
+  assert.equal(lockContainerStat.isDirectory(), true);
+  assert.equal(lockContainerStat.mode & 0o777, 0o700);
+  await assertNoPath(join(lockContainer, "active"));
+
+  let observedMarkerName;
+  await store.update(RUN_ID_1, async (current) => {
+    const activePath = join(current.directory, "run.lock", "active");
+    const activeStat = await stat(activePath);
+    assert.equal(activeStat.isDirectory(), true);
+    assert.equal(activeStat.mode & 0o777, 0o700);
+    const markers = await realFs.readdir(activePath);
+    assert.equal(markers.length, 1);
+    [observedMarkerName] = markers;
+    assert.match(observedMarkerName, LOCK_OWNER_TOKEN_RE);
+    assert.doesNotMatch(observedMarkerName, /[\\/]/);
+    const markerPath = join(activePath, observedMarkerName);
+    assert.equal(await fileMode(markerPath), 0o600);
+    const markerContent = await readFile(markerPath, "utf8");
+    assert.ok(markerContent.length <= 256);
+    assert.doesNotMatch(markerContent, /projectAlias|primaryTicket|relatedTickets|Implement OCR/);
+    return { state: RUN_STATES.LAUNCHING };
+  });
+
+  assert.ok(observedMarkerName);
+  await assertNoPath(join(lockContainer, "active"));
+  assert.deepEqual(await realFs.readdir(lockContainer), []);
+});
+
+test("reports bounded active lock contention with injected clock without deleting it", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const lockContainer = join(run.directory, "run.lock");
+  const activePath = join(lockContainer, "active");
+  const markerPath = join(activePath, "foreign-owner-marker");
+  const markerContent = "foreign owner DO-NOT-LEAK";
+  await mkdir(activePath, { recursive: true, mode: 0o755 });
+  await chmod(lockContainer, 0o755);
+  await chmod(activePath, 0o755);
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+  const staleTime = new Date("2025-01-01T00:00:00.000Z");
+  await utimes(activePath, staleTime, staleTime);
 
   await assert.rejects(
     () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
     (error) => {
       assert.match(error.message, /lock/i);
+      assert.match(error.message, /active/i);
       assert.match(error.message, /stale/i);
-      assert.match(error.message, /age/i);
-      assert.ok(error.message.includes(lockPath));
+      assert.match(error.message, /10m/);
+      assert.ok(error.message.includes(activePath));
+      assert.equal(error.details?.ageMs, 10 * 60 * 1000);
+      assert.equal(error.details?.stale, true);
       assert.ok(error.message.length < 500);
-      assert.doesNotMatch(error.message, /projectAlias|primaryTicket|relatedTickets/);
+      assert.doesNotMatch(error.message, /DO-NOT-LEAK|foreign owner|projectAlias|primaryTicket|relatedTickets/);
       return true;
     },
   );
-  assert.equal(await readFile(lockPath, "utf8"), "held by another writer");
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+  assert.equal(await fileMode(lockContainer), 0o700);
+  assert.equal(await fileMode(activePath), 0o700);
+});
+
+test("treats a legacy fixed-file lock as a manual-recovery conflict", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const lockContainer = join(run.directory, "run.lock");
+  const legacyContent = "legacy fixed-file owner DO-NOT-LEAK";
+  await realFs.rm(lockContainer, { recursive: true, force: true });
+  await writeFile(lockContainer, legacyContent, { mode: 0o600 });
+  await chmod(lockContainer, 0o666);
+
+  await assert.rejects(
+    () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
+    (error) => {
+      assert.match(error.message, /legacy|container/i);
+      assert.match(error.message, /manual/i);
+      assert.ok(error.message.includes(lockContainer));
+      assert.ok(error.message.length < 500);
+      assert.doesNotMatch(error.message, /DO-NOT-LEAK|legacy fixed-file owner/);
+      return true;
+    },
+  );
+  assert.equal(await readFile(lockContainer, "utf8"), legacyContent);
+  assert.equal(await fileMode(lockContainer), 0o600);
+  await assertNoPath(join(lockContainer, "active"));
 });
 
 test("read and list tighten preexisting private modes without recreating runs", async (t) => {
@@ -356,36 +448,7 @@ test("appendEvent tightens a permissive preexisting events file", async (t) => {
   assert.equal(await fileMode(eventsPath), 0o600);
 });
 
-test("lock contention tightens an existing lock and uses the injected clock for stale age", async (t) => {
-  const stateRoot = await tempStateRoot(t);
-  const store = createRunStore({
-    stateRoot,
-    randomUUID: () => RUN_ID_1,
-    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
-  });
-  const run = await store.create(plannedInput());
-  const lockPath = join(run.directory, "run.lock");
-  await writeFile(lockPath, "held by another writer", { mode: 0o600 });
-  await chmod(lockPath, 0o666);
-  const staleTime = new Date("2025-01-01T00:00:00.000Z");
-  await utimes(lockPath, staleTime, staleTime);
-
-  await assert.rejects(
-    () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
-    (error) => {
-      assert.match(error.message, /stale/i);
-      assert.match(error.message, /10m/);
-      assert.equal(error.details?.ageMs, 10 * 60 * 1000);
-      assert.equal(error.details?.stale, true);
-      assert.doesNotMatch(error.message, /held by another writer/);
-      return true;
-    },
-  );
-  assert.equal(await readFile(lockPath, "utf8"), "held by another writer");
-  assert.equal(await fileMode(lockPath), 0o600);
-});
-
-test("update does not unlink a replacement lock after losing ownership", async (t) => {
+test("writeAssignment tightens a preexisting assignment before a failed atomic overwrite", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({
     stateRoot,
@@ -393,24 +456,70 @@ test("update does not unlink a replacement lock after losing ownership", async (
     clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
   });
   const run = await store.create(plannedInput());
-  const lockPath = join(run.directory, "run.lock");
-  const replacementLock = "replacement owner DO-NOT-LEAK";
+  await store.writeAssignment(RUN_ID_1, "original assignment\n");
+  const assignmentPath = join(run.directory, "assignment.md");
+  await chmod(assignmentPath, 0o666);
+
+  const failingStore = createRunStore({
+    stateRoot,
+    fs: {
+      ...realFs,
+      async rename(from, to) {
+        if (to === assignmentPath) {
+          const error = new Error("forced assignment rename failure");
+          error.code = "EIO";
+          throw error;
+        }
+        return realFs.rename(from, to);
+      },
+    },
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:02:00.000Z"),
+  });
 
   await assert.rejects(
-    () => store.update(RUN_ID_1, async (current) => {
-      await realFs.unlink(join(current.directory, "run.lock"));
-      await writeFile(join(current.directory, "run.lock"), replacementLock, { mode: 0o600 });
+    () => failingStore.writeAssignment(RUN_ID_1, "new assignment\n"),
+    /rename temporary file|EIO/,
+  );
+  assert.equal(await readFile(assignmentPath, "utf8"), "original assignment\n");
+  assert.equal(await fileMode(assignmentPath), 0o600);
+});
+
+test("release does not unlink a replacement active directory with a different owner marker", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const lockContainer = join(run.directory, "run.lock");
+  const activePath = join(lockContainer, "active");
+  const replacementMarker = join(activePath, "replacement-owner-marker");
+  const replacementContent = "replacement owner DO-NOT-LEAK";
+
+  await assert.rejects(
+    () => store.update(RUN_ID_1, async () => {
+      const markers = await realFs.readdir(activePath);
+      assert.equal(markers.length, 1);
+      await realFs.unlink(join(activePath, markers[0]));
+      await realFs.rmdir(activePath);
+      await mkdir(activePath, { mode: 0o700 });
+      await writeFile(replacementMarker, replacementContent, { mode: 0o600 });
       throw new Error("updater exploded");
     }),
     (error) => {
-      assert.match(error.message, /lock ownership/i);
+      assert.match(error.message, /lock ownership|active lock/i);
+      assert.ok(error.message.includes(activePath));
       assert.ok(error.message.length < 500);
-      assert.doesNotMatch(error.message, /DO-NOT-LEAK|replacement owner/);
+      assert.doesNotMatch(error.message, /DO-NOT-LEAK|replacement owner|updater exploded/);
       return true;
     },
   );
-  assert.equal(await readFile(lockPath, "utf8"), replacementLock);
-  assert.equal(await fileMode(lockPath), 0o600);
+  assert.equal(await readFile(replacementMarker, "utf8"), replacementContent);
+  assert.equal(await fileMode(lockContainer), 0o700);
+  assert.equal(await fileMode(activePath), 0o700);
+  assert.equal(await fileMode(replacementMarker), 0o600);
 });
 
 test("appendEvent appends private JSONL entries with store-assigned unique IDs", async (t) => {

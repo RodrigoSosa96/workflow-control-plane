@@ -383,9 +383,9 @@ Reject implicit transitions and preserve a timestamped state history.
 
 - [ ] **Step 4: Implement atomic private persistence**
 
-Use these concrete operations: `await fs.mkdir(runDirectory, { recursive: true, mode: 0o700 })`; `await fs.open(lockPath, "wx", 0o600)`; `await fs.open(tempPath, "w", 0o600)` followed by `handle.sync()` and `fs.rename(tempPath, destinationPath)`. Never include raw run JSON in error messages. `events.jsonl` is append-only and each event has `version`, `id`, `type`, `runId`, and timestamp.
+Use these concrete operations: `await fs.mkdir(runDirectory, { recursive: true, mode: 0o700 })`; create the permanent private lock container `<runDirectory>/run.lock/` at `0700`; acquire exclusive ownership with `await fs.mkdir(<run.lock>/active, { mode: 0o700 })`; then create a random owner-marker file under that active directory using `await fs.open(<active>/<owner-token>, "wx", 0o600)`. On release, unlink only that owner-token path and call `rmdir(<run.lock>/active)`; if another valid owner marker exists, `rmdir` fails and must not delete it. Use `await fs.open(tempPath, "w", 0o600)` followed by `handle.sync()` and `fs.rename(tempPath, destinationPath)` for atomic data writes. Never include raw run JSON in error messages. `events.jsonl` is append-only and each event has `version`, `id`, `type`, `runId`, and timestamp.
 
-Do not remove stale locks automatically; return a bounded recovery message containing the lock path and age.
+Do not remove stale active locks automatically; return a bounded recovery message containing the active-lock path and age.
 
 - [ ] **Step 5: Run focused and full tests**
 
