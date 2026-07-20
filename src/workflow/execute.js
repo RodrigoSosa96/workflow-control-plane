@@ -174,15 +174,22 @@ async function observePaneProcess(herdr, paneId, expectedCommand, observeMs = 0)
   const windowMs = Math.max(0, Number.isFinite(observeMs) ? observeMs : 0);
   const deadline = Date.now() + windowMs;
   let lastProcessInfo = null;
+  let finalPollAfterDeadlinePending = windowMs > 0;
 
   while (true) {
     lastProcessInfo = await herdr.getPaneProcessInfo(paneId);
     if (!expectedCommand || matchesProcessIdentity(expectedCommand, lastProcessInfo)) {
       return lastProcessInfo;
     }
+
     if (Date.now() >= deadline) {
+      if (finalPollAfterDeadlinePending) {
+        finalPollAfterDeadlinePending = false;
+        continue;
+      }
       return lastProcessInfo;
     }
+
     const remainingMs = deadline - Date.now();
     await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(RUNTIME_OBSERVE_INTERVAL_MS, remainingMs)));
   }

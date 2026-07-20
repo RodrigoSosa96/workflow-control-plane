@@ -857,9 +857,57 @@ test("runtime works with the real Herdr adapter process-info contract", async ()
   ]);
 });
 
-test("runtime waits for a transient shell process to hand off to the requested command", async () => {
+test("runtime does a final process-info poll when a transient shell handoff reaches the observe deadline late", async (t) => {
   const calls = [];
+  let now = 1_000;
   let processInfoReads = 0;
+
+  t.mock.method(Date, "now", () => now);
+  t.mock.method(globalThis, "setTimeout", (callback, ms = 0) => {
+    now += ms;
+    queueMicrotask(() => callback());
+    return 0;
+  });
+
+  const shellProcessInfo = (paneId) => ({
+    running: true,
+    executable: "/usr/bin/zsh",
+    command: "/usr/bin/zsh",
+    argv: ["/usr/bin/zsh"],
+    cmdline: "/usr/bin/zsh",
+    pane_id: paneId,
+    shell_pid: 111,
+    foreground_process_group_id: 111,
+    foreground_processes: [
+      {
+        argv: ["/usr/bin/zsh"],
+        cmdline: "/usr/bin/zsh",
+        cwd: workspacePath,
+        name: "zsh",
+        pid: 111,
+      },
+    ],
+  });
+  const runtimeProcessInfo = (paneId) => ({
+    running: true,
+    executable: "sleep",
+    command: "sleep 10000",
+    argv: ["sleep", "10000"],
+    cmdline: "sleep 10000",
+    pane_id: paneId,
+    shell_pid: 111,
+    foreground_process_group_id: 222,
+    foreground_processes: [
+      {
+        argv: ["sleep", "10000"],
+        cmdline: "sleep 10000",
+        cwd: workspacePath,
+        name: "sleep",
+        pid: 222,
+      },
+    ],
+  });
+
   const herdr = {
     async createTab({ workspaceId, cwd, label, focus }) {
       calls.push({ kind: "herdr.tab.create", workspaceId, cwd, label, focus });
@@ -879,46 +927,14 @@ test("runtime waits for a transient shell process to hand off to the requested c
     async getPaneProcessInfo(paneId) {
       calls.push({ kind: "herdr.pane.process-info", paneId, read: processInfoReads + 1 });
       processInfoReads += 1;
-      if (processInfoReads <= 5) {
-        return {
-          running: true,
-          executable: "/usr/bin/zsh",
-          command: "/usr/bin/zsh",
-          argv: ["/usr/bin/zsh"],
-          cmdline: "/usr/bin/zsh",
-          pane_id: paneId,
-          shell_pid: 111,
-          foreground_process_group_id: 111,
-          foreground_processes: [
-            {
-              argv: ["/usr/bin/zsh"],
-              cmdline: "/usr/bin/zsh",
-              cwd: workspacePath,
-              name: "zsh",
-              pid: 111,
-            },
-          ],
-        };
+      if (processInfoReads <= 4) {
+        return shellProcessInfo(paneId);
       }
-      return {
-        running: true,
-        executable: "sleep",
-        command: "sleep 10000",
-        argv: ["sleep", "10000"],
-        cmdline: "sleep 10000",
-        pane_id: paneId,
-        shell_pid: 111,
-        foreground_process_group_id: 222,
-        foreground_processes: [
-          {
-            argv: ["sleep", "10000"],
-            cmdline: "sleep 10000",
-            cwd: workspacePath,
-            name: "sleep",
-            pid: 222,
-          },
-        ],
-      };
+      if (processInfoReads === 5) {
+        now = 1_151;
+        return shellProcessInfo(paneId);
+      }
+      return runtimeProcessInfo(paneId);
     },
   };
 
@@ -932,7 +948,7 @@ test("runtime waits for a transient shell process to hand off to the requested c
   assert.deepEqual(report.processes.map(({ id, status }) => ({ id, status })), [
     { id: "sleeper", status: "created" },
   ]);
-  assert.equal(calls.filter((call) => call.kind === "herdr.pane.process-info").length >= 6, true);
+  assert.equal(processInfoReads, 6);
 });
 
 test("runtime reuses existing expected processes without duplicate launches", async () => {
