@@ -131,6 +131,19 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   sandboxEqualsOverride.launcher.agent_profiles["codex-worker"].arguments = ["--sandbox=danger-full-access"];
   assert.throws(() => validateRegistry(sandboxEqualsOverride), /sandbox|danger-full-access/i);
 
+  const longSplitControls = [
+    ["claude-worker", ["--permission-mode", "bypassPermissions"], /permission-mode|bypasspermissions/i],
+    ["codex-worker", ["--sandbox", "danger-full-access"], /sandbox|danger-full-access/i],
+    ["codex-worker", ["--ask-for-approval", "never"], /approval|never/i],
+    ["codex-worker", ["--profile", "unsafe-profile"], /profile|unsafe-profile/i],
+    ["codex-worker", ["--config", 'sandbox = "danger-full-access"'], /config|sandbox|danger-full-access/i],
+  ];
+  for (const [profileName, argumentsList, pattern] of longSplitControls) {
+    const profile = registryValue();
+    profile.launcher.agent_profiles[profileName].arguments = argumentsList;
+    assert.throws(() => validateRegistry(profile), pattern);
+  }
+
   const sandboxShortOverride = registryValue();
   sandboxShortOverride.launcher.agent_profiles["codex-worker"].arguments = ["-s", "danger-full-access"];
   assert.throws(() => validateRegistry(sandboxShortOverride), /sandbox|danger-full-access/i);
