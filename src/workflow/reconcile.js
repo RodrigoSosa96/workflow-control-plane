@@ -126,6 +126,150 @@ function hasLiveProcessEvidence(processInfo) {
   return processInfoRunning(processInfo) || Boolean(processInfoCommand(processInfo) || processInfoExecutable(processInfo));
 }
 
+const WRITER_HARNESSES = new Set(["pi", "claude", "codex"]);
+const STOPPED_AGENT_STATUSES = new Set(["done", "completed", "exited", "stopped", "dead", "failed"]);
+
+function boundedReason(text, limit = 500) {
+  const normalized = String(text ?? "").replace(/\s+/gu, " ").trim();
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit - 14)}...[truncated]`;
+}
+
+function agentHarness(value) {
+  const raw = value?.agent ?? value?.harness ?? value?.agent_session?.agent ?? value?.agentSession?.agent;
+  if (typeof raw === "string") return raw.toLowerCase();
+  if (typeof value?.name === "string" && (
+    value?.agent_status !== undefined
+      || value?.agentStatus !== undefined
+      || value?.pane_id !== undefined
+      || value?.paneId !== undefined
+      || value?.agent_id !== undefined
+      || value?.agentId !== undefined
+  )) return "pi";
+  return null;
+}
+
+function agentProfileName(value) {
+  return value?.profileName ?? value?.profile_name ?? value?.workflow_profile ?? value?.workflowProfile ?? null;
+}
+
+function workflowRunId(value) {
+  return value?.workflow_run_id
+    ?? value?.workflowRunId
+    ?? value?.run_id
+    ?? value?.runId
+    ?? value?.env?.WORKFLOW_RUN_ID
+    ?? null;
+}
+
+function nativeSessionId(value) {
+  return value?.native_session_id
+    ?? value?.nativeSessionId
+    ?? value?.agent_session?.native_session_id
+    ?? value?.agentSession?.nativeSessionId
+    ?? null;
+}
+
+function agentStatus(value) {
+  const status = value?.agent_status ?? value?.agentStatus ?? value?.status ?? null;
+  return typeof status === "string" ? status.toLowerCase() : null;
+}
+
+function isLiveAgentWriter(value) {
+  const harness = agentHarness(value);
+  if (!WRITER_HARNESSES.has(harness)) return false;
+  const status = agentStatus(value);
+  return !status || !STOPPED_AGENT_STATUSES.has(status);
+}
+
+function writerName(value) {
+  return value?.name ?? value?.sessionName ?? value?.label ?? value?.terminal_title_stripped ?? value?.terminal_title ?? null;
+}
+
+function writerId(value) {
+  return value?.agent_id ?? value?.agentId ?? value?.pane_id ?? value?.paneId ?? writerName(value) ?? null;
+}
+
+function writerEvidence(value, source, canonicalPath) {
+  return {
+    source,
+    harness: agentHarness(value),
+    profileName: agentProfileName(value),
+    name: writerName(value),
+    runId: workflowRunId(value),
+    nativeSessionId: nativeSessionId(value),
+    id: writerId(value),
+    canonicalPath,
+  };
+}
+
+function writerDedupKey(writer) {
+  return [
+    writer.source,
+    writer.id,
+    writer.harness,
+    writer.profileName,
+    writer.name,
+    writer.runId,
+    writer.nativeSessionId,
+  ].map((value) => value ?? "").join("|");
+}
+
+function plannedAgentRunId(plan) {
+  return plan.agent?.runId ?? plan.run?.id ?? null;
+}
+
+function plannedNativeSessionId(plan) {
+  return plan.agent?.nativeSessionId ?? plan.run?.nativeSessionId ?? null;
+}
+
+function writerMatchesPlannedAgent(writer, plan) {
+  const expectedHarness = plan.agent?.harness ?? "pi";
+  if (writer.harness !== expectedHarness) return false;
+  const expectedRunId = plannedAgentRunId(plan);
+  if (expectedRunId && writer.runId === expectedRunId) return true;
+  const expectedNativeSessionId = plannedNativeSessionId(plan);
+  if (expectedNativeSessionId && writer.nativeSessionId === expectedNativeSessionId) return true;
+  return writer.name === plan.agent?.sessionName;
+}
+
+function summarizeWriter(writer) {
+  return [
+    writer.harness,
+    writer.profileName ? `profile ${writer.profileName}` : null,
+    writer.name ? `name ${writer.name}` : null,
+    writer.runId ? `run ${writer.runId}` : null,
+  ].filter(Boolean).join(" ");
+}
+
+async function collectLiveWritersInCheckout(plan, panes, actualAgents, canonicalPath) {
+  const expectedCanonicalPath = await canonicalPath(plan.agent.worktreePath);
+  const writers = new Map();
+  const agentsByPaneId = new Map(actualAgents
+    .filter((agent) => agent?.pane_id || agent?.paneId)
+    .map((agent) => [agent.pane_id ?? agent.paneId, agent]));
+
+  for (const agent of actualAgents) {
+    if (!isLiveAgentWriter(agent)) continue;
+    const canonical = await canonicalPath(agent.cwd ?? agent.foreground_cwd ?? agent.foregroundCwd);
+    if (canonical !== expectedCanonicalPath) continue;
+    const writer = writerEvidence(agent, "agent", canonical);
+    writers.set(writerDedupKey(writer), writer);
+  }
+
+  for (const pane of panes) {
+    if (!isLiveAgentWriter(pane)) continue;
+    const canonical = await panePath(pane, canonicalPath);
+    if (canonical !== expectedCanonicalPath) continue;
+    const relatedAgent = agentsByPaneId.get(paneId(pane));
+    const merged = relatedAgent ? { ...pane, ...relatedAgent, agent: pane.agent ?? relatedAgent.agent } : pane;
+    const writer = writerEvidence(merged, relatedAgent ? "agent" : "pane", canonical);
+    writers.set(writerDedupKey(writer), writer);
+  }
+
+  return [...writers.values()];
+}
+
 async function loadPaneProcessInfo(herdr, pane) {
   if (typeof herdr?.getPaneProcessInfo !== "function") return { available: false, value: null };
   const id = paneId(pane);
@@ -428,13 +572,18 @@ async function classifyTabIdentity(planned, actual, actualPanes, loadAgents, wor
 
   if (planned.kind === "agent") {
     const actualAgents = await loadAgents();
-    const matchingAgents = actualAgents.filter((agent) => agent.tab_id === actual.tab_id && agent.name === plan.agent.sessionName);
+    const expectedHarness = plan.agent?.harness ?? "pi";
+    const matchingAgents = actualAgents.filter((agent) => (
+      agent.tab_id === actual.tab_id
+        && agent.name === plan.agent.sessionName
+        && (!agentHarness(agent) || agentHarness(agent) === expectedHarness)
+    ));
     const agentMatches = [];
     for (const agent of matchingAgents) {
       if (await canonicalPath(agent.cwd) === expectedCanonicalPath) agentMatches.push(agent);
     }
     if (agentMatches.length > 1) {
-      return buildTabConflict(planned, actual, `Multiple Pi agents match agent tab ${planned.label}`);
+      return buildTabConflict(planned, actual, `Multiple ${expectedHarness} agents match agent tab ${planned.label}`);
     }
     if (agentMatches.length === 1) {
       return {
@@ -523,7 +672,7 @@ async function classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canon
   return { results, byLabel, panes: actualPanes };
 }
 
-async function classifyAgent(plan, tabs, loadAgents, canonicalPath) {
+async function classifyAgent(plan, tabs, panes, loadAgents, canonicalPath) {
   const actualAgents = await loadAgents();
   const tab = tabs.byLabel.get(plan.agent.tabLabel);
   if (!tab || tab.status !== "compatible") {
@@ -534,34 +683,43 @@ async function classifyAgent(plan, tabs, loadAgents, canonicalPath) {
     };
   }
 
-  const expectedCanonicalPath = await canonicalPath(plan.agent.worktreePath);
-  const matches = [];
-  for (const agent of actualAgents) {
-    const sameName = agent.name === plan.agent.sessionName;
-    const sameTab = !agent.tab_id || agent.tab_id === tab.actual.tab_id;
-    if (!sameName || !sameTab) continue;
-    if (await canonicalPath(agent.cwd) === expectedCanonicalPath) matches.push(agent);
+  const expectedHarness = plan.agent?.harness ?? "pi";
+  const liveWriters = await collectLiveWritersInCheckout(plan, panes, actualAgents, canonicalPath);
+  const matches = liveWriters.filter((writer) => writerMatchesPlannedAgent(writer, plan));
+  const distinctWriters = liveWriters.filter((writer) => !writerMatchesPlannedAgent(writer, plan));
+
+  if (distinctWriters.length > 0) {
+    const evidence = distinctWriters.map(summarizeWriter).filter(Boolean).join("; ");
+    return {
+      status: "conflict",
+      reason: boundedReason(`Distinct live writer owns checkout ${plan.agent.worktreePath}: ${evidence}; expected ${expectedHarness} profile ${plan.agent.profileName ?? "unknown"}`),
+      actual: liveWriters,
+    };
   }
 
   if (matches.length > 1) {
     return {
       status: "conflict",
-      reason: `Multiple Pi agents match ${plan.agent.sessionName}`,
+      reason: boundedReason(`Multiple ${expectedHarness} agents match ${plan.agent.sessionName}`),
       actual: matches,
     };
   }
 
   if (matches.length === 1) {
+    const match = matches[0];
+    const sameRun = plannedAgentRunId(plan) && match.runId === plannedAgentRunId(plan);
     return {
       status: "compatible",
-      reason: `Pi agent ${plan.agent.sessionName} is running`,
-      actual: matches[0],
+      reason: sameRun
+        ? `${expectedHarness} agent for the same run is running`
+        : `${expectedHarness} agent ${plan.agent.sessionName} is running`,
+      actual: match,
     };
   }
 
   return {
     status: "missing",
-    reason: `Pi agent ${plan.agent.sessionName} is not running`,
+    reason: `${expectedHarness} agent ${plan.agent.sessionName} is not running`,
     actual: null,
   };
 }
@@ -747,7 +905,7 @@ async function classifyOperation(operation, state, canonicalPath) {
     return { status: tab?.status ?? "missing", reason: tab?.reason ?? `Tab ${operation.label} is missing` };
   }
 
-  if (operation.kind === "pi.session.start") {
+  if (operation.kind === "agent.session.start" || operation.kind === "pi.session.start") {
     return { status: state.agent.status, reason: state.agent.reason };
   }
 
@@ -772,7 +930,7 @@ export async function reconcilePlan(plan, { git, herdr, realpath = defaultRealpa
   const tabs = await classifyTabs(plan, workspace, worktrees, herdr, loadAgents, canonicalPath);
   const agent = {
     ...plan.agent,
-    ...await classifyAgent(plan, tabs, loadAgents, canonicalPath),
+    ...await classifyAgent(plan, tabs, tabs.panes, loadAgents, canonicalPath),
   };
   const runtime = {
     ...plan.runtime,

@@ -1,5 +1,6 @@
 import { basename, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
+import { buildHarnessLaunch } from "./harnesses.js";
 
 function fail(category, message, details, exitCode = 1) {
   throw new WorkflowError(category, message, { details, exitCode });
@@ -93,8 +94,20 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
 
-function agentArgv(plan) {
-  return [plan.agent.command, "--name", plan.agent.sessionName];
+function hydrateAgentProfile(plan) {
+  const agent = plan.agent ?? {};
+  const profile = agent.profile && typeof agent.profile === "object" ? agent.profile : {};
+  return {
+    harness: agent.harness ?? "pi",
+    command: agent.command ?? "pi",
+    mode: profile.mode ?? "interactive",
+    roles: Array.isArray(agent.roles) ? agent.roles : ["implementer"],
+    model: profile.model ?? null,
+    arguments: Array.isArray(profile.arguments) ? profile.arguments : [],
+    ...(agent.harness === "claude" || profile.permission_mode !== undefined ? { permission_mode: profile.permission_mode ?? "manual" } : {}),
+    ...(agent.harness === "codex" || profile.sandbox !== undefined ? { sandbox: profile.sandbox ?? "workspace-write" } : {}),
+    ...(agent.harness === "codex" || profile.approval_policy !== undefined ? { approval_policy: profile.approval_policy ?? "on-request" } : {}),
+  };
 }
 
 function listValue(value, key) {
@@ -225,8 +238,12 @@ function runtimeFailureReason(process, processInfo) {
   return `Runtime process ${process.id} has mismatched executable or command evidence`;
 }
 
-function looksLikePiPane(pane) {
-  return pane?.agent === "pi" || pane?.agent_session?.agent === "pi";
+function paneHarness(pane) {
+  return pane?.agent ?? pane?.agent_session?.agent ?? pane?.agentSession?.agent ?? null;
+}
+
+function matchesExpectedHarnessPane(pane, expectedHarness) {
+  return paneHarness(pane) === expectedHarness;
 }
 
 function isIdleBootstrapPane(pane) {
@@ -421,7 +438,7 @@ async function resolveBootstrapContext(plan, worktreeOperation, ensured, herdr) 
   };
 }
 
-async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent }) {
+async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent, expectedHarness }) {
   if (typeof herdr.listTabs !== "function" || typeof herdr.listPanes !== "function") {
     return false;
   }
@@ -443,7 +460,7 @@ async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapP
 
   if (!startedTabExists) return false;
   if (startedAgent.tabId !== expectedTabId) return false;
-  if (!startedPane || !looksLikePiPane(startedPane)) return false;
+  if (!startedPane || !matchesExpectedHarnessPane(startedPane, expectedHarness)) return false;
   if (!bootstrapPane || !isIdleBootstrapPane(bootstrapPane)) return false;
   if (getPaneId(bootstrapPane) === getPaneId(startedPane)) return false;
   return true;
@@ -520,7 +537,7 @@ function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorT
   }
 }
 
-async function executeOrdinaryStart(plan, { herdr }) {
+async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -573,11 +590,19 @@ async function executeOrdinaryStart(plan, { herdr }) {
     }
 
     currentOperation = agentOperation;
+    const launch = buildAgentLaunch({
+      profileName: plan.agent.profileName ?? "pi-worker",
+      profile: hydrateAgentProfile(plan),
+      sessionName: plan.agent.sessionName,
+      cwd: plan.agent.worktreePath,
+      run: plan.run ?? null,
+    });
     const startedAgent = await herdr.startAgent({
       name: plan.agent.sessionName,
       cwd: plan.agent.worktreePath,
       tabId: agentTabId,
-      argv: agentArgv(plan),
+      argv: launch.argv,
+      env: launch.env,
       focus: false,
     });
 
@@ -605,6 +630,7 @@ async function executeOrdinaryStart(plan, { herdr }) {
             expectedTabId,
             bootstrapPaneId,
             startedAgent,
+          expectedHarness: plan.agent.harness ?? "pi",
           });
         } catch (error) {
           report.notes.push(`Retained the bootstrap shell pane because the post-start close safety inspection failed: ${error.message}`);
@@ -645,7 +671,7 @@ async function executeOrdinaryStart(plan, { herdr }) {
   }
 }
 
-async function executeGroupStart(plan, { git, herdr }) {
+async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -773,11 +799,19 @@ async function executeGroupStart(plan, { git, herdr }) {
     }
 
     currentOperation = agentOperation;
+    const launch = buildAgentLaunch({
+      profileName: plan.agent.profileName ?? "pi-worker",
+      profile: hydrateAgentProfile(plan),
+      sessionName: plan.agent.sessionName,
+      cwd: plan.agent.worktreePath,
+      run: plan.run ?? null,
+    });
     const startedAgent = await herdr.startAgent({
       name: plan.agent.sessionName,
       cwd: plan.agent.worktreePath,
       tabId: coordinatorTabId,
-      argv: agentArgv(plan),
+      argv: launch.argv,
+      env: launch.env,
       focus: false,
     });
 
@@ -968,12 +1002,12 @@ async function executeRuntimePhase(plan, { herdr, observeMs = DEFAULT_RUNTIME_OB
   }
 }
 
-export async function executeStart(reconciledPlan, { git, herdr } = {}) {
+export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch } = {}) {
   ensureStartablePlan(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
   return reconciledPlan.mode === "group"
-    ? await executeGroupStart(reconciledPlan, { git, herdr })
-    : await executeOrdinaryStart(reconciledPlan, { herdr });
+    ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch })
+    : await executeOrdinaryStart(reconciledPlan, { herdr, buildAgentLaunch });
 }
 
 export async function executeRuntime(reconciledPlan, { herdr, observeMs } = {}) {

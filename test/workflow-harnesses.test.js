@@ -1,0 +1,144 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { buildHarnessLaunch } from "../src/workflow/harnesses.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const RUN = Object.freeze({
+  id: RUN_ID,
+  directory: "/state/runs/11111111-1111-4111-8111-111111111111",
+  generation: 3,
+  stateRoot: "/state/runs",
+  controlPlaneBin: "/control/bin/workflow",
+  originalRequest: "Implement OCR payment extraction with SECRET-DO-NOT-LEAK",
+});
+const SESSION_NAME = "ocr-A-1-fix";
+const CWD = "/wt/ocr/A-1-fix";
+
+function profile(overrides) {
+  return {
+    harness: "pi",
+    command: "pi",
+    mode: "interactive",
+    roles: ["implementer"],
+    model: null,
+    arguments: [],
+    ...overrides,
+  };
+}
+
+function assertRunLaunch(spec, harness) {
+  assert.deepEqual(spec.env, {
+    WORKFLOW_RUN_ID: RUN_ID,
+    WORKFLOW_RUN_DIR: RUN.directory,
+    WORKFLOW_GENERATION: "3",
+    WORKFLOW_HARNESS: harness,
+    WORKFLOW_STATE_ROOT: RUN.stateRoot,
+    WORKFLOW_CONTROL_PLANE_BIN: RUN.controlPlaneBin,
+  });
+  assert.deepEqual(Object.keys(spec.env), [
+    "WORKFLOW_RUN_ID",
+    "WORKFLOW_RUN_DIR",
+    "WORKFLOW_GENERATION",
+    "WORKFLOW_HARNESS",
+    "WORKFLOW_STATE_ROOT",
+    "WORKFLOW_CONTROL_PLANE_BIN",
+  ]);
+  assert.equal(spec.argv.every((value) => typeof value === "string" && value.length > 0), true);
+
+  const bootstrap = spec.argv.at(-1);
+  assert.match(bootstrap, /assignment\.md/);
+  assert.match(bootstrap, /result\.json/);
+  assert.doesNotMatch(bootstrap, /SECRET-DO-NOT-LEAK|payment extraction|originalRequest/i);
+  assert.ok(bootstrap.length <= 500, `bootstrap prompt should be bounded, got ${bootstrap.length}`);
+}
+
+test("builds exact safe argv arrays and run env for Pi, Claude, and Codex profiles", () => {
+  const piSpec = buildHarnessLaunch({
+    profileName: "pi-worker",
+    profile: profile({ arguments: ["--plain-output"] }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+
+  assert.deepEqual(piSpec.argv.slice(0, 5), ["pi", "--name", "ocr-A-1-fix", "--session-id", piSpec.expected.nativeSessionId]);
+  assert.match(piSpec.expected.nativeSessionId, UUID_RE);
+  assert.equal(piSpec.expected.profileName, "pi-worker");
+  assert.equal(piSpec.expected.harness, "pi");
+  assert.equal(piSpec.argv.at(-2), "--plain-output");
+  assert.equal(piSpec.argv.includes("--model"), false);
+  assertRunLaunch(piSpec, "pi");
+
+  const claudeSpec = buildHarnessLaunch({
+    profileName: "claude-worker",
+    profile: profile({
+      harness: "claude",
+      command: "claude",
+      model: "claude-3-5-sonnet-latest",
+      arguments: ["--verbose"],
+      permission_mode: "manual",
+    }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+
+  assert.equal(claudeSpec.argv[0], "claude");
+  assert.ok(claudeSpec.argv.includes("--session-id"));
+  assert.match(claudeSpec.expected.nativeSessionId, UUID_RE);
+  assert.ok(claudeSpec.argv.includes("--permission-mode"));
+  assert.ok(claudeSpec.argv.includes("manual"));
+  assert.ok(claudeSpec.argv.includes("--add-dir"));
+  assert.ok(claudeSpec.argv.includes(CWD));
+  assert.ok(claudeSpec.argv.includes("--model"));
+  assert.ok(claudeSpec.argv.includes("claude-3-5-sonnet-latest"));
+  assert.equal(claudeSpec.argv.at(-2), "--verbose");
+  assertRunLaunch(claudeSpec, "claude");
+
+  const codexSpec = buildHarnessLaunch({
+    profileName: "codex-worker",
+    profile: profile({
+      harness: "codex",
+      command: "codex",
+      model: "gpt-5-codex",
+      arguments: ["--config", "ui=false"],
+      sandbox: "workspace-write",
+      approval_policy: "on-request",
+    }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+
+  assert.deepEqual(codexSpec.argv.slice(0, 3), ["codex", "-C", "/wt/ocr/A-1-fix"]);
+  assert.ok(codexSpec.argv.includes("workspace-write"));
+  assert.ok(codexSpec.argv.includes("on-request"));
+  assert.ok(codexSpec.argv.includes("--model"));
+  assert.ok(codexSpec.argv.includes("gpt-5-codex"));
+  assert.equal(codexSpec.argv.at(-3), "--config");
+  assert.equal(codexSpec.argv.at(-2), "ui=false");
+  assert.equal(codexSpec.expected.nativeSessionId, null);
+  assert.equal(codexSpec.expected.profileName, "codex-worker");
+  assert.equal(codexSpec.expected.harness, "codex");
+  assertRunLaunch(codexSpec, "codex");
+});
+
+test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
+  const spec = buildHarnessLaunch({
+    profileName: "pi-worker",
+    profile: profile({ arguments: ["--safe"] }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+  });
+
+  assert.deepEqual(spec.argv, ["pi", "--name", SESSION_NAME, "--safe"]);
+  assert.deepEqual(spec.env, {});
+  assert.deepEqual(spec.expected, {
+    profileName: "pi-worker",
+    harness: "pi",
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    nativeSessionId: null,
+  });
+});

@@ -75,9 +75,10 @@ test("installed symlink executes the workflow entry point", async () => {
 });
 
 test("parses documented workflow commands and options", () => {
-  assert.deepEqual(parseArgs(["doctor", "ocr"]), {
+  assert.deepEqual(parseArgs(["doctor", "ocr", "--agent", "codex-worker"]), {
     command: "doctor",
     projectAlias: "ocr",
+    agentProfile: "codex-worker",
     format: "compact",
   });
 
@@ -91,12 +92,13 @@ test("parses documented workflow commands and options", () => {
     format: "json",
   });
 
-  assert.deepEqual(parseArgs(["start", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--tickets", "ASANA-150,ASANA-140", "--yes"]), {
+  assert.deepEqual(parseArgs(["start", "ocr", "ASANA-123", "--feature", "Discovered Docs", "--tickets", "ASANA-150,ASANA-140", "--agent", "codex-worker", "--yes"]), {
     command: "start",
     projectAlias: "ocr",
     task: "ASANA-123",
     feature: "Discovered Docs",
     tickets: ["ASANA-150", "ASANA-140"],
+    agentProfile: "codex-worker",
     yes: true,
     format: "compact",
   });
@@ -402,6 +404,35 @@ test("runtime requires compatible Herdr server but not Pi integration", async ()
   assert.equal(allowedCode, 0);
   assert.equal(allowedExecuted, true);
   assert.deepEqual(allowed.stdout, ["runtime:compact:completed"]);
+});
+
+test("start accepts selected generic agent readiness without Pi or Claude checks", async () => {
+  const output = io();
+  let executed = false;
+  const code = await main(["start", "ocr", "ASANA-123", "--agent", "codex-worker", "--yes"], {
+    ...output,
+    planCommand: async (options) => {
+      assert.equal(options.agentProfile, "codex-worker");
+      return planPreview({
+        preconditions: {
+          git: { id: "binary:git", status: "ready", path: "/usr/bin/git" },
+          herdr: { id: "binary:herdr", status: "ready", path: "/usr/bin/herdr" },
+          herdrStatus: { id: "herdr:status", status: "ready" },
+          agent: { id: "binary:codex", status: "ready", path: "/usr/bin/codex", harness: "codex", profileName: "codex-worker" },
+          agentIntegration: { id: "herdr:integration:codex", status: "ready", harness: "codex", profileName: "codex-worker" },
+        },
+      });
+    },
+    executeStart: async () => {
+      executed = true;
+      return executionReport();
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status ?? value.reconciliation?.status}`,
+  });
+
+  assert.equal(code, 0);
+  assert.equal(executed, true);
+  assert.deepEqual(output.stdout, ["start:compact:completed"]);
 });
 
 test("maps conflict and preflight workflow errors to stable categories", async () => {

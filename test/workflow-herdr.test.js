@@ -948,3 +948,88 @@ test("starts an agent when the live contract omits agent_id", async () => {
     paneId: "w2:p9",
   });
 });
+
+test("starts an agent with discrete workflow env entries before argv", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "agent",
+          "start",
+          "ocr-ASANA-123-discovered-docs",
+          "--cwd",
+          "/repo/.worktrees/ASANA-123-discovered-docs",
+          "--tab",
+          "w2:t1",
+          "--no-focus",
+          "--env",
+          "WORKFLOW_RUN_ID=run-123",
+          "--env",
+          "WORKFLOW_HARNESS=codex",
+          "--",
+          "codex",
+          "-C",
+          "/repo/.worktrees/ASANA-123-discovered-docs",
+        ]);
+        assert.deepEqual(options, { allowFailure: true, cwd: "/repo/.worktrees/ASANA-123-discovered-docs" });
+      },
+      stdout: cliResult({
+        type: "agent_started",
+        agent: { agent_id: "a10", name: "ocr-ASANA-123-discovered-docs" },
+        tab: { tab_id: "w2:t1" },
+        pane: { pane_id: "w2:p10" },
+      }, "cli:agent:start"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.startAgent({
+    name: "ocr-ASANA-123-discovered-docs",
+    cwd: "/repo/.worktrees/ASANA-123-discovered-docs",
+    tabId: "w2:t1",
+    argv: ["codex", "-C", "/repo/.worktrees/ASANA-123-discovered-docs"],
+    env: {
+      WORKFLOW_RUN_ID: "run-123",
+      WORKFLOW_HARNESS: "codex",
+    },
+    focus: false,
+  });
+
+  assert.deepEqual(result, {
+    agentId: "a10",
+    tabId: "w2:t1",
+    paneId: "w2:p10",
+  });
+});
+
+test("startAgent rejects non-workflow env serialization before invoking Herdr", async () => {
+  const calls = [];
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run(command, args, options) {
+        calls.push({ command, args, options });
+        return { code: 0, stdout: cliResult(null), stderr: "" };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({
+      name: "ocr-ASANA-123-discovered-docs",
+      cwd: "/repo/.worktrees/ASANA-123-discovered-docs",
+      tabId: "w2:t1",
+      argv: ["codex", "-C", "/repo/.worktrees/ASANA-123-discovered-docs"],
+      env: {
+        PATH: "/usr/bin",
+      },
+      focus: false,
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /env|workflow/i);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, []);
+});

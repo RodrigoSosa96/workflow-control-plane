@@ -43,6 +43,9 @@ function buildPlan({
   workspaceId = "w1",
   agentTabActual,
   agentActual,
+  agentHarness = "pi",
+  agentProfileName = "pi-worker",
+  agentProfile = { mode: "interactive", model: null, arguments: [] },
 } = {}) {
   const rootWorkspace = { workspace_id: workspaceId };
   const rootTab = { tab_id: rootTabId, workspace_id: workspaceId, label: "bootstrap" };
@@ -77,10 +80,14 @@ function buildPlan({
       },
     ],
     agent: {
-      command: "pi",
+      command: agentHarness === "pi" ? "pi" : agentHarness,
       sessionName,
       tabLabel: "agent",
       worktreePath: workspacePath,
+      profileName: agentProfileName,
+      harness: agentHarness,
+      roles: ["implementer"],
+      profile: agentProfile,
       status: agentStatus,
       actual: agentActual ?? (agentStatus === "compatible" ? { agent_id: "a1", tab_id: rootTabId, workspace_id: workspaceId, name: sessionName } : null),
     },
@@ -243,8 +250,8 @@ function createHerdr(calls, {
       if (failRename) throw failRename;
       return { tab_id: tabId, label };
     },
-    async startAgent({ name, cwd, tabId, argv, focus }) {
-      calls.push({ kind: "herdr.agent.start", name, cwd, tabId, argv, focus });
+    async startAgent({ name, cwd, tabId, argv, env, focus }) {
+      calls.push({ kind: "herdr.agent.start", name, cwd, tabId, argv, env, focus });
       if (failStart) throw failStart;
       return startResult;
     },
@@ -356,6 +363,10 @@ function buildRuntimePlan({
       sessionName,
       tabLabel: "agent",
       worktreePath: workspacePath,
+      profileName: "pi-worker",
+      harness: "pi",
+      roles: ["implementer"],
+      profile: { mode: "interactive", model: null, arguments: [] },
       status: "compatible",
       actual: { agent_id: "a1", tab_id: "w1:t1", workspace_id: workspaceId, name: sessionName },
     },
@@ -456,6 +467,99 @@ test("creates native worktree and starts a named Pi session without a prompt", a
   assert.doesNotMatch(JSON.stringify(calls), /start-feature|implement/i);
   assert.equal(report.status, "completed");
   assert.equal(report.operations.at(-1).status, "created");
+});
+
+test("uses an injected launch builder immediately before Herdr agent start", async () => {
+  const calls = [];
+  const launchSpec = {
+    argv: ["codex", "-C", workspacePath, "Read assignment.md and write result.json."],
+    env: { WORKFLOW_RUN_ID: "run-123", WORKFLOW_HARNESS: "codex" },
+    expected: { profileName: "codex-worker", harness: "codex", nativeSessionId: null },
+  };
+  const plan = buildPlan({
+    agentHarness: "codex",
+    agentProfileName: "codex-worker",
+    agentProfile: {
+      mode: "interactive",
+      model: "gpt-5-codex",
+      arguments: [],
+      sandbox: "workspace-write",
+      approval_policy: "on-request",
+    },
+  });
+  plan.operations = plan.operations.map((operation) => operation.id === "agent"
+    ? { ...operation, kind: "agent.session.start", command: "codex" }
+    : operation);
+  plan.run = { id: "run-123", directory: "/state/run-123", generation: 1 };
+
+  const report = await executeStart(plan, fakeAdapters(calls), {
+    buildAgentLaunch(input) {
+      calls.push({ kind: "launch.builder", input });
+      return launchSpec;
+    },
+  });
+
+  assert.equal(report.status, "completed");
+  assert.deepEqual(calls.map((call) => call.kind).slice(0, 4), [
+    "herdr.worktree.create",
+    "herdr.tab.rename",
+    "launch.builder",
+    "herdr.agent.start",
+  ]);
+  const builderCall = calls.find((call) => call.kind === "launch.builder");
+  assert.equal(builderCall.input.profileName, "codex-worker");
+  assert.equal(builderCall.input.profile.harness, "codex");
+  assert.equal(builderCall.input.sessionName, sessionName);
+  assert.equal(builderCall.input.cwd, workspacePath);
+  assert.deepEqual(builderCall.input.run, plan.run);
+
+  const launch = calls.find((call) => call.kind === "herdr.agent.start");
+  assert.deepEqual(launch.argv, launchSpec.argv);
+  assert.deepEqual(launch.env, launchSpec.env);
+});
+
+test("closes the bootstrap shell when the started pane matches the selected non-Pi harness", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan({
+    agentHarness: "claude",
+    agentProfileName: "claude-worker",
+    agentProfile: {
+      mode: "interactive",
+      model: null,
+      arguments: [],
+      permission_mode: "manual",
+    },
+  }), fakeAdapters(calls, {
+    panes: {
+      w1: [
+        {
+          pane_id: "w1:p1",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+        },
+        {
+          pane_id: "w1:p2",
+          tab_id: "w1:t1",
+          workspace_id: "w1",
+          cwd: workspacePath,
+          foreground_cwd: workspacePath,
+          agent: "claude",
+          agent_status: "working",
+          agent_session: {
+            agent: "claude",
+            kind: "path",
+            source: "herdr:claude",
+            value: "/tmp/claude-session.jsonl",
+          },
+        },
+      ],
+    },
+  }));
+
+  assert.equal(report.status, "completed");
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close" && call.paneId === "w1:p1"), true);
 });
 
 test("reuses an already-open compatible workspace without mutating anything", async () => {

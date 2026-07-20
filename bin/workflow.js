@@ -19,15 +19,15 @@ const defaultRegistryPath = join(packageRoot, "projects.yaml");
 const HELP = `workflow — deterministic launcher for isolated development environments
 
 Commands:
-  workflow doctor [project] [--format compact|json]
-  workflow plan <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json]
-  workflow start <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--format compact|json] [--yes]
+  workflow doctor [project] [--agent <profile>] [--format compact|json]
+  workflow plan <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
+  workflow start <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--agent <profile>] [--format compact|json] [--yes]
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
-  workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json]
+  workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
 
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path`;
-const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "format", "yes", "help"]);
+const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help"]);
 
 function bound(text) {
   const value = String(text ?? "").replace(/\r\n?/g, "\n");
@@ -91,8 +91,13 @@ export function parseArgs(argv) {
   if (!["compact", "json"].includes(format)) throw new Error("--format must be compact or json.");
 
   if (command === "doctor") {
-    validateShape("doctor", positionals, options, { min: 0, max: 1 });
-    return { command, projectAlias: positionals[0], format };
+    validateShape("doctor", positionals, options, { min: 0, max: 1, allowedOptions: ["agent"] });
+    return {
+      command,
+      projectAlias: positionals[0],
+      ...(options.agent ? { agentProfile: options.agent } : {}),
+      format,
+    };
   }
 
   const baseOptions = {
@@ -103,16 +108,17 @@ export function parseArgs(argv) {
     ...(options.repos ? { repositories: parseCsvList(options.repos) } : {}),
     ...(options.tickets ? { tickets: parseCsvList(options.tickets) } : {}),
     ...(options.profile ? { runtimeProfile: options.profile } : {}),
+    ...(options.agent ? { agentProfile: options.agent } : {}),
     ...(options.yes ? { yes: true } : {}),
     format,
   };
 
   if (command === "plan") {
-    validateShape("plan", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile"] });
+    validateShape("plan", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile", "agent"] });
     return baseOptions;
   }
   if (command === "start") {
-    validateShape("start", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "yes"] });
+    validateShape("start", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "agent", "yes"] });
     return baseOptions;
   }
   if (command === "runtime") {
@@ -120,7 +126,7 @@ export function parseArgs(argv) {
     return baseOptions;
   }
   if (command === "status") {
-    validateShape("status", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile"] });
+    validateShape("status", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile", "agent"] });
     return baseOptions;
   }
 
@@ -156,16 +162,17 @@ function mutationCommand(command) {
   return command === "start" || command === "runtime";
 }
 
-function requiredPreconditions(command) {
-  return command === "runtime"
-    ? ["git", "herdr", "herdrStatus"]
-    : command === "start"
-      ? ["git", "herdr", "pi", "herdrStatus", "piIntegration"]
-      : [];
+function requiredPreconditions(command, preconditions = {}) {
+  if (command === "runtime") return ["git", "herdr", "herdrStatus"];
+  if (command !== "start") return [];
+  const generic = Object.hasOwn(preconditions, "agent") || Object.hasOwn(preconditions, "agentIntegration");
+  return generic
+    ? ["git", "herdr", "agent", "herdrStatus", "agentIntegration"]
+    : ["git", "herdr", "pi", "herdrStatus", "piIntegration"];
 }
 
 function assertPreconditions(command, preview) {
-  for (const name of requiredPreconditions(command)) {
+  for (const name of requiredPreconditions(command, preview?.preconditions ?? {})) {
     const check = preview?.preconditions?.[name];
     if (!check || typeof check !== "object" || typeof check.status !== "string") {
       throw new WorkflowError("PREFLIGHT", `Missing or malformed required precondition: ${name}`, { exitCode: 10 });

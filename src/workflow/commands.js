@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { planWorkflow } from "./planner.js";
+import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
 
@@ -52,40 +53,68 @@ function herdrServerCheck(liveStatus, reason = "Herdr server is not ready") {
     : readinessCheck("herdr:status", "conflict", { value: liveStatus ?? null, reason });
 }
 
-function piIntegrationCheck(integrations, reason) {
-  const piIntegration = integrations.find((integration) => integration.name === "pi");
-  if (piIntegration?.status === "current") {
-    return readinessCheck("herdr:integration:pi", "ready", { value: piIntegration });
-  }
-  return readinessCheck("herdr:integration:pi", piIntegration ? "conflict" : "missing", {
-    value: piIntegration ?? null,
-    reason: reason ?? (piIntegration ? `Pi integration is ${piIntegration.status}` : "Pi integration is not installed"),
-  });
-}
-
-async function resolveBinaries(lookupExecutable) {
-  const [gitPath, herdrPath, piPath] = await Promise.all([
-    lookupExecutable("git"),
-    lookupExecutable("herdr"),
-    lookupExecutable("pi"),
-  ]);
-
+function agentBinaryCheck(selectedAgent, path) {
+  const command = selectedAgent.profile.command;
+  const check = binaryCheck(command, path);
   return {
-    git: binaryCheck("git", gitPath),
-    herdr: binaryCheck("herdr", herdrPath),
-    pi: binaryCheck("pi", piPath),
+    ...check,
+    harness: selectedAgent.profile.harness,
+    profileName: selectedAgent.name,
   };
 }
 
-async function resolvePreconditions(lookupExecutable, herdr) {
-  const binaries = await resolveBinaries(lookupExecutable);
+function agentIntegrationCheck(selectedAgent, integrations, reason) {
+  const harness = selectedAgent.profile.harness;
+  const integration = integrations.find((entry) => entry.name === harness);
+  const id = `herdr:integration:${harness}`;
+  if (integration?.status === "current") {
+    return readinessCheck(id, "ready", {
+      harness,
+      profileName: selectedAgent.name,
+      value: integration,
+    });
+  }
+  return readinessCheck(id, integration ? "conflict" : "missing", {
+    harness,
+    profileName: selectedAgent.name,
+    value: integration ?? null,
+    reason: reason ?? (integration ? `${harness} integration is ${integration.status}` : `${harness} integration is not installed`),
+  });
+}
+
+async function resolveBinaries(lookupExecutable, selectedAgent) {
+  const [gitPath, herdrPath, agentPath] = await Promise.all([
+    lookupExecutable("git"),
+    lookupExecutable("herdr"),
+    lookupExecutable(selectedAgent.profile.command),
+  ]);
+
+  const agent = agentBinaryCheck(selectedAgent, agentPath);
+  const binaries = {
+    git: binaryCheck("git", gitPath),
+    herdr: binaryCheck("herdr", herdrPath),
+    agent,
+  };
+  if (selectedAgent.profile.harness === "pi") binaries.pi = agent;
+  return binaries;
+}
+
+async function resolvePreconditions(lookupExecutable, herdr, selectedAgent) {
+  const binaries = await resolveBinaries(lookupExecutable, selectedAgent);
   const preconditions = { ...binaries };
 
   if (!ready(binaries.herdr)) {
+    const agentIntegration = readinessCheck(`herdr:integration:${selectedAgent.profile.harness}`, "missing", {
+      harness: selectedAgent.profile.harness,
+      profileName: selectedAgent.name,
+      value: null,
+      reason: binaries.herdr.reason,
+    });
     return {
       ...preconditions,
       herdrStatus: readinessCheck("herdr:status", "missing", { value: null, reason: binaries.herdr.reason }),
-      piIntegration: readinessCheck("herdr:integration:pi", "missing", { value: null, reason: binaries.herdr.reason }),
+      agentIntegration,
+      ...(selectedAgent.profile.harness === "pi" ? { piIntegration: agentIntegration } : {}),
     };
   }
 
@@ -101,13 +130,14 @@ async function resolvePreconditions(lookupExecutable, herdr) {
 
   if (typeof herdr?.integrationStatus === "function") {
     try {
-      preconditions.piIntegration = piIntegrationCheck(await herdr.integrationStatus());
+      preconditions.agentIntegration = agentIntegrationCheck(selectedAgent, await herdr.integrationStatus());
     } catch (error) {
-      preconditions.piIntegration = piIntegrationCheck([], error.message);
+      preconditions.agentIntegration = agentIntegrationCheck(selectedAgent, [], error.message);
     }
   } else {
-    preconditions.piIntegration = piIntegrationCheck([], "Herdr integration inspection is unavailable");
+    preconditions.agentIntegration = agentIntegrationCheck(selectedAgent, [], "Herdr integration inspection is unavailable");
   }
+  if (selectedAgent.profile.harness === "pi") preconditions.piIntegration = preconditions.agentIntegration;
 
   return preconditions;
 }
@@ -156,6 +186,7 @@ function buildCommand(name, options, extras = {}) {
   if (options.feature) parts.push("--feature", quote(options.feature));
   if (options.repositories?.length) parts.push("--repos", options.repositories.join(","));
   if (name !== "doctor" && options.tickets?.length) parts.push("--tickets", options.tickets.join(","));
+  if (options.agentProfile && name !== "runtime") parts.push("--agent", options.agentProfile);
   const profile = extras.profile ?? options.runtimeProfile;
   if (profile) parts.push("--profile", profile);
   if (extras.yes) parts.push("--yes");
@@ -188,6 +219,7 @@ function cliRequestFromPlan(options, plan) {
     repositories: selectedRepositoriesForRequest(options, plan),
     tickets: plan.identity.relatedTickets,
     runtimeProfile: options.runtimeProfile,
+    agentProfile: options.agentProfile,
   };
 }
 
@@ -206,9 +238,9 @@ function runtimePhaseReady(reconciliation) {
 function startMutationReady(preconditions) {
   return ready(preconditions.git)
     && ready(preconditions.herdr)
-    && ready(preconditions.pi)
+    && ready(preconditions.agent ?? preconditions.pi)
     && ready(preconditions.herdrStatus)
-    && ready(preconditions.piIntegration);
+    && ready(preconditions.agentIntegration ?? preconditions.piIntegration);
 }
 
 function runtimeMutationReady(preconditions) {
@@ -254,7 +286,7 @@ function nextCommandFor(options, preconditions, reconciliation) {
   if (!startPhaseReady(reconciliation)) {
     return startMutationReady(preconditions)
       ? buildCommand("start", options, { yes: true })
-      : buildCommand("doctor", { projectAlias: options.projectAlias });
+      : buildCommand("doctor", { projectAlias: options.projectAlias, agentProfile: options.agentProfile });
   }
 
   if (!runtimePhaseReady(reconciliation)) {
@@ -263,7 +295,7 @@ function nextCommandFor(options, preconditions, reconciliation) {
         profile: reconciliation.runtime?.profileName ?? reconciliation.runtime?.tab?.profileName ?? reconciliation.runtime?.profile ?? reconciliation.runtime?.tab?.actual?.profileName ?? reconciliation.runtime?.tab?.actual?.profile ?? reconciliation.runtime?.tab?.profileName ?? reconciliation.runtime?.tab?.profile,
         yes: true,
       })
-      : buildCommand("doctor", { projectAlias: options.projectAlias });
+      : buildCommand("doctor", { projectAlias: options.projectAlias, agentProfile: options.agentProfile });
   }
 
   return buildCommand("status", options);
@@ -277,22 +309,41 @@ async function loadRegistryAndProject(options, injectedLoadRegistry, { requirePr
   return { registry, project };
 }
 
+function selectAgent(registry, project, options = {}) {
+  return resolveAgentProfile({
+    registry,
+    project,
+    requestedProfile: options.agentProfile,
+  });
+}
+
+function globalAgentProfileDiagnostics(registry, { include = false } = {}) {
+  if (!include) return undefined;
+  return Object.entries(registry.launcher.agent_profiles).map(([name, profile]) => ({
+    name,
+    harness: profile.harness,
+    command: profile.command,
+    roles: profile.roles,
+  }));
+}
+
 export async function doctorCommand(options = {}, {
   loadRegistry: injectedLoadRegistry = loadRegistry,
   git,
   herdr,
   lookupExecutable,
 } = {}) {
-  const { project } = await loadRegistryAndProject(options, injectedLoadRegistry, { requireProject: false });
-  const preconditions = await resolvePreconditions(lookupExecutable, herdr);
+  const { registry, project } = await loadRegistryAndProject(options, injectedLoadRegistry, { requireProject: false });
+  const selectedAgent = selectAgent(registry, project, options);
+  const preconditions = await resolvePreconditions(lookupExecutable, herdr, selectedAgent);
   const checks = [
     { id: "registry", status: "ready", path: options.registryPath },
     preconditions.git,
     preconditions.herdr,
-    preconditions.pi,
+    preconditions.agent,
     ...(project ? await inspectProjectRepositories(options.projectAlias, project, git) : []),
     preconditions.herdrStatus,
-    preconditions.piIntegration,
+    preconditions.agentIntegration,
   ];
 
   return {
@@ -301,6 +352,7 @@ export async function doctorCommand(options = {}, {
     checks,
     ok: checks.every((check) => check.status === "ready"),
     registryPath: options.registryPath,
+    agentProfiles: globalAgentProfileDiagnostics(registry, { include: !project && !options.agentProfile }),
   };
 }
 
@@ -311,7 +363,8 @@ export async function planCommand(options = {}, {
   lookupExecutable,
 } = {}) {
   const { registry, project } = await loadRegistryAndProject(options, injectedLoadRegistry);
-  const preconditions = await resolvePreconditions(lookupExecutable, herdr);
+  const selectedAgent = selectAgent(registry, project, options);
+  const preconditions = await resolvePreconditions(lookupExecutable, herdr, selectedAgent);
   const plan = planWorkflow({
     registry,
     projectAlias: options.projectAlias,
@@ -320,6 +373,7 @@ export async function planCommand(options = {}, {
     feature: options.feature,
     repositories: options.repositories,
     runtimeProfile: options.runtimeProfile,
+    agentProfile: options.agentProfile,
   });
   const reconciliation = await reconcilePlan(plan, { git, herdr: herdrReadModel(preconditions, herdr) });
   const request = requestFromPlan(options, plan);
@@ -344,7 +398,8 @@ export async function statusCommand(options = {}, {
   lookupExecutable,
 } = {}) {
   const { registry, project } = await loadRegistryAndProject(options, injectedLoadRegistry);
-  const preconditions = await resolvePreconditions(lookupExecutable, herdr);
+  const selectedAgent = selectAgent(registry, project, options);
+  const preconditions = await resolvePreconditions(lookupExecutable, herdr, selectedAgent);
   const plan = planWorkflow({
     registry,
     projectAlias: options.projectAlias,
@@ -353,6 +408,7 @@ export async function statusCommand(options = {}, {
     feature: options.feature,
     repositories: options.repositories,
     runtimeProfile: options.runtimeProfile,
+    agentProfile: options.agentProfile,
   });
   const reconciliation = await reconcilePlan(plan, { git, herdr: herdrReadModel(preconditions, herdr) });
   const request = requestFromPlan(options, plan);

@@ -263,7 +263,7 @@ test("resolves an explicit allowed agent profile without changing primary worktr
   });
   const agentOperation = plan.operations.find((operation) => operation.id === "agent");
 
-  assert.equal(plan.agent.command, registry.launcher.agent.command);
+  assert.equal(plan.agent.command, "codex");
   assert.equal(plan.agent.profileName, "codex-worker");
   assert.equal(plan.agent.harness, "codex");
   assert.deepEqual(plan.agent.roles, ["implementer", "reviewer"]);
@@ -274,8 +274,8 @@ test("resolves an explicit allowed agent profile without changing primary worktr
     sandbox: "workspace-write",
     approval_policy: "on-request",
   });
-  assert.equal(agentOperation.kind, "pi.session.start");
-  assert.equal(agentOperation.command, registry.launcher.agent.command);
+  assert.equal(agentOperation.kind, "agent.session.start");
+  assert.equal(agentOperation.command, "codex");
   assert.equal(plan.identity.task, "ASANA-123");
   assert.equal(plan.worktrees[0].branch, "feature/ASANA-123/discovered-docs");
   assert.equal(plan.agent.sessionName, "ocr-ASANA-123-discovered-docs");

@@ -168,14 +168,40 @@ function createHerdr({ statusResult, integrations = [], workspaces = [], tabs = 
   };
 }
 
-function deps({ git, herdr, lookup }) {
+function multiHarnessRegistry() {
+  const value = structuredClone(registry);
+  value.launcher.agent_profiles["claude-worker"] = {
+    harness: "claude",
+    command: "claude",
+    mode: "interactive",
+    roles: ["implementer"],
+    model: null,
+    arguments: [],
+    permission_mode: "manual",
+  };
+  value.launcher.agent_profiles["codex-worker"] = {
+    harness: "codex",
+    command: "codex",
+    mode: "interactive",
+    roles: ["implementer"],
+    model: "gpt-5-codex",
+    arguments: [],
+    sandbox: "workspace-write",
+    approval_policy: "on-request",
+  };
+  value.projects.ocr.allowed_agent_profiles = ["pi-worker", "claude-worker", "codex-worker"];
+  value.projects.acme.allowed_agent_profiles = ["pi-worker", "claude-worker", "codex-worker"];
+  return value;
+}
+
+function deps({ git, herdr, lookup, registryValue = registry }) {
   return {
     git,
     herdr,
     lookupExecutable: lookup.lookupExecutable,
     loadRegistry: async (path) => {
       assert.equal(path, "/tmp/projects.yaml");
-      return registry;
+      return registryValue;
     },
   };
 }
@@ -258,6 +284,85 @@ test("doctor without a project reports global prerequisites without repository i
   const compact = formatWorkflowResult("doctor", result, "compact");
   assert.match(compact, /Doctor: ready/);
   assert.doesNotMatch(compact, /Project:/);
+});
+
+test("doctor validates only the selected agent profile binary and Herdr integration", async () => {
+  const selectedRegistry = multiHarnessRegistry();
+  const lookup = createLookup({
+    git: "/usr/bin/git",
+    herdr: "/usr/bin/herdr",
+    codex: "/usr/bin/codex",
+  });
+  const git = createGit({
+    repositories: {
+      "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+    },
+  });
+  const herdr = createHerdr({
+    integrations: [
+      { name: "codex", status: "current", version: 1, path: "/home/you/.codex/herdr-state.sh" },
+    ],
+  });
+
+  const result = await doctorCommand({
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    agentProfile: "codex-worker",
+  }, deps({ git, herdr, lookup, registryValue: selectedRegistry }));
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.checks.map((check) => check.id), [
+    "registry",
+    "binary:git",
+    "binary:herdr",
+    "binary:codex",
+    "repository:ocr",
+    "herdr:status",
+    "herdr:integration:codex",
+  ]);
+  assert.deepEqual(lookup.calls, ["git", "herdr", "codex"]);
+  assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
+});
+
+test("plan uses selected Codex preconditions without requiring Pi or Claude readiness", async () => {
+  const selectedRegistry = multiHarnessRegistry();
+  const lookup = createLookup({
+    git: "/usr/bin/git",
+    herdr: "/usr/bin/herdr",
+    codex: "/usr/bin/codex",
+  });
+  const git = createGit({
+    repositories: {
+      "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath: "/repo/ocr/.git" },
+    },
+    worktrees: {
+      "/repo/ocr": [],
+    },
+  });
+  const herdr = createHerdr({
+    integrations: [
+      { name: "codex", status: "current", version: 1, path: "/home/you/.codex/herdr-state.sh" },
+    ],
+  });
+
+  const result = await planCommand({
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  }, deps({ git, herdr, lookup, registryValue: selectedRegistry }));
+
+  assert.equal(result.preconditions.agent.id, "binary:codex");
+  assert.equal(result.preconditions.agent.status, "ready");
+  assert.equal(result.preconditions.agent.profileName, "codex-worker");
+  assert.equal(result.preconditions.agent.harness, "codex");
+  assert.equal(result.preconditions.agentIntegration.id, "herdr:integration:codex");
+  assert.equal(result.preconditions.agentIntegration.status, "ready");
+  assert.equal(Object.hasOwn(result.preconditions, "pi"), false);
+  assert.equal(Object.hasOwn(result.preconditions, "claude"), false);
+  assert.deepEqual(lookup.calls, ["git", "herdr", "codex"]);
+  assert.equal(result.nextCommand, 'workflow start ocr ASANA-123 --feature "Discovered Docs" --agent codex-worker --yes');
 });
 
 test("plan stays read-only, returns ordered operations, and reports conflicts even when Pi is missing", async () => {
