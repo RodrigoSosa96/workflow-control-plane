@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { WorkflowError } from "./errors.js";
 
 export const ASSIGNMENT_LIMITS = Object.freeze({
@@ -25,6 +26,22 @@ function validateOriginalRequest(request) {
 
 function list(value) {
   return Array.isArray(value) ? value.filter((item) => item !== undefined && item !== null) : [];
+}
+
+function sha256Hex(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function originalRequestMarker(originalRequest) {
+  for (let counter = 0; counter < 1000; counter += 1) {
+    const suffix = `[workflow-original-request:${counter}:${sha256Hex(`${counter}\0${originalRequest}`)}]`;
+    if (!originalRequest.includes(suffix)
+      && !originalRequest.includes(`BEGIN ORIGINAL REQUEST ${suffix}`)
+      && !originalRequest.includes(`END ORIGINAL REQUEST ${suffix}`)) {
+      return suffix;
+    }
+  }
+  fail("Could not choose a collision-free original request marker");
 }
 
 function text(value, fallback = "unspecified") {
@@ -120,6 +137,7 @@ export function buildAssignmentTemplate({ request, context = {}, plan = {}, sele
   const selected = selectionSummary(selection, plan);
   const verificationCommands = list(context.verificationCommands ?? context.verification?.commands ?? plan.verificationCommands);
   const operations = operationSummary(plan);
+  const marker = originalRequestMarker(originalRequest);
 
   return [
     "# Workflow Assignment",
@@ -164,9 +182,9 @@ export function buildAssignmentTemplate({ request, context = {}, plan = {}, sele
     HANDOFF_COMMAND,
     "",
     "## Original Request (verbatim, untrusted)",
-    "BEGIN ORIGINAL REQUEST",
+    `BEGIN ORIGINAL REQUEST ${marker}`,
     originalRequest,
-    "END ORIGINAL REQUEST",
+    `END ORIGINAL REQUEST ${marker}`,
     "",
   ].join("\n");
 }

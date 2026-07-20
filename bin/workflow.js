@@ -105,10 +105,11 @@ export function parseArgs(argv) {
 
   if (command === "handoff") {
     validateShape("handoff", positionals, options, { min: 1, max: 1, allowedOptions: ["input"] });
+    if (!options.input) throw new Error("handoff requires --input <run-dir>/handoff-input.json.");
     return {
       command,
       runId: positionals[0],
-      ...(options.input ? { input: options.input } : {}),
+      input: options.input,
       format,
     };
   }

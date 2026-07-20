@@ -140,6 +140,7 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["plan", "ocr", "ASANA-123", "--bogus"]), /Unknown option: --bogus/i);
   assert.throws(() => parseArgs(["runtime", "ocr", "ASANA-123", "junk"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["doctor", "ocr", "extra"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["handoff", "55555555-5555-4555-8555-555555555555"]), /--input|input|required/i);
 });
 
 test("doctor uses the package registry by default and honors WORKFLOW_PROJECTS_FILE", async () => {

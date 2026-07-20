@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { HANDOFF_COMMAND } from "./assignment.js";
 
 export const WORKFLOW_ENV_KEYS = Object.freeze([
   "WORKFLOW_RUN_ID",
@@ -54,7 +55,7 @@ function runEnv(run, harness) {
 
 function runBootstrapPrompt(run) {
   if (!run) return null;
-  return "Read WORKFLOW_RUN_DIR/assignment.md, complete the assignment, then write the structured handoff JSON to WORKFLOW_RUN_DIR/result.json.";
+  return `Read "$WORKFLOW_RUN_DIR/assignment.md". Complete the assignment. Write structured handoff JSON only to "$WORKFLOW_RUN_DIR/handoff-input.json", then run exactly: ${HANDOFF_COMMAND}`;
 }
 
 function expectedLaunch({ profileName, profile, sessionName, cwd, nativeSessionId }) {

@@ -446,7 +446,10 @@ function canonicalHandoffInputPath(run) {
 }
 
 function assertCanonicalHandoffInput(inputPath, expectedPath) {
-  if (inputPath !== undefined && resolve(inputPath) !== resolve(expectedPath)) {
+  if (typeof inputPath !== "string" || inputPath.length === 0) {
+    failHandoff("Handoff --input is required and must be the canonical run-directory handoff-input.json path");
+  }
+  if (inputPath !== expectedPath || resolve(inputPath) !== resolve(expectedPath)) {
     failHandoff("Handoff input must be the canonical run-directory handoff-input.json path; arbitrary input paths are not accepted");
   }
 }

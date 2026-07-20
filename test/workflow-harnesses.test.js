@@ -48,8 +48,9 @@ function assertRunLaunch(spec, harness) {
 
   const bootstrap = spec.argv.at(-1);
   assert.match(bootstrap, /assignment\.md/);
-  assert.match(bootstrap, /result\.json/);
-  assert.doesNotMatch(bootstrap, /SECRET-DO-NOT-LEAK|payment extraction|originalRequest/i);
+  assert.match(bootstrap, /handoff-input\.json/);
+  assert.match(bootstrap, /node "\$WORKFLOW_CONTROL_PLANE_BIN" handoff "\$WORKFLOW_RUN_ID" --input "\$WORKFLOW_RUN_DIR\/handoff-input\.json"/);
+  assert.doesNotMatch(bootstrap, /write[^.]*result\.json|SECRET-DO-NOT-LEAK|payment extraction|originalRequest/i);
   assert.ok(bootstrap.length <= 500, `bootstrap prompt should be bounded, got ${bootstrap.length}`);
 }
 

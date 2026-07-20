@@ -32,6 +32,32 @@ function canonicalText(value) {
   return JSON.stringify(canonicalize(value));
 }
 
+const EXECUTION_INPUT_VERSION = 1;
+const VOLATILE_EXECUTION_OPTION_KEYS = new Set([
+  "approvalDigest",
+  "command",
+  "yes",
+  "format",
+  "runId",
+  "createdAt",
+  "updatedAt",
+  "originSession",
+  "env",
+]);
+
+function executionInputFor(options = {}) {
+  const safe = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (!VOLATILE_EXECUTION_OPTION_KEYS.has(key) && value !== undefined && typeof value !== "function") {
+      safe[key] = value;
+    }
+  }
+  return {
+    version: EXECUTION_INPUT_VERSION,
+    options: cloneData(canonicalize(safe)),
+  };
+}
+
 function list(value) {
   return Array.isArray(value) ? value.filter((item) => item !== undefined && item !== null) : [];
 }
@@ -99,21 +125,28 @@ function identityForDigest(plan = {}) {
   };
 }
 
-function digestPayload({ reconciliation, selection, assignment }) {
+function digestPayload({ project, request, executionInput, selection, preconditions, reconciliation, assignment, assignmentDigest, conflicts, operations }) {
   return {
-    version: 1,
-    identity: identityForDigest(reconciliation),
-    repositories: repositoriesForDigest(reconciliation),
+    version: 2,
+    executionInput,
+    project,
+    request,
+    preconditions,
+    reconciliation,
+    conflicts,
+    operations,
     selection: {
-      profileName: selection.profileName,
-      harness: selection.harness,
-      command: selection.command,
-      roles: selection.roles,
-      model: selection.model,
-      arguments: selection.arguments,
-      permissions: selection.permissions,
+      profileName: selection?.profileName,
+      harness: selection?.harness,
+      command: selection?.command,
+      roles: selection?.roles,
+      model: selection?.model,
+      arguments: selection?.arguments,
+      permissions: selection?.permissions,
+      reason: selection?.reason,
     },
     assignment,
+    assignmentDigest,
   };
 }
 
@@ -162,16 +195,18 @@ function assertPlanCommand(planCommand) {
 export async function createLaunchPreview(options = {}, deps = {}) {
   const planCommand = deps.planCommand;
   assertPlanCommand(planCommand);
+  const executionInput = executionInputFor(options);
+  const executionOptions = executionInput.options;
 
-  const planPreview = await planCommand(planCommandOptions(options), deps);
+  const planPreview = await planCommand(planCommandOptions(executionOptions), deps);
   const reconciliation = cloneData(planPreview.reconciliation);
   const selection = selectedProfile(reconciliation);
   const assignment = buildAssignmentTemplate({
-    request: options.request,
+    request: executionOptions.request,
     context: {
       project: planPreview.project,
-      stage: options.stage ?? "implementation",
-      verificationCommands: options.verificationCommands,
+      stage: executionOptions.stage ?? "implementation",
+      verificationCommands: executionOptions.verificationCommands,
     },
     plan: reconciliation,
     selection,
@@ -179,8 +214,9 @@ export async function createLaunchPreview(options = {}, deps = {}) {
 
   const preview = {
     command: "launch",
+    executionInput,
     project: cloneData(planPreview.project),
-    request: previewRequest(planPreview, options),
+    request: previewRequest(planPreview, executionOptions),
     selection,
     preconditions: cloneData(planPreview.preconditions ?? {}),
     reconciliation,
@@ -194,17 +230,42 @@ export async function createLaunchPreview(options = {}, deps = {}) {
   return preview;
 }
 
-function assertApprovalDigest(preview) {
+function assertSuppliedApprovalDigest(preview) {
   if (typeof preview?.approvalDigest !== "string" || !preview.approvalDigest) {
     fail("PREFLIGHT", "Missing approval digest; rerun launch preview and approve the current digest");
   }
+}
+
+function staleApprovalDigest(supplied, expected) {
+  fail("PREFLIGHT", "Stale approval digest; rerun launch preview before executing", {
+    supplied,
+    expected,
+  });
+}
+
+function assertApprovalDigest(preview) {
+  assertSuppliedApprovalDigest(preview);
   const expected = approvalDigestFor(preview);
   if (preview.approvalDigest !== expected) {
-    fail("PREFLIGHT", "Stale approval digest; rerun launch preview before executing", {
-      supplied: preview.approvalDigest,
-      expected,
-    });
+    staleApprovalDigest(preview.approvalDigest, expected);
   }
+}
+
+function executionOptionsFromPreview(preview) {
+  const executionInput = preview?.executionInput;
+  if (!executionInput || executionInput.version !== EXECUTION_INPUT_VERSION || !executionInput.options || typeof executionInput.options !== "object" || Array.isArray(executionInput.options)) {
+    fail("PREFLIGHT", "Launch preview is missing nonvolatile execution input; rerun launch preview before executing");
+  }
+  return cloneData(executionInput.options);
+}
+
+async function recomputeApprovedPreview(preview, deps) {
+  const fresh = await createLaunchPreview(executionOptionsFromPreview(preview), deps);
+  if (preview.approvalDigest !== fresh.approvalDigest) {
+    staleApprovalDigest(preview.approvalDigest, fresh.approvalDigest);
+  }
+  assertApprovalDigest(preview);
+  return fresh;
 }
 
 function requiredPreconditions(preconditions = {}) {
@@ -228,6 +289,21 @@ function assertLaunchable(preview) {
     if (!ready(check)) {
       fail("PREFLIGHT", check.reason ?? `Launch requires ready ${check.id ?? name}`);
     }
+  }
+}
+
+function launchAgentOperation(plan = {}) {
+  return list(plan.operations).find((operation) => operation.id === "agent" || operation.kind === "agent.session.start" || operation.kind === "pi.session.start") ?? null;
+}
+
+function assertNoPreexistingLaunchAgent(preview) {
+  const plan = preview.reconciliation ?? {};
+  const agentOperation = launchAgentOperation(plan);
+  if (plan.agent?.status === "compatible" || agentOperation?.reconciliation?.status === "compatible") {
+    fail("CONFLICT", "Pre-existing compatible agent cannot be reused for a newly approved launch", {
+      resource: "agent",
+      reason: "existing compatible agent did not receive this run assignment, environment, or bootstrap prompt",
+    }, 11);
   }
 }
 
@@ -292,6 +368,36 @@ function operationById(report, id) {
   return list(report?.operations).find((operation) => operation.id === id) ?? null;
 }
 
+function agentOperationReport(report) {
+  return operationById(report, "agent")
+    ?? list(report?.operations).find((operation) => operation.kind === "agent.session.start" || operation.kind === "pi.session.start")
+    ?? null;
+}
+
+function createdSelectedAgent(report) {
+  return agentOperationReport(report)?.status === "created";
+}
+
+function completedLaunchWithCreatedAgent(report) {
+  return report?.status !== "partial" && report?.status !== "failed" && createdSelectedAgent(report);
+}
+
+function partializeMissingCreatedAgent(report) {
+  if (createdSelectedAgent(report) || report?.status === "partial" || report?.status === "failed") return report;
+  return {
+    ...report,
+    status: "partial",
+    notes: [
+      ...list(report?.notes),
+      "Launch did not create the selected agent for this run; use workflow reconcile before retrying.",
+    ],
+    error: report?.error ?? {
+      name: "AgentNotCreatedError",
+      message: "Selected agent was not created for this workflow run",
+    },
+  };
+}
+
 function sessionPatch(report, launchExpected = {}) {
   const agent = operationById(report, "agent") ?? {};
   return {
@@ -333,23 +439,36 @@ function assertStore(store) {
 }
 
 export async function executeLaunch(preview, deps = {}) {
-  assertApprovalDigest(preview);
-  assertLaunchable(preview);
+  assertSuppliedApprovalDigest(preview);
+  if (typeof deps.planCommand !== "function") assertApprovalDigest(preview);
+  const fresh = await recomputeApprovedPreview(preview, deps);
+  assertLaunchable(fresh);
+  assertNoPreexistingLaunchAgent(fresh);
   assertStore(deps.store);
 
-  const stateRoot = deps.stateRoot ?? preview.stateRoot;
-  const controlPlaneBin = deps.controlPlaneBin ?? preview.controlPlaneBin;
+  const executionOptions = executionOptionsFromPreview(fresh);
+  const approvedStateRoot = executionOptions.stateRoot ?? fresh.stateRoot;
+  const approvedControlPlaneBin = executionOptions.controlPlaneBin ?? fresh.controlPlaneBin;
+  if (deps.stateRoot !== undefined && approvedStateRoot !== undefined && deps.stateRoot !== approvedStateRoot) {
+    fail("PREFLIGHT", "launch execution stateRoot does not match the approved launch preview");
+  }
+  if (deps.controlPlaneBin !== undefined && approvedControlPlaneBin !== undefined && deps.controlPlaneBin !== approvedControlPlaneBin) {
+    fail("PREFLIGHT", "launch execution controlPlaneBin does not match the approved launch preview");
+  }
+
+  const stateRoot = approvedStateRoot ?? deps.stateRoot;
+  const controlPlaneBin = approvedControlPlaneBin ?? deps.controlPlaneBin;
   if (typeof stateRoot !== "string" || !stateRoot) fail("PREFLIGHT", "launch execution requires stateRoot");
   if (typeof controlPlaneBin !== "string" || !controlPlaneBin) fail("PREFLIGHT", "launch execution requires controlPlaneBin");
 
   const store = deps.store;
-  const created = await store.create(runInput(preview, {
+  const created = await store.create(runInput(fresh, {
     stateRoot,
     controlPlaneBin,
     originSession: deps.originSession,
   }));
   const run = runForHarness(created, { stateRoot, controlPlaneBin });
-  await store.writeAssignment(run.id, assignmentWithExecutionHeader(run, preview.assignment));
+  await store.writeAssignment(run.id, assignmentWithExecutionHeader(run, fresh.assignment));
   await updateRun(store, run.id, {
     state: RUN_STATES.LAUNCHING,
     launchStartedAt: new Date().toISOString(),
@@ -359,32 +478,36 @@ export async function executeLaunch(preview, deps = {}) {
   const launchBuilder = deps.buildAgentLaunch ?? buildHarnessLaunch;
   const executeStart = deps.executeStart ?? defaultExecuteStart;
   const planForStart = {
-    ...cloneData(preview.reconciliation),
+    ...cloneData(fresh.reconciliation),
     run,
   };
 
   try {
-    const execution = await executeStart(planForStart, { git: deps.git, herdr: deps.herdr }, {
+    const rawExecution = await executeStart(planForStart, { git: deps.git, herdr: deps.herdr }, {
       buildAgentLaunch(input) {
         const spec = launchBuilder(input);
         launchExpected = spec.expected;
         return spec;
       },
     });
-    const session = sessionPatch(execution, launchExpected ?? {});
+    const execution = partializeMissingCreatedAgent(rawExecution);
+    const isRunning = completedLaunchWithCreatedAgent(execution);
+    const hasCreatedAgent = createdSelectedAgent(execution);
+    const session = hasCreatedAgent ? sessionPatch(execution, launchExpected ?? {}) : {};
     await updateRun(store, run.id, {
       state: RUN_STATES.RUNNING,
-      harness: preview.selection.harness,
-      profileName: preview.selection.profileName,
-      launchStatus: execution?.status ?? "unknown",
+      harness: fresh.selection.harness,
+      profileName: fresh.selection.profileName,
+      launchStatus: isRunning ? (execution?.status ?? "completed") : "partial",
       launchOperations: cloneData(execution?.operations ?? []),
       launchNotes: cloneData(execution?.notes ?? []),
-      ...session,
+      ...(hasCreatedAgent ? session : {}),
+      ...(!isRunning && execution?.error ? { launchError: cloneData(execution.error) } : {}),
     });
 
-    if (execution?.status === "partial" || execution?.status === "failed") {
+    if (!isRunning) {
       return buildLaunchReport("partial", run, execution, {
-        error: cloneData(execution.error),
+        error: cloneData(execution?.error),
       });
     }
 
@@ -399,8 +522,8 @@ export async function executeLaunch(preview, deps = {}) {
     try {
       await updateRun(store, run.id, {
         state: RUN_STATES.RUNNING,
-        harness: preview.selection.harness,
-        profileName: preview.selection.profileName,
+        harness: fresh.selection.harness,
+        profileName: fresh.selection.profileName,
         launchStatus: "partial",
         launchError: { name: error.name, message: error.message },
       });
