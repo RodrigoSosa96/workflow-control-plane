@@ -369,10 +369,10 @@ const ALLOWED = {
   launching: new Set(["running", "failed", "interrupted"]),
   running: new Set(["idle-awaiting-handoff", "needs-input", "completed", "blocked", "failed", "interrupted", "manual-handoff-required", "result-stale"]),
   "idle-awaiting-handoff": new Set(["running", "needs-input", "completed", "blocked", "failed", "interrupted", "manual-handoff-required", "result-stale"]),
-  "needs-input": new Set(["running", "interrupted"]),
+  "needs-input": new Set(["running", "interrupted", "result-stale"]),
   completed: new Set(["running", "result-stale"]),
   blocked: new Set(["running", "result-stale"]),
-  failed: new Set(["running"]),
+  failed: new Set(["running", "result-stale"]),
   interrupted: new Set(["running"]),
   "manual-handoff-required": new Set(["running"]),
   "result-stale": new Set(["running"]),
@@ -482,7 +482,7 @@ export const HANDOFF_LIMITS = Object.freeze({
 });
 ```
 
-`submitHandoff` must read expected tickets/repositories from `run.json`, compute current fingerprints, construct the canonical result with exact `runId`/`generation`, write a temporary file in the run directory, rename to `result.json`, archive the generation result, chmod `0600`, and transition the run. If the Git state later differs, `readCurrentResult` returns `result-stale` and updates run state without destroying the archived result.
+`submitHandoff` must read expected tickets/repositories from `run.json`, compute current fingerprints, construct the canonical result with exact `runId`/`generation`, calculate and persist a SHA-256 digest for its exact canonical bytes, write a temporary file in the run directory, rename to `result.json`, archive the generation result, chmod `0600`, and transition the run. `readCurrentResult` must compare the current artifact bytes against the stored digest before returning any terminal status; a missing, malformed, unregistered, digest-mismatched, or Git-stale artifact returns `result-stale` and atomically updates run state without destroying the archived result. If that stale-state update cannot persist, the read fails closed rather than returning a terminal result.
 
 - [ ] **Step 6: Run focused and full tests**
 

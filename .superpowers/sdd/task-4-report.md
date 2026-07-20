@@ -1,138 +1,85 @@
-# Task 4 Report: Git Fingerprints and Structured Handoffs
+# Task 4 Report: Herdr JSON Adapter
 
 ## Status
+Done
 
-Implemented Task 4 only: Git worktree fingerprints plus bounded structured handoff validation, canonical result creation, and current/stale result reads.
-
-## Files changed
-
-- `src/workflow/git.js`
-- `src/workflow/handoff.js`
-- `test/workflow-git.test.js`
-- `test/workflow-handoff.test.js`
-- `.superpowers/sdd/task-4-report.md`
+## Commit
+`feat(workflow): add Herdr orchestration adapter`
 
 ## RED evidence
-
-### Initial Task 4 RED
-
-Command:
-
-```bash
-node --test test/workflow-git.test.js test/workflow-handoff.test.js
-```
-
-Observed result before production implementation:
-
-- Focused command failed as expected.
-- `test/workflow-git.test.js`: `TypeError: git.fingerprint is not a function`.
-- `test/workflow-handoff.test.js`: `ERR_MODULE_NOT_FOUND` for `src/workflow/handoff.js`.
-- Summary: `10` pass, `3` fail.
-
-### Self-review regression RED
-
-During self-review, I identified that a current-looking `result.json` could be accepted without store registration and that invalid-state submission needed an explicit pre-artifact guard.
-
-Command:
-
-```bash
-node --test --test-name-pattern 'non-running|not registered' test/workflow-handoff.test.js
-```
-
-Observed result before the fix:
-
-- `submitHandoff refuses non-running runs without creating result artifacts`: failed with `Missing expected rejection`.
-- `readCurrentResult refuses current-looking artifacts that were not registered in the run store`: failed because actual status was `completed` instead of `result-stale`.
-- Summary: `0` pass, `2` fail.
+- Ran: `node --test test/workflow-herdr.test.js`
+- Result: failed with `ERR_MODULE_NOT_FOUND` for `src/workflow/herdr.js` before implementation.
 
 ## GREEN evidence
+### Herdr adapter
+- Ran: `node --test test/workflow-herdr.test.js`
+- Result: 12/12 tests passed.
 
-### Initial focused GREEN
+### Selected Task 4 verification
+- Ran: `node --test test/workflow-herdr.test.js test/workflow-process.test.js`
+- Result: 19/19 tests passed.
 
-Command:
-
-```bash
-node --test test/workflow-git.test.js test/workflow-handoff.test.js
-```
-
-Observed result after initial implementation:
-
-- Summary: `19` pass, `0` fail.
-
-### Regression GREEN
-
-Command:
-
-```bash
-node --test --test-name-pattern 'non-running|not registered' test/workflow-handoff.test.js
-```
-
-Observed result after the fix:
-
-- Summary: `2` pass, `0` fail.
-
-### Required focused suites
-
-Command:
-
-```bash
-node --test test/workflow-git.test.js test/workflow-handoff.test.js test/workflow-run-store.test.js
-```
-
-Observed final result:
-
-- Summary: `40` pass, `0` fail.
-
-## Full verification evidence
-
-Command:
-
-```bash
-npm test && git diff --check
-```
-
-Observed result:
-
-- Full suite: `241` pass, `0` fail.
-- `git diff --check`: exit `0` with no output.
-
-After adding new files with intent-to-add so the diff check included them:
-
-```bash
-git add -N src/workflow/handoff.js test/workflow-handoff.test.js && git diff --stat && git diff --check
-```
-
-Observed result:
-
-- Diff stat: `4 files changed, 1175 insertions(+), 2 deletions(-)`.
-- `git diff --check`: exit `0` with no output.
+### Full suite
+- Ran: `npm test`
+- Result: 116/116 tests passed.
 
 ## Implemented
-
-- Added `git.fingerprint({ cwd }) -> { head, branch, dirty, entries, digest }`.
-- Fingerprint digest is `sha256:<hex>` over normalized HEAD, branch, dirty flag, sorted porcelain status entries, and `lstat` metadata for dirty paths.
-- Fingerprinting resolves dirty paths under the Git worktree, rejects absolute/traversing paths, and never reads file contents.
-- Added `src/workflow/handoff.js` with:
-  - `HANDOFF_LIMITS`
-  - `validateHandoffInput(value, expected)`
-  - `submitHandoff({ store, git, runId, generation, input })`
-  - `readCurrentResult({ store, git, runId })`
-- Handoff validation enforces version, bounded total bytes/strings/arrays/file counts, known statuses, exact expected ticket set, known repository IDs, and relative path-safe changed files.
-- `submitHandoff` reads authoritative run/generation/tickets/repositories from the run store, computes current Git fingerprints, ignores caller-supplied identity/fingerprint claims, writes private canonical result artifacts atomically, and updates run metadata/state.
-- `readCurrentResult` requires store-registered result metadata and current Git fingerprints; stale or unregistered artifacts return `result-stale` and update run state without deleting archived generation results.
+- `src/workflow/herdr.js`
+  - `createHerdrAdapter({ runner, binary? })`
+  - JSON parsing/unwrapping with `WorkflowError` handling for API envelopes and malformed output
+  - read-only wrappers for status, workspace, tab, pane, and agent inspection plus dedicated integration-status parsing
+  - native worktree ensure flow for `missing`, `closed`, and already-open reconciliation states
+  - ID-threading helpers for worktree, tab, pane, and agent creation results
+- `test/workflow-herdr.test.js`
+  - fixture-runner coverage for JSON success/error parsing
+  - native worktree `created`, `opened`, and `already_open` responses
+  - explicit argv/focus handling for tab, pane, runtime-command, and agent-start wrappers
 
 ## Self-review
+- Reviewed `src/workflow/herdr.js` and `test/workflow-herdr.test.js` after GREEN.
+- Ran: `git diff --check`
+- Result: clean.
 
-- Scope: no launch, harness, CLI lifecycle, hook, cleanup, fetch/rebase/reset/push/merge/deploy behavior was added.
-- Security: no file contents are read for fingerprints; `.env.local` content is covered by tests and is absent from fingerprint output.
-- Path safety: Git status paths and handoff changed-file paths reject absolute paths, backslashes, empty segments, `.` segments, and `..` traversal.
-- Authority: canonical run ID, generation, ticket set, repository set, and fingerprints come from store/Git, not model input.
-- Staleness: `readCurrentResult` never returns `completed` for unregistered or Git-stale artifacts; it records `result-stale` where the state machine permits.
-- Atomicity/privacy: `result.json` and `results/generation-<n>.json` are written via private sibling temp files, `sync()`, `rename()`, and `0600` chmod; archive directory is `0700`.
-- Error safety: validation and stale errors are bounded and do not include raw handoff strings or artifact contents.
+## Concerns
+- None blocking.
 
-## Concerns / follow-ups
+## Review fix evidence
+### Critical 1: unsupported `--json` flags on JSON-default commands
+- Added failing argv-contract tests for `workspace list/get`, `tab list/create/rename`, `pane list/split/rename`, and `agent list` using the public Herdr 0.7.4 CLI shapes.
+- RED: `node --test test/workflow-herdr.test.js`
+- RED result: 9 failures, including explicit argv mismatches because the adapter appended unsupported `--json` flags.
+- Fix: removed `--json` from the affected wrappers while keeping it on documented worktree create/open and status.
+- GREEN: `node --test test/workflow-herdr.test.js`
+- GREEN result: 13/13 passed.
 
-- No blocking concerns for Task 4.
-- Future launch/lifecycle tasks should align their persisted repository descriptor shape with the supported handoff fields (`id`/`alias` plus `path`/`cwd`/`worktreePath`).
-- Result artifacts and run metadata are separate files, so there is no cross-file transaction; Task 4 mitigates this by requiring an accepting run state before writes and requiring store registration before a result can be current.
+### Critical 2: live `{ id, result }` and `{ id, error }` envelopes
+- Added failing live-envelope tests for status, workspace/tab/pane/agent list/get/create/split/start, and worktree create/open/already-open fixtures shaped like captured Herdr 0.7.4 responses.
+- RED: `node --test test/workflow-herdr.test.js`
+- RED result: worktree and agent normalization failed with missing IDs, and `runInPane` returned the raw `{ id, result }` envelope instead of the unwrapped result.
+- Fix: changed the adapter to unwrap any explicit `result` envelope while preserving explicit API `error` handling and legacy `{ ok: true, result }` compatibility.
+- GREEN: `node --test test/workflow-herdr.test.js`
+- GREEN result: 13/13 passed.
+
+### Focused verification
+- Ran: `node --test test/workflow-herdr.test.js test/workflow-process.test.js`
+- Result: 20/20 tests passed.
+
+### Full suite
+- Ran: `npm test`
+- Result: 117/117 tests passed.
+
+### Critical 3: plain-text `herdr integration status`
+- Added failing live-shaped text tests for `integration status` using public 0.7.4 output lines such as `pi: current (v5) (/path)` and `copilot: not installed (/path)`.
+- RED: `node --test test/workflow-herdr.test.js`
+- RED result: 3 failures because `integrationStatus()` still routed through JSON parsing, returned `null` for empty output instead of `[]`, and did not surface malformed-line diagnostics.
+- Fix: implemented a dedicated plain-text parser for `integrationStatus()` that returns stable entries `{ name, status, version?, path? }`, allows empty output as `[]`, and rejects malformed nonempty lines with a clear `HERDR` error.
+- GREEN: `node --test test/workflow-herdr.test.js`
+- GREEN result: 16/16 passed.
+
+### Focused verification (final)
+- Ran: `node --test test/workflow-herdr.test.js test/workflow-process.test.js`
+- Result: 23/23 tests passed.
+
+### Full suite (final)
+- Ran: `npm test`
+- Result: 120/120 tests passed.

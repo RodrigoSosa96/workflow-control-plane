@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -100,6 +101,10 @@ async function fileMode(path) {
 
 async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
+}
+
+function sha256Digest(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
 test("validates semantic input and replaces caller identity with expected values", () => {
@@ -354,4 +359,127 @@ test("readCurrentResult marks changed fingerprints stale without deleting archiv
   assert.equal((await store.read(run.id)).state, RUN_STATES.RESULT_STALE);
   assert.equal(await readFile(archivePath, "utf8"), archivedBefore);
   assert.equal(await fileMode(archivePath), 0o600);
+});
+
+test("readCurrentResult rejects a registered result when current artifact bytes are tampered", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const { store, run } = await createRunningRun(t, {
+    repositories: [{ id: "app", path: repoPath }],
+  });
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const result = await submitHandoff({ store, git, runId: run.id, generation: 1, input: validInput() });
+  const resultPath = join(run.directory, "result.json");
+  const archivePath = join(run.directory, "results", "generation-1.json");
+  const archiveBefore = await readFile(archivePath, "utf8");
+  const canonicalBytes = await readFile(resultPath);
+
+  const storedRun = await store.read(run.id);
+  assert.equal(storedRun.resultArtifactDigest, sha256Digest(canonicalBytes));
+
+  const tampered = { ...result, summary: "Tampered after registration while fingerprints still match." };
+  await writeFile(resultPath, `${JSON.stringify(tampered, null, 2)}\n`, { mode: 0o600 });
+
+  const current = await readCurrentResult({ store, git, runId: run.id });
+
+  assert.equal(current.status, RUN_STATES.RESULT_STALE);
+  assert.notEqual(current.status, "completed");
+  assert.deepEqual(current.result, tampered);
+  assert.ok(current.errors.some((message) => /digest|artifact|tamper|stale/i.test(message)));
+  assert.equal((await store.read(run.id)).state, RUN_STATES.RESULT_STALE);
+  assert.equal(await readFile(archivePath, "utf8"), archiveBefore);
+});
+
+test("readCurrentResult marks a missing current artifact stale before returning", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const { store, run } = await createRunningRun(t, {
+    repositories: [{ id: "app", path: repoPath }],
+  });
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  await submitHandoff({ store, git, runId: run.id, generation: 1, input: validInput() });
+  const archivePath = join(run.directory, "results", "generation-1.json");
+  const archivedBefore = await readFile(archivePath, "utf8");
+
+  await rm(join(run.directory, "result.json"), { force: true });
+  const current = await readCurrentResult({ store, git, runId: run.id });
+
+  assert.equal(current.status, RUN_STATES.RESULT_STALE);
+  assert.notEqual(current.status, "completed");
+  assert.ok(current.errors.some((message) => /missing|no current result/i.test(message)));
+  assert.equal((await store.read(run.id)).state, RUN_STATES.RESULT_STALE);
+  assert.equal(await readFile(archivePath, "utf8"), archivedBefore);
+});
+
+test("readCurrentResult marks a malformed current artifact stale before returning", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const { store, run } = await createRunningRun(t, {
+    repositories: [{ id: "app", path: repoPath }],
+  });
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  await submitHandoff({ store, git, runId: run.id, generation: 1, input: validInput() });
+  const resultPath = join(run.directory, "result.json");
+  const archivePath = join(run.directory, "results", "generation-1.json");
+  const archivedBefore = await readFile(archivePath, "utf8");
+
+  await writeFile(resultPath, "{ this is not json\n", { mode: 0o600 });
+  const current = await readCurrentResult({ store, git, runId: run.id });
+
+  assert.equal(current.status, RUN_STATES.RESULT_STALE);
+  assert.notEqual(current.status, "completed");
+  assert.ok(current.errors.some((message) => /malformed|invalid/i.test(message)));
+  assert.equal((await store.read(run.id)).state, RUN_STATES.RESULT_STALE);
+  assert.equal(await readFile(archivePath, "utf8"), archivedBefore);
+});
+
+test("readCurrentResult persists result-stale for needs-input and failed handoffs", async (t) => {
+  for (const [status, expectedState] of [
+    ["needs-input", RUN_STATES.NEEDS_INPUT],
+    ["failed", RUN_STATES.FAILED],
+  ]) {
+    const { repoPath } = await createDisposableRepo(t);
+    const { store, run } = await createRunningRun(t, {
+      repositories: [{ id: "app", path: repoPath }],
+    });
+    const git = createGitAdapter({ runner: createProcessRunner() });
+    await submitHandoff({
+      store,
+      git,
+      runId: run.id,
+      generation: 1,
+      input: validInput({
+        status,
+        summary: `Run finished with ${status}.`,
+        tickets: [ticket("A-1", status)],
+        nextAction: "Review stale result handling",
+      }),
+    });
+    assert.equal((await store.read(run.id)).state, expectedState);
+
+    await writeFile(join(repoPath, "src", "example.js"), `export const status = ${JSON.stringify(status)};\n`);
+    const current = await readCurrentResult({ store, git, runId: run.id });
+
+    assert.equal(current.status, RUN_STATES.RESULT_STALE, status);
+    assert.equal((await store.read(run.id)).state, RUN_STATES.RESULT_STALE, status);
+  }
+});
+
+test("readCurrentResult fails closed when stale state cannot be persisted", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const { store, run } = await createRunningRun(t, {
+    repositories: [{ id: "app", path: repoPath }],
+  });
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  await submitHandoff({ store, git, runId: run.id, generation: 1, input: validInput() });
+  await writeFile(join(repoPath, "src", "example.js"), "export const value = 3;\n");
+  const failingStore = {
+    read: (...args) => store.read(...args),
+    async update() {
+      throw new Error("forced result-stale update failure");
+    },
+  };
+
+  await assert.rejects(
+    () => readCurrentResult({ store: failingStore, git, runId: run.id }),
+    /forced result-stale update failure/,
+  );
+  assert.equal((await store.read(run.id)).state, RUN_STATES.COMPLETED);
 });

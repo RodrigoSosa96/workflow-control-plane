@@ -220,6 +220,30 @@ test("transitionRun accepts an omitted patch and still timestamps history", () =
   assert.ok(Number.isFinite(Date.parse(launching.stateHistory.at(-1).at)));
 });
 
+test("transitionRun permits needs-input and failed runs to become result-stale", () => {
+  for (const state of [RUN_STATES.NEEDS_INPUT, RUN_STATES.FAILED]) {
+    const run = {
+      id: RUN_ID_1,
+      state,
+      stateHistory: [{ from: RUN_STATES.RUNNING, to: state, at: "2025-01-01T00:00:00.000Z" }],
+      updatedAt: "2025-01-01T00:00:00.000Z",
+    };
+
+    const stale = transitionRun(run, RUN_STATES.RESULT_STALE, {
+      updatedAt: "2025-01-01T00:01:00.000Z",
+      resultStaleAt: "2025-01-01T00:01:00.000Z",
+    });
+
+    assert.equal(stale.state, RUN_STATES.RESULT_STALE);
+    assert.equal(stale.resultStaleAt, "2025-01-01T00:01:00.000Z");
+    assert.deepEqual(stale.stateHistory.at(-1), {
+      from: state,
+      to: RUN_STATES.RESULT_STALE,
+      at: "2025-01-01T00:01:00.000Z",
+    });
+  }
+});
+
 test("update preserves the original when the updater throws or requests an illegal transition", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { WorkflowError } from "./errors.js";
@@ -31,6 +32,14 @@ export const HANDOFF_LIMITS = Object.freeze({
 });
 
 let tempCounter = 0;
+
+function sha256Digest(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function canonicalResultText(result) {
+  return `${JSON.stringify(result, null, 2)}\n`;
+}
 
 function fail(message, details) {
   throw new WorkflowError("HANDOFF", message, { details });
@@ -471,8 +480,7 @@ async function writeAtomicText(fs, directory, filename, text) {
   await chmodPath(fs, destination, PRIVATE_FILE_MODE, filename);
 }
 
-async function writeResultArtifacts(directory, result, fs = defaultFs) {
-  const text = `${JSON.stringify(result, null, 2)}\n`;
+async function writeResultArtifacts(directory, result, text = canonicalResultText(result), fs = defaultFs) {
   await writeAtomicText(fs, directory, RESULT_FILE, text);
   const archiveDirectory = join(directory, ARCHIVE_DIR);
   await ensurePrivateDirectory(fs, archiveDirectory);
@@ -502,12 +510,14 @@ export async function submitHandoff({ store, git, runId, generation, input } = {
   const normalized = validateHandoffInput(input, expected);
   const fingerprints = await fingerprintRepositories(git, expected.repositories);
   const result = canonicalResult(normalized, expected.repositories, fingerprints);
+  const resultText = canonicalResultText(result);
+  const resultArtifactDigest = sha256Digest(resultText);
 
   await store.update(runId, async (current) => {
     const currentExpected = expectedFromRun(current);
     assertSameExpectations(expected, currentExpected);
     assertRunAcceptsHandoff(current);
-    await writeResultArtifacts(current.directory, result);
+    await writeResultArtifacts(current.directory, result, resultText);
     const paths = resultPaths(current.directory, result.generation);
     return {
       state: STATUS_TO_RUN_STATE[result.status],
@@ -515,6 +525,7 @@ export async function submitHandoff({ store, git, runId, generation, input } = {
       resultStatus: result.status,
       resultPath: paths.resultPath,
       resultArchivePath: paths.archivePath,
+      resultArtifactDigest,
       resultFingerprints: Object.fromEntries(result.repositories.map((repository) => [
         repository.id,
         repository.worktreeFingerprint,
@@ -528,22 +539,23 @@ export async function submitHandoff({ store, git, runId, generation, input } = {
 async function readResultFile(directory, fs = defaultFs) {
   const path = join(directory, RESULT_FILE);
   await chmodPath(fs, path, PRIVATE_FILE_MODE, RESULT_FILE, { missingOk: true });
-  let text;
+  let bytes;
   try {
-    text = await fs.readFile(path, "utf8");
+    bytes = await fs.readFile(path);
   } catch (error) {
     if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { missing: true };
     throwFs("read current result", path, error);
   }
 
+  const artifactDigest = sha256Digest(bytes);
   try {
-    return { result: JSON.parse(text) };
+    return { result: JSON.parse(bytes.toString("utf8")), artifactDigest };
   } catch (_error) {
-    return { invalid: true };
+    return { invalid: true, artifactDigest };
   }
 }
 
-function collectResultShapeErrors(result, expected, run) {
+function collectResultShapeErrors(result, expected, run, artifactDigest) {
   const errors = [];
   if (result === null || typeof result !== "object" || Array.isArray(result)) {
     return ["Current result is not a valid object"];
@@ -566,18 +578,25 @@ function collectResultShapeErrors(result, expected, run) {
   }
 
   const registeredFingerprints = run.resultFingerprints;
+  const registeredArtifactDigest = typeof run.resultArtifactDigest === "string" ? run.resultArtifactDigest.trim() : "";
   const registered = run.resultGeneration === result.generation
     && run.resultStatus === result.status
+    && registeredArtifactDigest
     && registeredFingerprints !== null
     && typeof registeredFingerprints === "object"
     && !Array.isArray(registeredFingerprints);
   if (!registered) {
     errors.push("Current result is not registered in the run store");
-  } else if (Array.isArray(result.repositories)) {
-    for (const repository of result.repositories) {
-      if (registeredFingerprints[repository.id] !== repository.worktreeFingerprint) {
-        errors.push("Current result fingerprint registration is stale");
-        break;
+  } else {
+    if (registeredArtifactDigest !== artifactDigest) {
+      errors.push("Current result artifact digest is stale");
+    }
+    if (Array.isArray(result.repositories)) {
+      for (const repository of result.repositories) {
+        if (registeredFingerprints[repository.id] !== repository.worktreeFingerprint) {
+          errors.push("Current result fingerprint registration is stale");
+          break;
+        }
       }
     }
   }
@@ -586,14 +605,26 @@ function collectResultShapeErrors(result, expected, run) {
 }
 
 async function markResultStale(store, runId) {
-  try {
-    await store.update(runId, () => ({
-      state: RUN_STATES.RESULT_STALE,
-      resultStaleAt: new Date().toISOString(),
-    }));
-  } catch (_error) {
-    // The caller still receives result-stale; some legacy states may not transition directly.
+  if (!store || typeof store.update !== "function") {
+    fail("Run store update interface is required to mark stale results");
   }
+  const resultStaleAt = new Date().toISOString();
+  await store.update(runId, (current) => {
+    if (current.state === RUN_STATES.RESULT_STALE) {
+      return { resultStaleAt };
+    }
+    return {
+      state: RUN_STATES.RESULT_STALE,
+      resultStaleAt,
+    };
+  });
+}
+
+async function returnResultStale(store, runId, result, errors) {
+  await markResultStale(store, runId);
+  const response = { status: RUN_STATES.RESULT_STALE, errors };
+  if (result !== undefined) response.result = result;
+  return response;
 }
 
 export async function readCurrentResult({ store, git, runId } = {}) {
@@ -604,15 +635,15 @@ export async function readCurrentResult({ store, git, runId } = {}) {
   const run = await store.read(runId);
   const current = await readResultFile(run.directory);
   if (current.missing) {
-    return { status: run.state, errors: ["No current result"] };
+    return returnResultStale(store, runId, undefined, ["No current result"]);
   }
   if (current.invalid) {
-    return { status: run.state, errors: ["Current result is invalid"] };
+    return returnResultStale(store, runId, undefined, ["Current result is invalid"]);
   }
 
   const expected = expectedFromRun(run);
   const result = current.result;
-  const errors = collectResultShapeErrors(result, expected, run);
+  const errors = collectResultShapeErrors(result, expected, run, current.artifactDigest);
   if (run.state === RUN_STATES.RESULT_STALE) {
     errors.push("Current result was already marked stale");
   }
@@ -631,8 +662,7 @@ export async function readCurrentResult({ store, git, runId } = {}) {
   }
 
   if (errors.length > 0) {
-    await markResultStale(store, runId);
-    return { status: RUN_STATES.RESULT_STALE, result, errors };
+    return returnResultStale(store, runId, result, errors);
   }
 
   return { status: result.status, result };
