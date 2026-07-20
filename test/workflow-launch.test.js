@@ -255,6 +255,27 @@ function assertNoLaunchMutations(calls) {
   assert.deepEqual(mutationCalls, []);
 }
 
+function errorDiagnostic(error) {
+  return JSON.stringify({
+    message: error.message,
+    details: error.details,
+    category: error.category,
+  });
+}
+
+function launchOptionsWithoutExecutionEnv(options = {}) {
+  return {
+    request: RAW_REQUEST,
+    registryPath: "/tmp/projects.yaml",
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    tickets: ["ASANA-140"],
+    repositories: ["app"],
+    agentProfile: "codex-worker",
+    ...options,
+  };
+}
+
 function createStore(calls, { failUpdateToRunning = null } = {}) {
   let run = null;
   const directory = join(STATE_ROOT, RUN_ID);
@@ -443,6 +464,56 @@ test("dry launch preview is data-only, mutates nothing, and keeps the raw reques
   assert.doesNotMatch(JSON.stringify(preview.request), /touch \/tmp\/no|Do not paraphrase/);
 });
 
+test("launch preview resolves approved execution environment from injected defaults and binds it to the digest", async () => {
+  const calls = [];
+  const preview = await createLaunchPreview(launchOptionsWithoutExecutionEnv(), {
+    planCommand: planCommandFactory(calls),
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+  });
+
+  assert.equal(preview.executionInput.options.stateRoot, STATE_ROOT);
+  assert.equal(preview.executionInput.options.controlPlaneBin, CONTROL_PLANE_BIN);
+  assert.ok(JSON.stringify(preview.executionInput).includes(STATE_ROOT));
+  assert.ok(JSON.stringify(preview.executionInput).includes(CONTROL_PLANE_BIN));
+
+  const changedStateRoot = await createLaunchPreview(launchOptionsWithoutExecutionEnv(), {
+    planCommand: planCommandFactory([]),
+    stateRoot: "/state/changed-after-preview",
+    controlPlaneBin: CONTROL_PLANE_BIN,
+  });
+  const changedControlPlaneBin = await createLaunchPreview(launchOptionsWithoutExecutionEnv(), {
+    planCommand: planCommandFactory([]),
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: "/changed/bin/workflow.js",
+  });
+
+  assert.notEqual(changedStateRoot.approvalDigest, preview.approvalDigest);
+  assert.notEqual(changedControlPlaneBin.approvalDigest, preview.approvalDigest);
+});
+
+test("launch preview requires a valid approved execution environment before planning", async () => {
+  const missingCalls = [];
+  await assert.rejects(
+    () => createLaunchPreview(launchOptionsWithoutExecutionEnv(), {
+      planCommand: planCommandFactory(missingCalls),
+    }),
+    /stateRoot|controlPlaneBin|required/i,
+  );
+  assert.deepEqual(missingCalls, []);
+
+  for (const [stateRoot, controlPlaneBin] of [["", CONTROL_PLANE_BIN], [STATE_ROOT, ""], [42, CONTROL_PLANE_BIN], [STATE_ROOT, {}]]) {
+    const calls = [];
+    await assert.rejects(
+      () => createLaunchPreview(launchOptionsWithoutExecutionEnv({ stateRoot, controlPlaneBin }), {
+        planCommand: planCommandFactory(calls),
+      }),
+      /stateRoot|controlPlaneBin|required|valid/i,
+    );
+    assert.deepEqual(calls, []);
+  }
+});
+
 test("approval digest binds request, selected profile permissions, tickets, repositories, branches, and assignment but excludes volatile run data", async () => {
   const base = await previewFor();
   const changedRequest = await previewFor({ request: `${RAW_REQUEST}\nOne more requirement.` });
@@ -507,6 +578,74 @@ test("missing or stale approval digests fail before any mutation", async () => {
       /approval digest|stale|missing/i,
     );
     assert.deepEqual(calls, []);
+  }
+});
+
+test("changed approved execution environment fails as stale before store or Herdr mutation", async () => {
+  const preview = await createLaunchPreview(launchOptionsWithoutExecutionEnv(), {
+    planCommand: planCommandFactory([]),
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+  });
+
+  for (const depsOverride of [
+    { stateRoot: "/state/changed-after-approval", controlPlaneBin: CONTROL_PLANE_BIN },
+    { stateRoot: STATE_ROOT, controlPlaneBin: "/changed/bin/workflow.js" },
+  ]) {
+    const calls = [];
+    const store = createStore(calls);
+    await assert.rejects(
+      () => executeLaunch(preview, {
+        planCommand: planCommandFactory(calls),
+        store,
+        ...depsOverride,
+        executeStart: async () => {
+          calls.push({ kind: "executeStart" });
+          return { status: "completed", operations: [{ id: "agent", kind: "agent.session.start", status: "created" }] };
+        },
+        herdr: {
+          async startAgent() {
+            calls.push({ kind: "herdr.startAgent" });
+          },
+        },
+      }),
+      /approval digest|stale/i,
+    );
+    assertNoLaunchMutations(calls);
+  }
+});
+
+test("approval digest validation redacts malformed and stale direct caller input", async () => {
+  const preview = await previewFor();
+  const malformedSecret = `SECRET-DO-NOT-LEAK ${RAW_REQUEST}`;
+  const staleDirectInput = JSON.parse(JSON.stringify(preview));
+  staleDirectInput.executionInput.options.request = `SECRET-STALE-DIRECT-INPUT ${RAW_REQUEST}`;
+
+  for (const candidate of [
+    { ...preview, approvalDigest: malformedSecret },
+    { ...preview, approvalDigest: `sha256:${"A".repeat(64)}` },
+    staleDirectInput,
+  ]) {
+    const calls = [];
+    const store = createStore(calls);
+    await assert.rejects(
+      () => executeLaunch(candidate, {
+        planCommand: planCommandFactory(calls),
+        store,
+        stateRoot: STATE_ROOT,
+        controlPlaneBin: CONTROL_PLANE_BIN,
+        executeStart: async () => {
+          calls.push({ kind: "executeStart" });
+          return { status: "completed", operations: [{ id: "agent", kind: "agent.session.start", status: "created" }] };
+        },
+      }),
+      (error) => {
+        assert.match(error.message, /approval digest|stale|invalid/i);
+        assert.doesNotMatch(errorDiagnostic(error), /SECRET-DO-NOT-LEAK|SECRET-STALE-DIRECT-INPUT|touch \/tmp\/no|Do not paraphrase/);
+        return true;
+      },
+    );
+    assertNoLaunchMutations(calls);
   }
 });
 
@@ -687,8 +826,54 @@ test("partial environment or agent startup failures preserve the run and return 
   assert.equal(report.recoveryCommand, `workflow reconcile --run ${RUN_ID}`);
   assert.deepEqual(report.guidance, [`workflow reconcile --run ${RUN_ID}`]);
   assert.equal(calls.some((call) => call.kind === "store.delete" || call.kind === "git.removeWorktree"), false);
-  assert.ok(store.snapshot(), "run should remain available for reconciliation");
+  const storedRun = store.snapshot();
+  assert.ok(storedRun, "run should remain available for reconciliation");
+  assert.equal(storedRun.state, RUN_STATES.FAILED);
+  assert.equal(storedRun.launchStatus, "partial");
+  assert.deepEqual(storedRun.stateHistory.map((entry) => entry.to), [
+    RUN_STATES.PLANNED,
+    RUN_STATES.LAUNCHING,
+    RUN_STATES.FAILED,
+  ]);
   assert.equal(calls.some((call) => call.kind === "store.writeAssignment"), true);
+});
+
+test("execution exceptions after run creation preserve artifacts as failed partial launches", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => {
+      calls.push({ kind: "executeStart" });
+      const error = new Error("agent launch crashed after run creation");
+      error.name = "AgentLaunchCrash";
+      throw error;
+    },
+  });
+
+  assert.equal(report.status, "partial");
+  assert.equal(report.runId, RUN_ID);
+  assert.equal(report.recoveryCommand, `workflow reconcile --run ${RUN_ID}`);
+  assert.deepEqual(report.guidance, [`workflow reconcile --run ${RUN_ID}`]);
+  assert.equal(calls.some((call) => call.kind === "store.delete" || call.kind === "git.removeWorktree"), false);
+  assert.equal(calls.some((call) => call.kind === "store.writeAssignment"), true);
+
+  const storedRun = store.snapshot();
+  assert.ok(storedRun, "run should remain available for reconciliation");
+  assert.equal(storedRun.state, RUN_STATES.FAILED);
+  assert.equal(storedRun.launchStatus, "partial");
+  assert.deepEqual(storedRun.launchError, { name: "AgentLaunchCrash", message: "agent launch crashed after run creation" });
+  assert.deepEqual(storedRun.stateHistory.map((entry) => entry.to), [
+    RUN_STATES.PLANNED,
+    RUN_STATES.LAUNCHING,
+    RUN_STATES.FAILED,
+  ]);
 });
 
 test("incompatible live writers block launch before prompt delivery or agent start", async () => {
@@ -773,7 +958,15 @@ test("launch reports partial when executeStart reuses rather than creates the se
 
   assert.equal(report.status, "partial");
   assert.equal(report.recoveryCommand, `workflow reconcile --run ${RUN_ID}`);
-  assert.equal(store.snapshot().launchStatus, "partial");
+  const storedRun = store.snapshot();
+  assert.equal(storedRun.launchStatus, "partial");
+  assert.equal(storedRun.state, RUN_STATES.FAILED);
+  assert.equal(storedRun.agentId, undefined);
+  assert.deepEqual(storedRun.stateHistory.map((entry) => entry.to), [
+    RUN_STATES.PLANNED,
+    RUN_STATES.LAUNCHING,
+    RUN_STATES.FAILED,
+  ]);
 });
 
 test("launchCommand recomputes immediately before execute and rejects stale approved digests before mutation", async () => {

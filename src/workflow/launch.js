@@ -33,6 +33,7 @@ function canonicalText(value) {
 }
 
 const EXECUTION_INPUT_VERSION = 1;
+const APPROVAL_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const VOLATILE_EXECUTION_OPTION_KEYS = new Set([
   "approvalDigest",
   "command",
@@ -45,11 +46,30 @@ const VOLATILE_EXECUTION_OPTION_KEYS = new Set([
   "env",
 ]);
 
-function executionInputFor(options = {}) {
-  const safe = {};
-  for (const [key, value] of Object.entries(options)) {
-    if (!VOLATILE_EXECUTION_OPTION_KEYS.has(key) && value !== undefined && typeof value !== "function") {
-      safe[key] = value;
+function approvedString(value, name) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    fail("PREFLIGHT", `launch preview requires valid ${name}`);
+  }
+  return value;
+}
+
+function optionOrDefault(options, deps, name) {
+  return Object.hasOwn(options, name) && options[name] !== undefined ? options[name] : deps[name];
+}
+
+function approvedExecutionEnvironment(options = {}, deps = {}) {
+  return {
+    stateRoot: approvedString(optionOrDefault(options, deps, "stateRoot"), "stateRoot"),
+    controlPlaneBin: approvedString(optionOrDefault(options, deps, "controlPlaneBin"), "controlPlaneBin"),
+  };
+}
+
+function executionInputFor(options = {}, deps = {}) {
+  const approvedEnvironment = approvedExecutionEnvironment(options, deps);
+  const safe = { ...options, ...approvedEnvironment };
+  for (const [key, value] of Object.entries(safe)) {
+    if (VOLATILE_EXECUTION_OPTION_KEYS.has(key) || value === undefined || typeof value === "function") {
+      delete safe[key];
     }
   }
   return {
@@ -194,8 +214,8 @@ function assertPlanCommand(planCommand) {
 
 export async function createLaunchPreview(options = {}, deps = {}) {
   const planCommand = deps.planCommand;
+  const executionInput = executionInputFor(options, deps);
   assertPlanCommand(planCommand);
-  const executionInput = executionInputFor(options);
   const executionOptions = executionInput.options;
 
   const planPreview = await planCommand(planCommandOptions(executionOptions), deps);
@@ -234,12 +254,15 @@ function assertSuppliedApprovalDigest(preview) {
   if (typeof preview?.approvalDigest !== "string" || !preview.approvalDigest) {
     fail("PREFLIGHT", "Missing approval digest; rerun launch preview and approve the current digest");
   }
+  if (!APPROVAL_DIGEST_PATTERN.test(preview.approvalDigest)) {
+    fail("PREFLIGHT", "Invalid approval digest; rerun launch preview and approve the current digest");
+  }
 }
 
-function staleApprovalDigest(supplied, expected) {
+function staleApprovalDigest(_supplied, expected, details = {}) {
   fail("PREFLIGHT", "Stale approval digest; rerun launch preview before executing", {
-    supplied,
-    expected,
+    ...(expected ? { expected } : {}),
+    ...details,
   });
 }
 
@@ -447,19 +470,14 @@ export async function executeLaunch(preview, deps = {}) {
   assertStore(deps.store);
 
   const executionOptions = executionOptionsFromPreview(fresh);
-  const approvedStateRoot = executionOptions.stateRoot ?? fresh.stateRoot;
-  const approvedControlPlaneBin = executionOptions.controlPlaneBin ?? fresh.controlPlaneBin;
-  if (deps.stateRoot !== undefined && approvedStateRoot !== undefined && deps.stateRoot !== approvedStateRoot) {
-    fail("PREFLIGHT", "launch execution stateRoot does not match the approved launch preview");
+  const stateRoot = approvedString(executionOptions.stateRoot, "stateRoot");
+  const controlPlaneBin = approvedString(executionOptions.controlPlaneBin, "controlPlaneBin");
+  if (deps.stateRoot !== undefined && deps.stateRoot !== stateRoot) {
+    staleApprovalDigest(preview.approvalDigest, fresh.approvalDigest, { field: "stateRoot" });
   }
-  if (deps.controlPlaneBin !== undefined && approvedControlPlaneBin !== undefined && deps.controlPlaneBin !== approvedControlPlaneBin) {
-    fail("PREFLIGHT", "launch execution controlPlaneBin does not match the approved launch preview");
+  if (deps.controlPlaneBin !== undefined && deps.controlPlaneBin !== controlPlaneBin) {
+    staleApprovalDigest(preview.approvalDigest, fresh.approvalDigest, { field: "controlPlaneBin" });
   }
-
-  const stateRoot = approvedStateRoot ?? deps.stateRoot;
-  const controlPlaneBin = approvedControlPlaneBin ?? deps.controlPlaneBin;
-  if (typeof stateRoot !== "string" || !stateRoot) fail("PREFLIGHT", "launch execution requires stateRoot");
-  if (typeof controlPlaneBin !== "string" || !controlPlaneBin) fail("PREFLIGHT", "launch execution requires controlPlaneBin");
 
   const store = deps.store;
   const created = await store.create(runInput(fresh, {
@@ -495,7 +513,7 @@ export async function executeLaunch(preview, deps = {}) {
     const hasCreatedAgent = createdSelectedAgent(execution);
     const session = hasCreatedAgent ? sessionPatch(execution, launchExpected ?? {}) : {};
     await updateRun(store, run.id, {
-      state: RUN_STATES.RUNNING,
+      state: isRunning ? RUN_STATES.RUNNING : RUN_STATES.FAILED,
       harness: fresh.selection.harness,
       profileName: fresh.selection.profileName,
       launchStatus: isRunning ? (execution?.status ?? "completed") : "partial",
@@ -521,7 +539,7 @@ export async function executeLaunch(preview, deps = {}) {
     };
     try {
       await updateRun(store, run.id, {
-        state: RUN_STATES.RUNNING,
+        state: RUN_STATES.FAILED,
         harness: fresh.selection.harness,
         profileName: fresh.selection.profileName,
         launchStatus: "partial",
