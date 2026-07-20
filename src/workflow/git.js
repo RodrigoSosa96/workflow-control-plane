@@ -1,4 +1,6 @@
-import { isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import * as defaultFs from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
 
 function trimLine(value) {
@@ -83,7 +85,83 @@ function fail(category, message, details, exitCode) {
   throw new WorkflowError(category, message, { details, exitCode });
 }
 
-export function createGitAdapter({ runner }) {
+function failGit(message, details) {
+  fail("GIT", message, details, 12);
+}
+
+function sortStatusEntries(left, right) {
+  return `${left.path}\0${left.fromPath ?? ""}\0${left.x}${left.y}`
+    .localeCompare(`${right.path}\0${right.fromPath ?? ""}\0${right.x}${right.y}`);
+}
+
+function assertSafeGitPath(rootPath, path) {
+  if (typeof path !== "string" || !path) {
+    failGit("Unsafe Git status path");
+  }
+  if (path.includes("\0") || path.includes("\\") || isAbsolute(path)) {
+    failGit("Unsafe Git status path");
+  }
+
+  const segments = path.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+    failGit("Unsafe Git status path traversal");
+  }
+
+  const resolvedPath = resolve(rootPath, path);
+  const child = relative(rootPath, resolvedPath);
+  if (!child || child.startsWith("..") || isAbsolute(child)) {
+    failGit("Git status path escapes the worktree");
+  }
+  return resolvedPath;
+}
+
+function fileType(stat) {
+  if (stat.isFile()) return "file";
+  if (stat.isDirectory()) return "directory";
+  if (stat.isSymbolicLink()) return "symlink";
+  if (stat.isFIFO()) return "fifo";
+  if (stat.isSocket()) return "socket";
+  if (stat.isCharacterDevice()) return "character-device";
+  if (stat.isBlockDevice()) return "block-device";
+  return "other";
+}
+
+async function pathMetadata(fs, path) {
+  try {
+    const stats = await fs.lstat(path);
+    return {
+      exists: true,
+      type: fileType(stats),
+      size: stats.size,
+      mode: stats.mode & 0o7777,
+      mtimeMs: Math.round(stats.mtimeMs),
+      ctimeMs: Math.round(stats.ctimeMs),
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return { exists: false };
+    }
+    failGit("Unable to read Git status metadata", { code: error?.code ?? "FS_ERROR" });
+  }
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = canonicalize(value[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+function digestFor(value) {
+  const hash = createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
+  return `sha256:${hash}`;
+}
+
+export function createGitAdapter({ runner, fs = defaultFs }) {
   return {
     async inspectRepository({ cwd }) {
       const root = await runner.run("git", ["rev-parse", "--show-toplevel"], { cwd });
@@ -128,6 +206,44 @@ export function createGitAdapter({ runner }) {
       return {
         dirty: entries.length > 0,
         entries,
+      };
+    },
+
+    async fingerprint({ cwd }) {
+      const root = await runner.run("git", ["rev-parse", "--show-toplevel"], { cwd });
+      const headResult = await runner.run("git", ["rev-parse", "HEAD"], { cwd });
+      const branchResult = await runner.run("git", ["branch", "--show-current"], { cwd });
+      const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd });
+      const rootPath = trimLine(root.stdout);
+      const head = trimLine(headResult.stdout);
+      const branch = trimLine(branchResult.stdout) || null;
+      const statusEntries = parseStatus(statusResult.stdout).sort(sortStatusEntries);
+      const entries = [];
+
+      for (const entry of statusEntries) {
+        const normalized = {
+          x: entry.x,
+          y: entry.y,
+          path: entry.path,
+          metadata: await pathMetadata(fs, assertSafeGitPath(rootPath, entry.path)),
+        };
+        if (entry.fromPath !== undefined) {
+          normalized.fromPath = entry.fromPath;
+          normalized.fromMetadata = await pathMetadata(fs, assertSafeGitPath(rootPath, entry.fromPath));
+        }
+        entries.push(normalized);
+      }
+
+      const fingerprint = {
+        head,
+        branch,
+        dirty: entries.length > 0,
+        entries,
+      };
+
+      return {
+        ...fingerprint,
+        digest: digestFor(fingerprint),
       };
     },
 

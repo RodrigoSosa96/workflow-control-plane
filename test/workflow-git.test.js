@@ -231,3 +231,64 @@ test("creates a child worktree in a disposable repository", async (t) => {
   assert.equal(branch, "feature/task");
   assert.equal(readme, "hello\n");
 });
+
+test("fingerprints clean and dirty worktrees without file contents", async (t) => {
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  const cleanRepo = await createDisposableRepo(t);
+  const clean = await git.fingerprint({ cwd: cleanRepo.repoPath });
+  const cleanAgain = await git.fingerprint({ cwd: cleanRepo.repoPath });
+
+  assert.equal(clean.digest, cleanAgain.digest);
+  assert.match(clean.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.match(clean.head, /^[0-9a-f]{40}$/);
+  assert.equal(clean.branch, "main");
+  assert.equal(clean.dirty, false);
+  assert.deepEqual(clean.entries, []);
+
+  await writeFile(join(cleanRepo.repoPath, "README.md"), "changed\n");
+  const trackedEdit = await git.fingerprint({ cwd: cleanRepo.repoPath });
+  assert.notEqual(trackedEdit.digest, clean.digest);
+  assert.equal(JSON.stringify(trackedEdit).includes("changed\\n"), false);
+  assert.ok(trackedEdit.entries.some((entry) => entry.path === "README.md" && entry.y === "M"));
+
+  const stagedRepo = await createDisposableRepo(t);
+  const stagedClean = await git.fingerprint({ cwd: stagedRepo.repoPath });
+  await writeFile(join(stagedRepo.repoPath, "README.md"), "staged only\n");
+  await gitExec(stagedRepo.repoPath, ["add", "README.md"]);
+  const stagedEdit = await git.fingerprint({ cwd: stagedRepo.repoPath });
+  assert.notEqual(stagedEdit.digest, stagedClean.digest);
+  assert.equal(JSON.stringify(stagedEdit).includes("staged only\\n"), false);
+  assert.ok(stagedEdit.entries.some((entry) => entry.path === "README.md" && entry.x === "M"));
+
+  const renameRepo = await createDisposableRepo(t);
+  const renameClean = await git.fingerprint({ cwd: renameRepo.repoPath });
+  await gitExec(renameRepo.repoPath, ["mv", "README.md", "docs.md"]);
+  const renamed = await git.fingerprint({ cwd: renameRepo.repoPath });
+  assert.notEqual(renamed.digest, renameClean.digest);
+  assert.ok(renamed.entries.some((entry) => entry.x === "R" && entry.path === "docs.md" && entry.fromPath === "README.md"));
+
+  const untrackedRepo = await createDisposableRepo(t);
+  await writeFile(join(untrackedRepo.repoPath, ".env.local"), "SECRET_TOKEN=short\n");
+  const untracked = await git.fingerprint({ cwd: untrackedRepo.repoPath });
+  await writeFile(join(untrackedRepo.repoPath, ".env.local"), "SECRET_TOKEN=longer-value\n");
+  const untrackedMetadataChanged = await git.fingerprint({ cwd: untrackedRepo.repoPath });
+  assert.notEqual(untrackedMetadataChanged.digest, untracked.digest);
+  assert.ok(untrackedMetadataChanged.entries.some((entry) => entry.path === ".env.local" && entry.x === "?"));
+  assert.equal(JSON.stringify(untrackedMetadataChanged).includes("SECRET_TOKEN"), false);
+});
+
+test("fingerprint rejects porcelain paths outside the worktree", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --show-toplevel": async () => ({ code: 0, stdout: "/repo\n", stderr: "" }),
+    "git rev-parse HEAD": async () => ({ code: 0, stdout: "0123456789012345678901234567890123456789\n", stderr: "" }),
+    "git branch --show-current": async () => ({ code: 0, stdout: "main\n", stderr: "" }),
+    "git status --porcelain=v1 -z": async () => ({ code: 0, stdout: " M ../secret.txt\0", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  await assert.rejects(
+    () => git.fingerprint({ cwd: "/repo" }),
+    /path|worktree|traversal/i,
+  );
+});
