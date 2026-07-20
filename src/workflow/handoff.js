@@ -646,14 +646,14 @@ async function markResultStale(store, runId, observed) {
   });
 }
 
-async function returnResultStale(store, runId, result, errors, observed) {
-  await markResultStale(store, runId, observed);
+async function returnResultStale(store, runId, result, errors, observed, { markStale = true } = {}) {
+  if (markStale) await markResultStale(store, runId, observed);
   const response = { status: RUN_STATES.RESULT_STALE, errors };
   if (result !== undefined) response.result = result;
   return response;
 }
 
-export async function readCurrentResult({ store, git, runId } = {}) {
+export async function readCurrentResult({ store, git, runId, markStale = true } = {}) {
   if (!store || typeof store.read !== "function") {
     fail("Run store interface is required");
   }
@@ -662,10 +662,10 @@ export async function readCurrentResult({ store, git, runId } = {}) {
   const observed = observedResultMetadata(run);
   const current = await readResultFile(run.directory);
   if (current.missing) {
-    return returnResultStale(store, runId, undefined, ["No current result"], observed);
+    return returnResultStale(store, runId, undefined, ["No current result"], observed, { markStale });
   }
   if (current.invalid) {
-    return returnResultStale(store, runId, undefined, ["Current result is invalid"], observed);
+    return returnResultStale(store, runId, undefined, ["Current result is invalid"], observed, { markStale });
   }
 
   const expected = expectedFromRun(run);
@@ -689,7 +689,7 @@ export async function readCurrentResult({ store, git, runId } = {}) {
   }
 
   if (errors.length > 0) {
-    return returnResultStale(store, runId, result, errors, observed);
+    return returnResultStale(store, runId, result, errors, observed, { markStale });
   }
 
   return { status: result.status, result };

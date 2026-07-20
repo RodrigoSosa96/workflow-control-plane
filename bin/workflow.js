@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 import { realpathSync, constants as fsConstants } from "node:fs";
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
+import { ASSIGNMENT_LIMITS } from "../src/workflow/assignment.js";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { doctorCommand as defaultDoctorCommand, handoffCommand as defaultHandoffCommand, planCommand as defaultPlanCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
+import { doctorCommand as defaultDoctorCommand, handoffCommand as defaultHandoffCommand, launchCommand as defaultLaunchCommand, planCommand as defaultPlanCommand, reconcileCommand as defaultReconcileCommand, resultCommand as defaultResultCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
 import { loadRegistry as defaultLoadRegistry } from "../src/workflow/registry.js";
 
 const OUTPUT_LIMIT = 12000;
+const LAUNCH_OUTPUT_LIMIT = 256 * 1024;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultRegistryPath = join(packageRoot, "projects.yaml");
 const HELP = `workflow — deterministic launcher for isolated development environments
@@ -23,6 +25,9 @@ Commands:
   workflow doctor [project] [--agent <profile>] [--format compact|json]
   workflow plan <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
   workflow start <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--agent <profile>] [--format compact|json] [--yes]
+  workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
+  workflow result <run-id> [--format compact|json]
+  workflow reconcile [project] --run <run-id> [--format compact|json]
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
   workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
   workflow handoff <run-id> --input <run-dir>/handoff-input.json [--format compact|json]
@@ -30,17 +35,17 @@ Commands:
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path
   WORKFLOW_STATE_ROOT      Workflow run-state root for handoff`;
-const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help", "input"]);
+const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help", "input", "prompt-file", "selection-reason", "origin-session", "dry-run", "approval-digest", "run"]);
 
-function bound(text) {
+function bound(text, limit = OUTPUT_LIMIT) {
   const value = String(text ?? "").replace(/\r\n?/g, "\n");
-  if (value.length <= OUTPUT_LIMIT) return value;
-  const suffix = "\n...[truncated]";
-  return value.slice(0, OUTPUT_LIMIT - suffix.length) + suffix;
+  if (value.length <= limit) return value;
+  const suffix = `\n...[output truncated at ${limit} characters]`;
+  return value.slice(0, Math.max(0, limit - suffix.length)) + suffix;
 }
 
-function emit(writer, text) {
-  writer(bound(text));
+function emit(writer, text, { limit = OUTPUT_LIMIT } = {}) {
+  writer(bound(text, limit));
 }
 
 function consumeOptions(tokens) {
@@ -56,7 +61,7 @@ function consumeOptions(tokens) {
     const name = token.slice(2);
     if (!KNOWN_OPTIONS.has(name)) throw new Error(`Unknown option: --${name}`);
     if (Object.hasOwn(options, name)) throw new Error(`Duplicate option: --${name}`);
-    if (name === "yes" || name === "help") {
+    if (name === "yes" || name === "help" || name === "dry-run") {
       options[name] = true;
       continue;
     }
@@ -83,6 +88,40 @@ function parseCsvList(value) {
     .filter(Boolean);
 }
 
+function assertCanonicalHandoffInputSyntax(input) {
+  const normalized = String(input ?? "").replace(/\\/gu, "/");
+  if (!normalized.includes("/") || !normalized.endsWith("/handoff-input.json") || normalized.includes("/../") || normalized.startsWith("../")) {
+    throw new Error("handoff --input must be the canonical <run-directory>/handoff-input.json path.");
+  }
+}
+
+function usageError(message) {
+  throw new WorkflowError("USAGE", message, { exitCode: 64 });
+}
+
+async function readPromptFile(path) {
+  if (typeof path !== "string" || !path.trim()) {
+    usageError("launch requires --prompt-file <path>.");
+  }
+  let bytes;
+  try {
+    bytes = await readFile(path);
+  } catch (error) {
+    usageError(`Prompt file could not be read (${error?.code ?? "FS_ERROR"}).`);
+  }
+  if (bytes.length > ASSIGNMENT_LIMITS.requestBytes) {
+    usageError("Prompt file request exceeds the 64 KiB limit.");
+  }
+  if (bytes.includes(0)) {
+    usageError("Prompt file request contains invalid NUL characters.");
+  }
+  const request = bytes.toString("utf8");
+  if (request.trim().length === 0) {
+    usageError("Prompt file request is empty.");
+  }
+  return request;
+}
+
 export function parseArgs(argv) {
   if (!argv.length || (argv.length === 1 && ["help", "--help"].includes(argv[0]))) {
     return { command: "help", format: "compact" };
@@ -106,10 +145,31 @@ export function parseArgs(argv) {
   if (command === "handoff") {
     validateShape("handoff", positionals, options, { min: 1, max: 1, allowedOptions: ["input"] });
     if (!options.input) throw new Error("handoff requires --input <run-dir>/handoff-input.json.");
+    assertCanonicalHandoffInputSyntax(options.input);
     return {
       command,
       runId: positionals[0],
       input: options.input,
+      format,
+    };
+  }
+
+  if (command === "result") {
+    validateShape("result", positionals, options, { min: 1, max: 1, allowedOptions: [] });
+    return {
+      command,
+      runId: positionals[0],
+      format,
+    };
+  }
+
+  if (command === "reconcile") {
+    validateShape("reconcile", positionals, options, { min: 0, max: 1, allowedOptions: ["run"] });
+    if (!options.run) throw new Error("reconcile requires --run <run-id>.");
+    return {
+      command,
+      ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
+      runId: options.run,
       format,
     };
   }
@@ -126,6 +186,27 @@ export function parseArgs(argv) {
     ...(options.yes ? { yes: true } : {}),
     format,
   };
+
+  if (command === "launch") {
+    validateShape("launch", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "agent", "prompt-file", "selection-reason", "origin-session", "dry-run", "approval-digest", "yes"] });
+    if (!options["prompt-file"]) throw new Error("launch requires --prompt-file <path>.");
+    return {
+      command,
+      projectAlias: positionals[0],
+      task: positionals[1],
+      ...(options.feature ? { feature: options.feature } : {}),
+      ...(options.repos ? { repositories: parseCsvList(options.repos) } : {}),
+      ...(options.tickets ? { tickets: parseCsvList(options.tickets) } : {}),
+      ...(options.agent ? { agentProfile: options.agent } : {}),
+      promptFile: options["prompt-file"],
+      ...(options["selection-reason"] ? { selectionReason: options["selection-reason"] } : {}),
+      ...(options["origin-session"] ? { originSession: options["origin-session"] } : {}),
+      ...(options["dry-run"] ? { dryRun: true } : {}),
+      ...(options["approval-digest"] ? { approvalDigest: options["approval-digest"] } : {}),
+      ...(options.yes ? { yes: true } : {}),
+      format,
+    };
+  }
 
   if (command === "plan") {
     validateShape("plan", positionals, options, { min: 2, max: 2, allowedOptions: ["feature", "repos", "tickets", "profile", "agent"] });
@@ -166,6 +247,7 @@ function createLiveDependencies(dependencies) {
   const runner = dependencies.runner ?? createProcessRunner();
   const stateRoot = dependencies.stateRoot ?? env.WORKFLOW_STATE_ROOT;
   return {
+    stateRoot,
     loadRegistry: dependencies.loadRegistry ?? defaultLoadRegistry,
     lookupExecutable: dependencies.lookupExecutable ?? ((name) => lookupExecutable(name, env)),
     git: dependencies.git ?? createGitAdapter({ runner }),
@@ -219,6 +301,7 @@ async function defaultConfirm({ prompt = "Proceed? [y/N] " } = {}) {
 
 function categorizeError(error) {
   if (error instanceof WorkflowError) {
+    if (error.category === "USAGE") return { category: "USAGE", exitCode: 64 };
     if (error.category === "CONFLICT") return { category: "CONFLICT", exitCode: 11 };
     if (error.category === "PREFLIGHT") return { category: "PREFLIGHT", exitCode: 10 };
     if (error.category === "HANDOFF") return { category: "HANDOFF", exitCode: 10 };
@@ -236,6 +319,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const doctorCommand = dependencies.doctorCommand ?? defaultDoctorCommand;
   const planCommand = dependencies.planCommand ?? defaultPlanCommand;
   const statusCommand = dependencies.statusCommand ?? defaultStatusCommand;
+  const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
+  const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
+  const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const handoffCommand = dependencies.handoffCommand ?? defaultHandoffCommand;
   const executeStart = dependencies.executeStart ?? defaultExecuteStart;
   const executeRuntime = dependencies.executeRuntime ?? defaultExecuteRuntime;
@@ -271,6 +357,64 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const result = await statusCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("status", result, args.format));
       return result.reconciliation?.status === "conflict" ? 11 : 0;
+    }
+
+    if (args.command === "launch") {
+      if (args.yes && !args.approvalDigest) {
+        emit(err, "USAGE: launch --yes requires --approval-digest from the current dry-run preview.");
+        return 64;
+      }
+      if (!args.dryRun && !args.yes && !isInteractive()) {
+        emit(err, "USAGE: launch requires interactive confirmation or --yes with --approval-digest.");
+        return 64;
+      }
+
+      const request = await readPromptFile(args.promptFile);
+      const command = await launchCommand({
+        ...options,
+        request,
+        controlPlaneBin: fileURLToPath(import.meta.url),
+      }, liveDependencies);
+
+      if (args.dryRun) {
+        emit(out, formatWorkflowResult("launch", command.preview, args.format), { limit: LAUNCH_OUTPUT_LIMIT });
+        return 0;
+      }
+
+      let approvalDigest = args.approvalDigest;
+      if (!args.yes) {
+        const previewText = formatWorkflowResult("launch", command.preview, "compact");
+        emit(err, previewText, { limit: LAUNCH_OUTPUT_LIMIT });
+        const approved = await confirm({
+          command: "launch",
+          preview: command.preview,
+          previewText,
+          prompt: "Proceed with workflow launch? [y/N] ",
+        });
+        if (!approved) {
+          emit(err, "USAGE: Confirmation declined; no changes were made.");
+          return 64;
+        }
+        approvalDigest = command.preview.approvalDigest;
+      }
+
+      const report = await command.execute({ approvalDigest });
+      emit(out, formatWorkflowResult("launch", report, args.format));
+      if (report.status === "partial") return 13;
+      if (report.status === "failed") return 12;
+      return 0;
+    }
+
+    if (args.command === "result") {
+      const result = await resultCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("result", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "reconcile") {
+      const result = await reconcileCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("reconcile", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 
     if (args.command === "handoff") {

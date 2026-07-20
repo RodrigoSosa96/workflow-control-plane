@@ -1,12 +1,20 @@
 import * as defaultFs from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
-import { submitHandoff as defaultSubmitHandoff } from "./handoff.js";
+import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
+import { RUN_STATES } from "./run-state.js";
+import { createRunStore } from "./run-store.js";
+
+export const RESULT_EXIT_CODES = Object.freeze({
+  pending: 20,
+  "result-stale": 21,
+  "manual-handoff-required": 22,
+});
 
 const EMPTY_HERDR_READ_MODEL = {
   async listWorkspaces() {
@@ -445,6 +453,193 @@ function canonicalHandoffInputPath(run) {
   return join(run.directory, "handoff-input.json");
 }
 
+function resultCommandFor(runId) {
+  return `workflow result ${runId}`;
+}
+
+function reconcileCommandFor(runId) {
+  return `workflow reconcile --run ${runId}`;
+}
+
+function relatedTicketsFromRun(run = {}) {
+  if (Array.isArray(run.relatedTickets)) return run.relatedTickets.map(String);
+  const primary = run.primaryTicket ?? run.task;
+  return Array.isArray(run.tickets) ? run.tickets.map(String).filter((ticket) => ticket !== primary) : [];
+}
+
+function repositoryAliasesFromRun(run = {}) {
+  if (Array.isArray(run.request?.repositories) && run.request.repositories.length > 0) {
+    return run.request.repositories.map(String);
+  }
+  return Array.isArray(run.repositories)
+    ? run.repositories.map((repository) => repository.alias ?? repository.id).filter(Boolean).map(String)
+    : [];
+}
+
+function buildStatusCommandForRun(run = {}) {
+  if (!run.projectAlias || !(run.task ?? run.primaryTicket)) return null;
+  const parts = ["workflow", "status", run.projectAlias, run.task ?? run.primaryTicket];
+  const feature = run.request?.feature ?? run.feature;
+  const repositories = repositoryAliasesFromRun(run);
+  const relatedTickets = relatedTicketsFromRun(run);
+  if (feature) parts.push("--feature", quote(String(feature)));
+  if (repositories.length) parts.push("--repos", repositories.join(","));
+  if (relatedTickets.length) parts.push("--tickets", relatedTickets.join(","));
+  return parts.join(" ");
+}
+
+function fallbackWorkspaceForRun(run = {}) {
+  if (run.workspacePath) return run.workspacePath;
+  if (Array.isArray(run.repositories) && run.repositories.length > 0) {
+    return run.repositories[0].path ?? run.repositories[0].worktreePath ?? null;
+  }
+  return run.worktreePath ?? run.checkoutPath ?? null;
+}
+
+function runCommandSummary(run) {
+  const statusCommand = buildStatusCommandForRun(run);
+  return {
+    resultCommand: resultCommandFor(run.id),
+    reconcileCommand: reconcileCommandFor(run.id),
+    handoffCommand: `workflow handoff ${run.id} --input ${canonicalHandoffInputPath(run)}`,
+    ...(statusCommand ? { statusCommand } : {}),
+  };
+}
+
+function runOutputBase(run) {
+  const workspacePath = fallbackWorkspaceForRun(run);
+  return {
+    runId: run.id,
+    runDirectory: run.directory,
+    projectAlias: run.projectAlias,
+    projectLabel: run.projectLabel,
+    task: run.task ?? run.primaryTicket,
+    primaryTicket: run.primaryTicket ?? run.task,
+    relatedTickets: relatedTicketsFromRun(run),
+    state: run.state,
+    harness: run.harness,
+    profileName: run.profileName,
+    workspace: workspacePath ? { path: workspacePath } : null,
+    fallbackWorkspace: workspacePath,
+    tabId: run.tabId ?? null,
+    paneId: run.paneId ?? null,
+    agentId: run.agentId ?? null,
+    nativeSessionId: run.nativeSessionId ?? null,
+    ...runCommandSummary(run),
+  };
+}
+
+function launchStateFromStatus(status) {
+  if (status === "running") return RUN_STATES.RUNNING;
+  if (status === "partial" || status === "failed") return RUN_STATES.FAILED;
+  return status ?? null;
+}
+
+function agentOperationFromReport(report = {}) {
+  return list(report.operations).find((operation) => operation.id === "agent" || operation.kind === "agent.session.start" || operation.kind === "pi.session.start") ?? null;
+}
+
+function runLikeFromLaunchPreview(report = {}, preview = {}) {
+  const identity = preview.reconciliation?.identity ?? {};
+  return {
+    id: report.runId,
+    directory: report.runDirectory,
+    projectAlias: identity.projectAlias,
+    projectLabel: identity.projectLabel,
+    task: identity.task,
+    primaryTicket: identity.primaryTicket ?? identity.task,
+    relatedTickets: list(identity.relatedTickets).map(String),
+    request: preview.request,
+    repositories: list(preview.reconciliation?.repositories).map((repository) => ({
+      id: repository.alias ?? repository.id,
+      alias: repository.alias ?? repository.id,
+      path: repository.worktreePath ?? repository.path,
+    })),
+  };
+}
+
+function decorateLaunchReport(report = {}, preview = {}) {
+  const agentOperation = agentOperationFromReport(report);
+  const workspacePath = preview.reconciliation?.workspace?.path ?? report.fallbackWorkspace ?? report.workspace?.path ?? null;
+  const runLike = runLikeFromLaunchPreview(report, preview);
+  return {
+    ...report,
+    state: report.state ?? launchStateFromStatus(report.status),
+    harness: report.harness ?? preview.selection?.harness,
+    profileName: report.profileName ?? preview.selection?.profileName,
+    workspace: report.workspace ?? (workspacePath ? { path: workspacePath } : null),
+    fallbackWorkspace: report.fallbackWorkspace ?? workspacePath,
+    tabId: report.tabId ?? agentOperation?.tabId ?? agentOperation?.tab_id ?? null,
+    paneId: report.paneId ?? agentOperation?.paneId ?? agentOperation?.pane_id ?? null,
+    agentId: report.agentId ?? agentOperation?.agentId ?? agentOperation?.agent_id ?? null,
+    resultCommand: report.resultCommand ?? resultCommandFor(report.runId),
+    statusCommand: report.statusCommand ?? buildStatusCommandForRun(runLike),
+    reconcileCommand: report.reconcileCommand ?? reconcileCommandFor(report.runId),
+  };
+}
+
+function hasRegisteredResult(run) {
+  return Boolean(run.resultPath || run.resultGeneration || run.resultArtifactDigest || run.resultStatus);
+}
+
+function pendingResultState(state) {
+  return new Set([
+    RUN_STATES.PLANNED,
+    RUN_STATES.LAUNCHING,
+    RUN_STATES.RUNNING,
+    RUN_STATES.IDLE_AWAITING_HANDOFF,
+    RUN_STATES.NEEDS_INPUT,
+  ]).has(state);
+}
+
+function manualResultState(state) {
+  return new Set([
+    RUN_STATES.MANUAL_HANDOFF_REQUIRED,
+    RUN_STATES.INTERRUPTED,
+    RUN_STATES.FAILED,
+  ]).has(state);
+}
+
+function stableResultExitCode(status) {
+  return RESULT_EXIT_CODES[status] ?? 0;
+}
+
+async function stateRootForCommand(options = {}, deps = {}) {
+  if (options.stateRoot) return options.stateRoot;
+  if (deps.stateRoot) return deps.stateRoot;
+  const injectedLoadRegistry = deps.loadRegistry ?? loadRegistry;
+  const registry = await injectedLoadRegistry(options.registryPath);
+  return registry.launcher.state_root;
+}
+
+async function storeForCommand(options = {}, deps = {}) {
+  if (deps.store) return deps.store;
+  const stateRoot = await stateRootForCommand(options, deps);
+  const factory = deps.createRunStore ?? createRunStore;
+  return factory({ stateRoot });
+}
+
+function ensureMatchingRunProject(options, run, command) {
+  if (options.projectAlias && run.projectAlias && options.projectAlias !== run.projectAlias) {
+    throw new WorkflowError(command.toUpperCase(), `${command} project ${options.projectAlias} does not match run project ${run.projectAlias}`, { exitCode: 10 });
+  }
+}
+
+function resultStatusWithoutArtifact(run) {
+  if (run.state === RUN_STATES.RESULT_STALE) return "result-stale";
+  if (manualResultState(run.state)) return "manual-handoff-required";
+  if (pendingResultState(run.state)) return "pending";
+  return "manual-handoff-required";
+}
+
+function reconcileStatusForRun(run) {
+  if (run.state === RUN_STATES.RESULT_STALE) return "result-stale";
+  if (hasRegisteredResult(run)) return run.resultStatus ?? run.state;
+  if (manualResultState(run.state)) return "manual-handoff-required";
+  if (pendingResultState(run.state)) return "pending";
+  return run.state;
+}
+
 function assertCanonicalHandoffInput(inputPath, expectedPath) {
   if (typeof inputPath !== "string" || inputPath.length === 0) {
     failHandoff("Handoff --input is required and must be the canonical run-directory handoff-input.json path");
@@ -507,9 +702,78 @@ export async function handoffCommand(options = {}, {
   });
 }
 
+export async function resultCommand(options = {}, deps = {}) {
+  const store = await storeForCommand(options, deps);
+  const readCurrentResult = deps.readCurrentResult ?? defaultReadCurrentResult;
+  const runId = assertRunId(options.runId);
+  const run = await store.read(runId);
+  const base = runOutputBase(run);
+
+  if (!hasRegisteredResult(run)) {
+    const status = resultStatusWithoutArtifact(run);
+    return {
+      command: "result",
+      ...base,
+      status,
+      exitCode: stableResultExitCode(status),
+      nextActions: status === "pending"
+        ? [base.resultCommand, base.reconcileCommand]
+        : [base.reconcileCommand],
+    };
+  }
+
+  const current = await readCurrentResult({ store, git: deps.git, runId, markStale: false });
+  const status = current.status;
+  return {
+    command: "result",
+    ...base,
+    status,
+    result: current.result,
+    errors: current.errors ?? [],
+    exitCode: stableResultExitCode(status),
+    nextActions: status === "result-stale" ? [base.reconcileCommand] : [],
+  };
+}
+
+export async function reconcileCommand(options = {}, deps = {}) {
+  const store = await storeForCommand(options, deps);
+  const runId = assertRunId(options.runId);
+  const run = await store.read(runId);
+  ensureMatchingRunProject(options, run, "reconcile");
+  const base = runOutputBase(run);
+  const status = reconcileStatusForRun(run);
+  const nextActions = [
+    base.resultCommand,
+    ...(base.statusCommand ? [base.statusCommand] : []),
+    base.handoffCommand,
+  ];
+
+  return {
+    command: "reconcile",
+    ...base,
+    projectAlias: options.projectAlias ?? base.projectAlias,
+    status,
+    nextActions,
+    cleanup: "none",
+    repairs: [],
+  };
+}
+
 export async function launchCommand(options = {}, deps = {}) {
-  return await createWorkflowLaunchCommand(options, {
+  const stateRoot = await stateRootForCommand(options, deps);
+  const controlPlaneBin = options.controlPlaneBin ?? deps.controlPlaneBin;
+  const store = deps.store ?? (deps.createRunStore ?? createRunStore)({ stateRoot });
+  const command = await createWorkflowLaunchCommand({ ...options, stateRoot, controlPlaneBin }, {
     ...deps,
+    store,
+    stateRoot,
+    controlPlaneBin,
     planCommand: deps.planCommand ?? planCommand,
   });
+  return {
+    preview: command.preview,
+    async execute(executeOptions = {}) {
+      return decorateLaunchReport(await command.execute(executeOptions), command.preview);
+    },
+  };
 }

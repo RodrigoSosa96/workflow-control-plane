@@ -1,12 +1,21 @@
 {
   "name": "workflow-control-plane",
   "version": "0.1.0",
+  "description": "Read-only Asana and multi-harness workflow control-plane CLIs.",
   "private": true,
   "type": "module",
   "bin": {
     "asana-workflow": "./bin/asana-workflow.js",
     "workflow": "./bin/workflow.js"
   },
+  "files": [
+    "bin",
+    "config",
+    "src",
+    ".pi/prompts",
+    "projects.yaml",
+    "README.md"
+  ],
   "scripts": {
     "test": "node --test"
   },

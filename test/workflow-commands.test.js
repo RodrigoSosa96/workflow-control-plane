@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { doctorCommand, planCommand, statusCommand } from "../src/workflow/commands.js";
+import { doctorCommand, planCommand, resultCommand, statusCommand } from "../src/workflow/commands.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
+import { RUN_STATES } from "../src/workflow/run-state.js";
 
 const registry = {
   launcher: {
@@ -607,6 +608,42 @@ test("plan exposes a suggested Acme coordination manifest and compact output pri
   assert.match(compact, /Suggested manifest/i);
   assert.match(compact, /coordination-manifest\.json/);
   assert.match(compact, /integrationOrder/);
+});
+
+test("result command verifies registered results through Task 4 in read-only mode", async () => {
+  const runId = "55555555-5555-4555-8555-555555555555";
+  const run = {
+    id: runId,
+    directory: "/state/workflow/55555555-5555-4555-8555-555555555555",
+    projectAlias: "ocr",
+    projectLabel: "ExampleProject",
+    task: "ASANA-123",
+    primaryTicket: "ASANA-123",
+    relatedTickets: ["ASANA-140"],
+    state: RUN_STATES.COMPLETED,
+    resultPath: "/state/workflow/55555555-5555-4555-8555-555555555555/result.json",
+    resultStatus: "completed",
+  };
+  const result = await resultCommand({ runId }, {
+    store: {
+      async read(id) {
+        assert.equal(id, runId);
+        return run;
+      },
+      async update() {
+        assert.fail("result command must remain read-only");
+      },
+    },
+    readCurrentResult: async (input) => {
+      assert.equal(input.runId, runId);
+      assert.equal(input.markStale, false);
+      return { status: "completed", result: { status: "completed", summary: "Done" } };
+    },
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.reconcileCommand, `workflow reconcile --run ${runId}`);
 });
 
 test("formats bounded compact output and normalized JSON", () => {

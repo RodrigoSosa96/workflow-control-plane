@@ -34,17 +34,30 @@ Acme is a workspace grouping three independent repositories; its worktrees must 
 
 ## Workflow launcher CLI
 
-The repository also includes a deterministic `workflow` CLI for dry-run planning, isolated worktree startup, runtime opt-in, and recovery status checks.
+The repository also includes a deterministic `workflow` CLI for read-only planning, isolated workspace start, approved multi-harness launch runs, worker handoff, result inspection, runtime opt-in, and recovery status checks.
 
 ### Launcher safety boundaries
 
-- `workflow doctor`, `workflow plan`, and `workflow status` are read-only.
-- `workflow start` and `workflow runtime` require explicit confirmation or `--yes`.
+- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, and `workflow reconcile` are read-only.
+- `workflow start`, `workflow launch`, and `workflow runtime` require explicit confirmation or `--yes`; `workflow launch --yes` also requires the current `--approval-digest` from a dry-run preview.
 - In other words, every mutating launcher command requires explicit confirmation or --yes.
+- `workflow start` and `workflow launch` are separate: `workflow start` preserves the original no-prompt workspace preparation semantics, while `workflow launch` creates an approved run assignment from `--prompt-file` and starts one selected worker harness.
 - `workflow start` does not submit an implementation prompt automatically.
 - Runtime processes stay opt-in through `workflow runtime`; `workflow start` prepares only the agent workspace.
+- `workflow launch` reads the untrusted request only from `--prompt-file`; there is no `--prompt` option, and the file is read as bytes rather than shell-interpreted text.
+- Private state lives under `projects.yaml` `launcher.state_root` (or `WORKFLOW_STATE_ROOT` for worker handoff) with private run directories, `assignment.md`, `handoff-input.json`, and canonical `result.json` artifacts.
+- The launcher follows a no-cleanup policy: failed or partial launches preserve worktrees, Herdr tabs/panes, run directories, and the fallback workspace for manual recovery.
 - Acme bundle planning must name the selected repositories explicitly with `--repos`.
 - Real Acme meta-repository setup remains a separate explicit checkpoint after disposable verification; the launcher branch must not initialize or modify the real work project automatically.
+- Native hooks and resume automation are explicitly unavailable in this stage; native hooks/resume are the next implementation stage, not current behavior.
+
+### Profile selection precedence
+
+Profile selection precedence is: explicit --agent wins first, then the project default profile, then the global default profile. Project allowlists in `projects.yaml` still apply, so an explicit profile outside `allowed_agent_profiles` is rejected. Profiles define the harness (`pi`, `claude`, or `codex`), binary, safe arguments, and permissions such as Claude `permission_mode` or Codex sandbox/approval policy.
+
+### Bundle semantics
+
+Bundle semantics keep the primary ticket as the branch/session/worktree identity. Related tickets supplied with `--tickets` are normalized, sorted, de-duplicated, and included in the assignment, result expectations, Acme manifests, and status commands without changing the primary ticket path.
 
 ### Launcher command flow
 
@@ -54,12 +67,29 @@ Run these from this repository after the design and implementation plan are appr
 workflow doctor ocr
 workflow plan ocr ASANA-123 --feature "Discovered Docs"
 workflow start ocr ASANA-123 --feature "Discovered Docs" --yes
+workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --dry-run
+workflow launch ocr ASANA-123 --agent claude-worker --prompt-file request.md --dry-run
+workflow launch ocr ASANA-123 --agent codex-worker --prompt-file request.md --dry-run
+workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --approval-digest sha256:<digest> --yes
+workflow result <run-id>
+workflow reconcile [project] --run <run-id>
+workflow handoff <run-id> --input <run-directory>/handoff-input.json
 workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes
 workflow status ocr ASANA-123 --feature "Discovered Docs"
 workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel
 ```
 
-Use `workflow plan` as the dry-run checkpoint before any mutation. If a launch is interrupted or a workspace already exists, inspect `workflow status` before retrying `workflow start` or `workflow runtime`.
+Use `workflow plan` as the read-only environment checkpoint before `workflow start`. Use `workflow launch ... --dry-run` as the assignment preview checkpoint before `workflow launch --yes`: the preview prints the full approved assignment and an approval digest, and the non-dry launch recomputes the current preview before accepting that digest. If a launch is interrupted, inspect `workflow result <run-id>`, `workflow reconcile --run <run-id>`, and the preserved fallback terminal/workspace before retrying any mutating command.
+
+### Worker handoff and results
+
+Workers write structured JSON only to `$WORKFLOW_RUN_DIR/handoff-input.json` and submit it with:
+
+```bash
+workflow handoff <run-id> --input <run-directory>/handoff-input.json
+```
+
+`workflow result <run-id>` reads the canonical result. Exit `0` means a current terminal result was available; exit `20` means pending, exit `21` means stale, and exit `22` means manual handoff is required. `workflow reconcile [project] --run <run-id>` performs no repair, launch, cleanup, or destructive action; it emits exact safe next actions such as `workflow result`, `workflow status`, and the canonical `workflow handoff` command.
 
 ## Asana workflow CLI
 
