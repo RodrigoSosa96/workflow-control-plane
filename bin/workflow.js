@@ -387,6 +387,23 @@ function createDefaultDelegationInspector(liveDependencies, dependencies = {}) {
 function createDefaultDelegationSpawner(liveDependencies, dependencies = {}) {
   return async ({ command, argv, cwd, env: launchEnv }) => await new Promise((resolveSpawn, rejectSpawn) => {
     let child;
+    let spawned = false;
+    let settled = false;
+    const resolveAfterSpawnFailure = () => {
+      if (settled) return;
+      settled = true;
+      resolveSpawn({ outcome: "spawned-but-unverified" });
+    };
+    const rejectBeforeSpawnFailure = (error) => {
+      if (settled) return;
+      settled = true;
+      rejectSpawn(processError(`Failed to start ${command}: ${error.message}`, {
+        reason: "spawn",
+        command,
+        argv,
+        cwd,
+      }));
+    };
     try {
       child = spawnChildProcess(command, argv, {
         cwd,
@@ -396,34 +413,26 @@ function createDefaultDelegationSpawner(liveDependencies, dependencies = {}) {
         stdio: "ignore",
       });
     } catch (error) {
-      rejectSpawn(processError(`Failed to start ${command}: ${error.message}`, {
-        reason: "spawn",
-        command,
-        argv,
-        cwd,
-      }));
+      rejectBeforeSpawnFailure(error);
       return;
     }
 
     child.once("error", (error) => {
-      rejectSpawn(processError(`Failed to start ${command}: ${error.message}`, {
-        reason: "spawn",
-        command,
-        argv,
-        cwd,
-      }));
+      if (spawned) {
+        resolveAfterSpawnFailure();
+        return;
+      }
+      rejectBeforeSpawnFailure(error);
     });
 
     child.once("spawn", async () => {
+      spawned = true;
+      child.unref?.();
       try {
         const pid = child.pid;
         if (!Number.isInteger(pid) || pid < 1) {
-          throw processError(`Failed to start ${command}: child pid is missing`, {
-            reason: "spawn",
-            command,
-            argv,
-            cwd,
-          });
+          resolveAfterSpawnFailure();
+          return;
         }
         const inspection = await inspectDelegationPid(pid, {
           runner: liveDependencies.runner,
@@ -431,21 +440,17 @@ function createDefaultDelegationSpawner(liveDependencies, dependencies = {}) {
           readCwd: dependencies.readDelegationCwd ?? fsRealpath,
         });
         if (!inspection) {
-          throw processError("Failed to inspect delegated Pi process", {
-            reason: "inspect",
-            command,
-            argv,
-            cwd,
-            pid: String(pid),
-          });
+          resolveAfterSpawnFailure();
+          return;
         }
-        child.unref?.();
+        if (settled) return;
+        settled = true;
         resolveSpawn({
           pid: String(pid),
           startedAt: inspection.startedAt,
         });
-      } catch (error) {
-        rejectSpawn(error);
+      } catch {
+        resolveAfterSpawnFailure();
       }
     });
   });

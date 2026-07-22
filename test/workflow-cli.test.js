@@ -1,16 +1,26 @@
 import assert from "node:assert/strict";
-import { mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { main, parseArgs } from "../bin/workflow.js";
+import { delegationRemediateCommand as defaultDelegationRemediateCommand } from "../src/workflow/commands.js";
+import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
+import { createDelegationServices } from "../src/workflow/delegation-services.js";
+import { createDelegationStore } from "../src/workflow/delegation-store.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { createPiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
-import { main, parseArgs } from "../bin/workflow.js";
+import { createRunStore } from "../src/workflow/run-store.js";
+import { RUN_STATES } from "../src/workflow/run-state.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const require = createRequire(import.meta.url);
+const mutableChildProcess = require("node:child_process");
 
 const io = () => {
   const stdout = [];
@@ -140,6 +150,141 @@ function delegationRemediationPreview(overrides = {}) {
     nextActions: ["approve-remediation"],
     ...overrides,
   };
+}
+
+const FIXTURE_PROJECT_ALIAS = "fixture";
+const FIXTURE_PROJECT_PATH = "/fixture/shared";
+const FIXTURE_CWD = "/fixture/review";
+const FIXTURE_POLICY = {
+  version: 1,
+  totalInternal: 4,
+  foreground: 3,
+  readOnlyBackground: 3,
+  writersTotal: 1,
+  writersPerCheckout: 1,
+  maxDepth: 1,
+  remediationTurns: 2,
+  allowBackgroundWriters: false,
+};
+const FIXTURE_REGISTRY = {
+  launcher: { delegation: FIXTURE_POLICY },
+  projects: {
+    [FIXTURE_PROJECT_ALIAS]: {
+      label: "Fixture Project",
+      path: FIXTURE_PROJECT_PATH,
+      delegation: {
+        remediationTurns: 2,
+      },
+    },
+  },
+};
+const FIXTURE_REVIEW_INPUT = Object.freeze({
+  role: "code-reviewer",
+  mode: "background",
+  originSessionId: "pi-origin-1",
+  cwd: FIXTURE_CWD,
+  brief: "Review only the frozen task. Keep all findings inside scope.",
+  task: "Review only the frozen task.",
+  budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+  remediationTurns: 2,
+});
+const FIXTURE_ROLE_LOADER = Object.freeze({
+  async loadDelegationRole({ name }) {
+    return Object.freeze({
+      name,
+      tools: ["read", "bash", "grep", "find", "ls"],
+      systemPrompt: "Review only the frozen brief.",
+    });
+  },
+});
+
+function uuidSequence(...values) {
+  let index = 0;
+  return () => values[index++] ?? values.at(-1);
+}
+
+function fixtureTransportIdentity(stateRoot, runId = RUN_ID, delegationId = DELEGATION_ID) {
+  return {
+    kind: "pi-delegation",
+    runId,
+    delegationId,
+    sessionPath: join(stateRoot, runId, "delegations", delegationId, "pi-session.jsonl"),
+    cwd: FIXTURE_CWD,
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  };
+}
+
+function completedDelegationResult(generation, summary = "Review completed") {
+  return {
+    status: "completed",
+    generation,
+    summary,
+    verification: [{ command: "git diff --check", status: "passed" }],
+    concerns: [],
+    nextAction: "Return findings to the coordinator",
+  };
+}
+
+async function createCompletedDelegationCliFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), "workflow-cli-remediation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateRoot = join(root, "state");
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
+  const run = await store.create({
+    projectAlias: FIXTURE_PROJECT_ALIAS,
+    primaryTicket: "A-1",
+    state: RUN_STATES.PLANNED,
+    repositories: [{ id: "repository", path: FIXTURE_CWD, branch: "main" }],
+  });
+  const delegations = createDelegationStore({
+    store,
+    randomUUID: uuidSequence(DELEGATION_ID),
+  });
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    randomUUID: uuidSequence(
+      "33333333-3333-4333-8333-333333333333",
+      "44444444-4444-4444-8444-444444444444",
+    ),
+    canonicalPath: async (value) => value,
+  });
+  const services = createDelegationServices({
+    registry: FIXTURE_REGISTRY,
+    projectAlias: FIXTURE_PROJECT_ALIAS,
+    runStore: store,
+    delegations,
+    reservations,
+    transport: {
+      async start() {
+        return { identity: fixtureTransportIdentity(stateRoot) };
+      },
+      async observeExact(identity) {
+        return { state: "idle", identity };
+      },
+      async deliverFollowUp() {
+        throw new Error("not used in setup");
+      },
+      async requestGracefulClose(identity) {
+        return { requested: false, manual: true, identity };
+      },
+    },
+    roles: FIXTURE_ROLE_LOADER,
+  });
+  const preview = await services.createPreview({ runId: run.id, input: FIXTURE_REVIEW_INPUT });
+  await services.executeApproved({ preview, approvalDigest: preview.approvalDigest });
+  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedDelegationResult(1) });
+  return { root, stateRoot, store, delegations, reservations };
+}
+
+async function remediationApprovalDigest(deps, prompt) {
+  const command = await defaultDelegationRemediateCommand({
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    prompt,
+    registryPath: "/fixture/projects.yaml",
+  }, deps);
+  return command.preview.approvalDigest;
 }
 
 test("installed symlink executes the workflow entry point", async () => {
@@ -790,6 +935,117 @@ test("main wires the live Pi delegation transport only for live reconcile and ap
     },
   }), 0);
   assert.equal(calls.length, 2);
+});
+
+test("live CLI remediation keeps manual recovery when post-spawn identity verification is unknown and blocks a second spawn", async (t) => {
+  const fixture = await createCompletedDelegationCliFixture(t);
+  const promptFile = join(fixture.root, "remediation.md");
+  await writeFile(promptFile, RAW_REQUEST);
+
+  const spawnCalls = [];
+  const psCalls = [];
+  const cwdReads = [];
+  let unrefCount = 0;
+  const originalSpawn = mutableChildProcess.spawn;
+  mutableChildProcess.spawn = (command, argv, options) => {
+    spawnCalls.push({ command, argv, options });
+    const child = new EventEmitter();
+    child.pid = 67890;
+    child.unref = () => {
+      unrefCount += 1;
+    };
+    queueMicrotask(() => {
+      child.emit("spawn");
+    });
+    return child;
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    mutableChildProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  });
+
+  const sharedDependencies = {
+    out() {},
+    err() {},
+    stateRoot: fixture.stateRoot,
+    store: fixture.store,
+    delegations: fixture.delegations,
+    reservations: fixture.reservations,
+    roles: FIXTURE_ROLE_LOADER,
+    loadRegistry: async () => FIXTURE_REGISTRY,
+    lookupExecutable: async () => "/usr/bin/pi",
+    runner: {
+      async run(command, argv, options) {
+        psCalls.push({ command, argv, options });
+        return { code: 0, stdout: "Wed Jan  1 00:20:00 2025 S\n" };
+      },
+    },
+    inspectDelegationProcess: async (identity) => {
+      assert.equal(identity.pid, "12345");
+      return null;
+    },
+    readDelegationCwd: async (path) => {
+      cwdReads.push(path);
+      const error = new Error("permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+    createPiDelegationTransport: (options) => createPiDelegationTransport({
+      ...options,
+      loadDelegationRole: FIXTURE_ROLE_LOADER.loadDelegationRole,
+    }),
+  };
+
+  const approvalDigest = await remediationApprovalDigest(sharedDependencies, RAW_REQUEST);
+  const firstOutput = io();
+  assert.equal(await main([
+    "delegation",
+    "remediate",
+    RUN_ID,
+    DELEGATION_ID,
+    "--prompt-file",
+    promptFile,
+    "--yes",
+    "--approval-digest",
+    approvalDigest,
+  ], {
+    ...sharedDependencies,
+    ...firstOutput,
+  }), 0);
+
+  const blockedRecord = (await fixture.store.read(RUN_ID)).delegations[DELEGATION_ID];
+  assert.equal(blockedRecord.generation, 1);
+  assert.equal(blockedRecord.remediation?.state, "manual-recovery");
+  assert.equal(blockedRecord.remediation?.reason, "spawned-but-unverified");
+  assert.ok(blockedRecord.remediation?.claimToken);
+  assert.equal(spawnCalls.length, 1);
+  assert.equal(unrefCount, 1);
+  assert.deepEqual(psCalls, [{
+    command: "ps",
+    argv: ["-p", "67890", "-o", "lstart=", "-o", "state="],
+    options: { allowFailure: true },
+  }]);
+  assert.deepEqual(cwdReads, ["/proc/67890/cwd"]);
+
+  const secondOutput = io();
+  const secondApprovalDigest = await remediationApprovalDigest(sharedDependencies, RAW_REQUEST);
+  assert.equal(await main([
+    "delegation",
+    "remediate",
+    RUN_ID,
+    DELEGATION_ID,
+    "--prompt-file",
+    promptFile,
+    "--yes",
+    "--approval-digest",
+    secondApprovalDigest,
+  ], {
+    ...sharedDependencies,
+    ...secondOutput,
+  }), 10);
+  assert.match(secondOutput.stderr[0], /claimed|launch|remediation/i);
+  assert.equal(spawnCalls.length, 1);
 });
 
 test("launch dry-run reads only --prompt-file, prints the approved assignment preview, and mutates nothing", async () => {
