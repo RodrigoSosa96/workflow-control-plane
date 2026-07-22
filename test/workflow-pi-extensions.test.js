@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { createPreparedDelegationRequest } from "../src/workflow/coordinator-policy.js";
 import { createWorkflowDelegationChildExtension } from "../.pi/extensions/workflow-delegation-child.ts";
-import { createWorkflowCoordinatorExtension } from "../.pi/extensions/workflow-coordinator/index.ts";
+import { createWorkflowCoordinatorExtension, createWorkflowCoordinatorRuntime } from "../.pi/extensions/workflow-coordinator/index.ts";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -107,6 +107,107 @@ function preview() {
     approvalDigest: `sha256:${"b".repeat(64)}`,
   });
 }
+
+test("coordinator live runtime resolves an absolute Pi binary and honors a validated WORKFLOW_PROJECTS_FILE override", async () => {
+  const transportCalls = [];
+  const services = [];
+  const registryPath = "/tmp/custom-projects.yaml";
+
+  const runtime = await createWorkflowCoordinatorRuntime({
+    env: {
+      WORKFLOW_PROJECTS_FILE: registryPath,
+      WORKFLOW_STATE_ROOT: "/state/override",
+    },
+    lookupExecutableImpl: async (name, { env } = {}) => {
+      assert.equal(name, "pi");
+      assert.equal(env.WORKFLOW_PROJECTS_FILE, registryPath);
+      return "/opt/pi/bin/pi";
+    },
+    loadRegistryImpl: async (path) => {
+      assert.equal(path, registryPath);
+      return {
+        launcher: { state_root: "/state/from-registry" },
+        projects: {
+          fixture: {
+            label: "Fixture Project",
+            path: CWD,
+            delegation: { remediationTurns: 2 },
+          },
+        },
+      };
+    },
+    createRunStoreImpl: ({ stateRoot }) => {
+      assert.equal(stateRoot, "/state/override");
+      return {
+        async read(runId) {
+          assert.equal(runId, RUN_ID);
+          return { id: runId, projectAlias: "fixture" };
+        },
+      };
+    },
+    createDelegationStoreImpl: () => ({
+      async list() {
+        return [];
+      },
+      async adoptResult() {
+        throw new Error("not used");
+      },
+    }),
+    createReservationStoreImpl: ({ stateRoot }) => {
+      assert.equal(stateRoot, "/state/override");
+      return {};
+    },
+    createTransportImpl: (options) => {
+      transportCalls.push(options);
+      return {
+        async start() {
+          throw new Error("not used");
+        },
+        async observeExact() {
+          return { state: "missing", identity: null };
+        },
+        async deliverFollowUp() {
+          throw new Error("not used");
+        },
+        async requestGracefulClose() {
+          return { requested: false, manual: true };
+        },
+      };
+    },
+    createDelegationServicesImpl: (input) => {
+      services.push(input);
+      return { marker: "services" };
+    },
+    loadDelegationRoleImpl: async ({ name }) => ({
+      name,
+      tools: ["read", "bash", "grep", "find", "ls"],
+      systemPrompt: "Review only the frozen brief.",
+    }),
+  });
+
+  assert.equal(transportCalls[0].piCommand, "/opt/pi/bin/pi");
+  assert.equal(transportCalls[0].stateRoot, "/state/override");
+  assert.equal(typeof transportCalls[0].controlPlaneBin, "string");
+
+  const resolved = await runtime.resolveServicesForRun(RUN_ID);
+  assert.equal(resolved.marker, "services");
+  assert.equal(services[0].projectAlias, "fixture");
+
+  await assert.rejects(
+    () => createWorkflowCoordinatorRuntime({
+      env: { WORKFLOW_PROJECTS_FILE: "relative-projects.yaml" },
+      lookupExecutableImpl: async () => "/opt/pi/bin/pi",
+      loadRegistryImpl: async () => ({ launcher: { state_root: "/state" }, projects: {} }),
+      createRunStoreImpl: () => ({ async read() { return { id: RUN_ID, projectAlias: "fixture" }; } }),
+      createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
+      createReservationStoreImpl: () => ({}),
+      createTransportImpl: () => ({ async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {} }),
+      createDelegationServicesImpl: () => ({}),
+      loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
+    }),
+    /WORKFLOW_PROJECTS_FILE|absolute|registry/i,
+  );
+});
 
 test("child extension stays inert until valid session env, records bounded lifecycle facts, and terminates only after a successful handoff", async () => {
   const pi = createFakePi();

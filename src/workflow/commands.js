@@ -735,14 +735,19 @@ function sha256Digest(text) {
 
 function delegationOwnership(record = {}) {
   const result = record.result ?? {};
+  const hasOriginSession = Boolean(record.originSessionId);
+  const consumed = Boolean(result.consumedBySessionId || result.consumedAt);
+  const adopted = Boolean(result.adoptedBySessionId || result.adoptedAt);
+  const consumedByOrigin = consumed && hasOriginSession && result.consumedBySessionId === record.originSessionId;
   let status = "available";
-  if (result.adoptedBySessionId) status = "adopted";
-  else if (result.consumedBySessionId) status = result.consumedBySessionId === record.originSessionId ? "consumed-by-origin" : "consumed-by-other";
+  if (adopted) status = "adopted";
+  else if (consumed) status = consumedByOrigin ? "consumed-by-origin" : "consumed";
   return {
     status,
-    originSessionId: record.originSessionId ?? null,
-    consumedBySessionId: result.consumedBySessionId ?? null,
-    adoptedBySessionId: result.adoptedBySessionId ?? null,
+    hasOriginSession,
+    consumed,
+    consumedByOrigin,
+    adopted,
   };
 }
 

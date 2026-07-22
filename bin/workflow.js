@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawn as spawnChildProcess } from "node:child_process";
-import { realpathSync, constants as fsConstants } from "node:fs";
-import { access, readFile, realpath as fsRealpath } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { readFile, realpath as fsRealpath } from "node:fs/promises";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
@@ -28,6 +28,7 @@ import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
 import { createPiDelegationTransport as defaultCreatePiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { loadRegistry as defaultLoadRegistry } from "../src/workflow/registry.js";
+import { lookupExecutable, resolveWorkflowProjectsFile } from "../src/workflow/runtime-config.js";
 
 const OUTPUT_LIMIT = 12000;
 const LAUNCH_OUTPUT_LIMIT = 256 * 1024;
@@ -332,20 +333,6 @@ export function parseArgs(argv) {
   throw new Error(`Unknown command: ${argv.join(" ")}\n\n${HELP}`);
 }
 
-async function lookupExecutable(name, env = process.env) {
-  const pathValue = env.PATH ?? "";
-  for (const directory of pathValue.split(delimiter).filter(Boolean)) {
-    const candidate = join(directory, name);
-    try {
-      await access(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {
-      // Continue searching PATH.
-    }
-  }
-  return null;
-}
-
 function createLiveDependencies(dependencies) {
   const env = dependencies.env ?? process.env;
   const runner = dependencies.runner ?? createProcessRunner();
@@ -355,7 +342,7 @@ function createLiveDependencies(dependencies) {
     runner,
     stateRoot,
     loadRegistry: dependencies.loadRegistry ?? defaultLoadRegistry,
-    lookupExecutable: dependencies.lookupExecutable ?? ((name) => lookupExecutable(name, env)),
+    lookupExecutable: dependencies.lookupExecutable ?? ((name) => lookupExecutable(name, { env })),
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
     store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot }) : undefined),
@@ -480,7 +467,10 @@ async function stateRootForTransport(options, liveDependencies) {
 async function withLiveDelegationTransport(options, liveDependencies, dependencies) {
   if (liveDependencies.transport) return liveDependencies;
   const createPiDelegationTransport = dependencies.createPiDelegationTransport ?? defaultCreatePiDelegationTransport;
-  const piCommand = await liveDependencies.lookupExecutable("pi") ?? "pi";
+  const piCommand = await liveDependencies.lookupExecutable("pi");
+  if (!piCommand || !isAbsolute(piCommand)) {
+    throw new WorkflowError("PREFLIGHT", "Pi executable must resolve to an absolute path for delegation", { exitCode: 10 });
+  }
   const stateRoot = await stateRootForTransport(options, liveDependencies);
   const inspectProcess = dependencies.inspectDelegationProcess ?? createDefaultDelegationInspector(liveDependencies);
   const spawnChild = dependencies.spawnDelegationChild ?? createDefaultDelegationSpawner(liveDependencies);
@@ -587,7 +577,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   let phase = "parse";
   try {
     const args = parseArgs(argv);
-    const registryPath = env.WORKFLOW_PROJECTS_FILE || defaultRegistryPath;
+    const registryPath = resolveWorkflowProjectsFile({ env, defaultPath: defaultRegistryPath });
     const options = { ...args, registryPath };
     phase = "runtime";
 

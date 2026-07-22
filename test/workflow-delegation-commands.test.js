@@ -168,7 +168,13 @@ test("delegation result returns bounded current advisory data and compact format
   assert.equal(result.exitCode, 0);
   assert.equal(result.canonical, true);
   assert.equal(result.advisoryReason, "run-origin");
-  assert.equal(result.ownership.status, "available");
+  assert.deepEqual(result.ownership, {
+    status: "available",
+    hasOriginSession: true,
+    consumed: false,
+    consumedByOrigin: false,
+    adopted: false,
+  });
   assert.equal(result.result.summary, "Reviewed scope SECRET-PROMPT-BODY");
   assert.deepEqual(result.nextActions, ["review-result", "reconcile"]);
   assert.equal(Object.hasOwn(result, "runDirectory"), false);
@@ -178,6 +184,10 @@ test("delegation result returns bounded current advisory data and compact format
   assert.match(compact, /Role: code-reviewer/);
   assert.match(compact, /Result status: completed/);
   assert.doesNotMatch(compact, /SECRET-PROMPT-BODY|stdout should stay private|sessionPath|\/state\/workflow/i);
+
+  const json = formatWorkflowResult("delegation-result", result, "json");
+  assert.doesNotMatch(json, /pi-origin-1|consumedBySessionId|adoptedBySessionId/i);
+  assert.deepEqual(JSON.parse(json).ownership, result.ownership);
 });
 
 test("delegation result distinguishes pending, stale, and explicitly adopted external results", async () => {
@@ -225,9 +235,10 @@ test("delegation result distinguishes pending, stale, and explicitly adopted ext
   assert.equal(adopted.advisoryReason, "external-run");
   assert.deepEqual(adopted.ownership, {
     status: "adopted",
-    originSessionId: "pi-origin-1",
-    consumedBySessionId: "pi-later-session",
-    adoptedBySessionId: "pi-later-session",
+    hasOriginSession: true,
+    consumed: true,
+    consumedByOrigin: false,
+    adopted: true,
   });
 });
 
@@ -279,12 +290,21 @@ test("delegation reconcile preserves process identity, ownership, observation, a
     assert.equal(Object.hasOwn(result.identity, "cwd"), false);
     assert.equal(result.observation.state, observation.state);
     assert.equal(Object.hasOwn(result.observation, "details"), false);
-    assert.equal(result.ownership.status, "available");
+    assert.deepEqual(result.ownership, {
+      status: "available",
+      hasOriginSession: true,
+      consumed: false,
+      consumedByOrigin: false,
+      adopted: false,
+    });
     assert.equal(result.reservation.state, "active");
     assert.equal(result.reservation.retained, false);
     assert.deepEqual(result.nextActions, ["deliver-result", "manual-review"]);
     assert.deepEqual(transport.calls.map((call) => call.method), []);
     assert.doesNotMatch(JSON.stringify(result), /SECRET-OWNER|sessionPath|observedCwd|\/state\/workflow/i);
+
+    const json = formatWorkflowResult("delegation-reconcile", result, "json");
+    assert.doesNotMatch(json, /pi-origin-1|consumedBySessionId|adoptedBySessionId/i);
   }
 });
 

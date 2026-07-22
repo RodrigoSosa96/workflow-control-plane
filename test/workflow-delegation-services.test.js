@@ -17,6 +17,7 @@ const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
 const RESERVATION_ID = "33333333-3333-4333-8333-333333333333";
 const RESERVATION_OWNER = "44444444-4444-4444-8444-444444444444";
 const PROJECT_ALIAS = "fixture";
+const PROJECT_PATH = "/fixture/shared";
 const CWD = "/fixture/review";
 const TASK = "Review only the frozen task.";
 const BRIEF = "Review only the frozen task. Keep all findings inside scope.";
@@ -38,7 +39,7 @@ const registry = {
   projects: {
     [PROJECT_ALIAS]: {
       label: "Fixture Project",
-      path: CWD,
+      path: PROJECT_PATH,
       delegation: {
         remediationTurns: 2,
       },
@@ -128,10 +129,15 @@ function createTransport({ startImpl, deliverFollowUpImpl, observations = [] } =
   };
 }
 
-async function createFixture(t, { transport } = {}) {
+async function createFixture(t, { transport, repositories = [{ id: "repository", path: CWD, branch: "main" }] } = {}) {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
-  const run = await store.create({ projectAlias: PROJECT_ALIAS, primaryTicket: "A-1", state: RUN_STATES.PLANNED });
+  const run = await store.create({
+    projectAlias: PROJECT_ALIAS,
+    primaryTicket: "A-1",
+    state: RUN_STATES.PLANNED,
+    repositories,
+  });
   const delegations = createDelegationStore({
     store,
     randomUUID: uuidSequence(DELEGATION_ID),
@@ -189,6 +195,24 @@ test("preview freezes role, cwd, budgets, and task digest without mutation", asy
   assert.equal(Object.isFrozen(preview.budget), true);
   assert.equal(Object.isFrozen(preview.tools), true);
   assert.equal((await store.read(run.id)).delegations, undefined);
+});
+
+test("preview binds delegation cwd to the parent run checkout and rejects the shared project path", async (t) => {
+  const { services, run } = await createFixture(t);
+
+  const preview = await services.createPreview({ runId: run.id, input: reviewInput });
+  assert.equal(preview.cwd, CWD);
+
+  await assert.rejects(
+    () => services.createPreview({
+      runId: run.id,
+      input: {
+        ...reviewInput,
+        cwd: PROJECT_PATH,
+      },
+    }),
+    /checkout|registered|run|cwd/i,
+  );
 });
 
 test("execute rejects changed approval data before store, reservation, or transport mutation", async (t) => {
@@ -305,6 +329,25 @@ test("reconcile returns bounded state and withholds automatic remediation after 
   assert.equal(reconciled.observation.state, "missing");
   assert.match(reconciled.nextActions.join(" "), /manual|deliver/i);
   assert.doesNotMatch(JSON.stringify(reconciled), /summary|verification|concerns|terminal|stdout|stderr/i);
+});
+
+test("reconcile does not suggest delivery after a current terminal result was consumed or adopted", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    observations: [{ state: "idle", identity: expectedIdentity }],
+  });
+  const { services, delegations, run } = await createFixture(t, { transport });
+  const preview = await services.createPreview({ runId: run.id, input: reviewInput });
+  await services.executeApproved({ preview, approvalDigest: preview.approvalDigest });
+  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(1) });
+
+  await delegations.adoptResult({ runId: run.id, delegationId: DELEGATION_ID, originSessionId: "pi-later-session" });
+  const reconciled = await services.reconcile({ runId: run.id, delegationId: DELEGATION_ID });
+
+  assert.equal(reconciled.resultStatus, "completed");
+  assert.equal(reconciled.nextActions.includes("deliver-result"), false);
+  assert.equal(reconciled.nextActions.includes("review-result"), true);
 });
 
 test("beginRemediation rejects missing observations before incrementing generation or delivering follow-up", async (t) => {

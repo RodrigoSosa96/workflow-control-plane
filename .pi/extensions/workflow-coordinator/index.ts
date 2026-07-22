@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { loadRegistry } from "../../../src/workflow/registry.js";
 import { createRunStore } from "../../../src/workflow/run-store.js";
 import { createDelegationStore } from "../../../src/workflow/delegation-store.js";
@@ -12,6 +12,7 @@ import { createPiDelegationTransport } from "../../../src/workflow/pi-delegation
 import { loadDelegationRole } from "../../../src/workflow/delegation-roles.js";
 import { validateSubagentRequestPolicy } from "../../../src/workflow/coordinator-policy.js";
 import { createDelegationWatcher } from "../../../src/workflow/delegation-watcher.js";
+import { lookupExecutable, resolveWorkflowProjectsFile } from "../../../src/workflow/runtime-config.js";
 
 const PROJECTS_FILE = fileURLToPath(new URL("../../../projects.yaml", import.meta.url));
 const CONTROL_PLANE_BIN = fileURLToPath(new URL("../../../bin/workflow.js", import.meta.url));
@@ -80,7 +81,7 @@ const prepareDelegationSchema = Type.Object({
   runId: Type.String(),
   role: Type.String(),
   mode: StringEnum(["foreground", "background"]),
-  cwd: Type.String(),
+  cwd: optional(Type.String()),
   brief: Type.String(),
   task: Type.String(),
   budget: budgetSchema,
@@ -181,7 +182,7 @@ function validatePrepareInput(input) {
     runId: ensureString(input.runId, "runId", 128),
     role: ensureString(input.role, "role", 128),
     mode: ensureString(input.mode, "mode", 32),
-    cwd: ensureString(input.cwd, "cwd"),
+    ...(input.cwd === undefined ? {} : { cwd: ensureString(input.cwd, "cwd") }),
     brief: ensureString(input.brief, "brief"),
     task: ensureString(input.task, "task"),
     budget: validateBudget(input.budget),
@@ -344,27 +345,50 @@ async function resolveCanonicalPath(value) {
   }
 }
 
-async function createLiveRuntime() {
-  const registry = await loadRegistry(PROJECTS_FILE);
-  const stateRoot = process.env.WORKFLOW_STATE_ROOT ?? registry?.launcher?.state_root;
-  const store = createRunStore({ stateRoot });
-  const delegations = createDelegationStore({ store });
-  const reservations = createDelegationReservationStore({
+export async function createWorkflowCoordinatorRuntime({
+  env = process.env,
+  projectsFile = resolveWorkflowProjectsFile({ env, defaultPath: PROJECTS_FILE }),
+  loadRegistryImpl = loadRegistry,
+  createRunStoreImpl = createRunStore,
+  createDelegationStoreImpl = createDelegationStore,
+  createReservationStoreImpl = createDelegationReservationStore,
+  createDelegationServicesImpl = createDelegationServices,
+  createTransportImpl = createPiDelegationTransport,
+  loadDelegationRoleImpl = loadDelegationRole,
+  lookupExecutableImpl = lookupExecutable,
+  canonicalPath = resolveCanonicalPath,
+  spawnChild = spawnChildProcess,
+  inspectProcess = inspectChildProcess,
+  controlPlaneBin = CONTROL_PLANE_BIN,
+  agentDirectory = AGENT_DIRECTORY,
+  childExtensionPath = CHILD_EXTENSION_PATH,
+} = {}) {
+  const registry = await loadRegistryImpl(projectsFile);
+  const stateRoot = env.WORKFLOW_STATE_ROOT ?? registry?.launcher?.state_root;
+  const piCommand = await lookupExecutableImpl("pi", { env });
+  if (typeof piCommand !== "string" || !piCommand || !isAbsolute(piCommand)) {
+    fail("Pi executable must resolve to an absolute path for delegation");
+  }
+
+  const store = createRunStoreImpl({ stateRoot });
+  const delegations = createDelegationStoreImpl({ store });
+  const reservations = createReservationStoreImpl({
     stateRoot,
-    canonicalPath: resolveCanonicalPath,
+    canonicalPath,
   });
   const roles = {
     async loadDelegationRole({ name }) {
-      return await loadDelegationRole({ name, agentDirectory: AGENT_DIRECTORY });
+      return await loadDelegationRoleImpl({ name, agentDirectory });
     },
   };
-  const transport = createPiDelegationTransport({
-    spawnChild: spawnChildProcess,
-    inspectProcess: inspectChildProcess,
+  const transport = createTransportImpl({
+    piCommand,
+    spawnChild,
+    inspectProcess,
     stateRoot,
-    controlPlaneBin: CONTROL_PLANE_BIN,
-    childExtensionPath: CHILD_EXTENSION_PATH,
-    agentDirectory: AGENT_DIRECTORY,
+    controlPlaneBin,
+    childExtensionPath,
+    agentDirectory,
     loadDelegationRole: roles.loadDelegationRole,
   });
   const servicesByProject = new Map();
@@ -374,7 +398,7 @@ async function createLiveRuntime() {
     async resolveServicesForRun(runId) {
       const run = await store.read(runId);
       if (!servicesByProject.has(run.projectAlias)) {
-        servicesByProject.set(run.projectAlias, createDelegationServices({
+        servicesByProject.set(run.projectAlias, createDelegationServicesImpl({
           registry,
           projectAlias: run.projectAlias,
           runStore: store,
@@ -394,6 +418,7 @@ export function createWorkflowCoordinatorExtension({
   delegations,
   getPreparedSubagentContext = async () => undefined,
   createWatcher = createDelegationWatcher,
+  createRuntime = createWorkflowCoordinatorRuntime,
 } = {}) {
   return function workflowCoordinatorExtension(pi) {
     const approvedPreviews = new Map();
@@ -405,7 +430,7 @@ export function createWorkflowCoordinatorExtension({
       if (resolveServicesForRun && delegations) {
         return { resolveServicesForRun, delegations };
       }
-      if (!runtimePromise) runtimePromise = createLiveRuntime();
+      if (!runtimePromise) runtimePromise = createRuntime();
       return await runtimePromise;
     }
 

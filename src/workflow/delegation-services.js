@@ -146,6 +146,51 @@ function validateRemediationTurns(value, policy) {
   return turns;
 }
 
+function validAbsolutePath(value) {
+  return typeof value === "string" && Boolean(value) && !value.includes("\0") && isAbsolute(value) && Buffer.byteLength(value, "utf8") <= MAX_SHORT_TEXT;
+}
+
+function uniquePaths(values) {
+  const seen = new Set();
+  const paths = [];
+  for (const value of values) {
+    if (!validAbsolutePath(value) || seen.has(value)) continue;
+    seen.add(value);
+    paths.push(value);
+  }
+  return paths;
+}
+
+function registeredRunCheckouts(run) {
+  const repositories = Array.isArray(run?.repositories) ? run.repositories : [];
+  return uniquePaths([
+    ...repositories.flatMap((repository) => [
+      repository?.path,
+      repository?.worktreePath,
+      repository?.checkoutPath,
+      repository?.repositoryPath,
+      repository?.cwd,
+    ]),
+    run?.repositoryPath,
+    run?.worktreePath,
+    run?.checkoutPath,
+    run?.path,
+  ]);
+}
+
+function resolveDelegationCwd(run, inputCwd) {
+  const candidates = registeredRunCheckouts(run);
+  if (candidates.length === 0) fail("delegation run has no registered checkout");
+  if (inputCwd === undefined) {
+    if (candidates.length !== 1) fail("delegation cwd must match one registered run checkout");
+    return candidates[0];
+  }
+
+  const cwd = assertString(inputCwd, "delegation cwd", { limit: MAX_SHORT_TEXT, absolute: true });
+  if (!candidates.includes(cwd)) fail("delegation cwd must match one registered run checkout");
+  return cwd;
+}
+
 function previewPayload(preview) {
   return {
     version: 1,
@@ -255,7 +300,6 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
   const policy = resolveDelegationPolicy({ registry, projectAlias });
   const project = registry?.projects?.[projectAlias];
   if (!project || typeof project !== "object") fail(`Unknown workflow project ${projectAlias}`);
-  const projectPath = assertString(project.path, "project path", { limit: MAX_SHORT_TEXT, absolute: true });
   const consumedApprovalDigests = new Set();
 
   async function validatedPreview(runId, input) {
@@ -268,8 +312,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     const roleDefinition = await loadRoleDefinition(roles, role);
     const mode = input.mode;
     validateMode(role, mode, policy);
-    const cwd = assertString(input.cwd, "delegation cwd", { limit: MAX_SHORT_TEXT, absolute: true });
-    if (cwd !== projectPath) fail("delegation cwd must match the registered project checkout");
+    const cwd = resolveDelegationCwd(run, input.cwd);
     const budget = validateBudget(input.budget, policy, role, mode);
     const remediationTurns = validateRemediationTurns(input.remediationTurns, policy);
     const task = assertString(input.task, "delegation task", { limit: MAX_TEXT_BYTES });
@@ -403,8 +446,19 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     if (identity) observation = await workerTransport.observeExact(identity);
 
     const nextActions = [];
-    if (record.result && TERMINAL_STATES.has(record.result.status)) {
-      nextActions.push("deliver-result");
+    const currentTerminalResult = Boolean(
+      record.result
+      && TERMINAL_STATES.has(record.result.status)
+      && record.result.generation === record.generation,
+    );
+    const consumedOrAdopted = Boolean(
+      record.result?.consumedBySessionId
+      || record.result?.consumedAt
+      || record.result?.adoptedBySessionId
+      || record.result?.adoptedAt,
+    );
+    if (currentTerminalResult) {
+      nextActions.push(consumedOrAdopted ? "review-result" : "deliver-result");
       if (observation?.state === "idle" && record.remediationTurnsUsed < record.remediationTurns) {
         nextActions.push("begin-remediation");
       } else if (observation?.state === "missing" || observation?.state === "mismatch") {
