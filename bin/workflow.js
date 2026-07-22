@@ -9,7 +9,19 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { ASSIGNMENT_LIMITS } from "../src/workflow/assignment.js";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { delegationHandoffCommand as defaultDelegationHandoffCommand, doctorCommand as defaultDoctorCommand, handoffCommand as defaultHandoffCommand, launchCommand as defaultLaunchCommand, planCommand as defaultPlanCommand, reconcileCommand as defaultReconcileCommand, resultCommand as defaultResultCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
+import {
+  delegationHandoffCommand as defaultDelegationHandoffCommand,
+  delegationReconcileCommand as defaultDelegationReconcileCommand,
+  delegationRemediateCommand as defaultDelegationRemediateCommand,
+  delegationResultCommand as defaultDelegationResultCommand,
+  doctorCommand as defaultDoctorCommand,
+  handoffCommand as defaultHandoffCommand,
+  launchCommand as defaultLaunchCommand,
+  planCommand as defaultPlanCommand,
+  reconcileCommand as defaultReconcileCommand,
+  resultCommand as defaultResultCommand,
+  statusCommand as defaultStatusCommand,
+} from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
@@ -31,6 +43,9 @@ Commands:
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
   workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
   workflow handoff <run-id> --input <run-dir>/handoff-input.json [--format compact|json]
+  workflow delegation result <run-id> <delegation-id> [--format compact|json]
+  workflow delegation reconcile <run-id> <delegation-id> [--format compact|json]
+  workflow delegation remediate <run-id> <delegation-id> --prompt-file <path> [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow delegation handoff <run-id> <delegation-id> --input <run-dir>/delegations/<delegation-id>/handoff-input.json [--format compact|json]
 
 Environment:
@@ -91,6 +106,7 @@ function parseCsvList(value) {
 
 const WINDOWS_ABSOLUTE_RE = /^[A-Za-z]:\//;
 const SAFE_PATH_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+const SAFE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function assertCanonicalHandoffInputSyntax(input) {
   const normalized = String(input ?? "").replace(/\\/gu, "/");
@@ -110,6 +126,12 @@ function assertCanonicalDelegationHandoffInputSyntax(input) {
 
   if (!absolute || normalized.includes("\0") || hasEmptySegment || hasTraversal || parts.at(-1) !== "handoff-input.json" || delegationIndex < 2 || delegationIndex !== parts.length - 3 || !SAFE_PATH_SEGMENT_RE.test(delegationPathId ?? "")) {
     throw new Error("delegation handoff --input must be the canonical <run-directory>/delegations/<delegation-id>/handoff-input.json path.");
+  }
+}
+
+function assertPathSafeUuidSyntax(value, context) {
+  if (typeof value !== "string" || !SAFE_UUID_RE.test(value)) {
+    throw new Error(`${context} must be a path-safe UUID.`);
   }
 }
 
@@ -176,21 +198,65 @@ export function parseArgs(argv) {
   }
 
   if (command === "delegation") {
-    if (positionals[0] !== "handoff") throw new Error(`Unknown command: ${argv.join(" ")}\n\n${HELP}`);
-    validateShape("delegation handoff", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: ["input"] });
-    if (!options.input) throw new Error("delegation handoff requires --input <run-dir>/delegations/<delegation-id>/handoff-input.json.");
-    assertCanonicalDelegationHandoffInputSyntax(options.input);
-    return {
-      command: "delegation-handoff",
-      runId: positionals[1],
-      delegationId: positionals[2],
-      input: options.input,
-      format,
-    };
+    const subcommand = positionals[0];
+    if (subcommand === "result") {
+      validateShape("delegation result", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: [] });
+      assertPathSafeUuidSyntax(positionals[1], "delegation result run ID");
+      assertPathSafeUuidSyntax(positionals[2], "delegation result delegation ID");
+      return {
+        command: "delegation-result",
+        runId: positionals[1],
+        delegationId: positionals[2],
+        format,
+      };
+    }
+    if (subcommand === "reconcile") {
+      validateShape("delegation reconcile", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: [] });
+      assertPathSafeUuidSyntax(positionals[1], "delegation reconcile run ID");
+      assertPathSafeUuidSyntax(positionals[2], "delegation reconcile delegation ID");
+      return {
+        command: "delegation-reconcile",
+        runId: positionals[1],
+        delegationId: positionals[2],
+        format,
+      };
+    }
+    if (subcommand === "remediate") {
+      validateShape("delegation remediate", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: ["prompt-file", "dry-run", "approval-digest", "yes"] });
+      if (!options["prompt-file"]) throw new Error("delegation remediate requires --prompt-file <path>.");
+      assertPathSafeUuidSyntax(positionals[1], "delegation remediate run ID");
+      assertPathSafeUuidSyntax(positionals[2], "delegation remediate delegation ID");
+      return {
+        command: "delegation-remediate",
+        runId: positionals[1],
+        delegationId: positionals[2],
+        promptFile: options["prompt-file"],
+        ...(options["dry-run"] ? { dryRun: true } : {}),
+        ...(options["approval-digest"] ? { approvalDigest: options["approval-digest"] } : {}),
+        ...(options.yes ? { yes: true } : {}),
+        format,
+      };
+    }
+    if (subcommand === "handoff") {
+      validateShape("delegation handoff", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: ["input"] });
+      if (!options.input) throw new Error("delegation handoff requires --input <run-dir>/delegations/<delegation-id>/handoff-input.json.");
+      assertPathSafeUuidSyntax(positionals[1], "delegation handoff run ID");
+      assertPathSafeUuidSyntax(positionals[2], "delegation handoff delegation ID");
+      assertCanonicalDelegationHandoffInputSyntax(options.input);
+      return {
+        command: "delegation-handoff",
+        runId: positionals[1],
+        delegationId: positionals[2],
+        input: options.input,
+        format,
+      };
+    }
+    throw new Error(`Unknown command: ${argv.join(" ")}\n\n${HELP}`);
   }
 
   if (command === "result") {
     validateShape("result", positionals, options, { min: 1, max: 1, allowedOptions: [] });
+    assertPathSafeUuidSyntax(positionals[0], "result run ID");
     return {
       command,
       runId: positionals[0],
@@ -201,6 +267,7 @@ export function parseArgs(argv) {
   if (command === "reconcile") {
     validateShape("reconcile", positionals, options, { min: 0, max: 1, allowedOptions: ["run"] });
     if (!options.run) throw new Error("reconcile requires --run <run-id>.");
+    assertPathSafeUuidSyntax(options.run, "reconcile run ID");
     return {
       command,
       ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
@@ -288,6 +355,11 @@ function createLiveDependencies(dependencies) {
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
     store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot }) : undefined),
+    transport: dependencies.transport,
+    delegations: dependencies.delegations,
+    reservations: dependencies.reservations,
+    roles: dependencies.roles,
+    createDelegationServices: dependencies.createDelegationServices,
   };
 }
 
@@ -365,6 +437,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
+  const delegationResultCommand = dependencies.delegationResultCommand ?? defaultDelegationResultCommand;
+  const delegationReconcileCommand = dependencies.delegationReconcileCommand ?? defaultDelegationReconcileCommand;
+  const delegationRemediateCommand = dependencies.delegationRemediateCommand ?? defaultDelegationRemediateCommand;
   const handoffCommand = dependencies.handoffCommand ?? defaultHandoffCommand;
   const delegationHandoffCommand = dependencies.delegationHandoffCommand ?? defaultDelegationHandoffCommand;
   const executeStart = dependencies.executeStart ?? defaultExecuteStart;
@@ -459,6 +534,40 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const result = await reconcileCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("reconcile", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "delegation-result") {
+      const result = await delegationResultCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("delegation-result", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "delegation-reconcile") {
+      const result = await delegationReconcileCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("delegation-reconcile", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "delegation-remediate") {
+      if (!args.dryRun && (!args.yes || !args.approvalDigest)) {
+        emit(err, "USAGE: delegation remediate requires --yes with --approval-digest from the current dry-run preview.");
+        return 64;
+      }
+
+      const prompt = await readPromptFile(args.promptFile);
+      const command = await delegationRemediateCommand({
+        ...options,
+        prompt,
+      }, liveDependencies);
+
+      if (args.dryRun) {
+        emit(out, formatWorkflowResult("delegation-remediate", command.preview, args.format));
+        return 0;
+      }
+
+      const report = await command.execute({ approvalDigest: args.approvalDigest });
+      emit(out, formatWorkflowResult("delegation-remediate", report, args.format));
+      return Number.isInteger(report.exitCode) ? report.exitCode : 0;
     }
 
     if (args.command === "handoff") {

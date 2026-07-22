@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
 import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./delegation-handoff.js";
 import { createDelegationReservationStore } from "./delegation-reservations.js";
+import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { planWorkflow } from "./planner.js";
@@ -33,6 +35,11 @@ const EMPTY_HERDR_READ_MODEL = {
     return { agents: [] };
   },
 };
+const RUN_LIKE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function list(value) {
+  return Array.isArray(value) ? value.filter((item) => item !== undefined && item !== null) : [];
+}
 
 function quote(value) {
   return /[^A-Za-z0-9_./:-]/.test(value) ? JSON.stringify(value) : value;
@@ -711,6 +718,203 @@ function parseHandoffJson(text) {
   }
 }
 
+function delegationError(category, message, exitCode = 10) {
+  throw new WorkflowError(category, message, { exitCode });
+}
+
+function assertPathSafeUuid(value, label, category = "PREFLIGHT") {
+  if (typeof value !== "string" || !RUN_LIKE_ID_RE.test(value)) {
+    delegationError(category, `${label} must be a path-safe UUID`);
+  }
+  return value.toLowerCase();
+}
+
+function sha256Digest(text) {
+  return `sha256:${createHash("sha256").update(String(text), "utf8").digest("hex")}`;
+}
+
+function delegationOwnership(record = {}) {
+  const result = record.result ?? {};
+  let status = "available";
+  if (result.adoptedBySessionId) status = "adopted";
+  else if (result.consumedBySessionId) status = result.consumedBySessionId === record.originSessionId ? "consumed-by-origin" : "consumed-by-other";
+  return {
+    status,
+    originSessionId: record.originSessionId ?? null,
+    consumedBySessionId: result.consumedBySessionId ?? null,
+    adoptedBySessionId: result.adoptedBySessionId ?? null,
+  };
+}
+
+function publicDelegationResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  return {
+    status: result.status ?? null,
+    generation: Number.isInteger(result.generation) ? result.generation : null,
+    summary: result.summary ?? null,
+    verification: list(result.verification).map((entry) => ({
+      command: entry.command,
+      status: entry.status,
+    })),
+    concerns: list(result.concerns).map(String),
+    nextAction: result.nextAction ?? null,
+  };
+}
+
+function delegationResultState(record = {}) {
+  if (!record.result) {
+    if (record.state === "prepared" || record.state === "running") return "pending";
+    return record.state ?? "pending";
+  }
+  if (record.result.generation !== record.generation) return "result-stale";
+  return record.result.status ?? record.state ?? "pending";
+}
+
+function stableDelegationExitCode(status) {
+  return RESULT_EXIT_CODES[status] ?? 0;
+}
+
+function delegationBase(run = {}, record = {}) {
+  return {
+    runId: run.id,
+    delegationId: record.id,
+    projectAlias: run.projectAlias,
+    projectLabel: run.projectLabel,
+    role: record.role,
+    mode: record.mode,
+    state: record.state,
+    generation: record.generation,
+  };
+}
+
+function delegationCanonicality(run = {}, record = {}) {
+  const canonical = Boolean(run.originSessionId) && run.originSessionId === record.originSessionId;
+  return {
+    canonical,
+    advisory: true,
+    advisoryReason: canonical ? "run-origin" : "external-run",
+  };
+}
+
+function publicIdentity(record = {}) {
+  if (!record.transportIdentity) return { status: "missing" };
+  return {
+    status: "recorded",
+    kind: record.transportIdentity.kind,
+    pid: record.transportIdentity.pid,
+    processStartedAt: record.transportIdentity.processStartedAt,
+    cwd: record.transportIdentity.cwd,
+  };
+}
+
+function publicObservation(observation, record = {}) {
+  if (!record.transportIdentity) return { state: "not-observed" };
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return { state: "not-observed" };
+  return {
+    state: observation.state ?? "not-observed",
+    ...(observation.details && typeof observation.details === "object" && !Array.isArray(observation.details)
+      ? { details: structuredClone(observation.details) }
+      : {}),
+  };
+}
+
+function publicReservation(record = {}, reservations = []) {
+  const active = list(reservations).find((reservation) => reservation?.delegationId === record.id && reservation?.state === "active") ?? null;
+  return {
+    state: active?.state ?? "missing",
+    retained: Boolean(active && record.startFailure),
+  };
+}
+
+function remediationState(record = {}) {
+  const total = Number.isInteger(record.remediationTurns) ? record.remediationTurns : 0;
+  const used = Number.isInteger(record.remediationTurnsUsed) ? record.remediationTurnsUsed : 0;
+  return {
+    remainingTurns: Math.max(0, total - used),
+    capped: used >= total,
+  };
+}
+
+async function loadDelegationContext(options = {}, deps = {}, command = "delegation") {
+  const runId = assertPathSafeUuid(options.runId, "run ID");
+  const delegationId = assertPathSafeUuid(options.delegationId, "delegation ID");
+  const store = await storeForCommand(options, deps);
+  const stateRoot = deps.reservations ? undefined : await stateRootForCommand(options, deps);
+  const reservations = deps.reservations ?? createDelegationReservationStore({ stateRoot });
+  const run = await store.read(runId);
+  ensureMatchingRunProject(options, run, command);
+  const registry = deps.registry ?? await (deps.loadRegistry ?? loadRegistry)(options.registryPath);
+  const project = resolveProject(registry, run.projectAlias);
+  const record = delegationRecordFor(run, delegationId);
+  return {
+    runId,
+    delegationId,
+    store,
+    delegations: deps.delegations ?? null,
+    reservations,
+    run,
+    registry,
+    project,
+    record,
+  };
+}
+
+function delegationServicesForContext(context, options = {}, deps = {}) {
+  const transport = deps.transport;
+  if (!transport) delegationError("PREFLIGHT", "delegation transport is required", 10);
+  const injectedCreateDelegationServices = deps.createDelegationServices;
+  const createDelegationServices = injectedCreateDelegationServices ?? defaultCreateDelegationServices;
+  return createDelegationServices({
+    registry: context.registry,
+    projectAlias: context.project.alias ?? context.run.projectAlias,
+    runStore: context.store,
+    delegations: context.delegations ?? (injectedCreateDelegationServices ? deps.delegations ?? {} : createDelegationStore({ store: context.store })),
+    reservations: context.reservations,
+    transport,
+    roles: deps.roles,
+  });
+}
+
+function delegationReviewEvidence(preview) {
+  return {
+    generation: preview.generation,
+    summary: "Approved via workflow delegation remediate CLI for the current delegation result",
+    insideFrozenBrief: true,
+  };
+}
+
+function delegationRemediationPreview(context, prompt) {
+  const { run, record } = context;
+  const status = delegationResultState(record);
+  if (!record.result || status === "pending" || status === "result-stale") {
+    delegationError("PREFLIGHT", "Delegation does not have a terminal current result");
+  }
+  if (remediationState(record).capped) {
+    delegationError("PREFLIGHT", "Delegation remediation limit is exhausted");
+  }
+  const promptDigest = sha256Digest(prompt);
+  const preview = {
+    command: "delegation-remediate",
+    ...delegationBase(run, record),
+    status,
+    resultStatus: record.result.status,
+    remediation: remediationState(record),
+    promptDigest,
+    approvalDigest: null,
+    nextActions: ["approve-remediation"],
+  };
+  preview.approvalDigest = sha256Digest(JSON.stringify({
+    runId: preview.runId,
+    delegationId: preview.delegationId,
+    generation: preview.generation,
+    role: preview.role,
+    mode: preview.mode,
+    resultStatus: preview.resultStatus,
+    promptDigest,
+  }));
+  return preview;
+}
+
 export async function handoffCommand(options = {}, {
   store,
   git,
@@ -774,6 +978,84 @@ export async function delegationHandoffCommand(options = {}, deps = {}) {
     delegationId,
     input,
   });
+}
+
+export async function delegationResultCommand(options = {}, deps = {}) {
+  const context = await loadDelegationContext(options, deps, "delegation result");
+  const { run, record } = context;
+  const status = delegationResultState(record);
+  return {
+    command: "delegation-result",
+    ...delegationBase(run, record),
+    status,
+    resultStatus: record.result?.status ?? null,
+    result: publicDelegationResult(record.result),
+    ownership: delegationOwnership(record),
+    ...delegationCanonicality(run, record),
+    exitCode: stableDelegationExitCode(status),
+    nextActions: status === "completed" || status === "blocked" || status === "failed"
+      ? ["review-result", "reconcile"]
+      : ["reconcile"],
+  };
+}
+
+export async function delegationReconcileCommand(options = {}, deps = {}) {
+  const context = await loadDelegationContext(options, deps, "delegation reconcile");
+  const services = delegationServicesForContext(context, options, deps);
+  const reconciled = await services.reconcile({ runId: context.runId, delegationId: context.delegationId });
+  const observation = context.record.transportIdentity ? await deps.transport.observeExact(context.record.transportIdentity) : null;
+  const reservations = await context.reservations.list({ projectAlias: context.run.projectAlias });
+  return {
+    command: "delegation-reconcile",
+    ...delegationBase(context.run, context.record),
+    status: reconciled.resultStatus ?? reconciled.state ?? context.record.state,
+    resultStatus: reconciled.resultStatus ?? null,
+    ownership: delegationOwnership(context.record),
+    identity: publicIdentity(context.record),
+    observation: publicObservation(observation, context.record),
+    reservation: publicReservation(context.record, reservations),
+    remediation: remediationState(context.record),
+    ...(context.record.startFailure ? { startFailure: { reason: context.record.startFailure.reason } } : {}),
+    nextActions: list(reconciled.nextActions).map(String),
+    cleanup: "none",
+    repairs: [],
+  };
+}
+
+export async function delegationRemediateCommand(options = {}, deps = {}) {
+  const context = await loadDelegationContext(options, deps, "delegation remediate");
+  const prompt = typeof options.prompt === "string" ? options.prompt : "";
+  const preview = delegationRemediationPreview(context, prompt);
+  return {
+    preview,
+    async execute(executeOptions = {}) {
+      if (executeOptions.approvalDigest !== preview.approvalDigest) {
+        delegationError("PREFLIGHT", "Stale approval digest; rerun delegation preview before executing", 10);
+      }
+      const freshContext = await loadDelegationContext(options, deps, "delegation remediate");
+      const freshPreview = delegationRemediationPreview(freshContext, prompt);
+      if (freshPreview.approvalDigest !== preview.approvalDigest) {
+        delegationError("PREFLIGHT", "Stale approval digest; rerun delegation preview before executing", 10);
+      }
+      const services = delegationServicesForContext(freshContext, options, deps);
+      const report = await services.beginRemediation({
+        runId: freshContext.runId,
+        delegationId: freshContext.delegationId,
+        expectedGeneration: freshPreview.generation,
+        reviewEvidence: delegationReviewEvidence(freshPreview),
+        prompt,
+      });
+      return {
+        command: "delegation-remediate",
+        ...delegationBase(freshContext.run, freshContext.record),
+        status: report.resultStatus ?? report.state,
+        resultStatus: report.resultStatus ?? null,
+        nextActions: list(report.nextActions).map(String),
+        state: report.state,
+        generation: report.generation,
+      };
+    },
+  };
 }
 
 export async function resultCommand(options = {}, deps = {}) {

@@ -55,6 +55,7 @@ function executionReport(overrides = {}) {
 }
 
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
+const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
 const APPROVAL_DIGEST = `sha256:${"1".repeat(64)}`;
 const RAW_REQUEST = "Fix `mail` exactly.\n\n$(touch /tmp/no)\nDo not paraphrase this.";
 
@@ -121,6 +122,24 @@ function launchReport(overrides = {}) {
   };
 }
 
+function delegationRemediationPreview(overrides = {}) {
+  return {
+    command: "delegation-remediate",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    projectAlias: "ocr",
+    projectLabel: "ExampleProject",
+    role: "code-reviewer",
+    mode: "background",
+    state: "completed",
+    generation: 1,
+    resultStatus: "completed",
+    approvalDigest: APPROVAL_DIGEST,
+    nextActions: ["approve-remediation"],
+    ...overrides,
+  };
+}
+
 test("installed symlink executes the workflow entry point", async () => {
   const dir = await mkdtemp(join(tmpdir(), "workflow-cli-link-"));
   const registryPath = join(dir, "projects.yaml");
@@ -140,6 +159,9 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow reconcile \[project\] --run <run-id>/);
   assert.match(result.stdout, /workflow runtime <project> <task> .*--tickets <csv>/);
   assert.match(result.stdout, /workflow status <project> <task> .*--tickets <csv>/);
+  assert.match(result.stdout, /workflow delegation result <run-id> <delegation-id>/);
+  assert.match(result.stdout, /workflow delegation reconcile <run-id> <delegation-id>/);
+  assert.match(result.stdout, /workflow delegation remediate <run-id> <delegation-id> --prompt-file <path> .*--dry-run.*--approval-digest <digest>.*--yes/);
   assert.match(result.stdout, /workflow delegation handoff <run-id> <delegation-id> --input <run-dir>\/delegations\/<delegation-id>\/handoff-input.json/);
   const doctorLine = result.stdout.split(/\r?\n/u).find((line) => line.includes("workflow doctor"));
   assert.doesNotMatch(doctorLine, /--tickets/);
@@ -225,10 +247,33 @@ test("parses documented workflow commands and options", () => {
     format: "compact",
   });
 
-  assert.deepEqual(parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), {
+  assert.deepEqual(parseArgs(["delegation", "result", RUN_ID, DELEGATION_ID, "--format", "json"]), {
+    command: "delegation-result",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    format: "json",
+  });
+
+  assert.deepEqual(parseArgs(["delegation", "reconcile", RUN_ID, DELEGATION_ID]), {
+    command: "delegation-reconcile",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", "/tmp/request.md", "--dry-run"]), {
+    command: "delegation-remediate",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    promptFile: "/tmp/request.md",
+    dryRun: true,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), {
     command: "delegation-handoff",
     runId: RUN_ID,
-    delegationId: "22222222-2222-4222-8222-222222222222",
+    delegationId: DELEGATION_ID,
     input: "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
     format: "compact",
   });
@@ -251,11 +296,23 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["doctor", "ocr", "extra"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["handoff", RUN_ID]), /--input|input|required/i);
   assert.throws(() => parseArgs(["handoff", RUN_ID, "--input", "/state/run/not-handoff.json"]), /handoff-input\.json|canonical/i);
+  assert.throws(() => parseArgs(["delegation", "result", RUN_ID]), /delegation-id|arguments|required/i);
+  assert.throws(() => parseArgs(["delegation", "result", "../not-a-run", DELEGATION_ID]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["delegation", "reconcile", RUN_ID, "/tmp/project"]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["delegation", "result", RUN_ID, DELEGATION_ID, "--last"]), /Unknown option: --last/i);
+  assert.throws(() => parseArgs(["delegation", "result", RUN_ID, DELEGATION_ID, "--continue"]), /Unknown option: --continue/i);
+  assert.throws(() => parseArgs(["delegation", "result", RUN_ID, DELEGATION_ID, "--prompt-file", "/tmp/request.md"]), /does not accept --prompt-file/i);
+  assert.throws(() => parseArgs(["delegation", "reconcile", RUN_ID, DELEGATION_ID, "--output", "/tmp/result.json"]), /Unknown option: --output/i);
+  assert.throws(() => parseArgs(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt", "SECRET-DO-NOT-LEAK"]), /Unknown option: --prompt/i);
+  assert.throws(() => parseArgs(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--mode", "background", "--prompt-file", "/tmp/request.md"]), /Unknown option: --mode/i);
+  assert.throws(() => parseArgs(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--cwd", "/tmp/work", "--prompt-file", "/tmp/request.md"]), /Unknown option: --cwd/i);
+  assert.throws(() => parseArgs(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--role", "sdd-implementer", "--prompt-file", "/tmp/request.md"]), /Unknown option: --role/i);
+  assert.throws(() => parseArgs(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", "/tmp/one.md", "--prompt-file", "/tmp/two.md"]), /Duplicate option/i);
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID]), /delegation-id|arguments|required/i);
-  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--input", "/state/run/not-handoff.json"]), /handoff-input\.json|canonical/i);
-  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "prompt text", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /unexpected argument/i);
-  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--yes", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /does not accept --yes|Unknown option: --yes/i);
-  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--output", "/tmp/result.json", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /Unknown option: --output/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--input", "/state/run/not-handoff.json"]), /handoff-input\.json|canonical/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "prompt text", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--yes", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /does not accept --yes|Unknown option: --yes/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--output", "/tmp/result.json", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /Unknown option: --output/i);
 
   for (const input of [
     "state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
@@ -269,7 +326,7 @@ test("rejects unknown, duplicate, and disallowed options", () => {
     "/state/run/delegations/22222222-2222-4222-8222-222222222222/hand\u0000off-input.json",
   ]) {
     assert.throws(
-      () => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--input", input]),
+      () => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--input", input]),
       /handoff-input\.json|canonical/i,
       input,
     );
@@ -344,7 +401,7 @@ test("main runs the canonical delegation handoff command with only allowlisted i
   const output = io();
   const calls = [];
   const runId = RUN_ID;
-  const delegationId = "22222222-2222-4222-8222-222222222222";
+  const delegationId = DELEGATION_ID;
   const input = `/state/run/delegations/${delegationId}/handoff-input.json`;
   const code = await main(["delegation", "handoff", runId, delegationId, "--input", input], {
     ...output,
@@ -379,6 +436,116 @@ test("main runs the canonical delegation handoff command with only allowlisted i
   }]);
   assert.deepEqual(output.stdout, ["delegation-handoff:compact:completed"]);
   assert.deepEqual(output.stderr, []);
+});
+
+test("main prints stable exits for delegation result and keeps delegation reconcile read-only", async () => {
+  for (const [status, expectedCode] of [["pending", 20], ["result-stale", 21]]) {
+    const output = io();
+    const code = await main(["delegation", "result", RUN_ID, DELEGATION_ID], {
+      ...output,
+      delegationResultCommand: async (options) => ({ command: "delegation-result", runId: options.runId, delegationId: options.delegationId, status, exitCode: expectedCode }),
+      formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status}`,
+    });
+    assert.equal(code, expectedCode);
+    assert.deepEqual(output.stdout, [`delegation-result:compact:${status}`]);
+    assert.deepEqual(output.stderr, []);
+  }
+
+  const reconcileOutput = io();
+  const reconcileCalls = [];
+  const reconcileCode = await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID, "--format", "json"], {
+    ...reconcileOutput,
+    delegationReconcileCommand: async (options) => {
+      reconcileCalls.push(options);
+      return {
+        command: "delegation-reconcile",
+        runId: options.runId,
+        delegationId: options.delegationId,
+        role: "code-reviewer",
+        mode: "background",
+        state: "completed",
+        generation: 1,
+        resultStatus: "completed",
+        nextActions: ["deliver-result", "manual-review"],
+      };
+    },
+    executeStart: async () => {
+      throw new Error("delegation reconcile must not start or repair anything");
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.nextActions.join(" | ")}`,
+  });
+
+  assert.equal(reconcileCode, 0);
+  assert.deepEqual(reconcileCalls, [{ command: "delegation-reconcile", runId: RUN_ID, delegationId: DELEGATION_ID, format: "json", registryPath: join(packageRoot, "projects.yaml") }]);
+  assert.match(reconcileOutput.stdout[0], /deliver-result/);
+  assert.match(reconcileOutput.stdout[0], /manual-review/);
+  assert.deepEqual(reconcileOutput.stderr, []);
+});
+
+test("delegation remediate dry-run reads only --prompt-file, and execution requires --yes plus the current digest", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-delegation-remediate-cli-"));
+  const promptFile = join(dir, "remediation $(touch should-not-run).md");
+  await writeFile(promptFile, RAW_REQUEST);
+
+  const previewOutput = io();
+  const previewCalls = [];
+  const previewCode = await main(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile, "--dry-run", "--format", "json"], {
+    ...previewOutput,
+    delegationRemediateCommand: async (options) => {
+      previewCalls.push({ kind: "command", options });
+      assert.equal(options.prompt, RAW_REQUEST);
+      assert.equal(options.promptFile, promptFile);
+      return {
+        preview: delegationRemediationPreview(),
+        async execute() {
+          previewCalls.push({ kind: "execute" });
+          return { state: "running", nextActions: ["await-result"] };
+        },
+      };
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.approvalDigest ?? value.state}`,
+  });
+  assert.equal(previewCode, 0);
+  assert.deepEqual(previewCalls.map((call) => call.kind), ["command"]);
+  assert.match(previewOutput.stdout[0], new RegExp(APPROVAL_DIGEST));
+  assert.deepEqual(previewOutput.stderr, []);
+
+  for (const argv of [
+    ["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile],
+    ["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile, "--yes"],
+  ]) {
+    const output = io();
+    let called = false;
+    const code = await main(argv, {
+      ...output,
+      isInteractive: () => false,
+      delegationRemediateCommand: async () => {
+        called = true;
+        return { preview: delegationRemediationPreview(), execute: async () => ({ state: "running" }) };
+      },
+    });
+    assert.equal(code, 64, argv.join(" "));
+    assert.equal(called, false, argv.join(" "));
+    assert.match(output.stderr[0], /--yes|approval-digest/i);
+  }
+
+  const executeOutput = io();
+  const executeCalls = [];
+  const executeCode = await main(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile, "--yes", "--approval-digest", APPROVAL_DIGEST], {
+    ...executeOutput,
+    isInteractive: () => false,
+    delegationRemediateCommand: async () => ({
+      preview: delegationRemediationPreview(),
+      async execute(executeOptions) {
+        executeCalls.push(executeOptions);
+        return { command: "delegation-remediate", state: "running", nextActions: ["await-result"] };
+      },
+    }),
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.state}`,
+  });
+  assert.equal(executeCode, 0);
+  assert.deepEqual(executeCalls, [{ approvalDigest: APPROVAL_DIGEST }]);
+  assert.deepEqual(executeOutput.stdout, ["delegation-remediate:compact:running"]);
 });
 
 test("launch dry-run reads only --prompt-file, prints the approved assignment preview, and mutates nothing", async () => {

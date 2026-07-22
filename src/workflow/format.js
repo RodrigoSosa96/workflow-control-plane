@@ -223,6 +223,24 @@ function formatReconcile(value) {
   return bound(lines.join("\n"));
 }
 
+function formatDelegation(value) {
+  const lines = [
+    `Run: ${text(value.runId)}`,
+    `Delegation: ${text(value.delegationId)}`,
+    `Role: ${text(value.role)}`,
+    `Mode: ${text(value.mode)}`,
+    `State: ${text(value.state)}`,
+    `Generation: ${text(value.generation)}`,
+    `Result status: ${text(value.resultStatus)}`,
+  ];
+  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
+  if (Array.isArray(value.nextActions) && value.nextActions.length > 0) {
+    lines.push("Next actions:");
+    for (const action of value.nextActions) lines.push(`- ${action}`);
+  }
+  return bound(lines.join("\n"));
+}
+
 function valueForJson(command, value) {
   if (command !== "launch" || !value || typeof value !== "object" || !Object.hasOwn(value, "assignment")) {
     return value;
@@ -278,6 +296,10 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatResult(value);
     case "reconcile":
       return formatReconcile(value);
+    case "delegation-result":
+    case "delegation-reconcile":
+    case "delegation-remediate":
+      return formatDelegation(value);
     default:
       return bound(JSON.stringify(normalizeJson(value), null, 2));
   }
