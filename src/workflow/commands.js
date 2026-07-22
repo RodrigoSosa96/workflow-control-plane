@@ -2,6 +2,9 @@ import * as defaultFs from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
+import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./delegation-handoff.js";
+import { createDelegationReservationStore } from "./delegation-reservations.js";
+import { createDelegationStore } from "./delegation-store.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
@@ -453,6 +456,10 @@ function canonicalHandoffInputPath(run) {
   return join(run.directory, "handoff-input.json");
 }
 
+function canonicalDelegationHandoffInputPath(run, delegationId) {
+  return join(run.directory, "delegations", delegationId, "handoff-input.json");
+}
+
 function resultCommandFor(runId) {
   return `workflow result ${runId}`;
 }
@@ -619,6 +626,16 @@ async function storeForCommand(options = {}, deps = {}) {
   return factory({ stateRoot });
 }
 
+async function delegationStoresForCommand(options = {}, deps = {}) {
+  const store = await storeForCommand(options, deps);
+  const stateRoot = deps.reservations ? undefined : await stateRootForCommand(options, deps);
+  return {
+    store,
+    delegations: deps.delegations ?? createDelegationStore({ store }),
+    reservations: deps.reservations ?? createDelegationReservationStore({ stateRoot }),
+  };
+}
+
 function ensureMatchingRunProject(options, run, command) {
   if (options.projectAlias && run.projectAlias && options.projectAlias !== run.projectAlias) {
     throw new WorkflowError(command.toUpperCase(), `${command} project ${options.projectAlias} does not match run project ${run.projectAlias}`, { exitCode: 10 });
@@ -661,6 +678,31 @@ function assertWorkflowRunEnv(runId, env = {}) {
   }
 }
 
+function assertDelegationId(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    failHandoff("delegation ID is required");
+  }
+  return value.trim();
+}
+
+function delegationRecordFor(run, delegationId) {
+  const record = run?.delegations?.[delegationId];
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    failHandoff("Delegation was not found");
+  }
+  return record;
+}
+
+function assertDelegationWorkflowEnv(runId, delegationId, generation, env = {}) {
+  assertWorkflowRunEnv(runId, env);
+  if (env.WORKFLOW_DELEGATION_ID !== undefined && env.WORKFLOW_DELEGATION_ID !== delegationId) {
+    failHandoff("WORKFLOW_DELEGATION_ID does not match the handoff delegation ID");
+  }
+  if (env.WORKFLOW_DELEGATION_GENERATION !== undefined && env.WORKFLOW_DELEGATION_GENERATION !== String(generation)) {
+    failHandoff("WORKFLOW_DELEGATION_GENERATION does not match the active delegation generation");
+  }
+}
+
 function parseHandoffJson(text) {
   try {
     return JSON.parse(text);
@@ -698,6 +740,38 @@ export async function handoffCommand(options = {}, {
     git,
     runId,
     generation: run.generation ?? 1,
+    input,
+  });
+}
+
+export async function delegationHandoffCommand(options = {}, deps = {}) {
+  assertNoHandoffOutputPath(options);
+  const runId = assertRunId(options.runId);
+  const delegationId = assertDelegationId(options.delegationId);
+  const env = options.env ?? deps.env ?? process.env;
+  const { store, delegations, reservations } = await delegationStoresForCommand(options, deps);
+  const fs = deps.fs ?? defaultFs;
+  const submitDelegationHandoff = deps.submitDelegationHandoff ?? defaultSubmitDelegationHandoff;
+  if (typeof fs?.readFile !== "function") {
+    failHandoff("Filesystem read interface is required");
+  }
+  if (typeof submitDelegationHandoff !== "function") {
+    failHandoff("submitDelegationHandoff interface is required");
+  }
+
+  const run = await store.read(runId);
+  const record = delegationRecordFor(run, delegationId);
+  assertDelegationWorkflowEnv(runId, delegationId, record.generation, env);
+  const inputPath = canonicalDelegationHandoffInputPath(run, delegationId);
+  assertCanonicalHandoffInput(options.input, inputPath);
+  const input = parseHandoffJson(await fs.readFile(inputPath, "utf8"));
+  return await submitDelegationHandoff({
+    store,
+    delegations,
+    reservations,
+    git: deps.git,
+    runId,
+    delegationId,
     input,
   });
 }

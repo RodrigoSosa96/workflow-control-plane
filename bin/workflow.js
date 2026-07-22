@@ -9,7 +9,7 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { ASSIGNMENT_LIMITS } from "../src/workflow/assignment.js";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { doctorCommand as defaultDoctorCommand, handoffCommand as defaultHandoffCommand, launchCommand as defaultLaunchCommand, planCommand as defaultPlanCommand, reconcileCommand as defaultReconcileCommand, resultCommand as defaultResultCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
+import { delegationHandoffCommand as defaultDelegationHandoffCommand, doctorCommand as defaultDoctorCommand, handoffCommand as defaultHandoffCommand, launchCommand as defaultLaunchCommand, planCommand as defaultPlanCommand, reconcileCommand as defaultReconcileCommand, resultCommand as defaultResultCommand, statusCommand as defaultStatusCommand } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
@@ -31,6 +31,7 @@ Commands:
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
   workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
   workflow handoff <run-id> --input <run-dir>/handoff-input.json [--format compact|json]
+  workflow delegation handoff <run-id> <delegation-id> --input <run-dir>/delegations/<delegation-id>/handoff-input.json [--format compact|json]
 
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path
@@ -95,6 +96,13 @@ function assertCanonicalHandoffInputSyntax(input) {
   }
 }
 
+function assertCanonicalDelegationHandoffInputSyntax(input) {
+  const normalized = String(input ?? "").replace(/\\/gu, "/");
+  if (!normalized.includes("/delegations/") || !normalized.endsWith("/handoff-input.json") || normalized.includes("/../") || normalized.startsWith("../")) {
+    throw new Error("delegation handoff --input must be the canonical <run-directory>/delegations/<delegation-id>/handoff-input.json path.");
+  }
+}
+
 function usageError(message) {
   throw new WorkflowError("USAGE", message, { exitCode: 64 });
 }
@@ -152,6 +160,20 @@ export function parseArgs(argv) {
     return {
       command,
       runId: positionals[0],
+      input: options.input,
+      format,
+    };
+  }
+
+  if (command === "delegation") {
+    if (positionals[0] !== "handoff") throw new Error(`Unknown command: ${argv.join(" ")}\n\n${HELP}`);
+    validateShape("delegation handoff", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: ["input"] });
+    if (!options.input) throw new Error("delegation handoff requires --input <run-dir>/delegations/<delegation-id>/handoff-input.json.");
+    assertCanonicalDelegationHandoffInputSyntax(options.input);
+    return {
+      command: "delegation-handoff",
+      runId: positionals[1],
+      delegationId: positionals[2],
       input: options.input,
       format,
     };
@@ -314,6 +336,14 @@ function categorizeError(error) {
   return { category: "INTERNAL", exitCode: 1 };
 }
 
+function pickDelegationIdentityEnv(env = {}) {
+  const picked = {};
+  for (const key of ["WORKFLOW_RUN_ID", "WORKFLOW_DELEGATION_ID", "WORKFLOW_DELEGATION_GENERATION"]) {
+    if (env[key] !== undefined) picked[key] = env[key];
+  }
+  return picked;
+}
+
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const out = dependencies.out ?? console.log;
   const err = dependencies.err ?? console.error;
@@ -326,6 +356,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const handoffCommand = dependencies.handoffCommand ?? defaultHandoffCommand;
+  const delegationHandoffCommand = dependencies.delegationHandoffCommand ?? defaultDelegationHandoffCommand;
   const executeStart = dependencies.executeStart ?? defaultExecuteStart;
   const executeRuntime = dependencies.executeRuntime ?? defaultExecuteRuntime;
   const confirm = dependencies.confirm ?? defaultConfirm;
@@ -423,6 +454,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (args.command === "handoff") {
       const result = await handoffCommand({ ...options, env }, liveDependencies);
       emit(out, formatWorkflowResult("handoff", result, args.format));
+      return 0;
+    }
+
+    if (args.command === "delegation-handoff") {
+      const result = await delegationHandoffCommand({ ...options, env: pickDelegationIdentityEnv(env) }, liveDependencies);
+      emit(out, formatWorkflowResult("delegation-handoff", result, args.format));
       return 0;
     }
 

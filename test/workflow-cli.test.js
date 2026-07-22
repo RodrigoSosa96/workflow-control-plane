@@ -140,6 +140,7 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow reconcile \[project\] --run <run-id>/);
   assert.match(result.stdout, /workflow runtime <project> <task> .*--tickets <csv>/);
   assert.match(result.stdout, /workflow status <project> <task> .*--tickets <csv>/);
+  assert.match(result.stdout, /workflow delegation handoff <run-id> <delegation-id> --input <run-dir>\/delegations\/<delegation-id>\/handoff-input.json/);
   const doctorLine = result.stdout.split(/\r?\n/u).find((line) => line.includes("workflow doctor"));
   assert.doesNotMatch(doctorLine, /--tickets/);
 });
@@ -223,6 +224,14 @@ test("parses documented workflow commands and options", () => {
     input: "/state/run/handoff-input.json",
     format: "compact",
   });
+
+  assert.deepEqual(parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), {
+    command: "delegation-handoff",
+    runId: RUN_ID,
+    delegationId: "22222222-2222-4222-8222-222222222222",
+    input: "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
+    format: "compact",
+  });
 });
 
 test("rejects unknown, duplicate, and disallowed options", () => {
@@ -242,6 +251,11 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["doctor", "ocr", "extra"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["handoff", RUN_ID]), /--input|input|required/i);
   assert.throws(() => parseArgs(["handoff", RUN_ID, "--input", "/state/run/not-handoff.json"]), /handoff-input\.json|canonical/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID]), /delegation-id|arguments|required/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--input", "/state/run/not-handoff.json"]), /handoff-input\.json|canonical/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "prompt text", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--yes", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /does not accept --yes|Unknown option: --yes/i);
+  assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--output", "/tmp/result.json", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /Unknown option: --output/i);
 });
 
 test("doctor uses the package registry by default and honors WORKFLOW_PROJECTS_FILE", async () => {
@@ -305,6 +319,47 @@ test("main runs the canonical handoff command without mutation confirmation", as
     },
   }]);
   assert.deepEqual(output.stdout, ["handoff:compact:completed"]);
+  assert.deepEqual(output.stderr, []);
+});
+
+test("main runs the canonical delegation handoff command with only allowlisted identity env", async () => {
+  const output = io();
+  const calls = [];
+  const runId = RUN_ID;
+  const delegationId = "22222222-2222-4222-8222-222222222222";
+  const input = `/state/run/delegations/${delegationId}/handoff-input.json`;
+  const code = await main(["delegation", "handoff", runId, delegationId, "--input", input], {
+    ...output,
+    env: {
+      WORKFLOW_RUN_ID: runId,
+      WORKFLOW_DELEGATION_ID: delegationId,
+      WORKFLOW_DELEGATION_GENERATION: "2",
+      WORKFLOW_RUN_DIR: "/state/run",
+      WORKFLOW_STATE_ROOT: "/state",
+      SECRET_TOKEN: "do-not-pass",
+    },
+    delegationHandoffCommand: async (options) => {
+      calls.push(options);
+      return { state: "completed", result: { status: "completed" } };
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.state}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{
+    command: "delegation-handoff",
+    runId,
+    delegationId,
+    input,
+    format: "compact",
+    registryPath: join(packageRoot, "projects.yaml"),
+    env: {
+      WORKFLOW_RUN_ID: runId,
+      WORKFLOW_DELEGATION_ID: delegationId,
+      WORKFLOW_DELEGATION_GENERATION: "2",
+    },
+  }]);
+  assert.deepEqual(output.stdout, ["delegation-handoff:compact:completed"]);
   assert.deepEqual(output.stderr, []);
 });
 
