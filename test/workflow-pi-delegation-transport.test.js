@@ -213,6 +213,40 @@ test("observeExact treats any exact live process as active and reserves missing 
   assert.equal(started.length, 1);
 });
 
+test("observeExact reports unknown when inspection cannot prove absence or identity", async () => {
+  const transport = createTransport({
+    inspectProcess: async () => {
+      const error = new Error("permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+  });
+  const identity = {
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: SESSION_PATH,
+    cwd: CWD,
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  };
+  const resume = {
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    role: "sdd-implementer",
+    mode: "foreground",
+    cwd: CWD,
+    generation: 2,
+    claimToken: "33333333-3333-4333-8333-333333333333",
+  };
+
+  assert.deepEqual(await transport.observeExact(identity), { state: "unknown", identity });
+  await assert.rejects(
+    () => transport.deliverFollowUp(identity, "Address the approved correction.", resume),
+    /absence could not be proven|unknown/i,
+  );
+});
+
 test("deliverFollowUp rebuilds exact-session remediation from persisted private state in a fresh transport", async () => {
   const launches = [];
   const transport = createTransport({
@@ -305,6 +339,36 @@ test("deliverFollowUp rejects matching sleeping live identities and mismatches, 
   const delivered = await missingTransport.deliverFollowUp(identity, "Address the approved correction.", resume);
   assert.equal(delivered.delivered, true);
   assert.equal(delivered.identity.pid, "67890");
+});
+
+
+test("deliverFollowUp reports a spawned-but-unverified outcome when exact post-spawn identity cannot be verified", async () => {
+  const transport = createTransport({
+    spawnChild: async () => ({ outcome: "spawned-but-unverified" }),
+    inspectProcess: async () => null,
+  });
+  const delivered = await transport.deliverFollowUp({
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: SESSION_PATH,
+    cwd: CWD,
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  }, "Address the approved correction.", {
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    role: "sdd-implementer",
+    mode: "foreground",
+    cwd: CWD,
+    generation: 2,
+    claimToken: "33333333-3333-4333-8333-333333333333",
+  });
+
+  assert.deepEqual(delivered, {
+    delivered: false,
+    outcome: "spawned-but-unverified",
+  });
 });
 
 test("requestGracefulClose returns manual guidance and never mutates the process", async () => {

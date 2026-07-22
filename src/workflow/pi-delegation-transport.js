@@ -102,6 +102,11 @@ function assertPrompt(value, context = "Pi delegation prompt") {
 
 function assertSpawnResult(value) {
   const result = assertObject(value, "spawn result");
+  if (result.outcome === "spawned-but-unverified") {
+    assertExactKeys(result, new Set(["outcome"]), "spawn result");
+    return { outcome: "spawned-but-unverified" };
+  }
+  assertExactKeys(result, new Set(["pid", "startedAt"]), "spawn result");
   return {
     pid: assertString(String(result.pid), "spawn result pid", { limit: 128 }),
     startedAt: assertString(result.startedAt, "spawn result startedAt", { limit: 128 }),
@@ -330,6 +335,9 @@ export function createPiDelegationTransport({
       }),
     });
     const spawned = assertSpawnResult(await spawnChild({ command, argv, cwd: context.cwd, env }));
+    if (spawned.outcome === "spawned-but-unverified") {
+      fail("delegated Pi process spawned but exact identity could not be verified");
+    }
     const identity = launchIdentity({
       runId: context.runId,
       delegationId: context.delegationId,
@@ -343,7 +351,12 @@ export function createPiDelegationTransport({
 
   async function observeExact(requestedIdentity) {
     const identity = assertTransportIdentity(requestedIdentity);
-    const observed = assertInspection(await inspectProcess(identity));
+    let observed;
+    try {
+      observed = assertInspection(await inspectProcess(identity));
+    } catch {
+      return { state: "unknown", identity };
+    }
     if (!observed) return { state: "missing", identity };
     if (observed.pid !== identity.pid || observed.startedAt !== identity.processStartedAt || observed.cwd !== identity.cwd) {
       return {
@@ -385,6 +398,9 @@ export function createPiDelegationTransport({
       bootstrap: assertPrompt(prompt),
     });
     const spawned = assertSpawnResult(await spawnChild({ command, argv, cwd: context.cwd, env }));
+    if (spawned.outcome === "spawned-but-unverified") {
+      return { delivered: false, outcome: "spawned-but-unverified" };
+    }
     const nextIdentity = launchIdentity({
       runId: identity.runId,
       delegationId: identity.delegationId,

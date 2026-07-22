@@ -61,8 +61,10 @@ test("rejects unsafe prompts and terminal-derived observations", async () => {
     () => createFakeWorkerTransport({ observations: [{ state: "idle", identity, details: { terminal: "do not trust this" } }] }),
     /terminal|observation/i,
   );
+  const unknown = createFakeWorkerTransport({ observations: [{ state: "unknown", identity }] });
+  assert.deepEqual(await unknown.observeExact(identity), { state: "unknown", identity });
   assert.throws(
-    () => createFakeWorkerTransport({ observations: [{ state: "unknown", identity }] }),
+    () => createFakeWorkerTransport({ observations: [{ state: "unexpected", identity }] }),
     /state|observation/i,
   );
 });

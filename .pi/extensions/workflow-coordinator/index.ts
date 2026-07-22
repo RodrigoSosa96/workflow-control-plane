@@ -338,24 +338,23 @@ async function spawnChildProcess({ command, argv, cwd, env }) {
 
     child.once("error", reject);
     child.once("spawn", async () => {
+      child.unref();
       try {
         const inspection = await inspectCoordinatorPid(child.pid, cwd);
-        if (!inspection) throw new Error("Failed to inspect delegated Pi process");
-        child.unref();
+        if (!inspection) {
+          resolvePromise({ outcome: "spawned-but-unverified" });
+          return;
+        }
         resolvePromise({ pid: String(child.pid), startedAt: inspection.startedAt });
-      } catch (error) {
-        reject(error);
+      } catch {
+        resolvePromise({ outcome: "spawned-but-unverified" });
       }
     });
   });
 }
 
 async function inspectChildProcess(identity) {
-  try {
-    return await inspectCoordinatorPid(identity.pid, identity.cwd);
-  } catch {
-    return null;
-  }
+  return await inspectCoordinatorPid(identity.pid, identity.cwd);
 }
 
 async function resolveCanonicalPath(value) {

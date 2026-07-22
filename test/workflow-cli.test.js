@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { WorkflowError } from "../src/workflow/errors.js";
+import { createPiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
 import { main, parseArgs } from "../bin/workflow.js";
 
@@ -629,6 +630,59 @@ test("CLI live delegation inspection exact-matches extension identities via the 
     argv: ["-p", "12345", "-o", "lstart=", "-o", "state="],
     options: { allowFailure: true },
   }]);
+});
+
+test("CLI live delegation inspection reports unknown when proc cwd inspection cannot be verified", async () => {
+  const extensionIdentity = {
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: `/state/workflow/${RUN_ID}/delegations/${DELEGATION_ID}/pi-session.jsonl`,
+    cwd: "/fixture/review",
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  };
+  let observePromise;
+
+  assert.equal(await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID], {
+    out() {},
+    err() {},
+    runner: {
+      async run() {
+        return { code: 0, stdout: "Wed Jan  1 00:10:00 2025 S\n" };
+      },
+    },
+    readDelegationCwd: async () => {
+      const error = new Error("permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async () => "/usr/bin/pi",
+    createPiDelegationTransport: (options) => {
+      const transport = createPiDelegationTransport(options);
+      observePromise = transport.observeExact(extensionIdentity).then((observation) => {
+        assert.deepEqual(observation, { state: "unknown", identity: extensionIdentity });
+      });
+      return transport;
+    },
+    delegationReconcileCommand: async (_options, liveDependencies) => {
+      assert.ok(liveDependencies.transport);
+      return {
+        command: "delegation-reconcile",
+        runId: RUN_ID,
+        delegationId: DELEGATION_ID,
+        role: "code-reviewer",
+        mode: "background",
+        state: "completed",
+        generation: 1,
+        resultStatus: "completed",
+        nextActions: ["manual-review"],
+      };
+    },
+    formatWorkflowResult: () => "ok",
+  }), 0);
+  await observePromise;
 });
 
 test("main wires the live Pi delegation transport only for live reconcile and approved remediation", async () => {

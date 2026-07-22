@@ -287,6 +287,19 @@ function validateTransportIdentity(identity, runId, delegationId) {
   return validated;
 }
 
+function validateRemediationDelivery(delivered, runId, delegationId) {
+  const value = assertObject(delivered, "transport remediation delivery");
+  if (value.delivered === false) {
+    assertExactKeys(value, new Set(["delivered", "outcome"]), "transport remediation delivery");
+    if (value.outcome !== "spawned-but-unverified") fail("transport remediation delivery outcome is unsupported");
+    return { delivered: false, outcome: "spawned-but-unverified" };
+  }
+  return {
+    delivered: true,
+    identity: validateTransportIdentity(value.identity ?? value, runId, delegationId),
+  };
+}
+
 export function createDelegationServices({ registry, projectAlias, runStore, delegations, reservations, transport, roles } = {}) {
   if (!runStore || typeof runStore.read !== "function") fail("delegation services require a compatible run store");
   if (
@@ -298,6 +311,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     || typeof delegations.claimRemediationLaunch !== "function"
     || typeof delegations.completeRemediationLaunch !== "function"
     || typeof delegations.rollbackRemediationLaunch !== "function"
+    || typeof delegations.markRemediationLaunchManualRecovery !== "function"
   ) {
     fail("delegation services require a compatible delegation store");
   }
@@ -533,18 +547,35 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
       return publicState(rolledBack, rolledBack.transportIdentity, ["begin-remediation", "manual-review"]);
     }
 
-    const identity = validateTransportIdentity(delivered?.identity ?? delivered, runId, delegationId);
+    const delivery = validateRemediationDelivery(delivered, runId, delegationId);
+    if (delivery.delivered !== true) {
+      const blocked = await delegations.markRemediationLaunchManualRecovery({
+        runId,
+        delegationId,
+        expectedGeneration,
+        claimToken,
+        reason: delivery.outcome,
+      });
+      return publicState(blocked, blocked.transportIdentity, ["manual-review"]);
+    }
+
     try {
       const remediating = await delegations.completeRemediationLaunch({
         runId,
         delegationId,
         expectedGeneration,
         claimToken,
-        identity,
+        identity: delivery.identity,
       });
-      return publicState(remediating, identity, ["await-result"]);
+      return publicState(remediating, delivery.identity, ["await-result"]);
     } catch (_error) {
-      const blocked = await readRecord(runId, delegationId);
+      const blocked = await delegations.markRemediationLaunchManualRecovery({
+        runId,
+        delegationId,
+        expectedGeneration,
+        claimToken,
+        reason: "post-spawn-persistence-failure",
+      });
       return publicState(blocked, blocked.transportIdentity, ["manual-review"]);
     }
   }

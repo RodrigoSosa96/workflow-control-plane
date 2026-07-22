@@ -156,6 +156,10 @@ function validateClaimToken(value, context = "delegation remediation claim token
   return token.toLowerCase();
 }
 
+function validateManualRecoveryReason(value) {
+  return assertString(value, "delegation remediation manual recovery reason", { limit: 128 });
+}
+
 function validateResult(value) {
   assertObject(value, "delegation result");
   assertExactKeys(value, new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]), "delegation result");
@@ -478,6 +482,32 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     });
   }
 
+  async function markRemediationLaunchManualRecovery({ runId, delegationId: id, expectedGeneration, claimToken, reason } = {}) {
+    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
+      fail("expected delegation generation must be a positive integer");
+    }
+    const validatedClaimToken = validateClaimToken(claimToken);
+    const manualReason = validateManualRecoveryReason(reason);
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: REMEDIABLE_STATES,
+      mutate: (record) => {
+        if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
+        if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
+        if (record.remediation.claimToken !== validatedClaimToken) fail("Delegation remediation launch claim is stale");
+        return {
+          ...record,
+          remediation: {
+            ...record.remediation,
+            state: "manual-recovery",
+            reason: manualReason,
+          },
+        };
+      },
+    });
+  }
+
   async function consumeResult({ runId, delegationId: id, originSessionId } = {}) {
     const consumer = assertString(originSessionId, "delegation origin session", { limit: 512 });
     return await updateRecord({
@@ -553,6 +583,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     claimRemediationLaunch,
     completeRemediationLaunch,
     rollbackRemediationLaunch,
+    markRemediationLaunchManualRecovery,
     list,
   });
 }

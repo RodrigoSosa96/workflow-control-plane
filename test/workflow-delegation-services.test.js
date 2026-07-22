@@ -466,6 +466,29 @@ test("beginRemediation rejects unsafe active observations before incrementing ge
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
 });
 
+test("beginRemediation rejects unknown observations before incrementing generation or delivering follow-up", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    observations: [{ state: "unknown", identity: expectedIdentity }],
+  });
+  const { services, store, run } = await createCompletedDelegation(t, { transport });
+
+  await assert.rejects(
+    () => services.beginRemediation({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      expectedGeneration: 1,
+      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+      prompt: "Address the approved correction.",
+    }),
+    /unknown|proven gone|remediation/i,
+  );
+
+  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 1);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
+});
+
 test("beginRemediation succeeds after rebuilding the transport from persisted private state", async (t) => {
   const firstIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
   const secondIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
@@ -655,6 +678,56 @@ test("beginRemediation permits only two turns with matching review evidence and 
   );
 });
 
+test("beginRemediation keeps manual recovery state after a spawned-but-unverified outcome", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    deliverFollowUpImpl: async () => ({ delivered: false, outcome: "spawned-but-unverified" }),
+    observations: [
+      { state: "missing", identity: expectedIdentity },
+      { state: "missing", identity: expectedIdentity },
+    ],
+  });
+  const fixture = await createCompletedDelegation(t, { transport });
+
+  const first = await fixture.services.beginRemediation({
+    runId: fixture.run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  });
+  assert.equal(first.state, "completed");
+  assert.deepEqual(first.nextActions, ["manual-review"]);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
+
+  const blockedRecord = (await fixture.store.read(fixture.run.id)).delegations[DELEGATION_ID];
+  assert.equal(blockedRecord.generation, 1);
+  assert.equal(blockedRecord.remediation?.state, "manual-recovery");
+
+  await assert.rejects(
+    () => fixture.services.beginRemediation({
+      runId: fixture.run.id,
+      delegationId: DELEGATION_ID,
+      expectedGeneration: 1,
+      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+      prompt: "Address the approved correction.",
+    }),
+    /claimed|launch|remediation/i,
+  );
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
+
+  await assert.rejects(
+    () => fixture.delegations.recordResult({
+      runId: fixture.run.id,
+      delegationId: DELEGATION_ID,
+      result: completedResult(2, "unverified child"),
+      claimToken: blockedRecord.remediation.claimToken,
+    }),
+    /generation|claim|stale|running/i,
+  );
+});
+
 test("beginRemediation blocks duplicate launch and invalid acceptance after post-spawn persistence failure", async (t) => {
   const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
   const nextIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
@@ -704,7 +777,7 @@ test("beginRemediation blocks duplicate launch and invalid acceptance after post
 
   const blockedRecord = (await fixture.store.read(fixture.run.id)).delegations[DELEGATION_ID];
   assert.equal(blockedRecord.generation, 1);
-  assert.equal(blockedRecord.remediation?.state, "launching");
+  assert.equal(blockedRecord.remediation?.state, "manual-recovery");
 
   await assert.rejects(
     () => brokenServices.beginRemediation({
@@ -725,7 +798,7 @@ test("beginRemediation blocks duplicate launch and invalid acceptance after post
       result: completedResult(2, "stale child"),
       claimToken: blockedRecord.remediation.claimToken,
     }),
-    /generation|stale|running/i,
+    /generation|claim|stale|running/i,
   );
 });
 

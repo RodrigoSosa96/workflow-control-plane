@@ -1,5 +1,5 @@
 const METHODS = Object.freeze(["start", "observeExact", "deliverFollowUp", "requestGracefulClose"]);
-const OBSERVATION_STATES = new Set(["active", "idle", "missing", "mismatch"]);
+const OBSERVATION_STATES = new Set(["active", "idle", "missing", "mismatch", "unknown"]);
 const FORBIDDEN_DETAIL_KEYS = new Set(["terminal", "paneText", "transcript", "stdout", "stderr"]);
 const MAX_PROMPT_BYTES = 64 * 1024;
 

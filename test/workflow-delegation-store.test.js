@@ -278,6 +278,69 @@ test("claims exactly one remediation launch, rolls back safely, and requires the
   assert.equal(completed.remediation, null);
 });
 
+test("persists non-retryable manual recovery after a spawned-but-unverified remediation launch", async (t) => {
+  const { run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
+  const firstIdentity = transportIdentity(run.id, FIRST_DELEGATION_ID);
+
+  await delegations.prepare({
+    runId: run.id,
+    input: {
+      role: "code-reviewer",
+      mode: "background",
+      originSessionId: "pi-origin-1",
+      cwd: "/fixture/review",
+      brief: "Review only the frozen task.",
+      task: "Review only the frozen task.",
+      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+      remediationTurns: 2,
+    },
+  });
+  await delegations.claim({ runId: run.id, delegationId: FIRST_DELEGATION_ID });
+  await delegations.recordTransportIdentity({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    identity: firstIdentity,
+  });
+  await delegations.recordResult({ runId: run.id, delegationId: FIRST_DELEGATION_ID, result: completedResult(1) });
+
+  const claimed = await delegations.claimRemediationLaunch({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    expectedGeneration: 1,
+  });
+  const blocked = await delegations.markRemediationLaunchManualRecovery({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    expectedGeneration: 1,
+    claimToken: claimed.remediation.claimToken,
+    reason: "spawned-but-unverified",
+  });
+  assert.equal(blocked.generation, 1);
+  assert.equal(blocked.result?.generation, 1);
+  assert.equal(blocked.remediationTurnsUsed, 0);
+  assert.equal(blocked.remediation.state, "manual-recovery");
+  assert.equal(blocked.remediation.reason, "spawned-but-unverified");
+
+  await assert.rejects(
+    () => delegations.claimRemediationLaunch({
+      runId: run.id,
+      delegationId: FIRST_DELEGATION_ID,
+      expectedGeneration: 1,
+    }),
+    /claimed|launch/i,
+  );
+
+  await assert.rejects(
+    () => delegations.recordResult({
+      runId: run.id,
+      delegationId: FIRST_DELEGATION_ID,
+      result: completedResult(2, "unverified child"),
+      claimToken: claimed.remediation.claimToken,
+    }),
+    /generation|claim|stale|running/i,
+  );
+});
+
 test("consumes exact-origin results once and supports explicit adoption", async (t) => {
   const { run, delegations } = await createFixture(t);
 

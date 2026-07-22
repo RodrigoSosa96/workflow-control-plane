@@ -168,6 +168,37 @@ test("submitDelegationHandoff accepts only the active remediation claim token fo
   assert.equal(accepted.result.generation, 2);
 });
 
+test("submitDelegationHandoff rejects unverified remediation children kept in manual recovery", async (t) => {
+  const { store, run, delegations, reservations } = await createFixture(t);
+
+  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: advisoryInput() });
+  const claimed = await delegations.claimRemediationLaunch({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+  });
+  await delegations.markRemediationLaunchManualRecovery({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    claimToken: claimed.remediation.claimToken,
+    reason: "spawned-but-unverified",
+  });
+
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput({ generation: 2 }),
+      store,
+      delegations,
+      reservations,
+      claimToken: claimed.remediation.claimToken,
+    }),
+    /generation|claim|stale|running/i,
+  );
+});
+
 test("submitDelegationHandoff rejects wrong identity, stale generations, unbounded summaries, missing reservations, and duplicate results", async (t) => {
   const { store, run, delegations, reservations } = await createFixture(t, { reserve: false });
 

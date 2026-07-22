@@ -32,10 +32,18 @@ export function parsePsProcessStatus(stdout) {
   };
 }
 
+function psProvesMissing(result) {
+  return result?.code === 1 && !String(result?.stdout ?? "").trim() && !String(result?.stderr ?? "").trim();
+}
+
+function procReadProvesMissing(error) {
+  return error?.code === "ENOENT" || error?.code === "ESRCH";
+}
+
 export async function inspectExactProcessByPid(pid, {
   runProcess,
   readCwd,
-  cwdFallback,
+  cwdFallback: _cwdFallback,
 } = {}) {
   const resolvedPid = assertPid(pid);
   if (typeof runProcess !== "function") fail("process inspection runProcess must be a function");
@@ -43,14 +51,17 @@ export async function inspectExactProcessByPid(pid, {
 
   const result = await runProcess(resolvedPid);
   if (!result || typeof result !== "object") fail("process inspection result must be an object");
-  if (result.code !== 0 || !String(result.stdout ?? "").trim()) return null;
+  if (psProvesMissing(result)) return null;
+  if (result.code !== 0) fail("process inspection could not verify whether the process still exists");
+  if (!String(result.stdout ?? "").trim()) fail("process inspection output is invalid");
 
   const parsed = parsePsProcessStatus(result.stdout);
-  let cwd = cwdFallback ?? null;
+  let cwd;
   try {
     cwd = await readCwd(`/proc/${resolvedPid}/cwd`);
-  } catch {
-    if (!cwd) return null;
+  } catch (error) {
+    if (procReadProvesMissing(error)) return null;
+    throw error;
   }
 
   return {
