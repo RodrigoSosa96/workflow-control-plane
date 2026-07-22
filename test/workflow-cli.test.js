@@ -256,6 +256,24 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "prompt text", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--yes", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /does not accept --yes|Unknown option: --yes/i);
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--output", "/tmp/result.json", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /Unknown option: --output/i);
+
+  for (const input of [
+    "state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
+    "/state/run/delegations/handoff-input.json",
+    "/state/run//delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
+    "/state/run/delegations//handoff-input.json",
+    "/state/run/delegations/../22222222-2222-4222-8222-222222222222/handoff-input.json",
+    "/state/run/delegations/22222222-2222-4222-8222-222222222222/../handoff-input.json",
+    "/state/run/delegations/22222222-2222-4222-8222-222222222222/extra/handoff-input.json",
+    "/state/run/delegations/22222222-2222-4222-8222-222222222222/result.json",
+    "/state/run/delegations/22222222-2222-4222-8222-222222222222/hand\u0000off-input.json",
+  ]) {
+    assert.throws(
+      () => parseArgs(["delegation", "handoff", RUN_ID, "22222222-2222-4222-8222-222222222222", "--input", input]),
+      /handoff-input\.json|canonical/i,
+      input,
+    );
+  }
 });
 
 test("doctor uses the package registry by default and honors WORKFLOW_PROJECTS_FILE", async () => {

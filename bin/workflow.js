@@ -89,6 +89,9 @@ function parseCsvList(value) {
     .filter(Boolean);
 }
 
+const WINDOWS_ABSOLUTE_RE = /^[A-Za-z]:\//;
+const SAFE_PATH_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+
 function assertCanonicalHandoffInputSyntax(input) {
   const normalized = String(input ?? "").replace(/\\/gu, "/");
   if (!normalized.includes("/") || !normalized.endsWith("/handoff-input.json") || normalized.includes("/../") || normalized.startsWith("../")) {
@@ -98,7 +101,14 @@ function assertCanonicalHandoffInputSyntax(input) {
 
 function assertCanonicalDelegationHandoffInputSyntax(input) {
   const normalized = String(input ?? "").replace(/\\/gu, "/");
-  if (!normalized.includes("/delegations/") || !normalized.endsWith("/handoff-input.json") || normalized.includes("/../") || normalized.startsWith("../")) {
+  const absolute = normalized.startsWith("/") || WINDOWS_ABSOLUTE_RE.test(normalized);
+  const parts = normalized.split("/");
+  const delegationIndex = parts.lastIndexOf("delegations");
+  const delegationPathId = parts.at(-2);
+  const hasEmptySegment = parts.some((part, index) => part.length === 0 && !(index === 0 && normalized.startsWith("/")));
+  const hasTraversal = parts.some((part) => part === "." || part === "..");
+
+  if (!absolute || normalized.includes("\0") || hasEmptySegment || hasTraversal || parts.at(-1) !== "handoff-input.json" || delegationIndex < 2 || delegationIndex !== parts.length - 3 || !SAFE_PATH_SEGMENT_RE.test(delegationPathId ?? "")) {
     throw new Error("delegation handoff --input must be the canonical <run-directory>/delegations/<delegation-id>/handoff-input.json path.");
   }
 }
