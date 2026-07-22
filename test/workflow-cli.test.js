@@ -600,7 +600,7 @@ test("CLI live delegation inspection exact-matches extension identities via the 
           throw new Error("not used");
         },
         async observeExact() {
-          return { state: "idle", identity: extensionIdentity };
+          return { state: "active", identity: extensionIdentity };
         },
         async deliverFollowUp() {
           throw new Error("not used");

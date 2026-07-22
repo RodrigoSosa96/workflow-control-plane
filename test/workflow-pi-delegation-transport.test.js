@@ -184,7 +184,7 @@ test("start rejects unsafe paths, mismatches, injected env, unmanaged tools, and
   assert.equal(launches.length, 0);
 });
 
-test("observeExact returns active or idle only when pid, start time, and cwd all match", async () => {
+test("observeExact treats any exact live process as active and reserves missing for proven-gone identities", async () => {
   const started = [];
   const inspections = [
     { pid: "12345", startedAt: "2025-01-01T00:10:00.000Z", cwd: CWD, active: true },
@@ -205,7 +205,7 @@ test("observeExact returns active or idle only when pid, start time, and cwd all
   const identity = (await transport.start(assignment())).identity;
 
   assert.equal((await transport.observeExact(identity)).state, "active");
-  assert.equal((await transport.observeExact(identity)).state, "idle");
+  assert.equal((await transport.observeExact(identity)).state, "active");
   assert.equal((await transport.observeExact(identity)).state, "missing");
   assert.equal((await transport.observeExact(identity)).state, "mismatch");
   assert.equal((await transport.observeExact(identity)).state, "mismatch");
@@ -260,7 +260,7 @@ test("deliverFollowUp rebuilds exact-session remediation from persisted private 
 });
 
 
-test("deliverFollowUp refuses active or mismatched live identities in a fresh transport", async () => {
+test("deliverFollowUp rejects matching sleeping live identities and mismatches, and only respawns after exact absence", async () => {
   const identity = {
     kind: "pi-delegation",
     runId: RUN_ID,
@@ -279,12 +279,12 @@ test("deliverFollowUp refuses active or mismatched live identities in a fresh tr
     generation: 2,
   };
 
-  const activeTransport = createTransport({
-    inspectProcess: async () => ({ pid: "12345", startedAt: "2025-01-01T00:10:00.000Z", cwd: CWD, active: true }),
+  const sleepingTransport = createTransport({
+    inspectProcess: async () => ({ pid: "12345", startedAt: "2025-01-01T00:10:00.000Z", cwd: CWD, active: false }),
   });
   await assert.rejects(
-    () => activeTransport.deliverFollowUp(identity, "Address the approved correction.", resume),
-    /active|exact worker/i,
+    () => sleepingTransport.deliverFollowUp(identity, "Address the approved correction.", resume),
+    /active|exists|exact worker/i,
   );
 
   const mismatchTransport = createTransport({
@@ -294,6 +294,14 @@ test("deliverFollowUp refuses active or mismatched live identities in a fresh tr
     () => mismatchTransport.deliverFollowUp(identity, "Address the approved correction.", resume),
     /mismatch|identity|exact/i,
   );
+
+  const missingTransport = createTransport({
+    spawnChild: async () => ({ pid: "67890", startedAt: "2025-01-01T00:20:00.000Z" }),
+    inspectProcess: async () => null,
+  });
+  const delivered = await missingTransport.deliverFollowUp(identity, "Address the approved correction.", resume);
+  assert.equal(delivered.delivered, true);
+  assert.equal(delivered.identity.pid, "67890");
 });
 
 test("requestGracefulClose returns manual guidance and never mutates the process", async () => {

@@ -345,15 +345,16 @@ export function createPiDelegationTransport({
         },
       };
     }
-    return { state: observed.active ? "active" : "idle", identity };
+    return { state: "active", identity };
   }
 
   async function deliverFollowUp(requestedIdentity, prompt, persistedRemediation) {
     const identity = assertTransportIdentity(requestedIdentity);
     const context = remediationContext(persistedRemediation, identity);
     const observation = await observeExact(identity);
-    if (observation.state === "active") fail("exact worker is still active");
+    if (observation.state === "active" || observation.state === "idle") fail("exact worker still exists and cannot be resumed");
     if (observation.state === "mismatch") fail("exact worker identity no longer matches the recorded session");
+    if (observation.state !== "missing") fail("exact worker absence could not be proven");
     const roleDefinition = await loadDelegationRole({ name: context.role, agentDirectory: resolvedAgentDirectory, fs });
     const env = safeEnv({
       runId: identity.runId,

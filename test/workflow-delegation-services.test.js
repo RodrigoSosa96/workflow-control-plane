@@ -309,7 +309,7 @@ test("execute retains a reservation and records start failure when transport sta
   assert.doesNotMatch(JSON.stringify(result), /SECRET-TRANSPORT-FAILURE/);
 });
 
-test("reconcile returns bounded state and withholds automatic remediation after missing observations", async (t) => {
+test("reconcile returns bounded state and allows remediation only after the exact process is proven gone", async (t) => {
   const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
   const transport = createTransport({
     startImpl: async () => ({ identity: expectedIdentity }),
@@ -327,7 +327,7 @@ test("reconcile returns bounded state and withholds automatic remediation after 
   assert.equal(reconciled.resultStatus, "completed");
   assert.deepEqual(reconciled.identity, expectedIdentity);
   assert.equal(reconciled.observation.state, "missing");
-  assert.match(reconciled.nextActions.join(" "), /manual|deliver/i);
+  assert.deepEqual(reconciled.nextActions, ["deliver-result", "begin-remediation"]);
   assert.doesNotMatch(JSON.stringify(reconciled), /summary|verification|concerns|terminal|stdout|stderr/i);
 });
 
@@ -350,27 +350,29 @@ test("reconcile does not suggest delivery after a current terminal result was co
   assert.equal(reconciled.nextActions.includes("review-result"), true);
 });
 
-test("beginRemediation rejects missing observations before incrementing generation or delivering follow-up", async (t) => {
+test("beginRemediation allows follow-up only after the exact prior process is proven gone", async (t) => {
   const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const nextIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
   const transport = createTransport({
     startImpl: async () => ({ identity: expectedIdentity }),
+    deliverFollowUpImpl: async () => ({ delivered: true, identity: nextIdentity }),
     observations: [{ state: "missing", identity: expectedIdentity }],
   });
   const { services, store, run } = await createCompletedDelegation(t, { transport });
 
-  await assert.rejects(
-    () => services.beginRemediation({
-      runId: run.id,
-      delegationId: DELEGATION_ID,
-      expectedGeneration: 1,
-      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
-      prompt: "Address the approved correction.",
-    }),
-    /observe|observation|missing|remediation/i,
-  );
+  const remediated = await services.beginRemediation({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  });
 
-  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 1);
-  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
+  assert.equal(remediated.state, "running");
+  assert.equal(remediated.generation, 2);
+  assert.deepEqual(remediated.identity, nextIdentity);
+  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 2);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
 });
 
 test("beginRemediation rejects mismatched observations before incrementing generation or delivering follow-up", async (t) => {
@@ -446,7 +448,7 @@ test("beginRemediation succeeds after rebuilding the transport from persisted pr
         identity: secondIdentity,
       };
     },
-    observations: [{ state: "idle", identity: firstIdentity }],
+    observations: [{ state: "missing", identity: firstIdentity }],
   });
   const freshServices = createDelegationServices({
     registry,
@@ -495,9 +497,9 @@ test("beginRemediation persists replacement identities and later observation/rem
       identity: identity.pid === firstIdentity.pid ? secondIdentity : thirdIdentity,
     }),
     observations: [
-      { state: "idle", identity: firstIdentity },
-      { state: "idle", identity: secondIdentity },
-      { state: "idle", identity: secondIdentity },
+      { state: "missing", identity: firstIdentity },
+      { state: "missing", identity: secondIdentity },
+      { state: "missing", identity: secondIdentity },
     ],
   });
   const { services, delegations, store, run } = await createCompletedDelegation(t, { transport });
@@ -553,9 +555,9 @@ test("beginRemediation permits only two turns with matching review evidence and 
       identity: identity.pid === expectedIdentity.pid ? secondIdentity : thirdIdentity,
     }),
     observations: [
-      { state: "idle", identity: expectedIdentity },
-      { state: "idle", identity: secondIdentity },
-      { state: "idle", identity: thirdIdentity },
+      { state: "missing", identity: expectedIdentity },
+      { state: "missing", identity: secondIdentity },
+      { state: "missing", identity: thirdIdentity },
     ],
   });
   const { services, delegations, run } = await createCompletedDelegation(t, { transport });
@@ -604,7 +606,7 @@ test("beginRemediation leaves the current generation and result intact when foll
     deliverFollowUpImpl: async () => {
       throw new Error("SECRET-DELIVERY-FAILURE");
     },
-    observations: [{ state: "idle", identity: expectedIdentity }],
+    observations: [{ state: "missing", identity: expectedIdentity }],
   });
   const { services, delegations, store, run } = await createFixture(t, { transport });
   const preview = await services.createPreview({ runId: run.id, input: reviewInput });

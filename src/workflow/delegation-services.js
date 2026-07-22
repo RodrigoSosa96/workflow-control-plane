@@ -459,9 +459,9 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     );
     if (currentTerminalResult) {
       nextActions.push(consumedOrAdopted ? "review-result" : "deliver-result");
-      if (observation?.state === "idle" && record.remediationTurnsUsed < record.remediationTurns) {
+      if (observation?.state === "missing" && record.remediationTurnsUsed < record.remediationTurns) {
         nextActions.push("begin-remediation");
-      } else if (observation?.state === "missing" || observation?.state === "mismatch") {
+      } else if (observation?.state === "mismatch") {
         nextActions.push("manual-review");
       }
     } else if (record.state === "running") {
@@ -488,8 +488,8 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     await activeReservation(record);
 
     const observation = await workerTransport.observeExact(record.transportIdentity);
-    if (observation?.state !== "idle") {
-      fail(`Delegation remediation observation is ${observation?.state ?? "missing"}; exact worker must be idle`);
+    if (observation?.state !== "missing") {
+      fail(`Delegation remediation observation is ${observation?.state ?? "unknown"}; exact worker must be proven gone`);
     }
 
     let delivered;
