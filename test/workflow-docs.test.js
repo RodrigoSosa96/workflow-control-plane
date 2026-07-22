@@ -29,6 +29,11 @@ test("README documents the workflow launcher commands and safety boundaries", as
   assert.match(readme, /fallback terminal|fallback workspace|preserved workspace/i);
   assert.match(readme, /no-cleanup|no cleanup|does not clean up/i);
   assert.match(readme, /native hooks[\s\S]*resume[\s\S]*next implementation stage/i);
+  assert.match(readme, /two-lane delegation foundation/i);
+  assert.match(readme, /one writer per checkout/i);
+  assert.match(readme, /background reviewers/i);
+  assert.match(readme, /workflow-owned worktree/i);
+  assert.match(readme, /does not install `?pi-subagents`?/i);
 });
 
 

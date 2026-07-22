@@ -8,6 +8,8 @@
 
 **Tech Stack:** Node.js 24 ES modules, `node:test`, Pi extension API 0.80+, Claude Code hooks 2.1+, Codex hooks 0.144+, Herdr 0.7.4, `pi-subagents@0.34.0` project-local package.
 
+> **Amendment — two-lane delegation:** Complete `2026-07-19-two-lane-delegation-foundation.md` first. This plan must consume its project policy, private delegation store, durable reservations, prepared-request validator, and narrow worker transport; it must not reimplement their state or lock rules.
+
 ## Global Constraints
 
 - Complete and review the multi-harness launch-core plan before starting this plan.
@@ -22,8 +24,10 @@
 - No agent, hook, or extension may delete a branch/worktree/workspace/run or perform deployment/production mutation.
 - Explicit close sends a graceful idle-session exit only after process identity validation; it must not kill an unknown or working process.
 - No permission, sandbox, or hook-trust bypass flags.
-- `pi-subagents` is pinned exactly to `0.34.0`, used only through its normal foreground tool/commands, and not imported through package internals.
-- Do not enable `pi-subagents` async mode, internal worktrees, watchdog behavior, or concurrency above 3.
+- `pi-subagents` is pinned exactly to `0.34.0`, used only through its supported public Pi tool surface and never through package internals.
+- Internal package worktrees, nested delegation, watchdog/scheduling/configuration actions, and unprepared requests are always blocked.
+- Background Pi delegations follow the effective project policy: read-only scouts/reviewers may be enabled only by a prepared request and durable reservation; writers remain foreground until the generated writer fixture gate succeeds, then still require a workflow-owned worktree and one writer-per-checkout reservation.
+- Concurrency follows the effective per-project policy rather than a fixed global cap; every request must hold matching total, role/mode, and writer-checkout capacity.
 - Install project packages and user-level Codex hook configuration only at their explicit checkpoints.
 - Start Pi timers/watchers only during `session_start`; stop them idempotently during `session_shutdown`.
 - Results may be injected only into the exact originating Pi session; later sessions require explicit adoption.
@@ -39,6 +43,10 @@ bin/
   workflow.js                              resume/reconcile/close/hooks commands
   workflow-handoff-hook.js                 Native hook stdin adapter
 src/workflow/
+  delegation-policy.js                     Effective project limits and role classification
+  delegation-store.js                      Frozen briefs, bounded internal state, generations
+  delegation-reservations.js               Durable capacity and writer-checkout ownership
+  worker-transport.js                      Exact external/internal transport boundary
   lifecycle.js                             Harness-neutral generation protocol
   hook-config.js                           Claude/Codex reviewed hook configuration
   resume.js                                Exact live/dead session resume planning/execution
@@ -80,6 +88,12 @@ test/
 ```
 
 ---
+
+### Task 0: Two-Lane Foundation Integration
+
+**Prerequisite:** `2026-07-19-two-lane-delegation-foundation.md` is complete with fresh full-suite evidence.
+
+Before any hook, package, or coordinator extension work, inject `resolveDelegationPolicy`, `createDelegationStore`, `createDelegationReservationStore`, `assertWorkerTransport`, and `validateSubagentRequestPolicy` through the lifecycle/coordinator dependencies. Add only adapter wiring tests here: no hook/user configuration write, package installation, or model invocation. External lifecycle continues to use canonical worker handoffs; internal delegation outputs remain advisory.
 
 ### Task 1: Generation-Aware Native Lifecycle Callback
 

@@ -8,6 +8,8 @@
 
 **Tech Stack:** Node.js 24 ES modules, `node:test`, temporary Git repositories, Herdr 0.7.4, Pi/Claude/Codex CLIs, existing Workflow Launcher and native lifecycle hooks.
 
+> **Amendment — two-lane delegation:** Complete the two-lane foundation and revised lifecycle/coordinator implementation before this plan. Fixtures must validate the same private delegation state, prepared-request guard, reservation capacity, and exact transport contracts used in production paths.
+
 ## Global Constraints
 
 - Complete and review both prior implementation plans before starting this plan.
@@ -24,6 +26,9 @@
 - Never fetch, push, deploy, mutate production, initialize real Acme, delete a real branch/worktree, or close a non-fixture Herdr workspace.
 - Never use Claude/Codex permission or hook-trust bypasses.
 - Fake harnesses must exercise the same assignment, run-store, handoff, generation, Git fingerprint, and Herdr start paths as real harnesses.
+- Two-lane fixture gates run in this exact order: deterministic policy/transport fake; read-only foreground and background delegation; one writer in a workflow-owned fixture worktree; then separately approved real harness canaries.
+- A read-only background fixture must prove project/role capacity, exact session identity, prepared-request consumption, result delivery, and no terminal-derived result.
+- A writer-background fixture must prove one writer per checkout, workflow-owned worktree identity, remediation limit, preserved reservation history, and no automatic cleanup before any real canary is considered.
 - Real-agent canaries perform one tiny deterministic edit and local verification only.
 - End every task with focused tests, full `npm test`, `git diff --check`, specification review, and code-quality review.
 

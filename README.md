@@ -52,6 +52,18 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 - Real Acme meta-repository setup remains a separate explicit checkpoint after disposable verification; the launcher branch must not initialize or modify the real work project automatically.
 - Native hooks and resume automation are explicitly unavailable in this stage; native hooks/resume are the next implementation stage, not current behavior.
 
+### Two-lane delegation foundation (not operational yet)
+
+The two-lane delegation foundation separates external Pi/Claude/Codex workflow workers from internal Pi delegations. `workflow` remains authoritative for ticket identity, assignments, lifecycle, results, locks, and all worktrees.
+
+| Lane | Allowed foundation policy |
+|---|---|
+| External worker | `workflow launch` owns the worktree and preserves the canonical handoff/result protocol. |
+| Internal scout/spec reviewer/code reviewer | Read-only advisory work; background reviewers are budgeted and require a later prepared-request coordinator guard. |
+| Internal implementer | Foreground only in the next stage; any later background writer requires a workflow-owned worktree and one writer per checkout. |
+
+The foundation enforces configurable per-project limits, exact-session metadata, immutable brief digests, and retained reservation history. It does not install `pi-subagents`, register hooks, launch agents, or enable background writers. Package configuration is never the authority: the later project-local coordinator guard must reject internal worktrees, nested delegation, unprepared requests, and unsafe administrative actions.
+
 ### Profile selection precedence
 
 Profile selection precedence is: explicit --agent wins first, then the project default profile, then the global default profile. Project allowlists in `projects.yaml` still apply, so an explicit profile outside `allowed_agent_profiles` is rejected. Profiles define the harness (`pi`, `claude`, or `codex`), binary, safe arguments, and permissions such as Claude `permission_mode` or Codex sandbox/approval policy.
