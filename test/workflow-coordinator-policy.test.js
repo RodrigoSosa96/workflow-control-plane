@@ -119,3 +119,19 @@ test("requires writer reservations and keeps background writers disabled", () =>
     /background writers/i,
   );
 });
+
+test("validation never rewrites the incoming subagent request", () => {
+  const prepared = createPreparedDelegationRequest({ delegation: delegation(), policy });
+  const incoming = request({ worktree: true, tools: ["grep"] });
+  const before = structuredClone(incoming);
+
+  const result = validateSubagentRequestPolicy({
+    request: incoming,
+    prepared,
+    policy,
+    reservation: reservation(),
+  });
+
+  assert.equal(result.allowed, false);
+  assert.deepEqual(incoming, before);
+});
