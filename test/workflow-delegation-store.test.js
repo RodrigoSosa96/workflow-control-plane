@@ -60,6 +60,15 @@ function transportIdentity(runId, delegationId) {
   };
 }
 
+function nextTransportIdentity(runId, delegationId, overrides = {}) {
+  return {
+    ...transportIdentity(runId, delegationId),
+    pid: "67890",
+    processStartedAt: "2025-01-01T00:20:00.000Z",
+    ...overrides,
+  };
+}
+
 async function createFixture(t, ids = [FIRST_DELEGATION_ID, SECOND_DELEGATION_ID, THIRD_DELEGATION_ID]) {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({
@@ -164,6 +173,78 @@ test("persists a private frozen brief, exact transport identity, and generation-
 
   const listed = await delegations.list({ originSessionId: "pi-origin-1" });
   assert.deepEqual(listed.map((item) => item.id), [FIRST_DELEGATION_ID]);
+});
+
+test("allows one next-generation transport identity replacement and rejects stale or same-generation overwrite", async (t) => {
+  const { run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
+  const firstIdentity = transportIdentity(run.id, FIRST_DELEGATION_ID);
+
+  await delegations.prepare({
+    runId: run.id,
+    input: {
+      role: "code-reviewer",
+      mode: "background",
+      originSessionId: "pi-origin-1",
+      cwd: "/fixture/review",
+      brief: "Review only the frozen task.",
+      task: "Review only the frozen task.",
+      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+      remediationTurns: 2,
+    },
+  });
+  await delegations.claim({ runId: run.id, delegationId: FIRST_DELEGATION_ID });
+  await delegations.recordTransportIdentity({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    identity: firstIdentity,
+  });
+  await delegations.recordResult({ runId: run.id, delegationId: FIRST_DELEGATION_ID, result: completedResult(1) });
+  await delegations.beginRemediation({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    expectedGeneration: 1,
+  });
+
+  await assert.rejects(
+    () => delegations.recordTransportIdentity({
+      runId: run.id,
+      delegationId: FIRST_DELEGATION_ID,
+      identity: firstIdentity,
+      replacement: {
+        previousGeneration: 1,
+        previousIdentity: firstIdentity,
+      },
+    }),
+    /new|replace|identity/i,
+  );
+
+  const secondIdentity = nextTransportIdentity(run.id, FIRST_DELEGATION_ID);
+  const replaced = await delegations.recordTransportIdentity({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    identity: secondIdentity,
+    replacement: {
+      previousGeneration: 1,
+      previousIdentity: firstIdentity,
+    },
+  });
+  assert.deepEqual(replaced.transportIdentity, secondIdentity);
+
+  await assert.rejects(
+    () => delegations.recordTransportIdentity({
+      runId: run.id,
+      delegationId: FIRST_DELEGATION_ID,
+      identity: nextTransportIdentity(run.id, FIRST_DELEGATION_ID, {
+        pid: "99999",
+        processStartedAt: "2025-01-01T00:30:00.000Z",
+      }),
+      replacement: {
+        previousGeneration: 1,
+        previousIdentity: firstIdentity,
+      },
+    }),
+    /stale|current|identity/i,
+  );
 });
 
 test("consumes exact-origin results once and supports explicit adoption", async (t) => {

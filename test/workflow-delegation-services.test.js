@@ -91,6 +91,15 @@ function transportIdentity(runId, delegationId) {
   };
 }
 
+function nextTransportIdentity(runId, delegationId, overrides = {}) {
+  return {
+    ...transportIdentity(runId, delegationId),
+    pid: "67890",
+    processStartedAt: "2025-01-01T00:20:00.000Z",
+    ...overrides,
+  };
+}
+
 function createTransport({ startImpl, deliverFollowUpImpl, observations = [] } = {}) {
   const base = createFakeWorkerTransport({ observations });
   const calls = [];
@@ -369,14 +378,81 @@ test("beginRemediation rejects unsafe active observations before incrementing ge
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
 });
 
+test("beginRemediation persists replacement identities and later observation/remediation uses them", async (t) => {
+  const firstIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const secondIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
+  const thirdIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID, {
+    pid: "99999",
+    processStartedAt: "2025-01-01T00:30:00.000Z",
+  });
+  const transport = createTransport({
+    startImpl: async () => ({ identity: firstIdentity }),
+    deliverFollowUpImpl: async (identity) => ({
+      delivered: true,
+      identity: identity.pid === firstIdentity.pid ? secondIdentity : thirdIdentity,
+    }),
+    observations: [
+      { state: "idle", identity: firstIdentity },
+      { state: "idle", identity: secondIdentity },
+      { state: "idle", identity: secondIdentity },
+    ],
+  });
+  const { services, delegations, store, run } = await createCompletedDelegation(t, { transport });
+
+  const first = await services.beginRemediation({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  });
+  assert.equal(first.state, "running");
+  assert.equal(first.generation, 2);
+  assert.deepEqual(first.identity, secondIdentity);
+  assert.deepEqual((await store.read(run.id)).delegations[DELEGATION_ID].transportIdentity, secondIdentity);
+
+  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(2, "First remediation done") });
+  const reconciled = await services.reconcile({ runId: run.id, delegationId: DELEGATION_ID });
+  assert.deepEqual(reconciled.identity, secondIdentity);
+
+  const second = await services.beginRemediation({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 2,
+    reviewEvidence: { generation: 2, summary: "Second bounded defect", insideFrozenBrief: true },
+    prompt: "Address the second approved correction.",
+  });
+  assert.equal(second.generation, 3);
+  assert.deepEqual(second.identity, thirdIdentity);
+  assert.deepEqual((await store.read(run.id)).delegations[DELEGATION_ID].transportIdentity, thirdIdentity);
+
+  assert.deepEqual(
+    transport.calls.filter((call) => call.method === "observeExact").map((call) => call.identity),
+    [firstIdentity, secondIdentity, secondIdentity],
+  );
+  assert.deepEqual(
+    transport.calls.filter((call) => call.method === "deliverFollowUp").map((call) => call.identity),
+    [firstIdentity, secondIdentity],
+  );
+});
+
 test("beginRemediation permits only two turns with matching review evidence and identity", async (t) => {
   const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const secondIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
+  const thirdIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID, {
+    pid: "99999",
+    processStartedAt: "2025-01-01T00:30:00.000Z",
+  });
   const transport = createTransport({
     startImpl: async () => ({ identity: expectedIdentity }),
+    deliverFollowUpImpl: async (identity) => ({
+      delivered: true,
+      identity: identity.pid === expectedIdentity.pid ? secondIdentity : thirdIdentity,
+    }),
     observations: [
       { state: "idle", identity: expectedIdentity },
-      { state: "idle", identity: expectedIdentity },
-      { state: "idle", identity: expectedIdentity },
+      { state: "idle", identity: secondIdentity },
+      { state: "idle", identity: thirdIdentity },
     ],
   });
   const { services, delegations, run } = await createCompletedDelegation(t, { transport });

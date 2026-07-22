@@ -92,6 +92,20 @@ function assertTransportIdentity(value) {
   });
 }
 
+function sameIdentity(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.kind === right.kind
+    && left.runId === right.runId
+    && left.delegationId === right.delegationId
+    && left.sessionPath === right.sessionPath
+    && left.cwd === right.cwd
+    && left.pid === right.pid
+    && left.processStartedAt === right.processStartedAt,
+  );
+}
+
 function assertPrompt(value, context = "Pi delegation prompt") {
   if (typeof value !== "string" || !value || value.includes("\0") || Buffer.byteLength(value, "utf8") > MAX_TEXT_BYTES) {
     fail(`${context} must be bounded valid text`);
@@ -337,14 +351,14 @@ export function createPiDelegationTransport({
 
   async function deliverFollowUp(requestedIdentity, prompt) {
     const identity = assertTransportIdentity(requestedIdentity);
+    const key = `${identity.runId}:${identity.delegationId}`;
+    const existing = launches.get(key);
+    if (!existing || !sameIdentity(existing.identity, identity)) {
+      fail("exact delegation session requires the latest cached identity");
+    }
     const observation = await observeExact(identity);
     if (observation.state === "active") fail("exact worker is still active");
     if (observation.state === "mismatch") fail("exact worker identity no longer matches the recorded session");
-    const key = `${identity.runId}:${identity.delegationId}`;
-    const existing = launches.get(key);
-    if (!existing || existing.identity.sessionPath !== identity.sessionPath) {
-      fail("exact delegation session is unknown to this transport instance");
-    }
     const generation = existing.generation + 1;
     const env = safeEnv({
       runId: identity.runId,

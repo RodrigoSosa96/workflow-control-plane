@@ -438,13 +438,25 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     }
 
     let remediating = await delegations.beginRemediation({ runId, delegationId, expectedGeneration });
+    let delivered;
     try {
-      await workerTransport.deliverFollowUp(record.transportIdentity, prompt);
-      return publicState(remediating, record.transportIdentity, ["await-result"]);
+      delivered = await workerTransport.deliverFollowUp(record.transportIdentity, prompt);
     } catch (_error) {
       remediating = await readRecord(runId, delegationId);
       return publicState(remediating, record.transportIdentity, ["manual-follow-up", "manual-review"]);
     }
+
+    const identity = validateTransportIdentity(delivered?.identity ?? delivered, runId, delegationId);
+    const recorded = await delegations.recordTransportIdentity({
+      runId,
+      delegationId,
+      identity,
+      replacement: {
+        previousGeneration: expectedGeneration,
+        previousIdentity: record.transportIdentity,
+      },
+    });
+    return publicState(recorded, identity, ["await-result"]);
   }
 
   return Object.freeze({ createPreview, executeApproved, reconcile, beginRemediation });

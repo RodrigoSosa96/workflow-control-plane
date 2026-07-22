@@ -117,6 +117,33 @@ function validateTransportIdentity(value, runId, delegationId) {
   return identity;
 }
 
+function sameTransportIdentity(left, right) {
+  return Boolean(
+    left
+    && right
+    && left.kind === right.kind
+    && left.runId === right.runId
+    && left.delegationId === right.delegationId
+    && left.sessionPath === right.sessionPath
+    && left.cwd === right.cwd
+    && left.pid === right.pid
+    && left.processStartedAt === right.processStartedAt,
+  );
+}
+
+function validateTransportIdentityReplacement(value, runId, delegationId) {
+  if (value === undefined) return null;
+  assertObject(value, "transport identity replacement");
+  assertExactKeys(value, new Set(["previousGeneration", "previousIdentity"]), "transport identity replacement");
+  if (!Number.isInteger(value.previousGeneration) || value.previousGeneration < 1) {
+    fail("transport identity replacement previousGeneration must be a positive integer");
+  }
+  return {
+    previousGeneration: value.previousGeneration,
+    previousIdentity: validateTransportIdentity(value.previousIdentity, runId, delegationId),
+  };
+}
+
 function validateResult(value) {
   assertObject(value, "delegation result");
   assertExactKeys(value, new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]), "delegation result");
@@ -247,14 +274,37 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     });
   }
 
-  async function recordTransportIdentity({ runId, delegationId: id, identity } = {}) {
+  async function recordTransportIdentity({ runId, delegationId: id, identity, replacement } = {}) {
     const transportIdentity = validateTransportIdentity(identity, runId, id);
+    const transportReplacement = validateTransportIdentityReplacement(replacement, runId, id);
     return await updateRecord({
       runId,
       delegationId: id,
       expectedStates: new Set(["running"]),
       mutate: (record) => {
-        if (record.transportIdentity) fail("Delegation transport identity is already recorded");
+        if (!transportReplacement) {
+          if (record.transportIdentity) fail("Delegation transport identity is already recorded");
+          return { ...record, transportIdentity };
+        }
+        if (!record.transportIdentity) fail("Delegation transport identity is missing");
+        if (record.generation !== transportReplacement.previousGeneration + 1) {
+          fail("Delegation transport identity replacement is stale");
+        }
+        if (!sameTransportIdentity(record.transportIdentity, transportReplacement.previousIdentity)) {
+          fail("Delegation transport identity replacement is stale");
+        }
+        if (
+          transportIdentity.sessionPath !== transportReplacement.previousIdentity.sessionPath
+          || transportIdentity.cwd !== transportReplacement.previousIdentity.cwd
+        ) {
+          fail("Delegation transport identity replacement must keep the same session and cwd");
+        }
+        if (
+          transportIdentity.pid === transportReplacement.previousIdentity.pid
+          && transportIdentity.processStartedAt === transportReplacement.previousIdentity.processStartedAt
+        ) {
+          fail("Delegation transport identity replacement must record a new exact process identity");
+        }
         return { ...record, transportIdentity };
       },
     });

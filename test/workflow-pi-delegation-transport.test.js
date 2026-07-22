@@ -213,7 +213,7 @@ test("observeExact returns active or idle only when pid, start time, and cwd all
   assert.equal(started.length, 1);
 });
 
-test("deliverFollowUp refuses active workers and resumes only the exact recorded session when missing", async () => {
+test("deliverFollowUp refuses active workers, resumes only the latest exact session, and rejects stale callers", async () => {
   const launches = [];
   const transport = createTransport({
     spawnChild: async (launch) => {
@@ -260,6 +260,12 @@ test("deliverFollowUp refuses active workers and resumes only the exact recorded
   assert.equal(resumedLaunch.argv[resumedLaunch.argv.indexOf("--session-dir") + 1], SESSION_DIRECTORY);
   assert.equal(resumedLaunch.env.WORKFLOW_DELEGATION_GENERATION, "2");
   assert.equal(resumedLaunch.argv.at(-1), "Address the approved correction.");
+
+  await assert.rejects(
+    () => resuming.deliverFollowUp(seededIdentity, "Retry with stale identity."),
+    /stale|latest|exact|identity/i,
+  );
+  assert.equal(launches.length, 3);
 });
 
 test("requestGracefulClose returns manual guidance and never mutates the process", async () => {
