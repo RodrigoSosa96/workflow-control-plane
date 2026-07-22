@@ -206,12 +206,13 @@ function reservationMatches(record, reservation) {
   return expected.every((resource) => reservation.resources.includes(resource));
 }
 
-function publicState(record, identity, nextActions) {
+function publicState(record, identity, nextActions, observation) {
   return {
     state: record.state,
     identity: identity ?? null,
     generation: record.generation,
     resultStatus: record.result?.status ?? null,
+    ...(observation ? { observation: clone(observation) } : {}),
     nextActions: Object.freeze([...nextActions]),
   };
 }
@@ -415,7 +416,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
 
     if (record.startFailure) nextActions.unshift("manual-release-reservation");
     if (!identity) nextActions.push("manual-review");
-    return publicState(record, identity, nextActions);
+    return publicState(record, identity, nextActions, observation);
   }
 
   async function beginRemediation({ runId, delegationId, expectedGeneration, reviewEvidence, prompt } = {}) {

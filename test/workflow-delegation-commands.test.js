@@ -264,6 +264,7 @@ test("delegation reconcile preserves process identity, ownership, observation, a
               state: "completed",
               generation: 1,
               resultStatus: "completed",
+              observation,
               nextActions: ["deliver-result", "manual-review"],
             };
           },
@@ -275,14 +276,52 @@ test("delegation reconcile preserves process identity, ownership, observation, a
     assert.equal(result.status, "completed");
     assert.equal(result.identity.status, "recorded");
     assert.equal(result.identity.pid, "12345");
+    assert.equal(Object.hasOwn(result.identity, "cwd"), false);
     assert.equal(result.observation.state, observation.state);
+    assert.equal(Object.hasOwn(result.observation, "details"), false);
     assert.equal(result.ownership.status, "available");
     assert.equal(result.reservation.state, "active");
     assert.equal(result.reservation.retained, false);
     assert.deepEqual(result.nextActions, ["deliver-result", "manual-review"]);
-    assert.deepEqual(transport.calls.map((call) => call.method), ["observeExact"]);
-    assert.doesNotMatch(JSON.stringify(result), /SECRET-OWNER|sessionPath|\/state\/workflow/i);
+    assert.deepEqual(transport.calls.map((call) => call.method), []);
+    assert.doesNotMatch(JSON.stringify(result), /SECRET-OWNER|sessionPath|observedCwd|\/state\/workflow/i);
   }
+});
+
+test("delegation reconcile reuses the service observation snapshot exactly once", async () => {
+  const transport = transportFor({ state: "idle", identity: transportIdentity() });
+  const observation = {
+    state: "mismatch",
+    identity: transportIdentity(),
+    details: { observedCwd: CWD },
+  };
+
+  const result = await delegationReconcileCommand({
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    registryPath: "/tmp/projects.yaml",
+  }, deps({
+    store: storeFor(runRecord(delegationRecord())),
+    reservations: reservationStore([{ delegationId: DELEGATION_ID, state: "active" }]),
+    transport,
+    createDelegationServices() {
+      return {
+        async reconcile() {
+          return {
+            state: "completed",
+            generation: 1,
+            resultStatus: "completed",
+            observation,
+            nextActions: ["deliver-result", "manual-review"],
+          };
+        },
+      };
+    },
+  }));
+
+  assert.equal(result.observation.state, "mismatch");
+  assert.equal(Object.hasOwn(result.observation, "details"), false);
+  assert.deepEqual(transport.calls, []);
 });
 
 test("delegation reconcile reports failed starts with retained reservations and remediation caps without mutating processes", async () => {

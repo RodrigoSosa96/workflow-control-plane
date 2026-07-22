@@ -298,10 +298,11 @@ test("reconcile returns bounded state and withholds automatic remediation after 
 
   const reconciled = await services.reconcile({ runId: run.id, delegationId: DELEGATION_ID });
 
-  assert.deepEqual(Object.keys(reconciled).sort(), ["generation", "identity", "nextActions", "resultStatus", "state"]);
+  assert.deepEqual(Object.keys(reconciled).sort(), ["generation", "identity", "nextActions", "observation", "resultStatus", "state"]);
   assert.equal(reconciled.state, "completed");
   assert.equal(reconciled.resultStatus, "completed");
   assert.deepEqual(reconciled.identity, expectedIdentity);
+  assert.equal(reconciled.observation.state, "missing");
   assert.match(reconciled.nextActions.join(" "), /manual|deliver/i);
   assert.doesNotMatch(JSON.stringify(reconciled), /summary|verification|concerns|terminal|stdout|stderr/i);
 });

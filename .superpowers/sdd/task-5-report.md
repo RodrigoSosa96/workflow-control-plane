@@ -70,4 +70,44 @@ git commit -m "feat(workflow): reconcile governed Pi delegations"
 ```
 
 ## Concerns
-- Live delegation reconcile/remediate still expects a transport dependency to be supplied by the caller/runtime wiring; this task wired the CLI surface and injectable command path safely, but did not add a new real Pi process transport bootstrap beyond the existing interfaces.
+- Default live delegation inspection assumes `ps` plus `/proc/<pid>/cwd`; non-Linux runtimes should inject `inspectDelegationProcess` / `spawnDelegationChild` seams.
+
+## Review fix follow-up — live transport, redaction, exit mapping, single observation
+
+### RED command
+```bash
+node --test test/workflow-delegation-commands.test.js test/workflow-cli.test.js
+```
+
+### RED result
+Failed as expected before the fix:
+- `main wires the live Pi delegation transport only for live reconcile and approved remediation` returned exit `1` because the CLI never constructed/injected `PiDelegationTransport`.
+- `maps conflict and preflight workflow errors to stable categories` returned exit `3` for `delegation-service` failures because they fell through to `CONFIG`.
+- `delegation reconcile preserves process identity...` still exposed transport `cwd` / observation details and performed an extra observation.
+- `delegation reconcile reuses the service observation snapshot exactly once` returned a second `idle` observation instead of the original `mismatch` snapshot.
+
+### GREEN implementation summary
+Implemented follow-up fixes in:
+- `bin/workflow.js`
+- `src/workflow/commands.js`
+- `src/workflow/delegation-services.js`
+- `test/workflow-cli.test.js`
+- `test/workflow-delegation-commands.test.js`
+- `test/workflow-delegation-services.test.js`
+
+Key outcomes:
+- live CLI wiring now constructs and injects `PiDelegationTransport` only for `delegation reconcile` and approved `delegation remediate`
+- transport construction uses safe `stateRoot` / control-plane context and injected spawn/inspect seams only
+- public reconcile identity/observation output now redacts `cwd`, `observedCwd`, and transport detail fields
+- delegation service failures now map to stable `PREFLIGHT` CLI exits instead of `CONFIG`
+- reconcile now returns the same observation snapshot used to compute next actions
+
+### GREEN commands
+```bash
+node --test test/workflow-delegation-commands.test.js test/workflow-cli.test.js test/workflow-delegation-services.test.js test/workflow-format.test.js
+npm test
+git diff --check
+```
+
+### GREEN result
+Passed.

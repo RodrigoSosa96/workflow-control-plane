@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import { spawn as spawnChildProcess } from "node:child_process";
 import { realpathSync, constants as fsConstants } from "node:fs";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, realpath as fsRealpath } from "node:fs/promises";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -25,6 +26,7 @@ import {
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
+import { createPiDelegationTransport as defaultCreatePiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { loadRegistry as defaultLoadRegistry } from "../src/workflow/registry.js";
 
 const OUTPUT_LIMIT = 12000;
@@ -349,6 +351,8 @@ function createLiveDependencies(dependencies) {
   const runner = dependencies.runner ?? createProcessRunner();
   const stateRoot = dependencies.stateRoot ?? env.WORKFLOW_STATE_ROOT;
   return {
+    env,
+    runner,
     stateRoot,
     loadRegistry: dependencies.loadRegistry ?? defaultLoadRegistry,
     lookupExecutable: dependencies.lookupExecutable ?? ((name) => lookupExecutable(name, env)),
@@ -360,6 +364,136 @@ function createLiveDependencies(dependencies) {
     reservations: dependencies.reservations,
     roles: dependencies.roles,
     createDelegationServices: dependencies.createDelegationServices,
+  };
+}
+
+function processError(message, details) {
+  return new WorkflowError("PROCESS", message, { exitCode: 12, details });
+}
+
+function parseStartedAt(value) {
+  const text = String(value ?? "").trim().replace(/\s+/gu, " ");
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : text;
+}
+
+function activeFromProcessState(value) {
+  const state = String(value ?? "").trim().toUpperCase();
+  return state.startsWith("R") || state.startsWith("D");
+}
+
+async function inspectDelegationPid(pid, { runner, cwdFallback } = {}) {
+  const result = await runner.run("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
+  if (result.code !== 0 || !result.stdout.trim()) return null;
+
+  const line = result.stdout.trim().split(/\r?\n/gu).at(-1)?.trim() ?? "";
+  const match = /^(?<startedAt>[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(?<state>[A-Z]+)/u.exec(line);
+  if (!match?.groups) {
+    throw processError("Failed to inspect delegated Pi process", { pid: String(pid), stdout: bound(result.stdout) });
+  }
+
+  let cwd = cwdFallback ?? null;
+  try {
+    cwd = await fsRealpath(`/proc/${pid}/cwd`);
+  } catch {
+    if (!cwd) return null;
+  }
+
+  return {
+    pid: String(pid),
+    startedAt: parseStartedAt(match.groups.startedAt),
+    cwd,
+    active: activeFromProcessState(match.groups.state),
+  };
+}
+
+function createDefaultDelegationInspector(liveDependencies) {
+  return async (identity) => await inspectDelegationPid(identity.pid, {
+    runner: liveDependencies.runner,
+    cwdFallback: identity.cwd,
+  });
+}
+
+function createDefaultDelegationSpawner(liveDependencies) {
+  return async ({ command, argv, cwd, env: launchEnv }) => await new Promise((resolveSpawn, rejectSpawn) => {
+    let child;
+    try {
+      child = spawnChildProcess(command, argv, {
+        cwd,
+        env: launchEnv,
+        shell: false,
+        detached: true,
+        stdio: "ignore",
+      });
+    } catch (error) {
+      rejectSpawn(processError(`Failed to start ${command}: ${error.message}`, {
+        reason: "spawn",
+        command,
+        argv,
+        cwd,
+      }));
+      return;
+    }
+
+    child.once("error", (error) => {
+      rejectSpawn(processError(`Failed to start ${command}: ${error.message}`, {
+        reason: "spawn",
+        command,
+        argv,
+        cwd,
+      }));
+    });
+
+    child.once("spawn", async () => {
+      try {
+        const pid = child.pid;
+        if (!Number.isInteger(pid) || pid < 1) {
+          throw processError(`Failed to start ${command}: child pid is missing`, {
+            reason: "spawn",
+            command,
+            argv,
+            cwd,
+          });
+        }
+        const inspection = await inspectDelegationPid(pid, {
+          runner: liveDependencies.runner,
+          cwdFallback: cwd,
+        });
+        child.unref?.();
+        resolveSpawn({
+          pid: String(pid),
+          startedAt: inspection?.startedAt ?? new Date().toISOString(),
+        });
+      } catch (error) {
+        rejectSpawn(error);
+      }
+    });
+  });
+}
+
+async function stateRootForTransport(options, liveDependencies) {
+  if (liveDependencies.stateRoot) return liveDependencies.stateRoot;
+  const registry = await liveDependencies.loadRegistry(options.registryPath);
+  return registry.launcher.state_root;
+}
+
+async function withLiveDelegationTransport(options, liveDependencies, dependencies) {
+  if (liveDependencies.transport) return liveDependencies;
+  const createPiDelegationTransport = dependencies.createPiDelegationTransport ?? defaultCreatePiDelegationTransport;
+  const piCommand = await liveDependencies.lookupExecutable("pi") ?? "pi";
+  const stateRoot = await stateRootForTransport(options, liveDependencies);
+  const inspectProcess = dependencies.inspectDelegationProcess ?? createDefaultDelegationInspector(liveDependencies);
+  const spawnChild = dependencies.spawnDelegationChild ?? createDefaultDelegationSpawner(liveDependencies);
+  return {
+    ...liveDependencies,
+    stateRoot,
+    transport: createPiDelegationTransport({
+      piCommand,
+      spawnChild,
+      inspectProcess,
+      stateRoot,
+      controlPlaneBin: fileURLToPath(import.meta.url),
+    }),
   };
 }
 
@@ -410,7 +544,9 @@ function categorizeError(error) {
   if (error instanceof WorkflowError) {
     if (error.category === "USAGE") return { category: "USAGE", exitCode: 64 };
     if (error.category === "CONFLICT") return { category: "CONFLICT", exitCode: 11 };
-    if (error.category === "PREFLIGHT") return { category: "PREFLIGHT", exitCode: 10 };
+    if (["PREFLIGHT", "delegation", "delegation-reservation", "delegation-service"].includes(error.category)) {
+      return { category: "PREFLIGHT", exitCode: 10 };
+    }
     if (error.category === "HANDOFF") return { category: "HANDOFF", exitCode: 10 };
     if (error.category === "PROCESS" || error.category === "HERDR") return { category: "PROCESS", exitCode: 12 };
     return { category: "CONFIG", exitCode: 3 };
@@ -543,7 +679,8 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
 
     if (args.command === "delegation-reconcile") {
-      const result = await delegationReconcileCommand(options, liveDependencies);
+      const commandDependencies = await withLiveDelegationTransport(options, liveDependencies, dependencies);
+      const result = await delegationReconcileCommand(options, commandDependencies);
       emit(out, formatWorkflowResult("delegation-reconcile", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
@@ -555,10 +692,13 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       }
 
       const prompt = await readPromptFile(args.promptFile);
+      const commandDependencies = args.dryRun
+        ? liveDependencies
+        : await withLiveDelegationTransport(options, liveDependencies, dependencies);
       const command = await delegationRemediateCommand({
         ...options,
         prompt,
-      }, liveDependencies);
+      }, commandDependencies);
 
       if (args.dryRun) {
         emit(out, formatWorkflowResult("delegation-remediate", command.preview, args.format));

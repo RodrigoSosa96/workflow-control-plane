@@ -796,25 +796,31 @@ function delegationCanonicality(run = {}, record = {}) {
   };
 }
 
-function publicIdentity(record = {}) {
-  if (!record.transportIdentity) return { status: "missing" };
+function transportIdentityFor(value = {}) {
+  if (value?.transportIdentity && typeof value.transportIdentity === "object" && !Array.isArray(value.transportIdentity)) {
+    return value.transportIdentity;
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) && typeof value.kind === "string") {
+    return value;
+  }
+  return null;
+}
+
+function publicIdentity(value = {}) {
+  const identity = transportIdentityFor(value);
+  if (!identity) return { status: "missing" };
   return {
     status: "recorded",
-    kind: record.transportIdentity.kind,
-    pid: record.transportIdentity.pid,
-    processStartedAt: record.transportIdentity.processStartedAt,
-    cwd: record.transportIdentity.cwd,
+    kind: identity.kind,
+    pid: identity.pid,
+    processStartedAt: identity.processStartedAt,
   };
 }
 
-function publicObservation(observation, record = {}) {
-  if (!record.transportIdentity) return { state: "not-observed" };
+function publicObservation(observation) {
   if (!observation || typeof observation !== "object" || Array.isArray(observation)) return { state: "not-observed" };
   return {
     state: observation.state ?? "not-observed",
-    ...(observation.details && typeof observation.details === "object" && !Array.isArray(observation.details)
-      ? { details: structuredClone(observation.details) }
-      : {}),
   };
 }
 
@@ -1003,7 +1009,6 @@ export async function delegationReconcileCommand(options = {}, deps = {}) {
   const context = await loadDelegationContext(options, deps, "delegation reconcile");
   const services = delegationServicesForContext(context, options, deps);
   const reconciled = await services.reconcile({ runId: context.runId, delegationId: context.delegationId });
-  const observation = context.record.transportIdentity ? await deps.transport.observeExact(context.record.transportIdentity) : null;
   const reservations = await context.reservations.list({ projectAlias: context.run.projectAlias });
   return {
     command: "delegation-reconcile",
@@ -1011,8 +1016,8 @@ export async function delegationReconcileCommand(options = {}, deps = {}) {
     status: reconciled.resultStatus ?? reconciled.state ?? context.record.state,
     resultStatus: reconciled.resultStatus ?? null,
     ownership: delegationOwnership(context.record),
-    identity: publicIdentity(context.record),
-    observation: publicObservation(observation, context.record),
+    identity: publicIdentity(reconciled.identity ?? context.record),
+    observation: publicObservation(reconciled.observation),
     reservation: publicReservation(context.record, reservations),
     remediation: remediationState(context.record),
     ...(context.record.startFailure ? { startFailure: { reason: context.record.startFailure.reason } } : {}),

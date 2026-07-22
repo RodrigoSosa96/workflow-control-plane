@@ -548,6 +548,113 @@ test("delegation remediate dry-run reads only --prompt-file, and execution requi
   assert.deepEqual(executeOutput.stdout, ["delegation-remediate:compact:running"]);
 });
 
+test("main wires the live Pi delegation transport only for live reconcile and approved remediation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-delegation-live-transport-"));
+  const promptFile = join(dir, "remediation.md");
+  await writeFile(promptFile, RAW_REQUEST);
+
+  const calls = [];
+  const fakeTransport = Object.freeze({
+    async start() {
+      throw new Error("transport start should not run in wiring tests");
+    },
+    async observeExact() {
+      throw new Error("transport observeExact should not run in wiring tests");
+    },
+    async deliverFollowUp() {
+      throw new Error("transport deliverFollowUp should not run in wiring tests");
+    },
+    async requestGracefulClose() {
+      return { requested: false, manual: true };
+    },
+  });
+
+  const sharedDependencies = {
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async (name) => {
+      assert.equal(name, "pi");
+      return "/usr/bin/pi";
+    },
+    spawnDelegationChild: async () => {
+      assert.fail("live transport wiring must not spawn Pi");
+    },
+    inspectDelegationProcess: async () => {
+      assert.fail("live transport wiring must not inspect processes");
+    },
+    createPiDelegationTransport: (options) => {
+      calls.push(options);
+      return fakeTransport;
+    },
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.state ?? value.status}`,
+  };
+
+  const reconcileOutput = io();
+  const reconcileCode = await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID], {
+    ...sharedDependencies,
+    ...reconcileOutput,
+    delegationReconcileCommand: async (_options, liveDependencies) => {
+      assert.equal(liveDependencies.transport, fakeTransport);
+      return {
+        command: "delegation-reconcile",
+        runId: RUN_ID,
+        delegationId: DELEGATION_ID,
+        role: "code-reviewer",
+        mode: "background",
+        state: "completed",
+        generation: 1,
+        resultStatus: "completed",
+        nextActions: ["deliver-result"],
+      };
+    },
+  });
+  assert.equal(reconcileCode, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].piCommand, "/usr/bin/pi");
+  assert.equal(calls[0].stateRoot, "/state/workflow");
+  assert.equal(typeof calls[0].controlPlaneBin, "string");
+  assert.equal(typeof calls[0].spawnChild, "function");
+  assert.equal(typeof calls[0].inspectProcess, "function");
+
+  const remediateOutput = io();
+  const remediateCode = await main(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile, "--yes", "--approval-digest", APPROVAL_DIGEST], {
+    ...sharedDependencies,
+    ...remediateOutput,
+    isInteractive: () => false,
+    delegationRemediateCommand: async (_options, liveDependencies) => {
+      assert.equal(liveDependencies.transport, fakeTransport);
+      return {
+        preview: delegationRemediationPreview(),
+        async execute() {
+          return { command: "delegation-remediate", state: "running", nextActions: ["await-result"] };
+        },
+      };
+    },
+  });
+  assert.equal(remediateCode, 0);
+  assert.equal(calls.length, 2);
+
+  const resultOutput = io();
+  assert.equal(await main(["delegation", "result", RUN_ID, DELEGATION_ID], {
+    ...sharedDependencies,
+    ...resultOutput,
+    delegationResultCommand: async (_options, liveDependencies) => {
+      assert.equal(liveDependencies.transport, undefined);
+      return { command: "delegation-result", runId: RUN_ID, delegationId: DELEGATION_ID, status: "completed", exitCode: 0 };
+    },
+  }), 0);
+
+  const dryRunOutput = io();
+  assert.equal(await main(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile, "--dry-run"], {
+    ...sharedDependencies,
+    ...dryRunOutput,
+    delegationRemediateCommand: async (_options, liveDependencies) => {
+      assert.equal(liveDependencies.transport, undefined);
+      return { preview: delegationRemediationPreview() };
+    },
+  }), 0);
+  assert.equal(calls.length, 2);
+});
+
 test("launch dry-run reads only --prompt-file, prints the approved assignment preview, and mutates nothing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "workflow-launch-cli-"));
   const promptFile = join(dir, "request $(touch should-not-run).md");
@@ -1037,6 +1144,15 @@ test("maps conflict and preflight workflow errors to stable categories", async (
     },
   }), 10);
   assert.deepEqual(preflight.stderr, ["PREFLIGHT: runtime workspace is not open"]);
+
+  const delegationService = io();
+  assert.equal(await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID], {
+    ...delegationService,
+    delegationReconcileCommand: async () => {
+      throw new WorkflowError("delegation-service", "exact worker must be idle");
+    },
+  }), 10);
+  assert.deepEqual(delegationService.stderr, ["PREFLIGHT: exact worker must be idle"]);
 });
 
 test("bounds formatted output before printing", async () => {
