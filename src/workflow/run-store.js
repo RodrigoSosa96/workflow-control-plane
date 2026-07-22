@@ -1,6 +1,6 @@
 import { randomUUID as defaultRandomUUID } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
 import { RUN_STATES, isRunState, transitionRun } from "./run-state.js";
 
@@ -62,6 +62,18 @@ function validateChildPath(root, child) {
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
     failStore("Invalid run ID; expected a path-safe UUID");
   }
+}
+
+function validatePrivateRelativePath(directory, value) {
+  if (typeof value !== "string" || !value.trim() || value.includes("\0") || isAbsolute(value)) {
+    failStore("Private artifact path must be a non-empty relative path");
+  }
+  const destination = resolve(directory, value);
+  const normalized = relative(directory, destination);
+  if (!normalized || normalized.startsWith("..") || isAbsolute(normalized)) {
+    failStore("Private artifact path must remain inside the run directory");
+  }
+  return normalized;
 }
 
 function sanitizeFsCode(error) {
@@ -223,11 +235,33 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     return parseRunJson(text, path, runId);
   }
 
+  async function ensurePrivateParentDirectories(directory, filename) {
+    const destination = resolve(directory, filename);
+    const parent = dirname(destination);
+    const normalizedParent = relative(directory, parent);
+    if (normalizedParent && (normalizedParent.startsWith("..") || isAbsolute(normalizedParent))) {
+      failStore("Private artifact path must remain inside the run directory");
+    }
+    try {
+      await fs.mkdir(parent, { recursive: true, mode: PRIVATE_DIR_MODE });
+    } catch (error) {
+      throwFs("create private artifact parent", parent, error);
+    }
+
+    let current = directory;
+    for (const segment of normalizedParent.split("/").filter(Boolean)) {
+      current = join(current, segment);
+      await chmodPrivateDirectory(current, "private artifact parent");
+    }
+  }
+
   async function writeAtomicText(directory, filename, text) {
+    const normalizedFilename = validatePrivateRelativePath(directory, filename);
+    await ensurePrivateParentDirectories(directory, normalizedFilename);
     tempCounter += 1;
-    const destination = join(directory, filename);
-    const tempPath = join(directory, `.${filename}.${process.pid}.${tempCounter}.tmp`);
-    await chmodPrivateFile(destination, filename, { missingOk: true });
+    const destination = join(directory, normalizedFilename);
+    const tempPath = join(dirname(destination), `.${basename(destination)}.${process.pid}.${tempCounter}.tmp`);
+    await chmodPrivateFile(destination, normalizedFilename, { missingOk: true });
     await chmodPrivateFile(tempPath, "temporary file", { missingOk: true });
     let handle;
     try {
@@ -260,7 +294,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     } catch (error) {
       throwFs("rename temporary file", destination, error);
     }
-    await chmodPrivateFile(destination, filename);
+    await chmodPrivateFile(destination, normalizedFilename);
   }
 
   async function writeRun(directory, run) {
@@ -701,5 +735,30 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     });
   }
 
-  return Object.freeze({ create, read, update, appendEvent, list, writeAssignment });
+  async function writePrivateFile(runId, { relativePath, text, updater } = {}) {
+    if (typeof text !== "string") {
+      failStore("writePrivateFile text must be a string");
+    }
+    if (typeof updater !== "function") {
+      failStore("writePrivateFile updater must be a function");
+    }
+    const id = ensureRunId(runId);
+    const directory = runDirectoryFor(id);
+    const filename = validatePrivateRelativePath(directory, relativePath);
+    await tightenExistingStateRootDirectory();
+    await tightenExistingRunDirectory(directory);
+
+    return withLock(directory, async () => {
+      const current = await readRunInternal(id, directory);
+      const patch = await updater(cloneJson(attachDirectory(current, directory)));
+      if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+        failStore("writePrivateFile updater must return an object");
+      }
+      await writeAtomicText(directory, filename, text);
+      const run = await writeRun(directory, updatedRun(current, patch));
+      return { run, path: join(directory, filename), writtenAt: run.updatedAt };
+    });
+  }
+
+  return Object.freeze({ create, read, update, appendEvent, list, writeAssignment, writePrivateFile });
 }

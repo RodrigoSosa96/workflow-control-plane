@@ -576,6 +576,66 @@ test("appendEvent appends private JSONL entries with store-assigned unique IDs",
   assert.equal((await stat(eventsPath)).mode & 0o777, 0o600);
 });
 
+test("writes a nested private artifact and updates the run under one run lock", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const relativePath = `delegations/${RUN_ID_2}/brief.md`;
+
+  const written = await store.writePrivateFile(RUN_ID_1, {
+    relativePath,
+    text: "frozen brief only",
+    updater: (current) => {
+      assert.equal(current.id, RUN_ID_1);
+      assert.equal(current.directory, run.directory);
+      return { delegationBriefPath: relativePath };
+    },
+  });
+
+  assert.equal(written.path, join(run.directory, relativePath));
+  assert.equal(await readFile(written.path, "utf8"), "frozen brief only");
+  assert.equal(await fileMode(join(run.directory, "delegations")), 0o700);
+  assert.equal(await fileMode(join(run.directory, "delegations", RUN_ID_2)), 0o700);
+  assert.equal(await fileMode(written.path), 0o600);
+  assert.equal((await store.read(RUN_ID_1)).delegationBriefPath, relativePath);
+});
+
+test("rejects unsafe private artifact paths without writing outside the run", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+
+  for (const relativePath of ["", "\0", "/tmp/escape", "../escape", "delegations/../../escape"]) {
+    await assert.rejects(
+      () => store.writePrivateFile(RUN_ID_1, {
+        relativePath,
+        text: "SECRET-DO-NOT-LEAK",
+        updater: () => ({}),
+      }),
+      (error) => {
+        assert.match(error.message, /private|path|relative/i);
+        assert.doesNotMatch(error.message, /SECRET-DO-NOT-LEAK/);
+        return true;
+      },
+    );
+  }
+
+  await assert.rejects(
+    () => store.writePrivateFile(RUN_ID_1, {
+      relativePath: "delegations/valid.md",
+      text: "brief",
+      updater: () => null,
+    }),
+    /updater|object/i,
+  );
+  await assertNoPath(join(stateRoot, "escape"));
+  await assertNoPath(join(run.directory, "escape"));
+});
+
 test("lists runs with filters and writes private assignments", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({
