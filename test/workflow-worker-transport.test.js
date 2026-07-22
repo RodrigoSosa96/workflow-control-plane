@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { createPiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { assertWorkerTransport, createFakeWorkerTransport } from "../src/workflow/worker-transport.js";
+
+const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const identity = Object.freeze({ kind: "herdr", paneId: "pane-1", processId: "pid-1" });
 
@@ -15,6 +20,19 @@ test("requires each worker transport operation", () => {
     delete transport[missing];
     assert.throws(() => assertWorkerTransport(transport), new RegExp(missing));
   }
+});
+
+test("pi delegation transport satisfies the worker transport contract", () => {
+  const transport = createPiDelegationTransport({
+    spawnChild: async () => ({ pid: "123", startedAt: "2025-01-01T00:00:00.000Z" }),
+    inspectProcess: async () => null,
+    stateRoot: "/state/workflow",
+    controlPlaneBin: "/control/bin/workflow",
+    childExtensionPath: join(projectRoot, ".pi", "extensions", "workflow-delegation-child.ts"),
+    agentDirectory: join(projectRoot, ".pi", "agents"),
+  });
+
+  assert.equal(assertWorkerTransport(transport), transport);
 });
 
 test("fake transport preserves exact identities and records no process side effects", async () => {
