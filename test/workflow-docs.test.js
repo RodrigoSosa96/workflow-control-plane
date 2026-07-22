@@ -100,6 +100,17 @@ test("supervised lifecycle plan defers internal Pi delegation details to the ada
   assert.doesNotMatch(plan, /\/subagents-doctor|\/subagents .*details/i);
 });
 
+test("fixture and canary plan keeps future-facing gates without Pi package smoke leftovers", async () => {
+  const plan = await read("docs/superpowers/plans/2026-07-19-workflow-fixture-canaries.md");
+  assert.match(plan, /artifact-level verification only/i);
+  assert.match(plan, /Two-lane fixture gates run in this exact order:[\s\S]*read-only foreground and background delegation[\s\S]*one writer in a workflow-owned fixture worktree[\s\S]*separately approved real harness canaries/i);
+  assert.match(plan, /read-only background fixture must prove[\s\S]*no terminal-derived result/i);
+  assert.match(plan, /writer-background fixture must prove[\s\S]*one writer per checkout[\s\S]*no automatic cleanup before any real canary is considered/i);
+  assert.match(plan, /Sequential real Pi\/Claude\/Codex canaries, each separately approved and preserved for inspection/i);
+  assert.doesNotMatch(plan, /\bpi list\b/i);
+  assert.doesNotMatch(plan, /pi install\b|npm view pi-subagents|npm pack pi-subagents|pi-subagents@/i);
+});
+
 test("AGENTS workflow stages include Plan between Design and Isolation", async () => {
   const agents = await read("AGENTS.md");
   assert.match(agents, /1\. \*\*Triage:\*\*[\s\S]*2\. \*\*Design:\*\*[\s\S]*3\. \*\*Plan:\*\*[\s\S]*4\. \*\*Isolation:\*\*/);

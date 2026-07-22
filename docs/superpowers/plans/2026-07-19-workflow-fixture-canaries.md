@@ -521,10 +521,11 @@ npm pack --dry-run
 git diff --check
 node bin/workflow.js doctor --format compact
 node bin/workflow.js hooks doctor --format compact
-pi list
 ```
 
-Then complete:
+Treat the command block above as artifact-level verification only. It does not satisfy or imply any fixture smoke, canary, or trust checkpoint.
+
+Then, only after the earlier staged gates are explicitly approved, complete:
 
 1. Real-Herdr fake-worker smoke for ordinary and group projects.
 2. Sequential real Pi/Claude/Codex canaries, each separately approved and preserved for inspection.
