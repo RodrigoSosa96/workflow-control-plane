@@ -432,6 +432,11 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     if (record.transportIdentity.cwd !== record.cwd) fail("Delegation cwd no longer matches the recorded identity");
     await activeReservation(record);
 
+    const observation = await workerTransport.observeExact(record.transportIdentity);
+    if (observation?.state !== "idle") {
+      fail(`Delegation remediation observation is ${observation?.state ?? "missing"}; exact worker must be idle`);
+    }
+
     let remediating = await delegations.beginRemediation({ runId, delegationId, expectedGeneration });
     try {
       await workerTransport.deliverFollowUp(record.transportIdentity, prompt);

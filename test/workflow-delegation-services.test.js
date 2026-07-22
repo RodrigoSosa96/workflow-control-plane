@@ -157,6 +157,14 @@ async function createFixture(t, { transport } = {}) {
   return { stateRoot, store, run, delegations, reservations, services, transport: effectiveTransport };
 }
 
+async function createCompletedDelegation(t, { transport } = {}) {
+  const fixture = await createFixture(t, { transport });
+  const preview = await fixture.services.createPreview({ runId: fixture.run.id, input: reviewInput });
+  await fixture.services.executeApproved({ preview, approvalDigest: preview.approvalDigest });
+  await fixture.delegations.recordResult({ runId: fixture.run.id, delegationId: DELEGATION_ID, result: completedResult(1) });
+  return fixture;
+}
+
 test("preview freezes role, cwd, budgets, and task digest without mutation", async (t) => {
   const { services, store, run } = await createFixture(t);
 
@@ -289,16 +297,89 @@ test("reconcile returns bounded state and withholds automatic remediation after 
   assert.doesNotMatch(JSON.stringify(reconciled), /summary|verification|concerns|terminal|stdout|stderr/i);
 });
 
+test("beginRemediation rejects missing observations before incrementing generation or delivering follow-up", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    observations: [{ state: "missing", identity: expectedIdentity }],
+  });
+  const { services, store, run } = await createCompletedDelegation(t, { transport });
+
+  await assert.rejects(
+    () => services.beginRemediation({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      expectedGeneration: 1,
+      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+      prompt: "Address the approved correction.",
+    }),
+    /observe|observation|missing|remediation/i,
+  );
+
+  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 1);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
+});
+
+test("beginRemediation rejects mismatched observations before incrementing generation or delivering follow-up", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    observations: [{
+      state: "mismatch",
+      identity: { ...expectedIdentity, pid: "99999", processStartedAt: "2025-01-01T00:20:00.000Z" },
+    }],
+  });
+  const { services, store, run } = await createCompletedDelegation(t, { transport });
+
+  await assert.rejects(
+    () => services.beginRemediation({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      expectedGeneration: 1,
+      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+      prompt: "Address the approved correction.",
+    }),
+    /observe|observation|mismatch|remediation/i,
+  );
+
+  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 1);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
+});
+
+test("beginRemediation rejects unsafe active observations before incrementing generation or delivering follow-up", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    observations: [{ state: "active", identity: expectedIdentity }],
+  });
+  const { services, store, run } = await createCompletedDelegation(t, { transport });
+
+  await assert.rejects(
+    () => services.beginRemediation({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      expectedGeneration: 1,
+      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+      prompt: "Address the approved correction.",
+    }),
+    /observe|observation|active|idle|remediation/i,
+  );
+
+  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 1);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
+});
+
 test("beginRemediation permits only two turns with matching review evidence and identity", async (t) => {
   const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
   const transport = createTransport({
     startImpl: async () => ({ identity: expectedIdentity }),
-    observations: [{ state: "idle", identity: expectedIdentity }],
+    observations: [
+      { state: "idle", identity: expectedIdentity },
+      { state: "idle", identity: expectedIdentity },
+      { state: "idle", identity: expectedIdentity },
+    ],
   });
-  const { services, delegations, run } = await createFixture(t, { transport });
-  const preview = await services.createPreview({ runId: run.id, input: reviewInput });
-  await services.executeApproved({ preview, approvalDigest: preview.approvalDigest });
-  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(1) });
+  const { services, delegations, run } = await createCompletedDelegation(t, { transport });
 
   const first = await services.beginRemediation({
     runId: run.id,
@@ -344,6 +425,7 @@ test("beginRemediation preserves the incremented generation when follow-up deliv
     deliverFollowUpImpl: async () => {
       throw new Error("SECRET-DELIVERY-FAILURE");
     },
+    observations: [{ state: "idle", identity: expectedIdentity }],
   });
   const { services, delegations, store, run } = await createFixture(t, { transport });
   const preview = await services.createPreview({ runId: run.id, input: reviewInput });
