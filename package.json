@@ -12,6 +12,8 @@
     "bin",
     "config",
     "src",
+    ".pi/agents",
+    ".pi/extensions",
     ".pi/prompts",
     "projects.yaml",
     "README.md"

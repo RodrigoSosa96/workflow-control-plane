@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Supervise Pi/Claude/Codex turns with native lifecycle hooks, generation-aware handoffs, exact-session resume/reconciliation, Pi-session result delivery, and conservative internal Pi delegation.
+**Goal:** Supervise external Pi/Claude/Codex turns with native lifecycle hooks, generation-aware handoffs, exact-session resume/reconciliation, graceful close, and session-owned result delivery while consuming the separate Workflow-owned Pi delegation adapter for internal work.
 
-**Architecture:** A harness-neutral lifecycle callback updates the private run store from native SessionStart/UserPromptSubmit/Stop/SessionEnd events. Generated Claude settings, an explicitly installed Codex hook profile, and a launched-worker Pi extension adapt native event shapes; a separate project-local coordinator extension previews/executes CLI plans, watches only runs owned by its Pi session, and injects validated results without terminal scraping.
+**Architecture:** A harness-neutral lifecycle callback updates the private run store from native SessionStart/UserPromptSubmit/Stop/SessionEnd events. Generated Claude settings, an explicitly installed Codex hook profile, a launched-worker Pi extension, and a Herdr-backed `WorkerTransport` adapt external event shapes. Internal Pi delegation previews, exact private sessions, advisory handoffs, and later-session adoption are owned by the separate Workflow adapter plan and are consumed here only through its stable contracts.
 
-**Tech Stack:** Node.js 24 ES modules, `node:test`, Pi extension API 0.80+, Claude Code hooks 2.1+, Codex hooks 0.144+, Herdr 0.7.4, `pi-subagents@0.34.0` project-local package.
+**Tech Stack:** Node.js 24 ES modules, `node:test`, Pi extension API 0.80+, Claude Code hooks 2.1+, Codex hooks 0.144+, Herdr 0.7.4.
 
-> **Amendment — two-lane delegation:** Complete `2026-07-19-two-lane-delegation-foundation.md` first. This plan must consume its project policy, private delegation store, durable reservations, prepared-request validator, and narrow worker transport; it must not reimplement their state or lock rules.
+> **Amendment — external lifecycle plus adapter prerequisite:** Complete `2026-07-19-two-lane-delegation-foundation.md` and `2026-07-19-workflow-owned-pi-delegation-adapter.md` first. This plan consumes their `WorkerTransport`, delegation services, exact private-session watcher/adoption, and managed-role contracts; it must not reimplement them or introduce package/global Pi state.
 
 ## Global Constraints
 
-- Complete and review the multi-harness launch-core plan before starting this plan.
+- Complete and review the multi-harness launch-core plan and the Workflow-owned adapter plan before starting this plan.
 - Follow strict red-green-refactor TDD for every production behavior.
 - A prompt or skill is advisory; native hooks and the run state machine own lifecycle truth.
 - Stop-hook continuation is bounded to two workflow-owned attempts and must never loop indefinitely.
@@ -24,13 +24,12 @@
 - No agent, hook, or extension may delete a branch/worktree/workspace/run or perform deployment/production mutation.
 - Explicit close sends a graceful idle-session exit only after process identity validation; it must not kill an unknown or working process.
 - No permission, sandbox, or hook-trust bypass flags.
-- `pi-subagents` is pinned exactly to `0.34.0`, used only through its supported public Pi tool surface and never through package internals.
-- Internal package worktrees, nested delegation, watchdog/scheduling/configuration actions, and unprepared requests are always blocked.
-- Background Pi delegations follow the effective project policy: read-only scouts/reviewers may be enabled only by a prepared request and durable reservation; writers remain foreground until the generated writer fixture gate succeeds, then still require a workflow-owned worktree and one writer-per-checkout reservation.
-- Concurrency follows the effective per-project policy rather than a fixed global cap; every request must hold matching total, role/mode, and writer-checkout capacity.
-- Install project packages and user-level Codex hook configuration only at their explicit checkpoints.
+- Canonical external completion remains the validated Workflow handoff artifact; internal delegation outputs remain advisory and exact private-session scoped.
+- Background writers stay disabled until the read-only and writer fixture gates pass, a separate canary is explicitly approved, and a reviewed policy change enables them.
+- No daemon, package, or global Pi state may hold workflow truth, session ownership, or delegation policy.
 - Start Pi timers/watchers only during `session_start`; stop them idempotently during `session_shutdown`.
 - Results may be injected only into the exact originating Pi session; later sessions require explicit adoption.
+- Never automatically release a reservation, clean up a run/worktree/session, or kill a process.
 - Never expose session transcript contents, `.env`, auth stores, hook trust stores, credentials, or raw environment data.
 - End every task with focused tests, full `npm test`, `git diff --check`, specification review, and code-quality review.
 
@@ -43,16 +42,12 @@ bin/
   workflow.js                              resume/reconcile/close/hooks commands
   workflow-handoff-hook.js                 Native hook stdin adapter
 src/workflow/
-  delegation-policy.js                     Effective project limits and role classification
-  delegation-store.js                      Frozen briefs, bounded internal state, generations
-  delegation-reservations.js               Durable capacity and writer-checkout ownership
-  worker-transport.js                      Exact external/internal transport boundary
+  worker-transport.js                      Exact external-worker transport boundary
   lifecycle.js                             Harness-neutral generation protocol
   hook-config.js                           Claude/Codex reviewed hook configuration
   resume.js                                Exact live/dead session resume planning/execution
   close.js                                 Explicit graceful worker close
-  coordinator-policy.js                    Pi subagent/launch policy helpers
-  coordinator-runs.js                      Session-owned watcher/adoption logic
+  coordinator-runs.js                      Session-owned external-result watcher/adoption logic
   commands.js                              Lifecycle command use cases
   harnesses.js                             Hook-enabled launch and exact resume argv
   herdr.js                                 send-text/send-keys/focus/wait helpers
@@ -60,15 +55,10 @@ src/workflow/
   reconcile.js                             Lifecycle/process/Git run reconciliation
   run-store.js                             Generation/result/event operations
 .pi/
-  settings.json                            Pinned project package source
-  agents/
-    sdd-implementer.md
-    spec-reviewer.md
-    code-reviewer.md
   extensions/
     workflow-worker-lifecycle.ts           Pi worker hook adapter and handoff tool
     workflow-coordinator/
-      index.ts                             Thin Pi coordinator extension
+      index.ts                             Thin Pi coordinator integration layer
       package.json                         Peer dependencies only when needed
 scripts/
   install-codex-workflow-hooks.js          Previewable fixed profile installer
@@ -78,7 +68,6 @@ test/
   workflow-hook-config.test.js
   workflow-resume.test.js
   workflow-close.test.js
-  workflow-coordinator-policy.test.js
   workflow-coordinator-runs.test.js
   workflow-pi-extensions.test.js
   workflow-cli.test.js                     Extended
@@ -89,11 +78,11 @@ test/
 
 ---
 
-### Task 0: Two-Lane Foundation Integration
+### Task 0: Two-Lane Foundation and Adapter Integration
 
-**Prerequisite:** `2026-07-19-two-lane-delegation-foundation.md` is complete with fresh full-suite evidence.
+**Prerequisite:** `2026-07-19-two-lane-delegation-foundation.md` and `2026-07-19-workflow-owned-pi-delegation-adapter.md` are complete with fresh full-suite evidence.
 
-Before any hook, package, or coordinator extension work, inject `resolveDelegationPolicy`, `createDelegationStore`, `createDelegationReservationStore`, `assertWorkerTransport`, and `validateSubagentRequestPolicy` through the lifecycle/coordinator dependencies. Add only adapter wiring tests here: no hook/user configuration write, package installation, or model invocation. External lifecycle continues to use canonical worker handoffs; internal delegation outputs remain advisory.
+Before any external hook, Herdr, resume, or close work, inject `assertWorkerTransport`, `createDelegationServices`, `createDelegationWatcher`, and result/adoption helpers through the lifecycle/coordinator boundary. Add only adapter-consumption wiring tests here: no package installation, no user/global Pi configuration, no real Pi child, and no model invocation. External lifecycle continues to use canonical worker handoffs; internal delegation outputs remain advisory and session-owned.
 
 ### Task 1: Generation-Aware Native Lifecycle Callback
 
@@ -497,58 +486,42 @@ git commit -m "feat(workflow): reconcile and resume exact worker sessions"
 
 ---
 
-### Task 4: Pi Coordinator Extension and Session-Owned Result Watcher
+### Task 4: Session-Owned External Result Delivery and Adapter Consumption
 
 **Files:**
-- Create: `src/workflow/coordinator-policy.js`
 - Create: `src/workflow/coordinator-runs.js`
-- Create: `.pi/extensions/workflow-coordinator/index.ts`
-- Create: `test/workflow-coordinator-policy.test.js`
+- Modify: `.pi/extensions/workflow-coordinator/index.ts`
 - Create: `test/workflow-coordinator-runs.test.js`
 - Modify: `test/workflow-pi-extensions.test.js`
 
 **Interfaces:**
-- Produces `validateSubagentRequestPolicy(input) -> { allowed, reason? }`.
 - Produces `createRunWatcher({ store, originSessionId, onResult, intervalMs?, clock? })` with `start()`, `poll()`, `stop()`.
-- Coordinator extension registers launch/reconcile/result/adopt/resume tools and slash commands.
+- Coordinator integration consumes adapter-owned delegation services/watchers and keeps later-session adoption explicit.
 
-- [ ] **Step 1: Write failing subagent policy tests**
-
-```js
-test("blocks unsupported internal background, worktree, and excessive concurrency", () => {
-  assert.match(validateSubagentRequestPolicy({ async: true }).reason, /foreground/i);
-  assert.match(validateSubagentRequestPolicy({ worktree: true }).reason, /launcher-owned worktree/i);
-  assert.match(validateSubagentRequestPolicy({ tasks: [{ agent: "a" }, { agent: "b" }], concurrency: 4 }).reason, /maximum.*3/i);
-  assert.equal(validateSubagentRequestPolicy({ agent: "spec-reviewer", task: "Review", async: false }).allowed, true);
-});
-```
-
-Walk sequential/static-parallel request shapes recursively. Block a child agent definition that requests `subagent` tools through the coordinator's managed roles. Unknown management actions pass through only when non-mutating; persistent config actions require direct user invocation rather than model automation.
-
-- [ ] **Step 2: Write failing watcher/adoption tests**
+- [ ] **Step 1: Write failing watcher/adoption tests**
 
 Cover:
 
 - watcher starts only after session start;
-- lists only unconsumed runs whose `originSessionId` exactly matches;
+- lists only unconsumed external results whose `originSessionId` exactly matches;
 - injects one bounded result and atomically marks it consumed by that session;
 - no duplicate injection after reload/poll races;
 - no injection into a different session;
 - shutdown clears timer and leaves results persistent;
-- a new session lists pending runs but requires explicit adoption;
-- stale/manual results produce status notices, not completion turns.
+- a new session lists pending results but requires explicit adoption;
+- stale/manual states produce status notices, not completion turns.
 
 Use fake timers/callbacks; never sleep in unit tests.
 
-- [ ] **Step 3: Verify RED**
+- [ ] **Step 2: Verify RED**
 
 ```bash
-node --test test/workflow-coordinator-policy.test.js test/workflow-coordinator-runs.test.js test/workflow-pi-extensions.test.js
+node --test test/workflow-coordinator-runs.test.js test/workflow-pi-extensions.test.js
 ```
 
-Expected: FAIL because coordinator modules/extension do not exist.
+Expected: FAIL because watcher/integration wiring is absent.
 
-- [ ] **Step 4: Implement the session-owned watcher**
+- [ ] **Step 3: Implement the session-owned watcher**
 
 The watcher polls bounded metadata, not terminal content. It has one in-flight poll, uses an unref'd timer where supported, stops idempotently, and calls `store.consumeResult(runId, originSessionId)` before notification to win races.
 
@@ -568,195 +541,43 @@ A completion callback receives only:
 }
 ```
 
-- [ ] **Step 5: Implement thin Pi tools with UI confirmation**
+- [ ] **Step 4: Wire thin Pi coordinator integration**
 
-Register tools with strict TypeBox schemas:
+Keep external run observation in this plan and consume the adapter-owned delegation tools exactly as documented in `2026-07-19-workflow-owned-pi-delegation-adapter.md`. Start watchers only in `session_start`; stop them in `session_shutdown`. Do not recreate delegation policy, role parsing, child-session management, package discovery, or user-global Pi configuration here.
 
-- `workflow_prepare_launch`
-- `workflow_execute_launch`
-- `workflow_reconcile_run`
-- `workflow_result`
-- `workflow_adopt_result`
-- `workflow_resume_run`
-
-The prepare tool returns/renders the complete assignment and approval digest. Execute/resume require `ctx.hasUI`, call `ctx.ui.confirm`, and execute exactly the in-memory approved preview; headless modes fail closed with a CLI command. The extension does not infer paths outside `projects.yaml` and uses the existing read-only Asana CLI only as context gathering.
-
-On a watcher result, use:
-
-```ts
-pi.sendMessage({
-  customType: "workflow-run-result",
-  content: boundedSummary,
-  display: true,
-  details,
-}, {
-  deliverAs: "followUp",
-  triggerTurn: ctx.isIdle(),
-});
-```
-
-Start the watcher in `session_start`; stop in `session_shutdown`. Persist minimal extension state through run-store consumption, not a second database.
-
-- [ ] **Step 6: Enforce subagent policy at `tool_call`**
-
-When `event.toolName === "subagent"`, call `validateSubagentRequestPolicy`. Return `{ block: true, reason }` for async, internal worktree, or concurrency violations. Do not mutate a dangerous request into a seemingly approved one.
-
-- [ ] **Step 7: Run extension tests and manual load smoke**
+- [ ] **Step 5: Run extension tests**
 
 ```bash
-node --test test/workflow-coordinator-policy.test.js test/workflow-coordinator-runs.test.js test/workflow-pi-extensions.test.js
+node --test test/workflow-coordinator-runs.test.js test/workflow-pi-extensions.test.js
 npm test
-pi -e ./.pi/extensions/workflow-coordinator/index.ts --no-session -p "List the workflow coordinator tools; do not launch anything."
 git diff --check
 ```
 
-Expected: tests pass; Pi lists tools and performs no mutation. This manual smoke may call the configured model once; show the command and obtain approval before running it if token use was not already approved for this verification.
+Expected: tests pass with no real Pi/model invocation.
 
-- [ ] **Step 8: Commit Task 4**
+- [ ] **Step 6: Commit Task 4**
 
 ```bash
-git add src/workflow/coordinator-policy.js src/workflow/coordinator-runs.js .pi/extensions/workflow-coordinator/index.ts test/workflow-coordinator-policy.test.js test/workflow-coordinator-runs.test.js test/workflow-pi-extensions.test.js
-git commit -m "feat(workflow): notify the originating Pi coordinator"
+git add src/workflow/coordinator-runs.js .pi/extensions/workflow-coordinator/index.ts test/workflow-coordinator-runs.test.js test/workflow-pi-extensions.test.js
+git commit -m "feat(workflow): notify the originating coordinator session"
 ```
 
 ---
 
-### Task 5: Pinned `pi-subagents` and Conservative SDD Roles
-
-**Files:**
-- Create/Modify: `.pi/settings.json`
-- Create: `.pi/agents/sdd-implementer.md`
-- Create: `.pi/agents/spec-reviewer.md`
-- Create: `.pi/agents/code-reviewer.md`
-- Modify: `.gitignore`
-- Create: `test/workflow-subagents-config.test.js`
-- Modify: `README.md`
-
-**Interfaces:**
-- Project Pi settings load exactly `npm:pi-subagents@0.34.0`.
-- Three project agents are discoverable with bounded tools and no nested subagent tool.
-- Coordinator policy remains the hard local guard for async/worktree/concurrency requests.
-
-- [ ] **Step 1: Review the exact package before installation**
-
-Run in a disposable directory:
-
-```bash
-npm view pi-subagents@0.34.0 version dist.integrity dist.tarball --json
-npm pack pi-subagents@0.34.0 --dry-run
-```
-
-Download/extract the tarball under `/tmp`, verify `package.json` version and Pi manifest, and review extension entrypoints plus install scripts. Confirm there is no package export for later `delegation`/`background-work` APIs and no install script that mutates unrelated user state. Record the integrity in the task report; do not commit the tarball.
-
-- [ ] **Step 2: Write failing config-policy tests**
-
-Test that `.pi/settings.json` contains the exact pinned source, not an unversioned/latest range. Parse each agent frontmatter and assert:
-
-- no `subagent` tool;
-- `maxSubagentDepth: 1`;
-- `async` absent or false;
-- implementer has read/bash/edit/write;
-- reviewers omit edit/write and explicitly prohibit modifications in prose;
-- all inherit project context;
-- names are exact and unique.
-
-Also assert `.gitignore` ignores `.pi/npm/` and no `.pi/npm` content is tracked.
-
-- [ ] **Step 3: Verify RED**
-
-Run: `node --test test/workflow-subagents-config.test.js`
-
-Expected: FAIL because settings/agents are absent.
-
-- [ ] **Step 4: Install the pinned package locally**
-
-After source review:
-
-```bash
-pi install -l npm:pi-subagents@0.34.0
-```
-
-Inspect the resulting `.pi/settings.json`. Keep only the exact package entry generated by Pi; do not manually copy package source into the repository. Add `.pi/npm/` to `.gitignore`.
-
-- [ ] **Step 5: Add conservative agent definitions**
-
-Use this frontmatter shape for the implementer:
-
-```yaml
----
-name: sdd-implementer
-description: Implements one approved plan task with TDD and a bounded report
-tools: read,bash,edit,write
-systemPromptMode: append
-inheritProjectContext: true
-inheritSkills: true
-async: false
-maxSubagentDepth: 1
----
-```
-
-The body must require: one task only, no subagents, TDD, no unapproved design changes, configured tests, `git diff --check`, no cleanup/push/deploy, and a final report with files/commands/risks.
-
-Reviewers use `tools: read,bash`, `async: false`, `maxSubagentDepth: 1`, no edits, and distinct prompts:
-
-- `spec-reviewer`: compare implementation only to task/spec; report missing/extra behavior.
-- `code-reviewer`: inspect correctness, safety, tests, simplicity, and regressions after spec approval.
-
-- [ ] **Step 6: Validate package and agent discovery**
-
-```bash
-node --test test/workflow-subagents-config.test.js
-pi list
-```
-
-Then start an interactive trusted project Pi and run:
-
-```text
-/subagents-doctor
-/subagents sdd-implementer details
-/subagents spec-reviewer details
-/subagents code-reviewer details
-```
-
-Do not launch a writing child in the main checkout. Use a read-only reviewer prompt or the later generated fixture for a real child test.
-
-- [ ] **Step 7: Update documentation**
-
-Document exact pin, foreground-only policy, max concurrency 3, no internal worktrees/watchdog, managed roles, coordinator tool-call guard, and the fact that version 0.34 has no public extension API. Document that upgrading requires separate review.
-
-- [ ] **Step 8: Run full verification and commit**
-
-```bash
-npm test
-npm pack --dry-run
-git diff --check
-git status --short
-```
-
-Then:
-
-```bash
-git add .pi/settings.json .pi/agents/sdd-implementer.md .pi/agents/spec-reviewer.md .pi/agents/code-reviewer.md .gitignore test/workflow-subagents-config.test.js README.md
-git commit -m "chore(workflow): pin conservative Pi subagents"
-```
-
-Never add `.pi/npm/`, `~/.pi`, sessions, run history, auth, or package caches.
-
----
-
-### Task 6: Lifecycle Documentation and Stage Verification
+### Task 5: Documentation and Staged Validation Handoff
 
 **Files:**
 - Modify: `README.md`
-- Modify: `docs/superpowers/specs/2026-07-19-multi-harness-workflow-coordinator-design.md` only if verified implementation constraints require a documented correction
+- Modify: `docs/superpowers/plans/2026-07-19-supervised-lifecycle-pi-coordinator.md`
 - Modify: `test/workflow-docs.test.js`
 
 **Interfaces:**
-- User documentation covers lifecycle states, generations, native hooks, fallback, resume/reconcile, closed Pi adoption, and explicit graceful close.
+- User documentation distinguishes canonical external worker results from advisory internal delegation results.
+- Downstream validation gates stay artifact-based and explicitly ordered.
 
 - [ ] **Step 1: Write failing documentation assertions**
 
-Assert README contains commands/examples for:
+Assert README documents:
 
 ```text
 workflow hooks doctor
@@ -764,19 +585,21 @@ workflow resume <run-id>
 workflow reconcile --run <run-id>
 workflow result <run-id>
 workflow close <run-id>
+workflow delegation result <run-id> <delegation-id>
+workflow delegation reconcile <run-id> <delegation-id>
 manual-handoff-required
 result-stale
 ```
 
-Also assert it states no terminal scraping, no guessed recent session, no automatic cleanup, and no cross-session result injection.
+Also assert it states: no terminal scraping, no guessed recent session, no automatic cleanup/release/kill, exact private internal sessions, advisory internal results, explicit later-session adoption, no package/global Pi state, and background writers still blocked until approved fixture/canary gates.
 
 - [ ] **Step 2: Update operational documentation**
 
-Include scenario tables:
+Include a two-lane table and scenario notes covering:
 
 | Scenario | Reconciled behavior |
 |---|---|
-| Origin Pi closes | result persists; later session explicitly adopts |
+| Origin Pi closes | external result persists; later session explicitly adopts any pending advisory delegation result |
 | Worker gets follow-up prompt | generation increments; previous result stales |
 | Worker closes with result | terminal result remains current |
 | Worker closes without result | interrupted/manual handoff |
@@ -784,42 +607,40 @@ Include scenario tables:
 | Git changes after handoff | result-stale |
 | Native session ID missing | resume refuses to guess |
 
-Explain that “return to Pi” means hook → run store → Pi watcher, not terminal switching. Explain hooks improve compliance but the hard guarantee is that missing/invalid/stale handoffs never become success.
+Explain that “return to Pi” means child/external handoff → run store → exact origin-session watcher, not terminal switching. Explain that hooks improve compliance but the hard guarantee is still that missing/invalid/stale handoffs never become success.
 
-- [ ] **Step 3: Run complete stage verification**
+- [ ] **Step 3: Run documentation-stage verification**
 
 ```bash
+node --test test/workflow-docs.test.js
 npm ci
 npm test
 npm pack --dry-run
 git diff --check
-node bin/workflow.js doctor --format compact
-node bin/workflow.js hooks doctor --format compact
-pi list
+git status --short
 ```
 
-Expected: all automated checks pass; doctor reports actual installed hook/package readiness without exposing credentials.
+Expected: all tests pass; package contents include no session state, generated artifacts, package cache, or credentials.
 
 - [ ] **Step 4: Commit documentation**
 
 ```bash
-git add README.md test/workflow-docs.test.js docs/superpowers/specs/2026-07-19-multi-harness-workflow-coordinator-design.md
-git commit -m "docs(workflow): explain supervised agent lifecycle"
+git add README.md docs/superpowers/plans/2026-07-19-supervised-lifecycle-pi-coordinator.md test/workflow-docs.test.js
+git commit -m "docs(workflow): explain external lifecycle and adapter boundary"
 ```
-
-If the spec was unchanged, omit it from `git add`.
 
 ---
 
 ## Stage 2 Completion Gate
 
-Before building the fixture/canaries:
+Before executing generated fixtures or any later canary:
 
-1. Run the full verification commands from Task 6 with fresh output.
-2. Run fresh specification and code-quality/security reviewers.
-3. Exercise only read-only coordinator commands in the real control-plane Pi session.
-4. Confirm no unexpected workspaces, workers, user config, or tracked package caches were created.
-5. Record exact Pi/Claude/Codex/Herdr and `pi-subagents` versions.
-6. Preserve branch/worktree/session resources; do not clean automatically.
+1. Re-run the artifact checks from Task 5 with fresh output.
+2. Review the full diff against `2026-07-19-two-lane-delegation-governance-design.md` and `2026-07-19-workflow-owned-pi-delegation-adapter-design.md`.
+3. Confirm external canonical handoffs remain distinct from internal advisory delegation results.
+4. Confirm exact private-session governance, explicit later-session adoption, one writer per checkout, and no terminal-derived result fields.
+5. Confirm no automatic cleanup, reservation release, or process kill was added.
+6. Proceed in order: read-only delegation fixtures, writer fixture, then a separately approved canary/trust checkpoint.
+7. Keep background writers disabled until those downstream gates pass and a reviewed policy change enables them.
 
-Do not run a real implementation prompt against OCR, Acme, or any registered project. Real harness execution belongs exclusively to the generated fixture plan.
+Do not mark fixtures, canaries, or trust checks as run or passed in this plan. Do not run a real implementation prompt against OCR, Acme, or any registered project here.

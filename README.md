@@ -50,19 +50,21 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 - The launcher follows a no-cleanup policy: failed or partial launches preserve worktrees, Herdr tabs/panes, run directories, and the fallback workspace for manual recovery.
 - Acme bundle planning must name the selected repositories explicitly with `--repos`.
 - Real Acme meta-repository setup remains a separate explicit checkpoint after disposable verification; the launcher branch must not initialize or modify the real work project automatically.
-- Native hooks and resume automation are explicitly unavailable in this stage; native hooks/resume are the next implementation stage, not current behavior.
+- `workflow hooks doctor`, `workflow resume`, and `workflow close` operate only on exact recorded worker identity; they never guess a recent session, scrape a terminal, or inject a result into another Pi session automatically.
+- No external or internal lane performs automatic cleanup, reservation release, or process kill; preserved resources remain available for manual inspection.
 
-### Two-lane delegation foundation (not operational yet)
+### Two-lane operator model
 
-The two-lane delegation foundation separates external Pi/Claude/Codex workflow workers from internal Pi delegations. `workflow` remains authoritative for ticket identity, assignments, lifecycle, results, locks, and all worktrees.
+The control plane runs two governed lanes. External Pi/Claude/Codex workers produce canonical Workflow results. Internal Pi delegations produce advisory evidence only. `workflow` remains authoritative for ticket identity, assignments, lifecycle, results, reservations, reconciliation, and all worktrees.
 
-| Lane | Allowed foundation policy |
-|---|---|
-| External worker | `workflow launch` owns the worktree and preserves the canonical handoff/result protocol. |
-| Internal scout/spec reviewer/code reviewer | Read-only advisory work; background reviewers are budgeted and require a later prepared-request coordinator guard. |
-| Internal implementer | Foreground only in the next stage; any later background writer requires a workflow-owned worktree and one writer per checkout. |
+| Lane | Result contract | Session and governance | Current gate |
+|---|---|---|---|
+| External worker | Canonical external worker result via `workflow handoff` and canonical `result.json`. | Workflow-owned worktree, native lifecycle hooks, exact external resume/close only. | Operational after approved launch preview and exact handoff. |
+| Internal delegation | Advisory internal delegation result via `workflow delegation handoff`, `workflow delegation result`, and `workflow delegation reconcile`. | Exact private session file below the parent run directory, Workflow child handoff plus origin-session watcher, later sessions require explicit adoption. | Read-only foreground/background fixtures first; background writers stay denied until the read-only and writer fixture gates pass, a separate canary is approved, and policy is reviewed. |
 
-The foundation enforces configurable per-project limits, exact-session metadata, immutable brief digests, and retained reservation history. It does not install `pi-subagents`, register hooks, launch agents, or enable background writers. Package configuration is never the authority: the later project-local coordinator guard must reject internal worktrees, nested delegation, unprepared requests, and unsafe administrative actions.
+Internal child sessions are Workflow-private. They are never sourced from `~/.pi`, a package daemon, or global Pi state. The control plane does not install or use `pi-subagents`; it ships its own `.pi/agents` and `.pi/extensions` paths, watches only the exact origin session, keeps internal results advisory, and preserves the one writer per checkout rule.
+
+Across both lanes there is no terminal scraping, no guessed recent session, and no automatic cleanup, release, or kill. Package or user-global Pi configuration is never the authority for delegation policy.
 
 ### Profile selection precedence
 
@@ -78,6 +80,7 @@ Run these from this repository after the design and implementation plan are appr
 
 ```bash
 workflow doctor ocr
+workflow hooks doctor --format compact
 workflow plan ocr ASANA-123 --feature "Discovered Docs"
 workflow start ocr ASANA-123 --feature "Discovered Docs" --yes
 workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --dry-run
@@ -86,7 +89,11 @@ workflow launch ocr ASANA-123 --agent codex-worker --prompt-file request.md --dr
 workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --approval-digest sha256:<digest> --yes
 workflow result <run-id>
 workflow reconcile [project] --run <run-id>
+workflow resume <run-id>
+workflow close <run-id>
 workflow handoff <run-id> --input <run-directory>/handoff-input.json
+workflow delegation result <run-id> <delegation-id>
+workflow delegation reconcile <run-id> <delegation-id>
 workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes
 workflow status ocr ASANA-123 --feature "Discovered Docs"
 workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel
@@ -96,13 +103,23 @@ Use `workflow plan` as the read-only environment checkpoint before `workflow sta
 
 ### Worker handoff and results
 
-Workers write structured JSON only to `$WORKFLOW_RUN_DIR/handoff-input.json` and submit it with:
+External workers write structured JSON only to `$WORKFLOW_RUN_DIR/handoff-input.json` and submit it with:
 
 ```bash
 workflow handoff <run-id> --input <run-directory>/handoff-input.json
 ```
 
-`workflow result <run-id>` reads the canonical result. Exit `0` means a current terminal result was available; exit `20` means pending, exit `21` means stale, and exit `22` means manual handoff is required. `workflow reconcile [project] --run <run-id>` performs no repair, launch, cleanup, or destructive action; it emits exact safe next actions such as `workflow result`, `workflow status`, and the canonical `workflow handoff` command.
+Internal Pi delegations keep their exact private session and bounded advisory artifacts below the parent run directory and submit only through the child handoff path:
+
+```bash
+workflow delegation handoff <run-id> <delegation-id> --input <run-directory>/delegations/<delegation-id>/handoff-input.json
+```
+
+`workflow result <run-id>` reads the canonical external worker result. `workflow delegation result <run-id> <delegation-id>` reads the current advisory internal delegation result, and `workflow delegation reconcile <run-id> <delegation-id>` reports exact private-session/process state plus next actions.
+
+External exit `0` means a current terminal result was available; exit `20` means pending, exit `21` means `result-stale`, and exit `22` means `manual-handoff-required`. `workflow reconcile [project] --run <run-id>` performs no repair, launch, cleanup, or destructive action; it emits exact safe next actions such as `workflow result`, `workflow status`, and the canonical `workflow handoff` command.
+
+If the origin Pi session closes before an advisory delegation result is consumed, the result stays pending. A later coordinator session must explicitly adopt it; no cross-session result injection occurs automatically.
 
 ## Asana workflow CLI
 
