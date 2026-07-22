@@ -72,14 +72,18 @@ function recordFor(run, id) {
 
 function validateBudget(value) {
   assertObject(value, "delegation budget");
-  assertExactKeys(value, new Set(["maxRuntimeMs", "concurrency"]), "delegation budget");
-  if (!Number.isInteger(value.maxRuntimeMs) || value.maxRuntimeMs < 1) {
-    fail("delegation budget.maxRuntimeMs must be a positive integer");
+  assertExactKeys(value, new Set(["maxRuntimeMs", "concurrency", "maxTurns", "maxToolCalls"]), "delegation budget");
+  for (const field of ["maxRuntimeMs", "concurrency", "maxTurns", "maxToolCalls"]) {
+    if (!Number.isInteger(value[field]) || value[field] < 1) {
+      fail(`delegation budget.${field} must be a positive integer`);
+    }
   }
-  if (!Number.isInteger(value.concurrency) || value.concurrency < 1) {
-    fail("delegation budget.concurrency must be a positive integer");
-  }
-  return { maxRuntimeMs: value.maxRuntimeMs, concurrency: value.concurrency };
+  return {
+    maxRuntimeMs: value.maxRuntimeMs,
+    concurrency: value.concurrency,
+    maxTurns: value.maxTurns,
+    maxToolCalls: value.maxToolCalls,
+  };
 }
 
 function validateSession(value) {
@@ -92,6 +96,25 @@ function validateSession(value) {
   };
   if (value.path !== undefined) session.path = assertString(value.path, "native session path", { limit: MAX_SHORT_TEXT, absolute: true });
   return session;
+}
+
+function validateTransportIdentity(value, runId, delegationId) {
+  assertObject(value, "transport identity");
+  assertExactKeys(value, new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]), "transport identity");
+  if (value.kind !== "pi-delegation") fail("transport identity kind is unsupported");
+  const identity = {
+    kind: "pi-delegation",
+    runId: assertString(value.runId, "transport identity runId", { limit: 128 }),
+    delegationId: assertString(value.delegationId, "transport identity delegationId", { limit: 128 }),
+    sessionPath: assertString(value.sessionPath, "transport identity sessionPath", { limit: MAX_SHORT_TEXT, absolute: true }),
+    cwd: assertString(value.cwd, "transport identity cwd", { limit: MAX_SHORT_TEXT, absolute: true }),
+    pid: assertString(value.pid, "transport identity pid", { limit: 128 }),
+    processStartedAt: assertString(value.processStartedAt, "transport identity processStartedAt", { limit: 128 }),
+  };
+  if (identity.runId !== runId || identity.delegationId !== delegationId) {
+    fail("transport identity does not match the delegation");
+  }
+  return identity;
 }
 
 function validateResult(value) {
@@ -172,6 +195,8 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           updatedAt: timestamp,
           briefPath: join(run.directory, relativePath),
           nativeSession: null,
+          transportIdentity: null,
+          startFailure: null,
           result: null,
           remediationTurnsUsed: 0,
           remediationTurns,
@@ -219,6 +244,36 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       delegationId: id,
       expectedStates: new Set(["running"]),
       mutate: (record) => ({ ...record, nativeSession }),
+    });
+  }
+
+  async function recordTransportIdentity({ runId, delegationId: id, identity } = {}) {
+    const transportIdentity = validateTransportIdentity(identity, runId, id);
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: new Set(["running"]),
+      mutate: (record) => {
+        if (record.transportIdentity) fail("Delegation transport identity is already recorded");
+        return { ...record, transportIdentity };
+      },
+    });
+  }
+
+  async function recordStartFailure({ runId, delegationId: id, reason } = {}) {
+    const boundedReason = assertString(reason, "delegation start failure reason", { limit: 1024 });
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: new Set(["running"]),
+      mutate: (record) => ({
+        ...record,
+        state: "failed",
+        startFailure: {
+          reason: boundedReason,
+          failedAt: now(clock),
+        },
+      }),
     });
   }
 
@@ -278,6 +333,55 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     });
   }
 
+  async function consumeResult({ runId, delegationId: id, originSessionId } = {}) {
+    const consumer = assertString(originSessionId, "delegation origin session", { limit: 512 });
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: TERMINAL_STATES,
+      mutate: (record) => {
+        if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
+          fail("Delegation does not have a terminal current result");
+        }
+        if (record.originSessionId !== consumer) fail("Delegation result belongs to a different origin session");
+        if (record.result.consumedBySessionId || record.result.consumedAt) fail("Delegation result has already been consumed");
+        return {
+          ...record,
+          result: {
+            ...record.result,
+            consumedBySessionId: consumer,
+            consumedAt: now(clock),
+          },
+        };
+      },
+    });
+  }
+
+  async function adoptResult({ runId, delegationId: id, originSessionId } = {}) {
+    const adopter = assertString(originSessionId, "delegation origin session", { limit: 512 });
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: TERMINAL_STATES,
+      mutate: (record) => {
+        if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
+          fail("Delegation does not have a terminal current result");
+        }
+        if (record.result.consumedBySessionId || record.result.consumedAt) fail("Delegation result has already been consumed");
+        return {
+          ...record,
+          result: {
+            ...record.result,
+            adoptedBySessionId: adopter,
+            adoptedAt: now(clock),
+            consumedBySessionId: adopter,
+            consumedAt: now(clock),
+          },
+        };
+      },
+    });
+  }
+
   async function list({ originSessionId } = {}) {
     if (originSessionId !== undefined) assertString(originSessionId, "delegation origin session", { limit: 512 });
     const runs = await store.list({});
@@ -292,5 +396,16 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     return results;
   }
 
-  return Object.freeze({ prepare, claim, recordSession, recordResult, beginRemediation, list });
+  return Object.freeze({
+    prepare,
+    claim,
+    recordSession,
+    recordTransportIdentity,
+    recordStartFailure,
+    recordResult,
+    consumeResult,
+    adoptResult,
+    beginRemediation,
+    list,
+  });
 }

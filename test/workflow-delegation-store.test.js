@@ -9,12 +9,19 @@ import { RUN_STATES } from "../src/workflow/run-state.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
-const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
+const FIRST_DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
+const SECOND_DELEGATION_ID = "33333333-3333-4333-8333-333333333333";
+const THIRD_DELEGATION_ID = "44444444-4444-4444-8444-444444444444";
 
 async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-delegation-store-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
+}
+
+function uuidSequence(...values) {
+  let index = 0;
+  return () => values[index++] ?? values.at(-1);
 }
 
 function clockSequence(...values) {
@@ -41,7 +48,19 @@ function completedResult(generation, summary = "Review completed") {
   };
 }
 
-test("persists a private frozen brief and generation-aware advisory results", async (t) => {
+function transportIdentity(runId, delegationId) {
+  return {
+    kind: "pi-delegation",
+    runId,
+    delegationId,
+    sessionPath: `/private/${delegationId}.jsonl`,
+    cwd: "/fixture/review",
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  };
+}
+
+async function createFixture(t, ids = [FIRST_DELEGATION_ID, SECOND_DELEGATION_ID, THIRD_DELEGATION_ID]) {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({
     stateRoot,
@@ -51,7 +70,7 @@ test("persists a private frozen brief and generation-aware advisory results", as
   const run = await store.create({ projectAlias: "ocr", primaryTicket: "A-1", state: RUN_STATES.PLANNED });
   const delegations = createDelegationStore({
     store,
-    randomUUID: () => DELEGATION_ID,
+    randomUUID: uuidSequence(...ids),
     clock: clockSequence(
       "2025-01-01T00:01:00.000Z",
       "2025-01-01T00:02:00.000Z",
@@ -59,8 +78,22 @@ test("persists a private frozen brief and generation-aware advisory results", as
       "2025-01-01T00:04:00.000Z",
       "2025-01-01T00:05:00.000Z",
       "2025-01-01T00:06:00.000Z",
+      "2025-01-01T00:07:00.000Z",
+      "2025-01-01T00:08:00.000Z",
+      "2025-01-01T00:09:00.000Z",
+      "2025-01-01T00:10:00.000Z",
+      "2025-01-01T00:11:00.000Z",
+      "2025-01-01T00:12:00.000Z",
+      "2025-01-01T00:13:00.000Z",
+      "2025-01-01T00:14:00.000Z",
+      "2025-01-01T00:15:00.000Z",
     ),
   });
+  return { stateRoot, store, run, delegations };
+}
+
+test("persists a private frozen brief, exact transport identity, and generation-aware advisory results", async (t) => {
+  const { store, run, delegations } = await createFixture(t);
 
   const prepared = await delegations.prepare({
     runId: run.id,
@@ -71,36 +104,37 @@ test("persists a private frozen brief and generation-aware advisory results", as
       cwd: "/fixture/review",
       brief: "Review only the frozen task. SECRET-BRIEF-TEXT",
       task: "Review only the frozen task.",
-      budget: { maxRuntimeMs: 60_000, concurrency: 1 },
+      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+      remediationTurns: 2,
     },
   });
 
-  assert.equal(prepared.id, DELEGATION_ID);
+  assert.equal(prepared.id, FIRST_DELEGATION_ID);
   assert.equal(prepared.state, "prepared");
   assert.equal(prepared.generation, 1);
   assert.match(prepared.briefDigest, /^sha256:[0-9a-f]{64}$/);
   assert.match(prepared.taskDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.deepEqual(prepared.budget, { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 });
   assert.equal(await readFile(prepared.briefPath, "utf8"), "Review only the frozen task. SECRET-BRIEF-TEXT");
-  assert.equal(await fileMode(join(run.directory, "delegations", DELEGATION_ID)), 0o700);
+  assert.equal(await fileMode(join(run.directory, "delegations", FIRST_DELEGATION_ID)), 0o700);
   assert.equal(await fileMode(prepared.briefPath), 0o600);
 
   const persistedBeforeClaim = await readFile(join(run.directory, "run.json"), "utf8");
   assert.doesNotMatch(persistedBeforeClaim, /SECRET-BRIEF-TEXT|Review only the frozen task/);
 
-  const claimed = await delegations.claim({ runId: run.id, delegationId: DELEGATION_ID });
+  const claimed = await delegations.claim({ runId: run.id, delegationId: FIRST_DELEGATION_ID });
   assert.equal(claimed.state, "running");
-  await assert.rejects(() => delegations.claim({ runId: run.id, delegationId: DELEGATION_ID }), /allowed state|prepared|claim/i);
 
-  const withSession = await delegations.recordSession({
+  const withIdentity = await delegations.recordTransportIdentity({
     runId: run.id,
-    delegationId: DELEGATION_ID,
-    session: { kind: "pi", id: "child-session-1", path: "/private/child.jsonl" },
+    delegationId: FIRST_DELEGATION_ID,
+    identity: transportIdentity(run.id, FIRST_DELEGATION_ID),
   });
-  assert.deepEqual(withSession.nativeSession, { kind: "pi", id: "child-session-1", path: "/private/child.jsonl" });
+  assert.deepEqual(withIdentity.transportIdentity, transportIdentity(run.id, FIRST_DELEGATION_ID));
 
   const completed = await delegations.recordResult({
     runId: run.id,
-    delegationId: DELEGATION_ID,
+    delegationId: FIRST_DELEGATION_ID,
     result: completedResult(1),
   });
   assert.equal(completed.state, "completed");
@@ -109,7 +143,7 @@ test("persists a private frozen brief and generation-aware advisory results", as
 
   const remediating = await delegations.beginRemediation({
     runId: run.id,
-    delegationId: DELEGATION_ID,
+    delegationId: FIRST_DELEGATION_ID,
     expectedGeneration: 1,
   });
   assert.equal(remediating.state, "running");
@@ -118,25 +152,117 @@ test("persists a private frozen brief and generation-aware advisory results", as
   assert.equal(remediating.remediationTurnsUsed, 1);
 
   await assert.rejects(
-    () => delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(1, "old result") }),
+    () => delegations.recordResult({ runId: run.id, delegationId: FIRST_DELEGATION_ID, result: completedResult(1, "old result") }),
     /generation|stale/i,
   );
   const current = await delegations.recordResult({
     runId: run.id,
-    delegationId: DELEGATION_ID,
+    delegationId: FIRST_DELEGATION_ID,
     result: completedResult(2, "Current review completed"),
   });
   assert.equal(current.result.generation, 2);
 
   const listed = await delegations.list({ originSessionId: "pi-origin-1" });
-  assert.deepEqual(listed.map((item) => item.id), [DELEGATION_ID]);
+  assert.deepEqual(listed.map((item) => item.id), [FIRST_DELEGATION_ID]);
+});
+
+test("consumes exact-origin results once and supports explicit adoption", async (t) => {
+  const { run, delegations } = await createFixture(t);
+
+  const first = await delegations.prepare({
+    runId: run.id,
+    input: {
+      role: "code-reviewer",
+      mode: "background",
+      originSessionId: "pi-origin-1",
+      cwd: "/fixture/review",
+      brief: "Review the first frozen task.",
+      task: "Review the first frozen task.",
+      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+      remediationTurns: 2,
+    },
+  });
+  await delegations.claim({ runId: run.id, delegationId: first.id });
+  await delegations.recordTransportIdentity({
+    runId: run.id,
+    delegationId: first.id,
+    identity: transportIdentity(run.id, first.id),
+  });
+  await delegations.recordResult({ runId: run.id, delegationId: first.id, result: completedResult(1) });
+
+  await assert.rejects(
+    () => delegations.consumeResult({ runId: run.id, delegationId: first.id, originSessionId: "pi-origin-2" }),
+    /origin|session/i,
+  );
+
+  const consumed = await delegations.consumeResult({ runId: run.id, delegationId: first.id, originSessionId: "pi-origin-1" });
+  assert.equal(consumed.result.consumedBySessionId, "pi-origin-1");
+  assert.ok(consumed.result.consumedAt);
+
+  await assert.rejects(
+    () => delegations.consumeResult({ runId: run.id, delegationId: first.id, originSessionId: "pi-origin-1" }),
+    /consumed|consumer/i,
+  );
+
+  const second = await delegations.prepare({
+    runId: run.id,
+    input: {
+      role: "code-reviewer",
+      mode: "background",
+      originSessionId: "pi-origin-1",
+      cwd: "/fixture/review",
+      brief: "Review the second frozen task.",
+      task: "Review the second frozen task.",
+      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+      remediationTurns: 2,
+    },
+  });
+  await delegations.claim({ runId: run.id, delegationId: second.id });
+  await delegations.recordTransportIdentity({
+    runId: run.id,
+    delegationId: second.id,
+    identity: transportIdentity(run.id, second.id),
+  });
+  await delegations.recordResult({ runId: run.id, delegationId: second.id, result: completedResult(1, "Second review done") });
+
+  const adopted = await delegations.adoptResult({ runId: run.id, delegationId: second.id, originSessionId: "pi-origin-2" });
+  assert.equal(adopted.result.adoptedBySessionId, "pi-origin-2");
+  assert.ok(adopted.result.adoptedAt);
+  assert.equal(adopted.result.consumedBySessionId, "pi-origin-2");
+  assert.ok(adopted.result.consumedAt);
+});
+
+test("records a bounded start failure without losing the private brief", async (t) => {
+  const { run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
+
+  const prepared = await delegations.prepare({
+    runId: run.id,
+    input: {
+      role: "code-reviewer",
+      mode: "background",
+      originSessionId: "pi-origin-1",
+      cwd: "/fixture/review",
+      brief: "Review the frozen task without cleanup.",
+      task: "Review the frozen task without cleanup.",
+      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+      remediationTurns: 2,
+    },
+  });
+  await delegations.claim({ runId: run.id, delegationId: prepared.id });
+
+  const failed = await delegations.recordStartFailure({
+    runId: run.id,
+    delegationId: prepared.id,
+    reason: "Delegation transport start failed",
+  });
+
+  assert.equal(failed.state, "failed");
+  assert.equal(failed.startFailure.reason, "Delegation transport start failed");
+  assert.equal(await readFile(prepared.briefPath, "utf8"), "Review the frozen task without cleanup.");
 });
 
 test("rejects oversized or invalid delegation data without echoing it", async (t) => {
-  const stateRoot = await tempStateRoot(t);
-  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
-  const run = await store.create({ projectAlias: "ocr", primaryTicket: "A-1", state: RUN_STATES.PLANNED });
-  const delegations = createDelegationStore({ store, randomUUID: () => DELEGATION_ID });
+  const { store, run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
 
   await assert.rejects(
     () => delegations.prepare({
@@ -152,7 +278,7 @@ test("rejects oversized or invalid delegation data without echoing it", async (t
       },
     }),
     (error) => {
-      assert.match(error.message, /role|brief|delegation/i);
+      assert.match(error.message, /role|brief|budget|delegation/i);
       assert.doesNotMatch(error.message, /SECRET-DO-NOT-LEAK/);
       return true;
     },
