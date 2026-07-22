@@ -2,6 +2,16 @@ version: 3
 launcher:
   worktree_root: /home/you/.herdr/worktrees
   state_root: /home/you/.local/state/workflow-launcher
+  delegation:
+    version: 1
+    totalInternal: 4
+    foreground: 3
+    readOnlyBackground: 3
+    writersTotal: 1
+    writersPerCheckout: 1
+    maxDepth: 1
+    remediationTurns: 2
+    allowBackgroundWriters: false
   session_template: "{project}-{task}-{slug}"
   default_agent_profile: pi-worker
   max_bundle_tickets: 10

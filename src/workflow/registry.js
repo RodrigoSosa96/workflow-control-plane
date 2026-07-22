@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { parse } from "yaml";
 import { WorkflowError } from "./errors.js";
+import { resolveProjectDelegationPolicy, validateDelegationPolicy } from "./delegation-policy.js";
 
 const ALLOWED_SPLITS = new Set(["left", "right", "up", "down"]);
 const ALLOWED_TEMPLATE_PLACEHOLDERS = new Set(["worktree_root", "project", "task", "slug"]);
@@ -306,6 +307,7 @@ function validateLauncherV3(launcher) {
   normalized.state_root = validateAbsolutePath(normalized.state_root, "launcher.state_root");
   normalized.session_template = validateTemplate(normalized.session_template, ALLOWED_TEMPLATE_PLACEHOLDERS, "launcher.session_template");
   normalized.default_agent_profile = validateString(normalized.default_agent_profile, "launcher.default_agent_profile");
+  normalized.delegation = validateDelegationPolicy(normalized.delegation, "launcher.delegation");
   if (!Number.isInteger(normalized.max_bundle_tickets) || normalized.max_bundle_tickets <= 0) {
     fail("schema", "launcher.max_bundle_tickets must be a positive integer");
   }
@@ -362,6 +364,21 @@ function validateProjectAgentReferences(projects, launcher) {
   }
 }
 
+function normalizeProjectDelegationPolicies(projects, launcher) {
+  const normalized = {};
+  for (const [projectName, project] of Object.entries(projects)) {
+    normalized[projectName] = {
+      ...project,
+      delegation: resolveProjectDelegationPolicy(
+        launcher.delegation,
+        project.delegation,
+        `projects.${projectName}.delegation`,
+      ),
+    };
+  }
+  return normalized;
+}
+
 function addLegacyLauncherAgent(launcher) {
   const defaultProfile = launcher.agent_profiles[launcher.default_agent_profile];
   return {
@@ -400,18 +417,19 @@ function migrateV2Registry(value) {
     projects,
   };
   const validatedLauncher = validateLauncherV3(normalized.launcher);
-  validateProjectAgentReferences(projects, validatedLauncher);
+  const normalizedProjects = normalizeProjectDelegationPolicies(projects, validatedLauncher);
+  validateProjectAgentReferences(normalizedProjects, validatedLauncher);
   return {
     ...normalized,
     launcher: addLegacyLauncherAgent(validatedLauncher),
-    projects,
+    projects: normalizedProjects,
   };
 }
 
 function validateV3Registry(value) {
   const registry = clone(value);
   const launcher = validateLauncherV3(registry.launcher);
-  const projects = validateProjects(registry.projects);
+  const projects = normalizeProjectDelegationPolicies(validateProjects(registry.projects), launcher);
   validateProjectAgentReferences(projects, launcher);
   return {
     ...registry,

@@ -452,3 +452,55 @@ test("resolves a registered project and rejects unknown aliases", () => {
   assert.equal(resolveProject(registry, "ocr").label, "OCR");
   assert.throws(() => resolveProject(registry, "missing"), /Unknown workflow project/);
 });
+
+test("normalizes delegation defaults and allows projects to tighten them", () => {
+  const value = validV3();
+  value.projects.ocr.delegation = {
+    totalInternal: 2,
+    foreground: 2,
+    readOnlyBackground: 1,
+  };
+
+  const registry = validateRegistry(value);
+
+  assert.deepEqual(registry.launcher.delegation, {
+    version: 1,
+    totalInternal: 4,
+    foreground: 3,
+    readOnlyBackground: 3,
+    writersTotal: 1,
+    writersPerCheckout: 1,
+    maxDepth: 1,
+    remediationTurns: 2,
+    allowBackgroundWriters: false,
+  });
+  assert.deepEqual(registry.projects.ocr.delegation, {
+    version: 1,
+    totalInternal: 2,
+    foreground: 2,
+    readOnlyBackground: 1,
+    writersTotal: 1,
+    writersPerCheckout: 1,
+    maxDepth: 1,
+    remediationTurns: 2,
+    allowBackgroundWriters: false,
+  });
+});
+
+test("rejects delegation overrides that relax a launcher writer budget", () => {
+  const value = validV3();
+  value.launcher.delegation = {
+    version: 1,
+    totalInternal: 4,
+    foreground: 3,
+    readOnlyBackground: 3,
+    writersTotal: 1,
+    writersPerCheckout: 1,
+    maxDepth: 1,
+    remediationTurns: 2,
+    allowBackgroundWriters: false,
+  };
+  value.projects.ocr.delegation = { writersTotal: 2 };
+
+  assert.throws(() => validateRegistry(value), /writersTotal.*launcher|writersTotal.*exceed/i);
+});
