@@ -371,7 +371,49 @@ test("beginRemediation allows follow-up only after the exact prior process is pr
   assert.equal(remediated.state, "running");
   assert.equal(remediated.generation, 2);
   assert.deepEqual(remediated.identity, nextIdentity);
-  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 2);
+  const persisted = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(persisted.generation, 2);
+  assert.equal(persisted.remediation?.state, "active");
+  assert.match(persisted.remediation?.claimToken ?? "", /^[0-9a-f-]{36}$/i);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
+});
+
+test("beginRemediation races claim atomically so only one follow-up child launches", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const nextIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
+  let releaseLaunch;
+  const launchGate = new Promise((resolve) => {
+    releaseLaunch = resolve;
+  });
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    deliverFollowUpImpl: async () => {
+      await launchGate;
+      return { delivered: true, identity: nextIdentity };
+    },
+    observations: [
+      { state: "missing", identity: expectedIdentity },
+      { state: "missing", identity: expectedIdentity },
+    ],
+  });
+  const { services, run } = await createCompletedDelegation(t, { transport });
+  const request = {
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  };
+
+  const first = services.beginRemediation(request);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = services.beginRemediation(request);
+  releaseLaunch();
+
+  const settled = await Promise.allSettled([first, second]);
+  assert.equal(settled.filter((entry) => entry.status === "fulfilled").length, 1);
+  assert.equal(settled.filter((entry) => entry.status === "rejected").length, 1);
+  assert.match(settled.find((entry) => entry.status === "rejected").reason.message, /claimed|launch|stale|remediation|locked|active lock/i);
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
 });
 
@@ -435,14 +477,13 @@ test("beginRemediation succeeds after rebuilding the transport from persisted pr
 
   const freshTransport = createTransport({
     deliverFollowUpImpl: async (_identity, _prompt, resume) => {
-      assert.deepEqual(resume, {
-        runId: RUN_ID,
-        delegationId: DELEGATION_ID,
-        role: "code-reviewer",
-        mode: "background",
-        cwd: CWD,
-        generation: 2,
-      });
+      assert.equal(resume.runId, RUN_ID);
+      assert.equal(resume.delegationId, DELEGATION_ID);
+      assert.equal(resume.role, "code-reviewer");
+      assert.equal(resume.mode, "background");
+      assert.equal(resume.cwd, CWD);
+      assert.equal(resume.generation, 2);
+      assert.match(resume.claimToken, /^[0-9a-f-]{36}$/i);
       return {
         delivered: true,
         identity: secondIdentity,
@@ -516,7 +557,12 @@ test("beginRemediation persists replacement identities and later observation/rem
   assert.deepEqual(first.identity, secondIdentity);
   assert.deepEqual((await store.read(run.id)).delegations[DELEGATION_ID].transportIdentity, secondIdentity);
 
-  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(2, "First remediation done") });
+  await delegations.recordResult({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    result: completedResult(2, "First remediation done"),
+    claimToken: (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken,
+  });
   const reconciled = await services.reconcile({ runId: run.id, delegationId: DELEGATION_ID });
   assert.deepEqual(reconciled.identity, secondIdentity);
 
@@ -560,7 +606,7 @@ test("beginRemediation permits only two turns with matching review evidence and 
       { state: "missing", identity: thirdIdentity },
     ],
   });
-  const { services, delegations, run } = await createCompletedDelegation(t, { transport });
+  const { services, delegations, store, run } = await createCompletedDelegation(t, { transport });
 
   const first = await services.beginRemediation({
     runId: run.id,
@@ -572,7 +618,12 @@ test("beginRemediation permits only two turns with matching review evidence and 
   assert.equal(first.state, "running");
   assert.equal(first.generation, 2);
 
-  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(2, "First remediation done") });
+  await delegations.recordResult({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    result: completedResult(2, "First remediation done"),
+    claimToken: (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken,
+  });
   const second = await services.beginRemediation({
     runId: run.id,
     delegationId: DELEGATION_ID,
@@ -582,7 +633,12 @@ test("beginRemediation permits only two turns with matching review evidence and 
   });
   assert.equal(second.generation, 3);
 
-  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: completedResult(3, "Second remediation done") });
+  await delegations.recordResult({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    result: completedResult(3, "Second remediation done"),
+    claimToken: (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken,
+  });
   await assert.rejects(
     () => services.beginRemediation({
       runId: run.id,
@@ -596,6 +652,80 @@ test("beginRemediation permits only two turns with matching review evidence and 
       assert.doesNotMatch(error.message, /SECRET-REMEDIATION-PROMPT/);
       return true;
     },
+  );
+});
+
+test("beginRemediation blocks duplicate launch and invalid acceptance after post-spawn persistence failure", async (t) => {
+  const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const nextIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: expectedIdentity }),
+    deliverFollowUpImpl: async () => ({ delivered: true, identity: nextIdentity }),
+    observations: [
+      { state: "missing", identity: expectedIdentity },
+      { state: "missing", identity: expectedIdentity },
+    ],
+  });
+  const fixture = await createCompletedDelegation(t, { transport });
+  const brokenDelegations = {
+    ...fixture.delegations,
+    async completeRemediationLaunch() {
+      throw new Error("SECRET-PERSISTENCE-FAILURE");
+    },
+  };
+  const brokenServices = createDelegationServices({
+    registry,
+    projectAlias: PROJECT_ALIAS,
+    runStore: fixture.store,
+    delegations: brokenDelegations,
+    reservations: fixture.reservations,
+    transport,
+    roles: {
+      async loadDelegationRole({ name }) {
+        return Object.freeze({
+          name,
+          tools: ["read", "bash", "grep", "find", "ls"],
+          systemPrompt: "Review only the frozen brief.",
+        });
+      },
+    },
+  });
+
+  const first = await brokenServices.beginRemediation({
+    runId: fixture.run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  });
+  assert.equal(first.state, "completed");
+  assert.deepEqual(first.nextActions, ["manual-review"]);
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
+
+  const blockedRecord = (await fixture.store.read(fixture.run.id)).delegations[DELEGATION_ID];
+  assert.equal(blockedRecord.generation, 1);
+  assert.equal(blockedRecord.remediation?.state, "launching");
+
+  await assert.rejects(
+    () => brokenServices.beginRemediation({
+      runId: fixture.run.id,
+      delegationId: DELEGATION_ID,
+      expectedGeneration: 1,
+      reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+      prompt: "Address the approved correction.",
+    }),
+    /claimed|launch|remediation/i,
+  );
+  assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
+
+  await assert.rejects(
+    () => fixture.delegations.recordResult({
+      runId: fixture.run.id,
+      delegationId: DELEGATION_ID,
+      result: completedResult(2, "stale child"),
+      claimToken: blockedRecord.remediation.claimToken,
+    }),
+    /generation|stale|running/i,
   );
 });
 
@@ -630,6 +760,8 @@ test("beginRemediation leaves the current generation and result intact when foll
   assert.equal(record.state, "completed");
   assert.equal(record.result?.generation, 1);
   assert.equal(record.result?.summary, "Review completed");
+  assert.equal(record.remediationTurnsUsed, 0);
+  assert.equal(record.remediation, null);
   assert.deepEqual(record.transportIdentity, expectedIdentity);
   assert.doesNotMatch(JSON.stringify(result), /SECRET-DELIVERY-FAILURE|SECRET-FOLLOW-UP-PROMPT/);
 });

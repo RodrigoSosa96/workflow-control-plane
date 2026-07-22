@@ -238,6 +238,7 @@ test("deliverFollowUp rebuilds exact-session remediation from persisted private 
     mode: "foreground",
     cwd: CWD,
     generation: 2,
+    claimToken: "33333333-3333-4333-8333-333333333333",
   });
 
   assert.deepEqual(delivered, {
@@ -256,6 +257,7 @@ test("deliverFollowUp rebuilds exact-session remediation from persisted private 
   assert.equal(resumedLaunch.argv[resumedLaunch.argv.indexOf("--session") + 1], SESSION_PATH);
   assert.equal(resumedLaunch.argv[resumedLaunch.argv.indexOf("--session-dir") + 1], SESSION_DIRECTORY);
   assert.equal(resumedLaunch.env.WORKFLOW_DELEGATION_GENERATION, "2");
+  assert.equal(resumedLaunch.env.WORKFLOW_DELEGATION_CLAIM_TOKEN, "33333333-3333-4333-8333-333333333333");
   assert.equal(resumedLaunch.argv.at(-1), "Address the approved correction.");
 });
 
@@ -277,6 +279,7 @@ test("deliverFollowUp rejects matching sleeping live identities and mismatches, 
     mode: "foreground",
     cwd: CWD,
     generation: 2,
+    claimToken: "33333333-3333-4333-8333-333333333333",
   };
 
   const sleepingTransport = createTransport({

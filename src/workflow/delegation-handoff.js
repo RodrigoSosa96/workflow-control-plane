@@ -117,7 +117,7 @@ function assertTransportIdentity(record, runId, delegationId) {
   }
 }
 
-export async function submitDelegationHandoff({ runId, delegationId, input, store, delegations, reservations } = {}) {
+export async function submitDelegationHandoff({ runId, delegationId, input, store, delegations, reservations, claimToken } = {}) {
   if (!store || typeof store.read !== "function") fail("Delegation handoff requires a run store");
   if (!delegations || typeof delegations.recordResult !== "function") fail("Delegation handoff requires a compatible delegation store");
   if (!reservations || typeof reservations.list !== "function") fail("Delegation handoff requires a compatible reservation store");
@@ -129,5 +129,5 @@ export async function submitDelegationHandoff({ runId, delegationId, input, stor
   if (record.generation !== normalized.generation) fail("Delegation handoff generation is not current");
   const matches = (await reservations.list({ projectAlias: run.projectAlias })).filter((reservation) => reservationMatches(record, reservation));
   if (matches.length !== 1) fail("Delegation reservation is missing or has changed");
-  return await delegations.recordResult({ runId: run.id, delegationId: id, result: normalized });
+  return await delegations.recordResult({ runId: run.id, delegationId: id, result: normalized, claimToken });
 }

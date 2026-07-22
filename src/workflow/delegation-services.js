@@ -289,7 +289,16 @@ function validateTransportIdentity(identity, runId, delegationId) {
 
 export function createDelegationServices({ registry, projectAlias, runStore, delegations, reservations, transport, roles } = {}) {
   if (!runStore || typeof runStore.read !== "function") fail("delegation services require a compatible run store");
-  if (!delegations || typeof delegations.prepare !== "function" || typeof delegations.claim !== "function" || typeof delegations.recordTransportIdentity !== "function" || typeof delegations.recordStartFailure !== "function" || typeof delegations.beginRemediation !== "function") {
+  if (
+    !delegations
+    || typeof delegations.prepare !== "function"
+    || typeof delegations.claim !== "function"
+    || typeof delegations.recordTransportIdentity !== "function"
+    || typeof delegations.recordStartFailure !== "function"
+    || typeof delegations.claimRemediationLaunch !== "function"
+    || typeof delegations.completeRemediationLaunch !== "function"
+    || typeof delegations.rollbackRemediationLaunch !== "function"
+  ) {
     fail("delegation services require a compatible delegation store");
   }
   if (!reservations || typeof reservations.reserve !== "function" || typeof reservations.list !== "function") {
@@ -446,6 +455,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     if (identity) observation = await workerTransport.observeExact(identity);
 
     const nextActions = [];
+    const remediationPending = Boolean(record.remediation?.state);
     const currentTerminalResult = Boolean(
       record.result
       && TERMINAL_STATES.has(record.result.status)
@@ -459,7 +469,9 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     );
     if (currentTerminalResult) {
       nextActions.push(consumedOrAdopted ? "review-result" : "deliver-result");
-      if (observation?.state === "missing" && record.remediationTurnsUsed < record.remediationTurns) {
+      if (remediationPending) {
+        nextActions.push("manual-review");
+      } else if (observation?.state === "missing" && record.remediationTurnsUsed < record.remediationTurns) {
         nextActions.push("begin-remediation");
       } else if (observation?.state === "mismatch") {
         nextActions.push("manual-review");
@@ -492,6 +504,14 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
       fail(`Delegation remediation observation is ${observation?.state ?? "unknown"}; exact worker must be proven gone`);
     }
 
+    const claimed = await delegations.claimRemediationLaunch({
+      runId,
+      delegationId,
+      expectedGeneration,
+    });
+    const claimToken = claimed.remediation?.claimToken;
+    if (typeof claimToken !== "string" || !claimToken) fail("Delegation remediation claim is missing");
+
     let delivered;
     try {
       delivered = await workerTransport.deliverFollowUp(record.transportIdentity, prompt, {
@@ -501,19 +521,32 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
         mode: record.mode,
         cwd: record.cwd,
         generation: expectedGeneration + 1,
+        claimToken,
       });
     } catch (_error) {
-      return publicState(record, record.transportIdentity, ["begin-remediation", "manual-review"]);
+      const rolledBack = await delegations.rollbackRemediationLaunch({
+        runId,
+        delegationId,
+        expectedGeneration,
+        claimToken,
+      });
+      return publicState(rolledBack, rolledBack.transportIdentity, ["begin-remediation", "manual-review"]);
     }
 
     const identity = validateTransportIdentity(delivered?.identity ?? delivered, runId, delegationId);
-    const remediating = await delegations.beginRemediation({
-      runId,
-      delegationId,
-      expectedGeneration,
-      identity,
-    });
-    return publicState(remediating, identity, ["await-result"]);
+    try {
+      const remediating = await delegations.completeRemediationLaunch({
+        runId,
+        delegationId,
+        expectedGeneration,
+        claimToken,
+        identity,
+      });
+      return publicState(remediating, identity, ["await-result"]);
+    } catch (_error) {
+      const blocked = await readRecord(runId, delegationId);
+      return publicState(blocked, blocked.transportIdentity, ["manual-review"]);
+    }
   }
 
   return Object.freeze({ createPreview, executeApproved, reconcile, beginRemediation });

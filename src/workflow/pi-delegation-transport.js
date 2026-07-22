@@ -154,11 +154,12 @@ function sessionDirectoryFromIdentity(identity, stateRoot) {
   return expected.sessionDirectory;
 }
 
-function safeEnv({ runId, delegationId, generation, runDirectory, stateRoot, controlPlaneBin }) {
+function safeEnv({ runId, delegationId, generation, claimToken, runDirectory, stateRoot, controlPlaneBin }) {
   return Object.freeze({
     WORKFLOW_RUN_ID: runId,
     WORKFLOW_DELEGATION_ID: delegationId,
     WORKFLOW_DELEGATION_GENERATION: String(generation),
+    ...(claimToken ? { WORKFLOW_DELEGATION_CLAIM_TOKEN: claimToken } : {}),
     WORKFLOW_RUN_DIR: runDirectory,
     WORKFLOW_STATE_ROOT: stateRoot,
     WORKFLOW_CONTROL_PLANE_BIN: controlPlaneBin,
@@ -193,7 +194,7 @@ function launchIdentity({ runId, delegationId, sessionPath, cwd, pid, startedAt 
 
 function remediationContext(value, identity) {
   const context = assertObject(value, "remediation context");
-  assertExactKeys(context, new Set(["runId", "delegationId", "role", "mode", "cwd", "generation"]), "remediation context");
+  assertExactKeys(context, new Set(["runId", "delegationId", "role", "mode", "cwd", "generation", "claimToken"]), "remediation context");
   const role = assertString(context.role, "remediation context role", { limit: 128 });
   const mode = assertString(context.mode, "remediation context mode", { limit: 32 });
   if (!MODES.has(mode)) fail("remediation context mode is unsupported");
@@ -204,7 +205,18 @@ function remediationContext(value, identity) {
   if (assertRunId(context.runId) !== identity.runId || assertString(context.delegationId, "remediation context delegationId", { limit: 128 }) !== identity.delegationId) {
     fail("remediation context must match the exact worker identity");
   }
-  return { runId: identity.runId, delegationId: identity.delegationId, role, mode, cwd, generation };
+  const claimToken = context.claimToken === undefined
+    ? undefined
+    : assertString(context.claimToken, "remediation context claimToken", { limit: 128 });
+  return {
+    runId: identity.runId,
+    delegationId: identity.delegationId,
+    role,
+    mode,
+    cwd,
+    generation,
+    ...(claimToken ? { claimToken } : {}),
+  };
 }
 
 function assignmentContext(approvedAssignment, { stateRoot, controlPlaneBin }) {
@@ -360,6 +372,7 @@ export function createPiDelegationTransport({
       runId: identity.runId,
       delegationId: identity.delegationId,
       generation: context.generation,
+      claimToken: context.claimToken,
       runDirectory: runDirectoryFor(resolvedStateRoot, identity.runId),
       stateRoot: resolvedStateRoot,
       controlPlaneBin: resolvedControlPlaneBin,

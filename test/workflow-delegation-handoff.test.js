@@ -14,8 +14,9 @@ import { RUN_STATES } from "../src/workflow/run-state.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
-const RESERVATION_ID = "33333333-3333-4333-8333-333333333333";
-const RESERVATION_OWNER = "44444444-4444-4444-8444-444444444444";
+const SECOND_DELEGATION_ID = "33333333-3333-4333-8333-333333333333";
+const RESERVATION_ID = "44444444-4444-4444-8444-444444444444";
+const RESERVATION_OWNER = "55555555-5555-4555-8555-555555555555";
 const PROJECT_ALIAS = "fixture";
 const CWD = "/fixture/review";
 
@@ -39,6 +40,14 @@ function transportIdentity() {
     cwd: CWD,
     pid: "12345",
     processStartedAt: "2025-01-01T00:10:00.000Z",
+  };
+}
+
+function nextTransportIdentity() {
+  return {
+    ...transportIdentity(),
+    pid: "67890",
+    processStartedAt: "2025-01-01T00:20:00.000Z",
   };
 }
 
@@ -115,6 +124,48 @@ test("submitDelegationHandoff records a bounded current-generation advisory resu
   assert.equal(result.result.status, "completed");
   assert.equal(result.result.generation, 1);
   assert.doesNotMatch(JSON.stringify(result), /stdout|stderr|terminal|transcript/i);
+});
+
+test("submitDelegationHandoff accepts only the active remediation claim token for the current child", async (t) => {
+  const { store, run, delegations, reservations } = await createFixture(t);
+
+  await delegations.recordResult({ runId: run.id, delegationId: DELEGATION_ID, result: advisoryInput() });
+  const claimed = await delegations.claimRemediationLaunch({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+  });
+  await delegations.completeRemediationLaunch({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    claimToken: claimed.remediation.claimToken,
+    identity: nextTransportIdentity(),
+  });
+
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput({ generation: 2 }),
+      store,
+      delegations,
+      reservations,
+      claimToken: SECOND_DELEGATION_ID,
+    }),
+    /claim|stale/i,
+  );
+
+  const accepted = await submitDelegationHandoff({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    input: advisoryInput({ generation: 2 }),
+    store,
+    delegations,
+    reservations,
+    claimToken: claimed.remediation.claimToken,
+  });
+  assert.equal(accepted.result.generation, 2);
 });
 
 test("submitDelegationHandoff rejects wrong identity, stale generations, unbounded summaries, missing reservations, and duplicate results", async (t) => {

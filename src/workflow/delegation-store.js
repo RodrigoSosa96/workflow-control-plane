@@ -58,6 +58,12 @@ function delegationId(randomUUID) {
   return value.toLowerCase();
 }
 
+function remediationClaimToken(randomUUID) {
+  const value = randomUUID();
+  if (typeof value !== "string" || !UUID_RE.test(value)) fail("delegation remediation claim generator returned an invalid UUID");
+  return value.toLowerCase();
+}
+
 function delegationMap(run) {
   if (run.delegations === undefined) return {};
   assertObject(run.delegations, "run.delegations");
@@ -144,6 +150,12 @@ function validateTransportIdentityReplacement(value, runId, delegationId) {
   };
 }
 
+function validateClaimToken(value, context = "delegation remediation claim token") {
+  const token = assertString(value, context, { limit: 128 });
+  if (!UUID_RE.test(token)) fail(`${context} must be a UUID`);
+  return token.toLowerCase();
+}
+
 function validateResult(value) {
   assertObject(value, "delegation result");
   assertExactKeys(value, new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]), "delegation result");
@@ -225,6 +237,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           transportIdentity: null,
           startFailure: null,
           result: null,
+          remediation: null,
           remediationTurnsUsed: 0,
           remediationTurns,
         };
@@ -327,7 +340,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     });
   }
 
-  async function recordResult({ runId, delegationId: id, result } = {}) {
+  async function recordResult({ runId, delegationId: id, result, claimToken } = {}) {
     assertString(id, "delegation ID", { limit: 128 });
     const validated = validateResult(result);
     const relativePath = privatePath(id, "result.json");
@@ -341,6 +354,15 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
         if (!record || typeof record !== "object" || Array.isArray(record)) fail("Delegation was not found");
         if (record.state !== "running") fail("Delegation is not running");
         if (record.generation !== validated.generation) fail("Delegation result generation is stale");
+        const activeRemediation = record.remediation?.state === "active" && record.remediation?.generation === validated.generation
+          ? record.remediation
+          : null;
+        if (activeRemediation) {
+          if (validateClaimToken(claimToken) !== activeRemediation.claimToken) fail("Delegation handoff claim is stale");
+        } else if (claimToken !== undefined) {
+          validateClaimToken(claimToken);
+          fail("Delegation handoff claim is not active for the current generation");
+        }
         return {
           delegations: {
             ...delegations,
@@ -348,6 +370,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
               ...record,
               state: validated.status,
               updatedAt: timestamp,
+              remediation: null,
               result: {
                 ...validated,
                 path: join(run.directory, relativePath),
@@ -361,40 +384,95 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     return written.run.delegations[id];
   }
 
-  async function beginRemediation({ runId, delegationId: id, expectedGeneration, identity } = {}) {
+  async function claimRemediationLaunch({ runId, delegationId: id, expectedGeneration } = {}) {
     if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
       fail("expected delegation generation must be a positive integer");
     }
-    const nextIdentity = identity === undefined ? null : validateTransportIdentity(identity, runId, id);
     return await updateRecord({
       runId,
       delegationId: id,
       expectedStates: REMEDIABLE_STATES,
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
+        if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
+          fail("Delegation does not have a terminal current result");
+        }
+        if (!record.transportIdentity) fail("Delegation transport identity is missing");
+        if (record.remediation) fail("Delegation remediation launch is already claimed");
         if (record.remediationTurnsUsed >= record.remediationTurns) fail("Delegation remediation limit is exhausted");
-        if (nextIdentity) {
-          if (!record.transportIdentity) fail("Delegation transport identity is missing");
-          if (
-            nextIdentity.sessionPath !== record.transportIdentity.sessionPath
-            || nextIdentity.cwd !== record.transportIdentity.cwd
-          ) {
-            fail("Delegation remediation identity must keep the same session and cwd");
-          }
-          if (
-            nextIdentity.pid === record.transportIdentity.pid
-            && nextIdentity.processStartedAt === record.transportIdentity.processStartedAt
-          ) {
-            fail("Delegation remediation identity must record a new exact process identity");
-          }
+        return {
+          ...record,
+          remediation: {
+            state: "launching",
+            generation: record.generation + 1,
+            claimToken: remediationClaimToken(randomUUID),
+            claimedAt: now(clock),
+          },
+        };
+      },
+    });
+  }
+
+  async function completeRemediationLaunch({ runId, delegationId: id, expectedGeneration, claimToken, identity } = {}) {
+    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
+      fail("expected delegation generation must be a positive integer");
+    }
+    const validatedClaimToken = validateClaimToken(claimToken);
+    const nextIdentity = validateTransportIdentity(identity, runId, id);
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: REMEDIABLE_STATES,
+      mutate: (record) => {
+        if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
+        if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
+        if (record.remediation.claimToken !== validatedClaimToken) fail("Delegation remediation launch claim is stale");
+        if (record.remediation.generation !== expectedGeneration + 1) fail("Delegation remediation launch generation is stale");
+        if (!record.transportIdentity) fail("Delegation transport identity is missing");
+        if (
+          nextIdentity.sessionPath !== record.transportIdentity.sessionPath
+          || nextIdentity.cwd !== record.transportIdentity.cwd
+        ) {
+          fail("Delegation remediation identity must keep the same session and cwd");
+        }
+        if (
+          nextIdentity.pid === record.transportIdentity.pid
+          && nextIdentity.processStartedAt === record.transportIdentity.processStartedAt
+        ) {
+          fail("Delegation remediation identity must record a new exact process identity");
         }
         return {
           ...record,
           state: "running",
-          generation: record.generation + 1,
+          generation: record.remediation.generation,
           result: null,
+          transportIdentity: nextIdentity,
           remediationTurnsUsed: record.remediationTurnsUsed + 1,
-          ...(nextIdentity ? { transportIdentity: nextIdentity } : {}),
+          remediation: {
+            ...record.remediation,
+            state: "active",
+          },
+        };
+      },
+    });
+  }
+
+  async function rollbackRemediationLaunch({ runId, delegationId: id, expectedGeneration, claimToken } = {}) {
+    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
+      fail("expected delegation generation must be a positive integer");
+    }
+    const validatedClaimToken = validateClaimToken(claimToken);
+    return await updateRecord({
+      runId,
+      delegationId: id,
+      expectedStates: REMEDIABLE_STATES,
+      mutate: (record) => {
+        if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
+        if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
+        if (record.remediation.claimToken !== validatedClaimToken) fail("Delegation remediation launch claim is stale");
+        return {
+          ...record,
+          remediation: null,
         };
       },
     });
@@ -472,7 +550,9 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     recordResult,
     consumeResult,
     adoptResult,
-    beginRemediation,
+    claimRemediationLaunch,
+    completeRemediationLaunch,
+    rollbackRemediationLaunch,
     list,
   });
 }

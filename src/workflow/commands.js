@@ -988,6 +988,7 @@ export async function delegationHandoffCommand(options = {}, deps = {}) {
     runId,
     delegationId,
     input,
+    claimToken: env.WORKFLOW_DELEGATION_CLAIM_TOKEN,
   });
 }
 

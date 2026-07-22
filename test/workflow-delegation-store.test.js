@@ -150,15 +150,27 @@ test("persists a private frozen brief, exact transport identity, and generation-
   assert.equal(completed.result.generation, 1);
   assert.equal(await fileMode(completed.result.path), 0o600);
 
-  const remediating = await delegations.beginRemediation({
+  const remediationClaim = await delegations.claimRemediationLaunch({
     runId: run.id,
     delegationId: FIRST_DELEGATION_ID,
     expectedGeneration: 1,
+  });
+  assert.equal(remediationClaim.generation, 1);
+  assert.equal(remediationClaim.remediation.state, "launching");
+  assert.equal(remediationClaim.remediation.generation, 2);
+
+  const remediating = await delegations.completeRemediationLaunch({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    expectedGeneration: 1,
+    claimToken: remediationClaim.remediation.claimToken,
+    identity: nextTransportIdentity(run.id, FIRST_DELEGATION_ID),
   });
   assert.equal(remediating.state, "running");
   assert.equal(remediating.generation, 2);
   assert.equal(remediating.result, null);
   assert.equal(remediating.remediationTurnsUsed, 1);
+  assert.equal(remediating.remediation.state, "active");
 
   await assert.rejects(
     () => delegations.recordResult({ runId: run.id, delegationId: FIRST_DELEGATION_ID, result: completedResult(1, "old result") }),
@@ -168,14 +180,16 @@ test("persists a private frozen brief, exact transport identity, and generation-
     runId: run.id,
     delegationId: FIRST_DELEGATION_ID,
     result: completedResult(2, "Current review completed"),
+    claimToken: remediationClaim.remediation.claimToken,
   });
   assert.equal(current.result.generation, 2);
+  assert.equal(current.remediation, null);
 
   const listed = await delegations.list({ originSessionId: "pi-origin-1" });
   assert.deepEqual(listed.map((item) => item.id), [FIRST_DELEGATION_ID]);
 });
 
-test("allows one next-generation transport identity replacement and rejects stale or same-generation overwrite", async (t) => {
+test("claims exactly one remediation launch, rolls back safely, and requires the active claim token for handoff", async (t) => {
   const { run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
   const firstIdentity = transportIdentity(run.id, FIRST_DELEGATION_ID);
 
@@ -199,52 +213,69 @@ test("allows one next-generation transport identity replacement and rejects stal
     identity: firstIdentity,
   });
   await delegations.recordResult({ runId: run.id, delegationId: FIRST_DELEGATION_ID, result: completedResult(1) });
-  await delegations.beginRemediation({
+
+  const claimed = await delegations.claimRemediationLaunch({
     runId: run.id,
     delegationId: FIRST_DELEGATION_ID,
     expectedGeneration: 1,
   });
+  assert.equal(claimed.generation, 1);
+  assert.equal(claimed.remediation.state, "launching");
 
   await assert.rejects(
-    () => delegations.recordTransportIdentity({
+    () => delegations.claimRemediationLaunch({
       runId: run.id,
       delegationId: FIRST_DELEGATION_ID,
-      identity: firstIdentity,
-      replacement: {
-        previousGeneration: 1,
-        previousIdentity: firstIdentity,
-      },
+      expectedGeneration: 1,
     }),
-    /new|replace|identity/i,
+    /claimed|launch/i,
   );
 
-  const secondIdentity = nextTransportIdentity(run.id, FIRST_DELEGATION_ID);
-  const replaced = await delegations.recordTransportIdentity({
+  const rolledBack = await delegations.rollbackRemediationLaunch({
     runId: run.id,
     delegationId: FIRST_DELEGATION_ID,
-    identity: secondIdentity,
-    replacement: {
-      previousGeneration: 1,
-      previousIdentity: firstIdentity,
-    },
+    expectedGeneration: 1,
+    claimToken: claimed.remediation.claimToken,
   });
-  assert.deepEqual(replaced.transportIdentity, secondIdentity);
+  assert.equal(rolledBack.generation, 1);
+  assert.equal(rolledBack.result?.generation, 1);
+  assert.equal(rolledBack.remediationTurnsUsed, 0);
+  assert.equal(rolledBack.remediation, null);
+
+  const restarted = await delegations.claimRemediationLaunch({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    expectedGeneration: 1,
+  });
+  const secondIdentity = nextTransportIdentity(run.id, FIRST_DELEGATION_ID);
+  const remediating = await delegations.completeRemediationLaunch({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    expectedGeneration: 1,
+    claimToken: restarted.remediation.claimToken,
+    identity: secondIdentity,
+  });
+  assert.deepEqual(remediating.transportIdentity, secondIdentity);
+  assert.equal(remediating.remediation.state, "active");
 
   await assert.rejects(
-    () => delegations.recordTransportIdentity({
+    () => delegations.recordResult({
       runId: run.id,
       delegationId: FIRST_DELEGATION_ID,
-      identity: nextTransportIdentity(run.id, FIRST_DELEGATION_ID, {
-        pid: "99999",
-        processStartedAt: "2025-01-01T00:30:00.000Z",
-      }),
-      replacement: {
-        previousGeneration: 1,
-        previousIdentity: firstIdentity,
-      },
+      result: completedResult(2, "wrong claim"),
+      claimToken: SECOND_DELEGATION_ID,
     }),
-    /stale|current|identity/i,
+    /claim|stale/i,
   );
+
+  const completed = await delegations.recordResult({
+    runId: run.id,
+    delegationId: FIRST_DELEGATION_ID,
+    result: completedResult(2, "Current review completed"),
+    claimToken: restarted.remediation.claimToken,
+  });
+  assert.equal(completed.result.generation, 2);
+  assert.equal(completed.remediation, null);
 });
 
 test("consumes exact-origin results once and supports explicit adoption", async (t) => {
