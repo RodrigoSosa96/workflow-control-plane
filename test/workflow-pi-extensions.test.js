@@ -7,7 +7,9 @@ import { createWorkflowCoordinatorExtension } from "../.pi/extensions/workflow-c
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
+const ADOPTABLE_DELEGATION_ID = "33333333-3333-4333-8333-333333333333";
 const ORIGIN_SESSION_ID = "pi-origin-1";
+const LATER_SESSION_ID = "pi-origin-2";
 const CWD = "/fixture/review";
 const TASK = "Review the frozen brief.";
 const policy = {
@@ -182,12 +184,48 @@ test("child extension stays inert until valid session env, records bounded lifec
   assert.equal(result.terminate, true);
 });
 
-test("coordinator extension registers exact tools, starts its watcher only in session_start, and injects consumed results as follow-ups", async () => {
+test("coordinator extension registers exact tools, starts its watcher only in session_start, sanitizes advisory results, and allows later-session explicit adoption", async () => {
   const pi = createFakePi();
   const watcherCalls = [];
   const previewValue = preview();
   const confirmations = [];
+  const listCalls = [];
   let watcherOptions;
+
+  const advisoryRecord = {
+    id: DELEGATION_ID,
+    parentRunId: RUN_ID,
+    role: "code-reviewer",
+    mode: "background",
+    originSessionId: ORIGIN_SESSION_ID,
+    generation: 1,
+    state: "completed",
+    result: {
+      status: "completed",
+      generation: 1,
+      summary: "Reviewed scope",
+      verification: [{ command: "git diff --check", status: "passed" }],
+      concerns: [],
+      nextAction: "Await coordinator",
+      path: "/state/private/result.json",
+      writtenAt: "2025-01-01T00:00:00.000Z",
+      consumedBySessionId: ORIGIN_SESSION_ID,
+      consumedAt: "2025-01-01T00:00:01.000Z",
+      adoptedBySessionId: LATER_SESSION_ID,
+      adoptedAt: "2025-01-01T00:00:02.000Z",
+    },
+  };
+  const adoptableRecord = {
+    ...structuredClone(advisoryRecord),
+    id: ADOPTABLE_DELEGATION_ID,
+    result: {
+      ...structuredClone(advisoryRecord.result),
+      consumedBySessionId: undefined,
+      consumedAt: undefined,
+      adoptedBySessionId: undefined,
+      adoptedAt: undefined,
+    },
+  };
 
   const services = {
     async createPreview({ runId, input }) {
@@ -205,44 +243,23 @@ test("coordinator extension registers exact tools, starts its watcher only in se
     },
   };
   const delegations = {
-    async list({ originSessionId }) {
-      assert.equal(originSessionId, ORIGIN_SESSION_ID);
-      return [{
-        id: DELEGATION_ID,
-        parentRunId: RUN_ID,
-        role: "code-reviewer",
-        mode: "background",
-        originSessionId,
-        generation: 1,
-        state: "completed",
-        result: {
-          status: "completed",
-          generation: 1,
-          summary: "Reviewed scope",
-          verification: [],
-          concerns: [],
-          nextAction: "Await coordinator",
-        },
-      }];
+    async list({ originSessionId } = {}) {
+      listCalls.push(originSessionId);
+      const records = [structuredClone(advisoryRecord), structuredClone(adoptableRecord)];
+      return originSessionId ? records.filter((record) => record.originSessionId === originSessionId) : records;
     },
     async adoptResult({ runId, delegationId, originSessionId }) {
+      assert.equal(runId, RUN_ID);
+      assert.equal(delegationId, ADOPTABLE_DELEGATION_ID);
+      assert.equal(originSessionId, LATER_SESSION_ID);
       return {
-        id: delegationId,
-        parentRunId: runId,
-        role: "code-reviewer",
-        mode: "background",
-        originSessionId,
-        generation: 1,
-        state: "completed",
+        ...structuredClone(adoptableRecord),
         result: {
-          status: "completed",
-          generation: 1,
-          summary: "Reviewed scope",
-          verification: [],
-          concerns: [],
-          nextAction: "Await coordinator",
+          ...structuredClone(adoptableRecord.result),
           adoptedBySessionId: originSessionId,
+          adoptedAt: "2025-01-01T00:00:03.000Z",
           consumedBySessionId: originSessionId,
+          consumedAt: "2025-01-01T00:00:03.000Z",
         },
       };
     },
@@ -332,10 +349,28 @@ test("coordinator extension registers exact tools, starts its watcher only in se
   assert.equal(confirmations.length >= 2, true);
 
   const advisory = await resultTool.execute("call-4", { runId: RUN_ID, delegationId: DELEGATION_ID }, undefined, undefined, createContext({ hasUI: false }));
-  assert.equal(advisory.details.state, "completed");
+  assert.deepEqual(advisory.details, {
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    role: "code-reviewer",
+    generation: 1,
+    state: "completed",
+    summary: "Reviewed scope",
+    verification: [{ command: "git diff --check", status: "passed" }],
+    concerns: [],
+    nextAction: "Await coordinator",
+  });
+  assert.doesNotMatch(JSON.stringify(advisory), /path|writtenAt|consumedBySessionId|consumedAt|adoptedBySessionId|adoptedAt/);
 
-  const adopted = await adoptTool.execute("call-5", { runId: RUN_ID, delegationId: DELEGATION_ID }, undefined, undefined, ctx);
-  assert.equal(adopted.details.result.adoptedBySessionId, ORIGIN_SESSION_ID);
+  const adopted = await adoptTool.execute(
+    "call-5",
+    { runId: RUN_ID, delegationId: ADOPTABLE_DELEGATION_ID },
+    undefined,
+    undefined,
+    createContext({ confirmations: [], sessionId: LATER_SESSION_ID }),
+  );
+  assert.equal(adopted.details.result.adoptedBySessionId, LATER_SESSION_ID);
+  assert.equal(listCalls.includes(undefined), true);
 
   const remediated = await remediateTool.execute("call-6", {
     runId: RUN_ID,
@@ -353,6 +388,53 @@ test("coordinator extension registers exact tools, starts its watcher only in se
   await pi.emit("session_shutdown", { reason: "quit" }, ctx);
   await pi.emit("session_shutdown", { reason: "quit" }, ctx);
   assert.deepEqual(watcherCalls, ["start", "stop", "stop"]);
+});
+
+test("coordinator remediation rejects invalid insideFrozenBrief at the extension boundary before confirmation or execution", async () => {
+  const pi = createFakePi();
+  const confirmations = [];
+  let remediationCalls = 0;
+
+  createWorkflowCoordinatorExtension({
+    resolveServicesForRun: async () => ({
+      async beginRemediation() {
+        remediationCalls += 1;
+        return { state: "running", generation: 2, nextActions: ["await-result"] };
+      },
+    }),
+    delegations: {
+      async list() {
+        return [];
+      },
+      async adoptResult() {
+        throw new Error("not used");
+      },
+    },
+    createWatcher() {
+      return { start() {}, stop() {} };
+    },
+  })(pi);
+
+  const remediateTool = pi.tool("workflow_remediate_delegation");
+  for (const insideFrozenBrief of [false, "true", 1]) {
+    await assert.rejects(
+      () => remediateTool.execute("call-invalid", {
+        runId: RUN_ID,
+        delegationId: DELEGATION_ID,
+        expectedGeneration: 1,
+        reviewEvidence: {
+          generation: 1,
+          summary: "Still inside the frozen brief.",
+          insideFrozenBrief,
+        },
+        prompt: "Address the approved correction.",
+      }, undefined, undefined, createContext({ confirmations })),
+      /insideFrozenBrief|frozen brief|true/i,
+    );
+  }
+
+  assert.equal(confirmations.length, 0);
+  assert.equal(remediationCalls, 0);
 });
 
 test("coordinator tool_call blocks only unsafe or unprepared subagent requests and never rewrites input", async () => {

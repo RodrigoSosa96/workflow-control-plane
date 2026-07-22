@@ -165,10 +165,11 @@ function validateReviewEvidence(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("reviewEvidence must be an object");
   const keys = Object.keys(value);
   if (keys.some((key) => !(key in reviewEvidenceSchema.properties))) fail("reviewEvidence contains unsupported fields");
+  if (value.insideFrozenBrief !== true) fail("reviewEvidence.insideFrozenBrief must be true");
   return {
     generation: ensureInteger(value.generation, "reviewEvidence.generation"),
     summary: ensureString(value.summary, "reviewEvidence.summary"),
-    insideFrozenBrief: value.insideFrozenBrief === true,
+    insideFrozenBrief: true,
   };
 }
 
@@ -225,16 +226,29 @@ function renderPreview(preview) {
   ].join("\n"));
 }
 
-function renderDelegationRecord(record) {
+function advisoryDetailsForRecord(record) {
+  return {
+    runId: record.parentRunId,
+    delegationId: record.id,
+    role: record.role,
+    generation: record.generation,
+    state: record.state,
+    summary: record.result?.summary ?? null,
+    verification: structuredClone(record.result?.verification ?? []),
+    concerns: structuredClone(record.result?.concerns ?? []),
+    nextAction: record.result?.nextAction ?? null,
+  };
+}
+
+function renderDelegationRecord(details) {
   return bound([
-    `Delegation ${record.id}`,
-    `Run: ${record.parentRunId}`,
-    `Role: ${record.role}`,
-    `Mode: ${record.mode}`,
-    `State: ${record.state}`,
-    `Generation: ${record.generation}`,
-    `Result: ${record.result?.status ?? "pending"}`,
-    record.result?.summary ? `Summary: ${record.result.summary}` : "",
+    `Delegation ${details.delegationId}`,
+    `Run: ${details.runId}`,
+    `Role: ${details.role}`,
+    `State: ${details.state}`,
+    `Generation: ${details.generation}`,
+    details.summary ? `Summary: ${details.summary}` : "",
+    details.nextAction ? `Next action: ${details.nextAction}` : "",
   ].filter(Boolean).join("\n"));
 }
 
@@ -399,7 +413,7 @@ export function createWorkflowCoordinatorExtension({
       return await (await runtime()).resolveServicesForRun(runId);
     }
 
-    async function findDelegation(runId, delegationId, originSessionId) {
+    async function findDelegation(runId, delegationId, { originSessionId } = {}) {
       const records = await (await runtime()).delegations.list(originSessionId ? { originSessionId } : {});
       const record = records.find((entry) => entry.parentRunId === runId && entry.id === delegationId);
       if (!record) fail("Delegation was not found");
@@ -535,18 +549,11 @@ export function createWorkflowCoordinatorExtension({
       parameters: delegationSelectorSchema,
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const input = validateSelector(params);
-        const record = await findDelegation(input.runId, input.delegationId, sessionIdFromContext(ctx));
+        const record = await findDelegation(input.runId, input.delegationId, { originSessionId: sessionIdFromContext(ctx) });
+        const advisory = advisoryDetailsForRecord(record);
         return {
-          content: [{ type: "text", text: renderDelegationRecord(record) }],
-          details: {
-            runId: input.runId,
-            delegationId: record.id,
-            role: record.role,
-            mode: record.mode,
-            state: record.state,
-            generation: record.generation,
-            result: record.result ?? null,
-          },
+          content: [{ type: "text", text: renderDelegationRecord(advisory) }],
+          details: advisory,
         };
       },
     });
@@ -559,8 +566,8 @@ export function createWorkflowCoordinatorExtension({
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const input = validateSelector(params);
         const originSessionId = sessionIdFromContext(ctx);
-        const record = await findDelegation(input.runId, input.delegationId, originSessionId);
-        const approved = await confirmMutation(ctx, "Adopt Workflow delegation result?", renderDelegationRecord(record), {
+        const record = await findDelegation(input.runId, input.delegationId);
+        const approved = await confirmMutation(ctx, "Adopt Workflow delegation result?", renderDelegationRecord(advisoryDetailsForRecord(record)), {
           runId: input.runId,
           delegationId: input.delegationId,
           originSessionId,

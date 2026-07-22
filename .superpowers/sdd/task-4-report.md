@@ -127,3 +127,33 @@ Passed.
 - `test/workflow-pi-extensions.test.js`
 - `test/workflow-delegation-watcher.test.js`
 - `test/workflow-coordinator-policy.test.js`
+
+## Follow-up fix RED/GREEN evidence
+### RED
+Command:
+```bash
+node --test test/workflow-pi-extensions.test.js test/workflow-delegation-watcher.test.js test/workflow-coordinator-policy.test.js
+```
+Observed failures before the fix:
+- `workflow_adopt_delegation_result` still filtered lookup to the adopter session, so later-session explicit adoption failed.
+- `workflow_remediate_delegation` accepted invalid `insideFrozenBrief` values past the extension boundary.
+- `workflow_delegation_result` exposed unsanitized raw result metadata in `details`.
+
+### GREEN
+Focused:
+```bash
+node --test test/workflow-pi-extensions.test.js test/workflow-delegation-watcher.test.js test/workflow-coordinator-policy.test.js
+```
+Passed (`11/11`).
+
+Full:
+```bash
+npm test
+```
+Passed (`362/362`).
+
+Diff hygiene:
+```bash
+git diff --check
+```
+Passed.
