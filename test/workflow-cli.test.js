@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { WorkflowError } from "../src/workflow/errors.js";
+import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
 import { main, parseArgs } from "../bin/workflow.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -546,6 +547,88 @@ test("delegation remediate dry-run reads only --prompt-file, and execution requi
   assert.equal(executeCode, 0);
   assert.deepEqual(executeCalls, [{ approvalDigest: APPROVAL_DIGEST }]);
   assert.deepEqual(executeOutput.stdout, ["delegation-remediate:compact:running"]);
+});
+
+test("CLI live delegation inspection exact-matches extension identities via the shared processStartedAt format", async () => {
+  const extensionInspection = await inspectExactProcessByPid("12345", {
+    async runProcess() {
+      return { code: 0, stdout: "Wed Jan  1 00:10:00 2025 S\n" };
+    },
+    async readCwd() {
+      return "/fixture/review";
+    },
+    cwdFallback: "/fixture/review",
+  });
+  const extensionIdentity = {
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: `/state/workflow/${RUN_ID}/delegations/${DELEGATION_ID}/pi-session.jsonl`,
+    cwd: "/fixture/review",
+    pid: "12345",
+    processStartedAt: extensionInspection.startedAt,
+  };
+  const psCalls = [];
+  let inspectPromise;
+
+  assert.equal(await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID], {
+    out() {},
+    err() {},
+    runner: {
+      async run(command, argv, options) {
+        psCalls.push({ command, argv, options });
+        return { code: 0, stdout: "Wed Jan  1 00:10:00 2025 S\n" };
+      },
+    },
+    readDelegationCwd: async (path) => {
+      assert.equal(path, "/proc/12345/cwd");
+      return "/fixture/review";
+    },
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async () => "/usr/bin/pi",
+    createPiDelegationTransport: (options) => {
+      inspectPromise = options.inspectProcess(extensionIdentity).then((observed) => {
+        assert.deepEqual(observed, {
+          pid: "12345",
+          startedAt: extensionIdentity.processStartedAt,
+          cwd: "/fixture/review",
+          active: false,
+        });
+      });
+      return {
+        async start() {
+          throw new Error("not used");
+        },
+        async observeExact() {
+          return { state: "idle", identity: extensionIdentity };
+        },
+        async deliverFollowUp() {
+          throw new Error("not used");
+        },
+        async requestGracefulClose() {
+          return { requested: false, manual: true };
+        },
+      };
+    },
+    delegationReconcileCommand: async () => ({
+      command: "delegation-reconcile",
+      runId: RUN_ID,
+      delegationId: DELEGATION_ID,
+      role: "code-reviewer",
+      mode: "background",
+      state: "completed",
+      generation: 1,
+      resultStatus: "completed",
+      nextActions: ["deliver-result"],
+    }),
+    formatWorkflowResult: () => "ok",
+  }), 0);
+  await inspectPromise;
+  assert.deepEqual(psCalls, [{
+    command: "ps",
+    argv: ["-p", "12345", "-o", "lstart=", "-o", "state="],
+    options: { allowFailure: true },
+  }]);
 });
 
 test("main wires the live Pi delegation transport only for live reconcile and approved remediation", async () => {

@@ -26,6 +26,7 @@ import {
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
+import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
 import { createPiDelegationTransport as defaultCreatePiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { loadRegistry as defaultLoadRegistry } from "../src/workflow/registry.js";
 import { lookupExecutable, resolveWorkflowProjectsFile } from "../src/workflow/runtime-config.js";
@@ -358,50 +359,32 @@ function processError(message, details) {
   return new WorkflowError("PROCESS", message, { exitCode: 12, details });
 }
 
-function parseStartedAt(value) {
-  const text = String(value ?? "").trim().replace(/\s+/gu, " ");
-  const parsed = Date.parse(text);
-  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : text;
-}
-
-function activeFromProcessState(value) {
-  const state = String(value ?? "").trim().toUpperCase();
-  return state.startsWith("R") || state.startsWith("D");
-}
-
-async function inspectDelegationPid(pid, { runner, cwdFallback } = {}) {
-  const result = await runner.run("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
-  if (result.code !== 0 || !result.stdout.trim()) return null;
-
-  const line = result.stdout.trim().split(/\r?\n/gu).at(-1)?.trim() ?? "";
-  const match = /^(?<startedAt>[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(?<state>[A-Z]+)/u.exec(line);
-  if (!match?.groups) {
-    throw processError("Failed to inspect delegated Pi process", { pid: String(pid), stdout: bound(result.stdout) });
-  }
-
-  let cwd = cwdFallback ?? null;
+async function inspectDelegationPid(pid, { runner, cwdFallback, readCwd = fsRealpath } = {}) {
   try {
-    cwd = await fsRealpath(`/proc/${pid}/cwd`);
-  } catch {
-    if (!cwd) return null;
+    return await inspectExactProcessByPid(pid, {
+      async runProcess(resolvedPid) {
+        return await runner.run("ps", ["-p", String(resolvedPid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
+      },
+      readCwd,
+      cwdFallback,
+    });
+  } catch (error) {
+    throw processError("Failed to inspect delegated Pi process", {
+      pid: String(pid),
+      reason: error?.message ?? "inspect",
+    });
   }
-
-  return {
-    pid: String(pid),
-    startedAt: parseStartedAt(match.groups.startedAt),
-    cwd,
-    active: activeFromProcessState(match.groups.state),
-  };
 }
 
-function createDefaultDelegationInspector(liveDependencies) {
+function createDefaultDelegationInspector(liveDependencies, dependencies = {}) {
   return async (identity) => await inspectDelegationPid(identity.pid, {
     runner: liveDependencies.runner,
     cwdFallback: identity.cwd,
+    readCwd: dependencies.readDelegationCwd ?? fsRealpath,
   });
 }
 
-function createDefaultDelegationSpawner(liveDependencies) {
+function createDefaultDelegationSpawner(liveDependencies, dependencies = {}) {
   return async ({ command, argv, cwd, env: launchEnv }) => await new Promise((resolveSpawn, rejectSpawn) => {
     let child;
     try {
@@ -445,11 +428,21 @@ function createDefaultDelegationSpawner(liveDependencies) {
         const inspection = await inspectDelegationPid(pid, {
           runner: liveDependencies.runner,
           cwdFallback: cwd,
+          readCwd: dependencies.readDelegationCwd ?? fsRealpath,
         });
+        if (!inspection) {
+          throw processError("Failed to inspect delegated Pi process", {
+            reason: "inspect",
+            command,
+            argv,
+            cwd,
+            pid: String(pid),
+          });
+        }
         child.unref?.();
         resolveSpawn({
           pid: String(pid),
-          startedAt: inspection?.startedAt ?? new Date().toISOString(),
+          startedAt: inspection.startedAt,
         });
       } catch (error) {
         rejectSpawn(error);
@@ -472,8 +465,8 @@ async function withLiveDelegationTransport(options, liveDependencies, dependenci
     throw new WorkflowError("PREFLIGHT", "Pi executable must resolve to an absolute path for delegation", { exitCode: 10 });
   }
   const stateRoot = await stateRootForTransport(options, liveDependencies);
-  const inspectProcess = dependencies.inspectDelegationProcess ?? createDefaultDelegationInspector(liveDependencies);
-  const spawnChild = dependencies.spawnDelegationChild ?? createDefaultDelegationSpawner(liveDependencies);
+  const inspectProcess = dependencies.inspectDelegationProcess ?? createDefaultDelegationInspector(liveDependencies, dependencies);
+  const spawnChild = dependencies.spawnDelegationChild ?? createDefaultDelegationSpawner(liveDependencies, dependencies);
   return {
     ...liveDependencies,
     stateRoot,

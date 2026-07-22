@@ -213,35 +213,32 @@ test("observeExact returns active or idle only when pid, start time, and cwd all
   assert.equal(started.length, 1);
 });
 
-test("deliverFollowUp refuses active workers, resumes only the latest exact session, and rejects stale callers", async () => {
+test("deliverFollowUp rebuilds exact-session remediation from persisted private state in a fresh transport", async () => {
   const launches = [];
   const transport = createTransport({
     spawnChild: async (launch) => {
       launches.push(structuredClone(launch));
-      return launches.length === 1
-        ? { pid: "12345", startedAt: "2025-01-01T00:10:00.000Z" }
-        : { pid: "67890", startedAt: "2025-01-01T00:20:00.000Z" };
-    },
-    inspectProcess: async (identity) => (launches.length === 1
-      ? { pid: identity.pid, startedAt: identity.processStartedAt, cwd: identity.cwd, active: true }
-      : null),
-  });
-
-  const identity = (await transport.start(assignment())).identity;
-  await assert.rejects(() => transport.deliverFollowUp(identity, "Address the approved correction."), /active|exact worker/i);
-  assert.equal(launches.length, 1);
-
-  const resuming = createTransport({
-    spawnChild: async (launch) => {
-      launches.push(structuredClone(launch));
-      return launches.length === 2
-        ? { pid: "12345", startedAt: "2025-01-01T00:10:00.000Z" }
-        : { pid: "67890", startedAt: "2025-01-01T00:20:00.000Z" };
+      return { pid: "67890", startedAt: "2025-01-01T00:20:00.000Z" };
     },
     inspectProcess: async () => null,
   });
-  const seededIdentity = (await resuming.start(assignment())).identity;
-  const delivered = await resuming.deliverFollowUp(seededIdentity, "Address the approved correction.");
+
+  const delivered = await transport.deliverFollowUp({
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: SESSION_PATH,
+    cwd: CWD,
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  }, "Address the approved correction.", {
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    role: "sdd-implementer",
+    mode: "foreground",
+    cwd: CWD,
+    generation: 2,
+  });
 
   assert.deepEqual(delivered, {
     delivered: true,
@@ -260,12 +257,43 @@ test("deliverFollowUp refuses active workers, resumes only the latest exact sess
   assert.equal(resumedLaunch.argv[resumedLaunch.argv.indexOf("--session-dir") + 1], SESSION_DIRECTORY);
   assert.equal(resumedLaunch.env.WORKFLOW_DELEGATION_GENERATION, "2");
   assert.equal(resumedLaunch.argv.at(-1), "Address the approved correction.");
+});
 
+
+test("deliverFollowUp refuses active or mismatched live identities in a fresh transport", async () => {
+  const identity = {
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: SESSION_PATH,
+    cwd: CWD,
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+  };
+  const resume = {
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    role: "sdd-implementer",
+    mode: "foreground",
+    cwd: CWD,
+    generation: 2,
+  };
+
+  const activeTransport = createTransport({
+    inspectProcess: async () => ({ pid: "12345", startedAt: "2025-01-01T00:10:00.000Z", cwd: CWD, active: true }),
+  });
   await assert.rejects(
-    () => resuming.deliverFollowUp(seededIdentity, "Retry with stale identity."),
-    /stale|latest|exact|identity/i,
+    () => activeTransport.deliverFollowUp(identity, "Address the approved correction.", resume),
+    /active|exact worker/i,
   );
-  assert.equal(launches.length, 3);
+
+  const mismatchTransport = createTransport({
+    inspectProcess: async () => ({ pid: "99999", startedAt: "2025-01-01T00:20:00.000Z", cwd: CWD, active: false }),
+  });
+  await assert.rejects(
+    () => mismatchTransport.deliverFollowUp(identity, "Address the approved correction.", resume),
+    /mismatch|identity|exact/i,
+  );
 });
 
 test("requestGracefulClose returns manual guidance and never mutates the process", async () => {

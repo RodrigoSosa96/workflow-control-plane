@@ -361,10 +361,11 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     return written.run.delegations[id];
   }
 
-  async function beginRemediation({ runId, delegationId: id, expectedGeneration } = {}) {
+  async function beginRemediation({ runId, delegationId: id, expectedGeneration, identity } = {}) {
     if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
       fail("expected delegation generation must be a positive integer");
     }
+    const nextIdentity = identity === undefined ? null : validateTransportIdentity(identity, runId, id);
     return await updateRecord({
       runId,
       delegationId: id,
@@ -372,12 +373,28 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (record.remediationTurnsUsed >= record.remediationTurns) fail("Delegation remediation limit is exhausted");
+        if (nextIdentity) {
+          if (!record.transportIdentity) fail("Delegation transport identity is missing");
+          if (
+            nextIdentity.sessionPath !== record.transportIdentity.sessionPath
+            || nextIdentity.cwd !== record.transportIdentity.cwd
+          ) {
+            fail("Delegation remediation identity must keep the same session and cwd");
+          }
+          if (
+            nextIdentity.pid === record.transportIdentity.pid
+            && nextIdentity.processStartedAt === record.transportIdentity.processStartedAt
+          ) {
+            fail("Delegation remediation identity must record a new exact process identity");
+          }
+        }
         return {
           ...record,
           state: "running",
           generation: record.generation + 1,
           result: null,
           remediationTurnsUsed: record.remediationTurnsUsed + 1,
+          ...(nextIdentity ? { transportIdentity: nextIdentity } : {}),
         };
       },
     });

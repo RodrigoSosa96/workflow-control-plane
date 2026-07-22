@@ -10,6 +10,7 @@ import { createDelegationReservationStore } from "../../../src/workflow/delegati
 import { createDelegationServices } from "../../../src/workflow/delegation-services.js";
 import { createPiDelegationTransport } from "../../../src/workflow/pi-delegation-transport.js";
 import { loadDelegationRole } from "../../../src/workflow/delegation-roles.js";
+import { inspectExactProcessByPid } from "../../../src/workflow/process-observation.js";
 import { validateSubagentRequestPolicy } from "../../../src/workflow/coordinator-policy.js";
 import { createDelegationWatcher } from "../../../src/workflow/delegation-watcher.js";
 import { lookupExecutable, resolveWorkflowProjectsFile } from "../../../src/workflow/runtime-config.js";
@@ -286,11 +287,37 @@ function summarizeExecution(result) {
   return bound(`Workflow delegation state: ${result.state}; generation ${result.generation}.`);
 }
 
-async function processStartTick(pid) {
-  const text = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-  const endCommand = text.lastIndexOf(")");
-  const fields = text.slice(endCommand + 2).trim().split(/\s+/);
-  return fields[19];
+async function runPsForPid(pid) {
+  return await new Promise<{ code: number | null; stdout: string }>((resolvePromise, reject) => {
+    let child;
+    try {
+      child = spawn("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], {
+        shell: false,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let stdout = "";
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      resolvePromise({ code, stdout });
+    });
+  });
+}
+
+async function inspectCoordinatorPid(pid, cwdFallback) {
+  return await inspectExactProcessByPid(pid, {
+    runProcess: runPsForPid,
+    readCwd: async (path) => await fs.readlink(path),
+    cwdFallback,
+  });
 }
 
 async function spawnChildProcess({ command, argv, cwd, env }) {
@@ -312,9 +339,10 @@ async function spawnChildProcess({ command, argv, cwd, env }) {
     child.once("error", reject);
     child.once("spawn", async () => {
       try {
+        const inspection = await inspectCoordinatorPid(child.pid, cwd);
+        if (!inspection) throw new Error("Failed to inspect delegated Pi process");
         child.unref();
-        const startedAt = await processStartTick(child.pid);
-        resolvePromise({ pid: String(child.pid), startedAt });
+        resolvePromise({ pid: String(child.pid), startedAt: inspection.startedAt });
       } catch (error) {
         reject(error);
       }
@@ -324,14 +352,7 @@ async function spawnChildProcess({ command, argv, cwd, env }) {
 
 async function inspectChildProcess(identity) {
   try {
-    const startedAt = await processStartTick(identity.pid);
-    const cwd = await fs.readlink(`/proc/${identity.pid}/cwd`);
-    return {
-      pid: identity.pid,
-      startedAt,
-      cwd,
-      active: true,
-    };
+    return await inspectCoordinatorPid(identity.pid, identity.cwd);
   } catch {
     return null;
   }

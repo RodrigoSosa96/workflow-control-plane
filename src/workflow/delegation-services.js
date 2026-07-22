@@ -492,26 +492,28 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
       fail(`Delegation remediation observation is ${observation?.state ?? "missing"}; exact worker must be idle`);
     }
 
-    let remediating = await delegations.beginRemediation({ runId, delegationId, expectedGeneration });
     let delivered;
     try {
-      delivered = await workerTransport.deliverFollowUp(record.transportIdentity, prompt);
+      delivered = await workerTransport.deliverFollowUp(record.transportIdentity, prompt, {
+        runId,
+        delegationId,
+        role: record.role,
+        mode: record.mode,
+        cwd: record.cwd,
+        generation: expectedGeneration + 1,
+      });
     } catch (_error) {
-      remediating = await readRecord(runId, delegationId);
-      return publicState(remediating, record.transportIdentity, ["manual-follow-up", "manual-review"]);
+      return publicState(record, record.transportIdentity, ["begin-remediation", "manual-review"]);
     }
 
     const identity = validateTransportIdentity(delivered?.identity ?? delivered, runId, delegationId);
-    const recorded = await delegations.recordTransportIdentity({
+    const remediating = await delegations.beginRemediation({
       runId,
       delegationId,
+      expectedGeneration,
       identity,
-      replacement: {
-        previousGeneration: expectedGeneration,
-        previousIdentity: record.transportIdentity,
-      },
     });
-    return publicState(recorded, identity, ["await-result"]);
+    return publicState(remediating, identity, ["await-result"]);
   }
 
   return Object.freeze({ createPreview, executeApproved, reconcile, beginRemediation });

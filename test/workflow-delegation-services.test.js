@@ -113,12 +113,12 @@ function createTransport({ startImpl, deliverFollowUpImpl, observations = [] } =
     async observeExact(identity) {
       return await base.observeExact(identity);
     },
-    async deliverFollowUp(identity, prompt) {
+    async deliverFollowUp(identity, prompt, resume) {
       if (deliverFollowUpImpl) {
-        calls.push({ method: "deliverFollowUp", identity: structuredClone(identity) });
-        return await deliverFollowUpImpl(identity, prompt);
+        calls.push({ method: "deliverFollowUp", identity: structuredClone(identity), resume: structuredClone(resume) });
+        return await deliverFollowUpImpl(identity, prompt, resume);
       }
-      return await base.deliverFollowUp(identity, prompt);
+      return await base.deliverFollowUp(identity, prompt, resume);
     },
     async requestGracefulClose(identity) {
       return await base.requestGracefulClose(identity);
@@ -422,6 +422,65 @@ test("beginRemediation rejects unsafe active observations before incrementing ge
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 0);
 });
 
+test("beginRemediation succeeds after rebuilding the transport from persisted private state", async (t) => {
+  const firstIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const secondIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
+  const fixture = await createCompletedDelegation(t, {
+    transport: createTransport({
+      startImpl: async () => ({ identity: firstIdentity }),
+    }),
+  });
+
+  const freshTransport = createTransport({
+    deliverFollowUpImpl: async (_identity, _prompt, resume) => {
+      assert.deepEqual(resume, {
+        runId: RUN_ID,
+        delegationId: DELEGATION_ID,
+        role: "code-reviewer",
+        mode: "background",
+        cwd: CWD,
+        generation: 2,
+      });
+      return {
+        delivered: true,
+        identity: secondIdentity,
+      };
+    },
+    observations: [{ state: "idle", identity: firstIdentity }],
+  });
+  const freshServices = createDelegationServices({
+    registry,
+    projectAlias: PROJECT_ALIAS,
+    runStore: fixture.store,
+    delegations: fixture.delegations,
+    reservations: fixture.reservations,
+    transport: freshTransport,
+    roles: {
+      async loadDelegationRole({ name }) {
+        return Object.freeze({
+          name,
+          tools: ["read", "bash", "grep", "find", "ls"],
+          systemPrompt: "Review only the frozen brief.",
+        });
+      },
+    },
+  });
+
+  const remediated = await freshServices.beginRemediation({
+    runId: fixture.run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  });
+
+  assert.equal(remediated.state, "running");
+  assert.equal(remediated.generation, 2);
+  assert.deepEqual(remediated.identity, secondIdentity);
+  assert.deepEqual((await fixture.store.read(fixture.run.id)).delegations[DELEGATION_ID].transportIdentity, secondIdentity);
+  assert.deepEqual(freshTransport.calls.filter((call) => call.method === "start"), []);
+});
+
 test("beginRemediation persists replacement identities and later observation/remediation uses them", async (t) => {
   const firstIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
   const secondIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
@@ -538,7 +597,7 @@ test("beginRemediation permits only two turns with matching review evidence and 
   );
 });
 
-test("beginRemediation preserves the incremented generation when follow-up delivery fails", async (t) => {
+test("beginRemediation leaves the current generation and result intact when follow-up delivery fails", async (t) => {
   const expectedIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
   const transport = createTransport({
     startImpl: async () => ({ identity: expectedIdentity }),
@@ -560,9 +619,15 @@ test("beginRemediation preserves the incremented generation when follow-up deliv
     prompt: "SECRET-FOLLOW-UP-PROMPT",
   });
 
-  assert.equal(result.state, "running");
-  assert.equal(result.generation, 2);
-  assert.match(result.nextActions.join(" "), /manual/i);
-  assert.equal((await store.read(run.id)).delegations[DELEGATION_ID].generation, 2);
+  assert.equal(result.state, "completed");
+  assert.equal(result.generation, 1);
+  assert.equal(result.resultStatus, "completed");
+  assert.match(result.nextActions.join(" "), /remediation|manual/i);
+  const record = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(record.generation, 1);
+  assert.equal(record.state, "completed");
+  assert.equal(record.result?.generation, 1);
+  assert.equal(record.result?.summary, "Review completed");
+  assert.deepEqual(record.transportIdentity, expectedIdentity);
   assert.doesNotMatch(JSON.stringify(result), /SECRET-DELIVERY-FAILURE|SECRET-FOLLOW-UP-PROMPT/);
 });

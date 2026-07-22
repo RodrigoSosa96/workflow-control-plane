@@ -6,6 +6,7 @@ import { loadDelegationRole as defaultLoadDelegationRole } from "./delegation-ro
 const RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_SHORT_TEXT = 4096;
 const MAX_TEXT_BYTES = 64 * 1024;
+const MODES = new Set(["foreground", "background"]);
 const IDENTITY_KEYS = new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]);
 const ASSIGNMENT_KEYS = new Set([
   "runId",
@@ -92,20 +93,6 @@ function assertTransportIdentity(value) {
   });
 }
 
-function sameIdentity(left, right) {
-  return Boolean(
-    left
-    && right
-    && left.kind === right.kind
-    && left.runId === right.runId
-    && left.delegationId === right.delegationId
-    && left.sessionPath === right.sessionPath
-    && left.cwd === right.cwd
-    && left.pid === right.pid
-    && left.processStartedAt === right.processStartedAt,
-  );
-}
-
 function assertPrompt(value, context = "Pi delegation prompt") {
   if (typeof value !== "string" || !value || value.includes("\0") || Buffer.byteLength(value, "utf8") > MAX_TEXT_BYTES) {
     fail(`${context} must be bounded valid text`);
@@ -160,6 +147,13 @@ function sessionPaths(runDirectory, delegationId) {
   return { sessionDirectory: directory, sessionPath };
 }
 
+function sessionDirectoryFromIdentity(identity, stateRoot) {
+  const runDirectory = runDirectoryFor(stateRoot, identity.runId);
+  const expected = sessionPaths(runDirectory, identity.delegationId);
+  if (identity.sessionPath !== expected.sessionPath) fail("transport identity sessionPath does not match the private session artifact");
+  return expected.sessionDirectory;
+}
+
 function safeEnv({ runId, delegationId, generation, runDirectory, stateRoot, controlPlaneBin }) {
   return Object.freeze({
     WORKFLOW_RUN_ID: runId,
@@ -195,6 +189,22 @@ function launchIdentity({ runId, delegationId, sessionPath, cwd, pid, startedAt 
     pid,
     processStartedAt: startedAt,
   });
+}
+
+function remediationContext(value, identity) {
+  const context = assertObject(value, "remediation context");
+  assertExactKeys(context, new Set(["runId", "delegationId", "role", "mode", "cwd", "generation"]), "remediation context");
+  const role = assertString(context.role, "remediation context role", { limit: 128 });
+  const mode = assertString(context.mode, "remediation context mode", { limit: 32 });
+  if (!MODES.has(mode)) fail("remediation context mode is unsupported");
+  const cwd = assertAbsolutePath(context.cwd, "remediation context cwd");
+  if (cwd !== identity.cwd) fail("remediation context cwd must match the exact worker identity");
+  const generation = context.generation;
+  if (!Number.isInteger(generation) || generation < 1) fail("remediation context generation must be a positive integer");
+  if (assertRunId(context.runId) !== identity.runId || assertString(context.delegationId, "remediation context delegationId", { limit: 128 }) !== identity.delegationId) {
+    fail("remediation context must match the exact worker identity");
+  }
+  return { runId: identity.runId, delegationId: identity.delegationId, role, mode, cwd, generation };
 }
 
 function assignmentContext(approvedAssignment, { stateRoot, controlPlaneBin }) {
@@ -270,7 +280,6 @@ export function createPiDelegationTransport({
   const resolvedChildExtensionPath = assertAbsolutePath(childExtensionPath, "childExtensionPath");
   if (resolvedChildExtensionPath.startsWith("npm:")) fail("childExtensionPath must be a local path");
   const resolvedAgentDirectory = assertAbsolutePath(agentDirectory, "agentDirectory");
-  const launches = new Map();
 
   async function start(approvedAssignment) {
     const context = assignmentContext(approvedAssignment, {
@@ -317,16 +326,6 @@ export function createPiDelegationTransport({
       pid: spawned.pid,
       startedAt: spawned.startedAt,
     });
-    launches.set(`${context.runId}:${context.delegationId}`, {
-      runId: context.runId,
-      delegationId: context.delegationId,
-      cwd: context.cwd,
-      sessionPath,
-      sessionDirectory,
-      generation: context.generation,
-      tools: [...roleDefinition.tools],
-      identity,
-    });
     return { identity };
   }
 
@@ -349,42 +348,37 @@ export function createPiDelegationTransport({
     return { state: observed.active ? "active" : "idle", identity };
   }
 
-  async function deliverFollowUp(requestedIdentity, prompt) {
+  async function deliverFollowUp(requestedIdentity, prompt, persistedRemediation) {
     const identity = assertTransportIdentity(requestedIdentity);
-    const key = `${identity.runId}:${identity.delegationId}`;
-    const existing = launches.get(key);
-    if (!existing || !sameIdentity(existing.identity, identity)) {
-      fail("exact delegation session requires the latest cached identity");
-    }
+    const context = remediationContext(persistedRemediation, identity);
     const observation = await observeExact(identity);
     if (observation.state === "active") fail("exact worker is still active");
     if (observation.state === "mismatch") fail("exact worker identity no longer matches the recorded session");
-    const generation = existing.generation + 1;
+    const roleDefinition = await loadDelegationRole({ name: context.role, agentDirectory: resolvedAgentDirectory, fs });
     const env = safeEnv({
       runId: identity.runId,
       delegationId: identity.delegationId,
-      generation,
+      generation: context.generation,
       runDirectory: runDirectoryFor(resolvedStateRoot, identity.runId),
       stateRoot: resolvedStateRoot,
       controlPlaneBin: resolvedControlPlaneBin,
     });
     const argv = launchArgv({
       sessionPath: identity.sessionPath,
-      sessionDirectory: existing.sessionDirectory,
+      sessionDirectory: sessionDirectoryFromIdentity(identity, resolvedStateRoot),
       childExtensionPath: resolvedChildExtensionPath,
-      tools: existing.tools,
+      tools: Array.isArray(roleDefinition.tools) ? roleDefinition.tools : fail("delegation role tools must be an array"),
       bootstrap: assertPrompt(prompt),
     });
-    const spawned = assertSpawnResult(await spawnChild({ command, argv, cwd: existing.cwd, env }));
+    const spawned = assertSpawnResult(await spawnChild({ command, argv, cwd: context.cwd, env }));
     const nextIdentity = launchIdentity({
       runId: identity.runId,
       delegationId: identity.delegationId,
       sessionPath: identity.sessionPath,
-      cwd: existing.cwd,
+      cwd: context.cwd,
       pid: spawned.pid,
       startedAt: spawned.startedAt,
     });
-    launches.set(key, { ...existing, generation, identity: nextIdentity });
     return { delivered: true, identity: nextIdentity };
   }
 
