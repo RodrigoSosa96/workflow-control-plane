@@ -3,6 +3,10 @@ import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { access, rm } from "node:fs/promises";
 import { createSmokeRunner } from "../scripts/smoke-workflow-fixture.js";
+import { createWorkflowFixture } from "../src/workflow/fixture.js";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function runSmoke(args, { stdin, env } = {}) {
   return new Promise((resolve) => {
@@ -31,6 +35,17 @@ test("runner accepts injected env and streams", async () => {
     stdin: { once: () => {}, isTTY: true },
   });
   assert.equal(typeof runner.run, "function");
+});
+
+test("fixture single repo contains canary edit target and test", async () => {
+  const fixture = await createWorkflowFixture({
+    root: join(tmpdir(), `workflow-canary-target-test-${Date.now()}`),
+    packageRoot: new URL("..", import.meta.url).pathname,
+  });
+  const fixtureJs = await readFile(join(fixture.projects["fixture-single"].path, "fixture.js"), "utf8");
+  const testJs = await readFile(join(fixture.projects["fixture-single"].path, "test.js"), "utf8");
+  assert.match(fixtureJs, /export const value = "initial"/);
+  assert.match(testJs, /assert\.equal\(value, "initial"\)/);
 });
 
 test("--real requires TTY", async () => {

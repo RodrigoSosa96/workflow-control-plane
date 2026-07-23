@@ -4,6 +4,8 @@ import { cleanupWorkflowFixture } from "../src/workflow/fixture-cleanup.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 
 function parseArgs(argv) {
   const args = { fake: false, real: false, keep: false, agent: null };
@@ -51,6 +53,35 @@ async function assertRealModeAllowed(args, { env, stdin, stdout }) {
   }
 }
 
+const CANARY_ASSIGNMENT = `This is a controlled Workflow canary. Perform exactly these steps:
+
+1. Edit fixture.js so the exported value changes from "initial" to "implemented".
+2. Update the matching assertion in test.js if needed.
+3. Run \`node --test\` in this repository.
+4. Submit the required structured workflow handoff for tickets FIX-101 and FIX-102.
+
+Do not push, fetch, access secrets, alter permissions, close the workspace, or clean up resources.
+Do not perform any work beyond the edit and test described above.`;
+
+function printCanaryDisclosure(fixture, agent, stdout) {
+  stdout.write("=== Workflow Real Canary ===\n");
+  stdout.write(`Harness: ${agent}\n`);
+  stdout.write(`Fixture root: ${fixture.root}\n`);
+  stdout.write(`Registry: ${fixture.registryPath}\n`);
+  stdout.write(`State root: ${fixture.stateRoot}\n`);
+  stdout.write(`Tickets: FIX-101, FIX-102\n`);
+  stdout.write("\nAssignment:\n");
+  stdout.write(CANARY_ASSIGNMENT);
+  stdout.write("\n\nWARNING: This will start a real Pi harness and may consume API tokens.\n");
+  stdout.write("All resources will be preserved (--keep is required).\n\n");
+}
+
+async function writePromptFile(root) {
+  const promptPath = join(root, "canary-prompt.txt");
+  await writeFile(promptPath, CANARY_ASSIGNMENT);
+  return promptPath;
+}
+
 async function runSmoke({ args, env, stdin, stdout, stderr }) {
   if (!args.fake && !args.real) {
     stderr.write("USAGE: smoke-workflow-fixture --fake --keep | --real --agent pi --keep\n");
@@ -64,8 +95,13 @@ async function runSmoke({ args, env, stdin, stdout, stderr }) {
       stderr.write(`${error.message}\n`);
       return { code: 1 };
     }
-    stderr.write("Real canary mode is not yet implemented. Use --fake for fixture-only smoke.\n");
-    return { code: 1 };
+    const fixture = await createWorkflowFixture({
+      root: join(tmpdir(), `workflow-smoke-real-${args.agent}-${Date.now()}-${randomUUID().slice(0, 8)}`),
+      packageRoot: new URL("..", import.meta.url).pathname,
+    });
+    printCanaryDisclosure(fixture, args.agent, stdout);
+    const promptPath = await writePromptFile(fixture.root);
+    return { fixture, promptPath };
   }
 
   // Fake mode

@@ -128,6 +128,19 @@ async function initFixtureRepo(path) {
   await execFileAsync("git", ["-C", path, "config", "user.name", "Workflow Fixture"]);
   await execFileAsync("git", ["-C", path, "config", "user.email", "workflow-fixture@example.invalid"]);
   await writeFile(join(path, "README.md"), "# Workflow Fixture\n");
+  await writeFile(join(path, "fixture.js"), `export const value = "initial";\n`);
+  await writeFile(
+    join(path, "test.js"),
+    `import { value } from "./fixture.js";\nimport assert from "node:assert/strict";\nimport { test } from "node:test";\n\ntest("fixture value matches expectation", () => {\n  assert.equal(value, "initial");\n});\n`,
+  );
+  await writeFile(
+    join(path, "package.json"),
+    JSON.stringify({ type: "module", scripts: { test: "node --test" } }, null, 2) + "\n",
+  );
+  await writeFile(
+    join(path, "AGENTS.md"),
+    "# Fixture-only safety\n\nThis is a disposable Workflow canary fixture. Do not push or reuse.\n",
+  );
   await execFileAsync("git", ["-C", path, "add", "--all"]);
   await execFileAsync("git", ["-C", path, "commit", "-m", "test: initialize workflow fixture"]);
 }
