@@ -1,5 +1,6 @@
 import { basename, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
+import { buildHarnessLaunch } from "./harnesses.js";
 
 function fail(category, message, details, exitCode = 1) {
   throw new WorkflowError(category, message, { details, exitCode });
@@ -93,8 +94,21 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
 
-function agentArgv(plan) {
-  return [plan.agent.command, "--name", plan.agent.sessionName];
+function hydrateAgentProfile(plan) {
+  const agent = plan.agent ?? {};
+  const profile = agent.profile && typeof agent.profile === "object" ? agent.profile : {};
+  const harness = agent.harness ?? profile.harness ?? "pi";
+  return {
+    harness,
+    command: agent.command ?? profile.command ?? harness,
+    mode: profile.mode ?? "interactive",
+    roles: Array.isArray(agent.roles) ? agent.roles : ["implementer"],
+    model: profile.model ?? null,
+    arguments: Array.isArray(profile.arguments) ? profile.arguments : [],
+    ...(harness === "claude" || profile.permission_mode !== undefined ? { permission_mode: profile.permission_mode ?? "manual" } : {}),
+    ...(harness === "codex" || profile.sandbox !== undefined ? { sandbox: profile.sandbox ?? "workspace-write" } : {}),
+    ...(harness === "codex" || profile.approval_policy !== undefined ? { approval_policy: profile.approval_policy ?? "on-request" } : {}),
+  };
 }
 
 function listValue(value, key) {
@@ -121,6 +135,110 @@ function getWorkspacePath(value) {
 function commandExecutable(command) {
   if (typeof command !== "string") return null;
   return command.trim().split(/\s+/u)[0] ?? null;
+}
+
+const AGENT_START_KINDS = new Set(["agent.session.start", "pi.session.start"]);
+const AGENT_HARNESSES = new Set(["pi", "claude", "codex"]);
+
+function normalizeAgentHarness(value, context) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length === 0) {
+    fail("PREFLIGHT", `${context} must be one of pi, claude, or codex`, { [context]: value }, 10);
+  }
+  const normalized = value.toLowerCase();
+  if (!AGENT_HARNESSES.has(normalized)) {
+    fail("PREFLIGHT", `Unsupported agent harness ${value}`, { [context]: value }, 10);
+  }
+  return normalized;
+}
+
+function commandAgentHarness(command) {
+  const executable = commandExecutable(command);
+  if (!executable) return null;
+  const harness = basename(executable).toLowerCase();
+  return AGENT_HARNESSES.has(harness) ? harness : null;
+}
+
+function agentStartOperation(plan) {
+  return findOperation(plan, "agent")
+    ?? plan.operations?.find((operation) => AGENT_START_KINDS.has(operation.kind))
+    ?? null;
+}
+
+function validateAgentStartIdentity(plan) {
+  const operation = agentStartOperation(plan);
+  if (!operation) return;
+  if (!AGENT_START_KINDS.has(operation.kind)) {
+    fail("PREFLIGHT", `Unsupported agent operation kind ${operation.kind}`, {
+      operationId: operation.id ?? null,
+      operationKind: operation.kind ?? null,
+    }, 10);
+  }
+
+  const agent = plan.agent ?? {};
+  const profile = agent.profile && typeof agent.profile === "object" ? agent.profile : {};
+  const agentHarness = normalizeAgentHarness(agent.harness, "agent.harness");
+  const profileHarness = normalizeAgentHarness(profile.harness, "agent.profile.harness");
+  if (agentHarness && profileHarness && agentHarness !== profileHarness) {
+    fail("PREFLIGHT", "Agent harness and profile harness disagree", {
+      agentHarness,
+      profileHarness,
+      operationKind: operation.kind,
+    }, 10);
+  }
+
+  const expectedHarness = agentHarness ?? profileHarness;
+  const commandHarnesses = [
+    commandAgentHarness(agent.command),
+    commandAgentHarness(profile.command),
+    commandAgentHarness(operation.command),
+  ].filter(Boolean);
+  const distinctCommandHarnesses = [...new Set(commandHarnesses)];
+  if (distinctCommandHarnesses.length > 1) {
+    fail("PREFLIGHT", "Agent command identities disagree", {
+      agentCommand: agent.command ?? null,
+      profileCommand: profile.command ?? null,
+      operationCommand: operation.command ?? null,
+      commandHarnesses: distinctCommandHarnesses,
+    }, 10);
+  }
+
+  const commandHarness = distinctCommandHarnesses[0] ?? null;
+  if (!expectedHarness) {
+    if (operation.kind === "pi.session.start") {
+      if (commandHarness && commandHarness !== "pi") {
+        fail("PREFLIGHT", "Legacy Pi session start cannot use a non-Pi command without an explicit harness", {
+          operationKind: operation.kind,
+          command: operation.command ?? agent.command ?? profile.command ?? null,
+          commandHarness,
+        }, 10);
+      }
+      return;
+    }
+
+    fail("PREFLIGHT", "agent.session.start requires an explicit agent harness", {
+      operationKind: operation.kind,
+      command: operation.command ?? agent.command ?? profile.command ?? null,
+      commandHarness,
+    }, 10);
+  }
+
+  if (operation.kind === "pi.session.start" && expectedHarness !== "pi") {
+    fail("PREFLIGHT", "Legacy pi.session.start operations must use the Pi harness", {
+      operationKind: operation.kind,
+      expectedHarness,
+    }, 10);
+  }
+
+  if (commandHarness && commandHarness !== expectedHarness) {
+    fail("PREFLIGHT", "Agent harness and command disagree", {
+      expectedHarness,
+      commandHarness,
+      agentCommand: agent.command ?? null,
+      profileCommand: profile.command ?? null,
+      operationCommand: operation.command ?? null,
+    }, 10);
+  }
 }
 
 function processInfoCommand(processInfo) {
@@ -174,15 +292,22 @@ async function observePaneProcess(herdr, paneId, expectedCommand, observeMs = 0)
   const windowMs = Math.max(0, Number.isFinite(observeMs) ? observeMs : 0);
   const deadline = Date.now() + windowMs;
   let lastProcessInfo = null;
+  let finalPollAfterDeadlinePending = windowMs > 0;
 
   while (true) {
     lastProcessInfo = await herdr.getPaneProcessInfo(paneId);
     if (!expectedCommand || matchesProcessIdentity(expectedCommand, lastProcessInfo)) {
       return lastProcessInfo;
     }
+
     if (Date.now() >= deadline) {
+      if (finalPollAfterDeadlinePending) {
+        finalPollAfterDeadlinePending = false;
+        continue;
+      }
       return lastProcessInfo;
     }
+
     const remainingMs = deadline - Date.now();
     await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(RUNTIME_OBSERVE_INTERVAL_MS, remainingMs)));
   }
@@ -218,8 +343,12 @@ function runtimeFailureReason(process, processInfo) {
   return `Runtime process ${process.id} has mismatched executable or command evidence`;
 }
 
-function looksLikePiPane(pane) {
-  return pane?.agent === "pi" || pane?.agent_session?.agent === "pi";
+function paneHarness(pane) {
+  return pane?.agent ?? pane?.agent_session?.agent ?? pane?.agentSession?.agent ?? null;
+}
+
+function matchesExpectedHarnessPane(pane, expectedHarness) {
+  return paneHarness(pane) === expectedHarness;
 }
 
 function isIdleBootstrapPane(pane) {
@@ -414,7 +543,7 @@ async function resolveBootstrapContext(plan, worktreeOperation, ensured, herdr) 
   };
 }
 
-async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent }) {
+async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent, expectedHarness }) {
   if (typeof herdr.listTabs !== "function" || typeof herdr.listPanes !== "function") {
     return false;
   }
@@ -436,7 +565,7 @@ async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapP
 
   if (!startedTabExists) return false;
   if (startedAgent.tabId !== expectedTabId) return false;
-  if (!startedPane || !looksLikePiPane(startedPane)) return false;
+  if (!startedPane || !matchesExpectedHarnessPane(startedPane, expectedHarness)) return false;
   if (!bootstrapPane || !isIdleBootstrapPane(bootstrapPane)) return false;
   if (getPaneId(bootstrapPane) === getPaneId(startedPane)) return false;
   return true;
@@ -513,7 +642,7 @@ function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorT
   }
 }
 
-async function executeOrdinaryStart(plan, { herdr }) {
+async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -566,11 +695,19 @@ async function executeOrdinaryStart(plan, { herdr }) {
     }
 
     currentOperation = agentOperation;
+    const launch = buildAgentLaunch({
+      profileName: plan.agent.profileName ?? "pi-worker",
+      profile: hydrateAgentProfile(plan),
+      sessionName: plan.agent.sessionName,
+      cwd: plan.agent.worktreePath,
+      run: plan.run ?? null,
+    });
     const startedAgent = await herdr.startAgent({
       name: plan.agent.sessionName,
       cwd: plan.agent.worktreePath,
       tabId: agentTabId,
-      argv: agentArgv(plan),
+      argv: launch.argv,
+      env: launch.env,
       focus: false,
     });
 
@@ -598,6 +735,7 @@ async function executeOrdinaryStart(plan, { herdr }) {
             expectedTabId,
             bootstrapPaneId,
             startedAgent,
+          expectedHarness: plan.agent.harness ?? "pi",
           });
         } catch (error) {
           report.notes.push(`Retained the bootstrap shell pane because the post-start close safety inspection failed: ${error.message}`);
@@ -638,7 +776,7 @@ async function executeOrdinaryStart(plan, { herdr }) {
   }
 }
 
-async function executeGroupStart(plan, { git, herdr }) {
+async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -766,11 +904,19 @@ async function executeGroupStart(plan, { git, herdr }) {
     }
 
     currentOperation = agentOperation;
+    const launch = buildAgentLaunch({
+      profileName: plan.agent.profileName ?? "pi-worker",
+      profile: hydrateAgentProfile(plan),
+      sessionName: plan.agent.sessionName,
+      cwd: plan.agent.worktreePath,
+      run: plan.run ?? null,
+    });
     const startedAgent = await herdr.startAgent({
       name: plan.agent.sessionName,
       cwd: plan.agent.worktreePath,
       tabId: coordinatorTabId,
-      argv: agentArgv(plan),
+      argv: launch.argv,
+      env: launch.env,
       focus: false,
     });
 
@@ -961,12 +1107,13 @@ async function executeRuntimePhase(plan, { herdr, observeMs = DEFAULT_RUNTIME_OB
   }
 }
 
-export async function executeStart(reconciledPlan, { git, herdr } = {}) {
+export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch } = {}) {
   ensureStartablePlan(reconciledPlan);
+  validateAgentStartIdentity(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
   return reconciledPlan.mode === "group"
-    ? await executeGroupStart(reconciledPlan, { git, herdr })
-    : await executeOrdinaryStart(reconciledPlan, { herdr });
+    ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch })
+    : await executeOrdinaryStart(reconciledPlan, { herdr, buildAgentLaunch });
 }
 
 export async function executeRuntime(reconciledPlan, { herdr, observeMs } = {}) {

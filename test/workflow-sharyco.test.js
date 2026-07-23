@@ -58,9 +58,19 @@ async function createFixture(t) {
   const registry = {
     launcher: {
       worktree_root: join(root, "worktrees"),
-      agent: {
-        command: "pi",
-        session_template: "{project}-{task}-{slug}",
+      state_root: join(root, "workflow-state"),
+      session_template: "{project}-{task}-{slug}",
+      default_agent_profile: "pi-worker",
+      max_bundle_tickets: 10,
+      agent_profiles: {
+        "pi-worker": {
+          harness: "pi",
+          command: "pi",
+          mode: "interactive",
+          roles: ["coordinator", "implementer"],
+          model: null,
+          arguments: [],
+        },
       },
     },
     projects: {
@@ -69,6 +79,8 @@ async function createFixture(t) {
         kind: "work",
         path: metaPath,
         repository: "group",
+        default_agent_profile: "pi-worker",
+        allowed_agent_profiles: ["pi-worker"],
         worktree: {
           branch_template: "ticket/{task}/{slug}",
           path_template: "{worktree_root}/acme/{task}-{slug}",
@@ -280,11 +292,12 @@ function createFakeHerdr({ repoKey }) {
   };
 }
 
-async function reconcileAcmePlan({ registry, git, herdr, repositories }) {
+async function reconcileAcmePlan({ registry, git, herdr, repositories, tickets }) {
   const plan = planWorkflow({
     registry,
     projectAlias: "acme",
     task: "ASANA-456",
+    tickets,
     feature: "Onboarding",
     repositories,
   });
@@ -353,6 +366,28 @@ test("creates three selected Acme child worktrees in deterministic order", async
   assert.equal(await gitBranch(join(plan.workspace.path, "repos/backend")), "feature/ASANA-456/onboarding");
   assert.equal(await gitBranch(join(plan.workspace.path, "repos/panel")), "feature/ASANA-456/onboarding");
   assert.equal(await gitBranch(join(plan.workspace.path, "repos/webapp")), "feature/acme/webapp/onboarding");
+});
+
+test("keeps Acme child worktree naming tied to the primary ticket bundle identity", async (t) => {
+  const { registry, git, herdr } = await createFixture(t);
+  const { plan, reconciled } = await reconcileAcmePlan({
+    registry,
+    git,
+    herdr,
+    repositories: ["panel", "backend"],
+    tickets: ["ASANA-499", "ASANA-460", "ASANA-460"],
+  });
+
+  const report = await executeStart(reconciled, { git, herdr });
+
+  assert.equal(plan.identity.task, "ASANA-456");
+  assert.equal(plan.identity.primaryTicket, "ASANA-456");
+  assert.deepEqual(plan.identity.relatedTickets, ["ASANA-460", "ASANA-499"]);
+  assert.deepEqual(plan.identity.tickets, ["ASANA-456", "ASANA-460", "ASANA-499"]);
+  assert.match(plan.workspace.path, /ASANA-456-onboarding$/);
+  assert.equal(await gitBranch(join(plan.workspace.path, "repos/backend")), "feature/ASANA-456/onboarding");
+  assert.equal(await gitBranch(join(plan.workspace.path, "repos/panel")), "feature/ASANA-456/onboarding");
+  assert.deepEqual(report.repositories.map((repo) => repo.alias), ["backend", "panel"]);
 });
 
 test("reuses existing child worktrees and does not relaunch coordinator Pi", async (t) => {

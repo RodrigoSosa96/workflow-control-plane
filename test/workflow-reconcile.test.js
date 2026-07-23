@@ -6,9 +6,38 @@ import { reconcilePlan } from "../src/workflow/reconcile.js";
 const registry = {
   launcher: {
     worktree_root: "/tmp/worktrees",
-    agent: {
-      command: "pi",
-      session_template: "{project}-{task}-{slug}",
+    state_root: "/tmp/workflow-state",
+    session_template: "{project}-{task}-{slug}",
+    default_agent_profile: "pi-worker",
+    max_bundle_tickets: 10,
+    agent_profiles: {
+      "pi-worker": {
+        harness: "pi",
+        command: "pi",
+        mode: "interactive",
+        roles: ["coordinator", "implementer"],
+        model: null,
+        arguments: [],
+      },
+      "claude-worker": {
+        harness: "claude",
+        command: "claude",
+        mode: "interactive",
+        roles: ["implementer"],
+        model: null,
+        arguments: [],
+        permission_mode: "manual",
+      },
+      "codex-worker": {
+        harness: "codex",
+        command: "codex",
+        mode: "interactive",
+        roles: ["implementer"],
+        model: "gpt-5-codex",
+        arguments: [],
+        sandbox: "workspace-write",
+        approval_policy: "on-request",
+      },
     },
   },
   projects: {
@@ -18,6 +47,8 @@ const registry = {
       path: "/repo/ocr",
       repository: "monorepo",
       base_branch: "dev",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker", "claude-worker", "codex-worker"],
       worktree: {
         branch_template: "feature/{task}/{slug}",
         path_template: "{worktree_root}/{project}/{task}-{slug}",
@@ -38,6 +69,8 @@ const registry = {
       kind: "work",
       path: "/repo/acme",
       repository: "group",
+      default_agent_profile: "pi-worker",
+      allowed_agent_profiles: ["pi-worker", "claude-worker", "codex-worker"],
       worktree: {
         branch_template: "ticket/{task}/{slug}",
         path_template: "{worktree_root}/acme/{task}-{slug}",
@@ -126,6 +159,56 @@ function createRealpath({ canonical = {}, missing = [] } = {}) {
   };
 }
 
+function compatibleGitFor(plan, commonDirPath = "/repo/ocr/.git") {
+  return createGit({
+    repositories: {
+      "/repo/ocr": { rootPath: "/repo/ocr", commonDirPath },
+      [plan.worktrees[0].path]: { rootPath: plan.worktrees[0].path, commonDirPath },
+    },
+    worktrees: {
+      "/repo/ocr": [
+        { path: plan.worktrees[0].path, branch: branchRef(plan.worktrees[0].branch) },
+      ],
+    },
+    statuses: {
+      [plan.worktrees[0].path]: { dirty: false, entries: [] },
+    },
+  });
+}
+
+function herdrWithAgent(plan, { workspaceId = "w-agent", agents = [], panes = [] } = {}) {
+  return createHerdr({
+    workspaces: [
+      {
+        workspace_id: workspaceId,
+        worktree: {
+          checkout_path: plan.workspace.path,
+          repo_key: "/repo/ocr/.git",
+        },
+      },
+    ],
+    tabs: {
+      [workspaceId]: [
+        { tab_id: `${workspaceId}:t1`, workspace_id: workspaceId, label: "agent" },
+        { tab_id: `${workspaceId}:t2`, workspace_id: workspaceId, label: "runtime" },
+      ],
+    },
+    panes: {
+      [workspaceId]: [
+        {
+          pane_id: `${workspaceId}:p1`,
+          tab_id: `${workspaceId}:t1`,
+          label: "agent-shell",
+          cwd: plan.agent.worktreePath,
+          foreground_cwd: plan.agent.worktreePath,
+        },
+        ...panes,
+      ],
+    },
+    agents,
+  });
+}
+
 test("classifies a compatible ordinary plan from Git and Herdr facts", async () => {
   const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
   const commonDirPath = "/repo/ocr/.git";
@@ -209,6 +292,451 @@ test("classifies a compatible ordinary plan from Git and Herdr facts", async () 
   assert.equal(reconciled.agent.status, "compatible");
   assert.equal(reconciled.runtime.processes[0].status, "compatible");
   assert.equal(reconciled.operations.find((operation) => operation.id === "worktree").reconciliation.status, "open");
+});
+
+test("matches selected Codex ownership with generic harness evidence", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const workspaceId = "w-codex";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: compatibleGitFor(plan),
+    herdr: herdrWithAgent(plan, {
+      workspaceId,
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: plan.agent.sessionName,
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.agent.status, "compatible");
+  assert.match(reconciled.agent.reason, /codex/i);
+  assert.doesNotMatch(reconciled.agent.reason, /Pi agent/i);
+  assert.equal(reconciled.operations.find((operation) => operation.id === "agent").reconciliation.status, "compatible");
+});
+
+test("reports a conflict when a distinct live writer owns the planned checkout", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const workspaceId = "w-conflict";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: compatibleGitFor(plan),
+    herdr: herdrWithAgent(plan, {
+      workspaceId,
+      agents: [
+        {
+          agent: "pi",
+          profileName: "pi-worker",
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: "ocr-ASANA-123-other-run",
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+          originalRequest: "SECRET-DO-NOT-LEAK",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout/i);
+  assert.match(reconciled.agent.reason, /pi/i);
+  assert.match(reconciled.agent.reason, /codex-worker|codex/i);
+  assert.doesNotMatch(reconciled.agent.reason, /SECRET-DO-NOT-LEAK/);
+  assert.ok(reconciled.agent.reason.length <= 500);
+  assert.equal(reconciled.status, "conflict");
+  assert.equal(reconciled.operations.find((operation) => operation.id === "agent").reconciliation.status, "conflict");
+});
+
+test("treats same-harness same-run live ownership as compatible even before native session capture", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "11111111-1111-4111-8111-111111111111";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-same-run";
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: herdrWithAgent(runPlan, {
+      workspaceId,
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: "codex-lifecycle-name-not-yet-captured",
+          cwd: runPlan.agent.worktreePath,
+          agent_status: "working",
+          workflow_run_id: runId,
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.agent.status, "compatible");
+  assert.match(reconciled.agent.reason, /same run|codex/i);
+});
+
+test("treats split agent identity and pane cwd as the same compatible planned run", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "55555555-5555-4555-8555-555555555555";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-split-evidence";
+  const paneId = `${workspaceId}:agent-pane`;
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: runPlan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: `${workspaceId}:t1`, workspace_id: workspaceId, label: "agent" },
+          { tab_id: `${workspaceId}:t2`, workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: paneId,
+            tab_id: `${workspaceId}:t1`,
+            workspace_id: workspaceId,
+            cwd: runPlan.agent.worktreePath,
+            foreground_cwd: runPlan.agent.worktreePath,
+          },
+        ],
+      },
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          pane_id: paneId,
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: "codex-lifecycle-name-not-yet-captured",
+          agent_status: "working",
+          workflow_run_id: runId,
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.tabs.find((tab) => tab.label === "agent").status, "compatible");
+  assert.equal(reconciled.agent.status, "compatible");
+  assert.match(reconciled.agent.reason, /same run|codex/i);
+  assert.equal(reconciled.agent.actual.source, "agent");
+  assert.equal(reconciled.agent.actual.runId, runId);
+  assert.equal(reconciled.agent.actual.canonicalPath, runPlan.agent.worktreePath);
+});
+
+test("reports a conflict when the missing planned agent tab has the same expected run live off-tab", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "66666666-6666-4666-8666-666666666666";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-missing-same-run";
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: runPlan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: `${workspaceId}:other`, workspace_id: workspaceId, label: "other" },
+          { tab_id: `${workspaceId}:runtime`, workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: `${workspaceId}:writer-pane`,
+            tab_id: `${workspaceId}:other`,
+            workspace_id: workspaceId,
+            cwd: runPlan.agent.worktreePath,
+            foreground_cwd: runPlan.agent.worktreePath,
+            agent: "codex",
+            agent_status: "working",
+          },
+        ],
+      },
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          pane_id: `${workspaceId}:writer-pane`,
+          tab_id: `${workspaceId}:other`,
+          workspace_id: workspaceId,
+          name: "codex-lifecycle-name-not-yet-captured",
+          cwd: runPlan.agent.worktreePath,
+          agent_status: "working",
+          workflow_run_id: runId,
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.tabs.find((tab) => tab.label === "agent").status, "missing");
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout|agent tab/i);
+  assert.match(reconciled.agent.reason, /codex/i);
+  assert.equal(reconciled.agent.actual[0].runId, runId);
+  assert.equal(reconciled.operations.find((operation) => operation.id === "agent").reconciliation.status, "conflict");
+});
+
+test("reports a conflict when the agent tab is missing but an off-tab writer owns the checkout", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const workspaceId = "w-missing-agent-tab";
+
+  const reconciled = await reconcilePlan(plan, {
+    git: compatibleGitFor(plan),
+    herdr: createHerdr({
+      workspaces: [
+        {
+          workspace_id: workspaceId,
+          worktree: {
+            checkout_path: plan.workspace.path,
+            repo_key: "/repo/ocr/.git",
+          },
+        },
+      ],
+      tabs: {
+        [workspaceId]: [
+          { tab_id: `${workspaceId}:other`, workspace_id: workspaceId, label: "other" },
+          { tab_id: `${workspaceId}:runtime`, workspace_id: workspaceId, label: "runtime" },
+        ],
+      },
+      panes: {
+        [workspaceId]: [
+          {
+            pane_id: `${workspaceId}:writer-pane`,
+            tab_id: `${workspaceId}:other`,
+            workspace_id: workspaceId,
+            cwd: plan.agent.worktreePath,
+            foreground_cwd: plan.agent.worktreePath,
+            agent: "pi",
+            agent_status: "working",
+          },
+        ],
+      },
+      agents: [
+        {
+          agent: "pi",
+          profileName: "pi-worker",
+          pane_id: `${workspaceId}:writer-pane`,
+          tab_id: `${workspaceId}:other`,
+          workspace_id: workspaceId,
+          name: "ocr-ASANA-123-other-run",
+          cwd: plan.agent.worktreePath,
+          agent_status: "working",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.tabs.find((tab) => tab.label === "agent").status, "missing");
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout/i);
+  assert.match(reconciled.agent.reason, /pi/i);
+  assert.equal(reconciled.operations.find((operation) => operation.id === "agent").reconciliation.status, "conflict");
+});
+
+test("reports a conflict when a same-name writer omits the planned workflow run id", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "22222222-2222-4222-8222-222222222222";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-missing-run-id";
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: herdrWithAgent(runPlan, {
+      workspaceId,
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: runPlan.agent.sessionName,
+          cwd: runPlan.agent.worktreePath,
+          agent_status: "working",
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout/i);
+});
+
+test("reports a conflict when a same-name writer has a different workflow run id", async () => {
+  const plan = planWorkflow({
+    registry,
+    projectAlias: "ocr",
+    task: "ASANA-123",
+    feature: "Discovered Docs",
+    agentProfile: "codex-worker",
+  });
+  const runId = "33333333-3333-4333-8333-333333333333";
+  const runPlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      runId,
+      nativeSessionId: null,
+    },
+  };
+  const workspaceId = "w-different-run-id";
+
+  const reconciled = await reconcilePlan(runPlan, {
+    git: compatibleGitFor(runPlan),
+    herdr: herdrWithAgent(runPlan, {
+      workspaceId,
+      agents: [
+        {
+          agent: "codex",
+          profileName: "codex-worker",
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: runPlan.agent.sessionName,
+          cwd: runPlan.agent.worktreePath,
+          agent_status: "working",
+          workflow_run_id: "44444444-4444-4444-8444-444444444444",
+          native_session_id: null,
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout/i);
+  assert.match(reconciled.agent.reason, /44444444-4444-4444-8444-444444444444/);
+});
+
+test("reports a conflict when a same-name writer has a different planned native session id", async () => {
+  const plan = planWorkflow({ registry, projectAlias: "ocr", task: "ASANA-123", feature: "Discovered Docs" });
+  const nativePlan = {
+    ...plan,
+    agent: {
+      ...plan.agent,
+      nativeSessionId: "expected-native-session",
+    },
+  };
+  const workspaceId = "w-different-native-id";
+
+  const reconciled = await reconcilePlan(nativePlan, {
+    git: compatibleGitFor(nativePlan),
+    herdr: herdrWithAgent(nativePlan, {
+      workspaceId,
+      agents: [
+        {
+          tab_id: `${workspaceId}:t1`,
+          workspace_id: workspaceId,
+          name: nativePlan.agent.sessionName,
+          cwd: nativePlan.agent.worktreePath,
+          agent_status: "working",
+          native_session_id: "other-native-session",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(reconciled.agent.status, "conflict");
+  assert.match(reconciled.agent.reason, /live writer|checkout/i);
 });
 
 test("treats symlinked planned and actual worktree paths as the same canonical checkout", async () => {

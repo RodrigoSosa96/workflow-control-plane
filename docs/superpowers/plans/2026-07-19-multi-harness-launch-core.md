@@ -369,10 +369,10 @@ const ALLOWED = {
   launching: new Set(["running", "failed", "interrupted"]),
   running: new Set(["idle-awaiting-handoff", "needs-input", "completed", "blocked", "failed", "interrupted", "manual-handoff-required", "result-stale"]),
   "idle-awaiting-handoff": new Set(["running", "needs-input", "completed", "blocked", "failed", "interrupted", "manual-handoff-required", "result-stale"]),
-  "needs-input": new Set(["running", "interrupted"]),
+  "needs-input": new Set(["running", "interrupted", "result-stale"]),
   completed: new Set(["running", "result-stale"]),
   blocked: new Set(["running", "result-stale"]),
-  failed: new Set(["running"]),
+  failed: new Set(["running", "result-stale"]),
   interrupted: new Set(["running"]),
   "manual-handoff-required": new Set(["running"]),
   "result-stale": new Set(["running"]),
@@ -383,9 +383,9 @@ Reject implicit transitions and preserve a timestamped state history.
 
 - [ ] **Step 4: Implement atomic private persistence**
 
-Use these concrete operations: `await fs.mkdir(runDirectory, { recursive: true, mode: 0o700 })`; `await fs.open(lockPath, "wx", 0o600)`; `await fs.open(tempPath, "w", 0o600)` followed by `handle.sync()` and `fs.rename(tempPath, destinationPath)`. Never include raw run JSON in error messages. `events.jsonl` is append-only and each event has `version`, `id`, `type`, `runId`, and timestamp.
+Use these concrete operations: `await fs.mkdir(runDirectory, { recursive: true, mode: 0o700 })`; create the permanent private lock container `<runDirectory>/run.lock/` at `0700`; acquire exclusive ownership with `await fs.mkdir(<run.lock>/active, { mode: 0o700 })`; then create a random owner-marker file under that active directory using `await fs.open(<active>/<owner-token>, "wx", 0o600)`. On release, unlink only that owner-token path and call `rmdir(<run.lock>/active)`; if another valid owner marker exists, `rmdir` fails and must not delete it. Use `await fs.open(tempPath, "w", 0o600)` followed by `handle.sync()` and `fs.rename(tempPath, destinationPath)` for atomic data writes. Never include raw run JSON in error messages. `events.jsonl` is append-only and each event has `version`, `id`, `type`, `runId`, and timestamp.
 
-Do not remove stale locks automatically; return a bounded recovery message containing the lock path and age.
+Do not remove stale active locks automatically; return a bounded recovery message containing the active-lock path and age.
 
 - [ ] **Step 5: Run focused and full tests**
 
@@ -482,7 +482,7 @@ export const HANDOFF_LIMITS = Object.freeze({
 });
 ```
 
-`submitHandoff` must read expected tickets/repositories from `run.json`, compute current fingerprints, construct the canonical result with exact `runId`/`generation`, write a temporary file in the run directory, rename to `result.json`, archive the generation result, chmod `0600`, and transition the run. If the Git state later differs, `readCurrentResult` returns `result-stale` and updates run state without destroying the archived result.
+`submitHandoff` must read expected tickets/repositories from `run.json`, compute current fingerprints, construct the canonical result with exact `runId`/`generation`, calculate and persist a SHA-256 digest for its exact canonical bytes, write a temporary file in the run directory, rename to `result.json`, archive the generation result, chmod `0600`, and transition the run. `readCurrentResult` must compare the current artifact bytes against the stored digest before returning any terminal status; a missing, malformed, unregistered, digest-mismatched, or Git-stale artifact returns `result-stale` and atomically updates run state without destroying the archived result. Its stale transition must conditionally verify the observed generation, result digest, and result status inside the store update; if those values changed or the update cannot persist, the read fails closed rather than returning a terminal result.
 
 - [ ] **Step 6: Run focused and full tests**
 

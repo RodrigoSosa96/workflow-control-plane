@@ -1,5 +1,14 @@
 import { WorkflowError } from "./errors.js";
 
+const WORKFLOW_ENV_KEYS = new Set([
+  "WORKFLOW_RUN_ID",
+  "WORKFLOW_RUN_DIR",
+  "WORKFLOW_GENERATION",
+  "WORKFLOW_HARNESS",
+  "WORKFLOW_STATE_ROOT",
+  "WORKFLOW_CONTROL_PLANE_BIN",
+]);
+
 function fail(category, message, details, exitCode = 1) {
   throw new WorkflowError(category, message, { details, exitCode });
 }
@@ -205,6 +214,25 @@ function pushOption(args, flag, value) {
 
 function pushFocus(args, focus = false) {
   args.push(focus ? "--focus" : "--no-focus");
+}
+
+function normalizeWorkflowEnv(env = {}) {
+  if (env === undefined || env === null) return [];
+  if (typeof env !== "object" || Array.isArray(env)) {
+    fail("PREFLIGHT", "startAgent env must be a workflow env object", { env }, 10);
+  }
+
+  const entries = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (!WORKFLOW_ENV_KEYS.has(key)) {
+      fail("PREFLIGHT", `startAgent env contains non-workflow key ${key}`, { key }, 10);
+    }
+    if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+      fail("PREFLIGHT", `startAgent env ${key} must be a non-empty string`, { key }, 10);
+    }
+    entries.push(`${key}=${value}`);
+  }
+  return entries;
 }
 
 function normalizeWorktreeDisposition(type, fallback) {
@@ -440,7 +468,7 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       return normalizePaneProcessInfo(await invoke("pane", "process-info", ["--pane", paneId]));
     },
 
-    async startAgent({ name, cwd, workspaceId, tabId, split, argv, focus = false }) {
+    async startAgent({ name, cwd, workspaceId, tabId, split, argv, env = {}, focus = false }) {
       if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
         fail("PREFLIGHT", "startAgent requires argv from a trusted source", {
           name,
@@ -451,6 +479,7 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
           argv,
         }, 10);
       }
+      const envEntries = normalizeWorkflowEnv(env);
 
       const args = [name];
       pushOption(args, "--cwd", cwd);
@@ -458,6 +487,7 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       pushOption(args, "--tab", tabId);
       pushOption(args, "--split", split);
       pushFocus(args, focus);
+      for (const entry of envEntries) args.push("--env", entry);
       args.push("--", ...argv);
 
       return normalizeAgentResult(await invoke("agent", "start", args, { cwd }));

@@ -1,13 +1,41 @@
 import { readFile as defaultReadFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { parse } from "yaml";
 import { WorkflowError } from "./errors.js";
+import { resolveProjectDelegationPolicy, validateDelegationPolicy } from "./delegation-policy.js";
 
 const ALLOWED_SPLITS = new Set(["left", "right", "up", "down"]);
 const ALLOWED_TEMPLATE_PLACEHOLDERS = new Set(["worktree_root", "project", "task", "slug"]);
 const ALLOWED_CHILD_TEMPLATE_PLACEHOLDERS = new Set(["project", "task", "slug", "repository"]);
 const ALLOWED_REPOSITORIES = new Set(["monorepo", "single", "group"]);
+const HARNESSES = new Set(["pi", "claude", "codex"]);
+const MODES = new Set(["interactive"]);
+const CLAUDE_PERMISSION_MODES = new Set(["manual", "acceptEdits", "plan", "auto", "dontAsk"]);
+const CODEX_SANDBOXES = new Set(["read-only", "workspace-write"]);
+const CODEX_APPROVALS = new Set(["untrusted", "on-request"]);
+const COMMON_PROFILE_FIELDS = new Set(["harness", "command", "mode", "roles", "model", "arguments"]);
+const PROFILE_FIELDS_BY_HARNESS = {
+  pi: COMMON_PROFILE_FIELDS,
+  claude: new Set([...COMMON_PROFILE_FIELDS, "permission_mode"]),
+  codex: new Set([...COMMON_PROFILE_FIELDS, "sandbox", "approval_policy"]),
+};
+const FORBIDDEN_ARGUMENTS = [
+  "--dangerously-skip-permissions",
+  "--allow-dangerously-skip-permissions",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--dangerously-bypass-hook-trust",
+];
+const RAW_CONTROL_ARGUMENTS = {
+  claude: [{ field: "permission_mode", options: ["--permission-mode"] }],
+  codex: [
+    { field: "sandbox", options: ["--sandbox", "-s"] },
+    { field: "approval_policy", options: ["--ask-for-approval", "-a"] },
+    { field: "profile", options: ["--profile", "-p"] },
+    { field: "config", options: ["--config", "-c"] },
+  ],
+};
+const LEGACY_STATE_ROOT = join(homedir(), ".local", "state", "workflow-launcher");
 
 function fail(category, message, options) {
   throw new WorkflowError(category, message, options);
@@ -61,6 +89,59 @@ function validateTemplate(template, allowedPlaceholders, context) {
     }
   }
   return value;
+}
+
+function validateOptionalString(value, context) {
+  if (value === undefined || value === null) return null;
+  return validateString(value, context);
+}
+
+function validateNonEmptyStringList(values, context) {
+  if (!Array.isArray(values) || values.length === 0) {
+    fail("schema", `${context} must be a non-empty array`);
+  }
+  return values.map((value, index) => validateString(value, `${context}[${index}]`));
+}
+
+function validateOptionalStringList(values, context) {
+  if (values === undefined) return undefined;
+  const normalized = validateNonEmptyStringList(values, context);
+  const seen = new Set();
+  for (const value of normalized) {
+    if (seen.has(value)) fail("schema", `${context} must not contain duplicate value ${value}`);
+    seen.add(value);
+  }
+  return normalized;
+}
+
+function matchesRawOption(argument, option) {
+  return argument === option
+    || argument.startsWith(`${option}=`)
+    || (/^-[^-]$/.test(option) && argument.startsWith(option) && argument.length > option.length);
+}
+
+function validateArguments(values, profileName, harness) {
+  if (values === undefined) return [];
+  if (!Array.isArray(values)) fail("schema", `agent profile ${profileName}.arguments must be an array`);
+
+  const argumentsList = values.map((value, index) => validateString(value, `agent profile ${profileName}.arguments[${index}]`));
+
+  for (const argument of argumentsList) {
+    const lower = argument.toLowerCase();
+    for (const forbidden of FORBIDDEN_ARGUMENTS) {
+      if (matchesRawOption(lower, forbidden)) {
+        fail("schema", `agent profile ${profileName} must not include dangerous argument ${argument}`);
+      }
+    }
+
+    for (const control of RAW_CONTROL_ARGUMENTS[harness] ?? []) {
+      if (control.options.some((option) => matchesRawOption(lower, option))) {
+        fail("schema", `agent profile ${profileName} must not override structured ${control.field} via raw argument ${argument}`);
+      }
+    }
+  }
+
+  return argumentsList;
 }
 
 function validateRuntimeProcess(process, index, profileName) {
@@ -138,8 +219,18 @@ function validateProjectKind(project, projectName) {
   return project.kind;
 }
 
+function validateProjectAgentSettings(project, projectName) {
+  if (project.default_agent_profile !== undefined) {
+    project.default_agent_profile = validateString(project.default_agent_profile, `${projectName}.default_agent_profile`);
+  }
+  if (project.allowed_agent_profiles !== undefined) {
+    project.allowed_agent_profiles = validateOptionalStringList(project.allowed_agent_profiles, `${projectName}.allowed_agent_profiles`);
+  }
+  return project;
+}
+
 function validateOrdinaryProject(project, projectName) {
-  const normalized = clone(project);
+  const normalized = validateProjectAgentSettings(clone(project), projectName);
   normalized.kind = validateProjectKind(normalized, projectName);
   normalized.path = validateAbsolutePath(normalized.path, `${projectName}.path`);
   normalized.repository = validateString(normalized.repository, `${projectName}.repository`);
@@ -168,7 +259,7 @@ function validateGroupRepository(repository, repositoryName, projectName) {
 }
 
 function validateGroupProject(project, projectName) {
-  const normalized = clone(project);
+  const normalized = validateProjectAgentSettings(clone(project), projectName);
   normalized.kind = validateProjectKind(normalized, projectName);
   normalized.path = validateAbsolutePath(normalized.path, `${projectName}.path`);
   normalized.repository = validateString(normalized.repository, `${projectName}.repository`);
@@ -196,7 +287,7 @@ function validateGroupProject(project, projectName) {
   return normalized;
 }
 
-function validateLauncher(launcher) {
+function validateLauncherV2(launcher) {
   if (!isObject(launcher)) fail("schema", "launcher must be an object");
   const normalized = clone(launcher);
   normalized.worktree_root = validateAbsolutePath(normalized.worktree_root, "launcher.worktree_root");
@@ -206,6 +297,35 @@ function validateLauncher(launcher) {
     command: validateString(normalized.agent.command, "launcher.agent.command"),
     session_template: validateTemplate(normalized.agent.session_template, ALLOWED_TEMPLATE_PLACEHOLDERS, "launcher.agent.session_template"),
   };
+  return normalized;
+}
+
+function validateLauncherV3(launcher) {
+  if (!isObject(launcher)) fail("schema", "launcher must be an object");
+  const normalized = clone(launcher);
+  normalized.worktree_root = validateAbsolutePath(normalized.worktree_root, "launcher.worktree_root");
+  normalized.state_root = validateAbsolutePath(normalized.state_root, "launcher.state_root");
+  normalized.session_template = validateTemplate(normalized.session_template, ALLOWED_TEMPLATE_PLACEHOLDERS, "launcher.session_template");
+  normalized.default_agent_profile = validateString(normalized.default_agent_profile, "launcher.default_agent_profile");
+  normalized.delegation = validateDelegationPolicy(normalized.delegation, "launcher.delegation");
+  if (!Number.isInteger(normalized.max_bundle_tickets) || normalized.max_bundle_tickets <= 0) {
+    fail("schema", "launcher.max_bundle_tickets must be a positive integer");
+  }
+  if (!isObject(normalized.agent_profiles) || Object.keys(normalized.agent_profiles).length === 0) {
+    fail("schema", "launcher.agent_profiles must contain at least one profile");
+  }
+
+  const agentProfiles = {};
+  for (const [profileName, profileValue] of Object.entries(normalized.agent_profiles)) {
+    validateString(profileName, "launcher.agent_profiles key");
+    agentProfiles[profileName] = validateAgentProfile(profileName, profileValue);
+  }
+
+  if (!agentProfiles[normalized.default_agent_profile]) {
+    fail("schema", `launcher.default_agent_profile ${normalized.default_agent_profile} does not match any profile`);
+  }
+
+  normalized.agent_profiles = agentProfiles;
   return normalized;
 }
 
@@ -220,6 +340,103 @@ function validateProjects(projects) {
       : validateOrdinaryProject(project, projectName);
   }
   return normalized;
+}
+
+function validateProjectAgentReferences(projects, launcher) {
+  const profileNames = new Set(Object.keys(launcher.agent_profiles));
+  const globalDefault = launcher.default_agent_profile;
+
+  for (const [projectName, project] of Object.entries(projects)) {
+    if (project.default_agent_profile !== undefined && !profileNames.has(project.default_agent_profile)) {
+      fail("schema", `${projectName}.default_agent_profile ${project.default_agent_profile} does not match any launcher agent profile`);
+    }
+    if (project.allowed_agent_profiles !== undefined) {
+      for (const profileName of project.allowed_agent_profiles) {
+        if (!profileNames.has(profileName)) {
+          fail("schema", `${projectName}.allowed_agent_profiles contains unknown profile ${profileName}`);
+        }
+      }
+      const effectiveDefault = project.default_agent_profile ?? globalDefault;
+      if (!project.allowed_agent_profiles.includes(effectiveDefault)) {
+        fail("schema", `${projectName}.default_agent_profile ${effectiveDefault} must be included in ${projectName}.allowed_agent_profiles`);
+      }
+    }
+  }
+}
+
+function normalizeProjectDelegationPolicies(projects, launcher) {
+  const normalized = {};
+  for (const [projectName, project] of Object.entries(projects)) {
+    normalized[projectName] = {
+      ...project,
+      delegation: resolveProjectDelegationPolicy(
+        launcher.delegation,
+        project.delegation,
+        `projects.${projectName}.delegation`,
+      ),
+    };
+  }
+  return normalized;
+}
+
+function addLegacyLauncherAgent(launcher) {
+  const defaultProfile = launcher.agent_profiles[launcher.default_agent_profile];
+  return {
+    ...launcher,
+    agent: {
+      command: defaultProfile.command,
+      session_template: launcher.session_template,
+    },
+  };
+}
+
+function migrateV2Registry(value) {
+  const registry = clone(value);
+  const launcher = validateLauncherV2(registry.launcher);
+  const projects = validateProjects(registry.projects);
+  const normalized = {
+    ...registry,
+    version: 3,
+    launcher: {
+      worktree_root: launcher.worktree_root,
+      state_root: LEGACY_STATE_ROOT,
+      session_template: launcher.agent.session_template,
+      default_agent_profile: "pi-worker",
+      max_bundle_tickets: 10,
+      agent_profiles: {
+        "pi-worker": {
+          harness: "pi",
+          command: launcher.agent.command,
+          mode: "interactive",
+          roles: ["coordinator", "implementer", "reviewer"],
+          model: null,
+          arguments: [],
+        },
+      },
+    },
+    projects,
+  };
+  const validatedLauncher = validateLauncherV3(normalized.launcher);
+  const normalizedProjects = normalizeProjectDelegationPolicies(projects, validatedLauncher);
+  validateProjectAgentReferences(normalizedProjects, validatedLauncher);
+  return {
+    ...normalized,
+    launcher: addLegacyLauncherAgent(validatedLauncher),
+    projects: normalizedProjects,
+  };
+}
+
+function validateV3Registry(value) {
+  const registry = clone(value);
+  const launcher = validateLauncherV3(registry.launcher);
+  const projects = normalizeProjectDelegationPolicies(validateProjects(registry.projects), launcher);
+  validateProjectAgentReferences(projects, launcher);
+  return {
+    ...registry,
+    version: 3,
+    launcher: addLegacyLauncherAgent(launcher),
+    projects,
+  };
 }
 
 export async function loadRegistry(path, { readFile = defaultReadFile } = {}) {
@@ -240,13 +457,61 @@ export async function loadRegistry(path, { readFile = defaultReadFile } = {}) {
   return validateRegistry(parsed);
 }
 
+export function validateAgentProfile(name, value) {
+  if (!isObject(value)) fail("schema", `agent profile ${name} must be an object`);
+  const normalized = clone(value);
+  if (Object.hasOwn(normalized, "bypassPermissions")) {
+    fail("schema", `agent profile ${name} must not set bypassPermissions`);
+  }
+
+  normalized.harness = validateString(normalized.harness, `agent profile ${name}.harness`);
+  if (!HARNESSES.has(normalized.harness)) {
+    fail("schema", `agent profile ${name}.harness must be one of ${[...HARNESSES].join(", ")} (received ${normalized.harness})`);
+  }
+
+  for (const key of Object.keys(normalized)) {
+    if (!PROFILE_FIELDS_BY_HARNESS[normalized.harness].has(key)) {
+      fail("schema", `agent profile ${name} contains unknown field ${key}`);
+    }
+  }
+
+  normalized.command = validateString(normalized.command, `agent profile ${name}.command`);
+  normalized.mode = validateString(normalized.mode, `agent profile ${name}.mode`);
+  if (!MODES.has(normalized.mode)) {
+    fail("schema", `agent profile ${name}.mode must be one of ${[...MODES].join(", ")}`);
+  }
+  normalized.roles = validateNonEmptyStringList(normalized.roles, `agent profile ${name}.roles`);
+  normalized.model = validateOptionalString(normalized.model, `agent profile ${name}.model`);
+  normalized.arguments = validateArguments(normalized.arguments, name, normalized.harness);
+
+  if (normalized.harness === "claude") {
+    normalized.permission_mode = validateString(normalized.permission_mode, `agent profile ${name}.permission_mode`);
+    if (!CLAUDE_PERMISSION_MODES.has(normalized.permission_mode)) {
+      fail("schema", `agent profile ${name}.permission_mode must be one of ${[...CLAUDE_PERMISSION_MODES].join(", ")} (received ${normalized.permission_mode})`);
+    }
+  }
+
+  if (normalized.harness === "codex") {
+    normalized.sandbox = validateString(normalized.sandbox, `agent profile ${name}.sandbox`);
+    if (!CODEX_SANDBOXES.has(normalized.sandbox)) {
+      fail("schema", `agent profile ${name}.sandbox must be one of ${[...CODEX_SANDBOXES].join(", ")} (received ${normalized.sandbox})`);
+    }
+    normalized.approval_policy = validateString(normalized.approval_policy, `agent profile ${name}.approval_policy`);
+    if (!CODEX_APPROVALS.has(normalized.approval_policy)) {
+      fail("schema", `agent profile ${name}.approval_policy must be one of ${[...CODEX_APPROVALS].join(", ")} (received ${normalized.approval_policy})`);
+    }
+  }
+
+  return normalized;
+}
+
 export function validateRegistry(value) {
   const registry = clone(value);
   if (!isObject(registry)) fail("schema", "Registry must be an object");
-  if (registry.version !== 2) fail("schema", "Registry must use version 2");
-  const launcher = validateLauncher(registry.launcher);
-  const projects = validateProjects(registry.projects);
-  return deepFreeze({ ...registry, version: 2, launcher, projects });
+  if (registry.version === 1) fail("schema", "Registry version 1 is not supported");
+  if (registry.version === 2) return deepFreeze(migrateV2Registry(registry));
+  if (registry.version === 3) return deepFreeze(validateV3Registry(registry));
+  fail("schema", `Registry must use version 2 or 3 (received ${registry.version ?? "unknown"})`);
 }
 
 export function resolveProject(registry, alias) {

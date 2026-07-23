@@ -1,85 +1,159 @@
-# Task 4 Report: Herdr JSON Adapter
+# Task 4 Report — Add the Child and Coordinator Pi Extensions
 
 ## Status
-Done
+Completed in the isolated worktree and committed.
 
 ## Commit
-`feat(workflow): add Herdr orchestration adapter`
+- `feat(workflow): deliver governed Pi delegation results`
+
+## Scope delivered
+Implemented the Task 4 files only:
+- `.pi/extensions/workflow-delegation-child.ts`
+- `.pi/extensions/workflow-coordinator/index.ts`
+- `src/workflow/delegation-watcher.js`
+- `test/workflow-delegation-watcher.test.js`
+- `test/workflow-pi-extensions.test.js`
+- `test/workflow-coordinator-policy.test.js`
 
 ## RED evidence
-- Ran: `node --test test/workflow-herdr.test.js`
-- Result: failed with `ERR_MODULE_NOT_FOUND` for `src/workflow/herdr.js` before implementation.
+Added the new extension and watcher tests first, then ran the focused RED command before implementation.
 
-## GREEN evidence
-### Herdr adapter
-- Ran: `node --test test/workflow-herdr.test.js`
-- Result: 12/12 tests passed.
+Command:
+```bash
+node --test test/workflow-pi-extensions.test.js test/workflow-delegation-watcher.test.js test/workflow-coordinator-policy.test.js
+```
 
-### Selected Task 4 verification
-- Ran: `node --test test/workflow-herdr.test.js test/workflow-process.test.js`
-- Result: 19/19 tests passed.
+Observed failure before implementation:
+- `ERR_MODULE_NOT_FOUND` for `src/workflow/delegation-watcher.js`
+- `ERR_MODULE_NOT_FOUND` for `.pi/extensions/workflow-delegation-child.ts`
 
-### Full suite
-- Ran: `npm test`
-- Result: 116/116 tests passed.
+This matched the task brief expectation that the run should fail because the extension and watcher files did not yet exist.
 
-## Implemented
-- `src/workflow/herdr.js`
-  - `createHerdrAdapter({ runner, binary? })`
-  - JSON parsing/unwrapping with `WorkflowError` handling for API envelopes and malformed output
-  - read-only wrappers for status, workspace, tab, pane, and agent inspection plus dedicated integration-status parsing
-  - native worktree ensure flow for `missing`, `closed`, and already-open reconciliation states
-  - ID-threading helpers for worktree, tab, pane, and agent creation results
-- `test/workflow-herdr.test.js`
-  - fixture-runner coverage for JSON success/error parsing
-  - native worktree `created`, `opened`, and `already_open` responses
-  - explicit argv/focus handling for tab, pane, runtime-command, and agent-start wrappers
+## Implementation summary
+### Child extension
+- Registered exactly one tool: `workflow_delegation_handoff`.
+- Used a strict schema with `status` enum values `completed|blocked|failed`.
+- Kept the factory inert; no timers, watcher startup, or process work happens before session events.
+- Validated only the allowlisted `WORKFLOW_*` environment.
+- Recorded bounded lifecycle facts on:
+  - `session_start`
+  - `before_agent_start`
+  - `agent_settled`
+  - `session_shutdown`
+- Avoided storing raw prompt text; only prompt byte count is recorded.
+- Routed terminal submission through an injected/default fixed handoff adapter and returned `terminate: true` only after successful submission.
 
-## Self-review
-- Reviewed `src/workflow/herdr.js` and `test/workflow-herdr.test.js` after GREEN.
-- Ran: `git diff --check`
-- Result: clean.
+### Delegation watcher
+- Added `createDelegationWatcher({ delegations, originSessionId, onResult, onNotice, intervalMs, clock })`.
+- Starts only when explicitly started by the coordinator session.
+- Maintains one in-flight poll.
+- Lists by exact origin session, filters terminal current-generation unconsumed results, then atomically consumes before delivery.
+- Delivers only bounded payload fields:
+  - `runId`
+  - `delegationId`
+  - `role`
+  - `generation`
+  - `state`
+  - `summary`
+  - `verification`
+  - `concerns`
+  - `nextAction`
+- Emits one-time notices for stale/manual states without converting them into completion deliveries.
+- Stops idempotently and clears its timer.
 
-## Concerns
-- None blocking.
+### Coordinator extension
+- Registered exactly these tools:
+  - `workflow_prepare_delegation`
+  - `workflow_execute_delegation`
+  - `workflow_delegation_result`
+  - `workflow_adopt_delegation_result`
+  - `workflow_remediate_delegation`
+- Added a `tool_call` guard for `subagent` using `validateSubagentRequestPolicy` without rewriting input.
+- Enforced UI confirmation for mutating tools.
+- Used strict additional-properties-closed schemas for extension tools.
+- Stored approved previews in memory and executed only approved in-memory digests.
+- Started the session-owned watcher in `session_start` and stopped it in `session_shutdown`.
+- Injected consumed results with:
+  - `deliverAs: "followUp"`
+  - `triggerTurn: ctx.isIdle()`
+- Kept adoption explicit; no implicit cross-session delivery path was added.
 
-## Review fix evidence
-### Critical 1: unsupported `--json` flags on JSON-default commands
-- Added failing argv-contract tests for `workspace list/get`, `tab list/create/rename`, `pane list/split/rename`, and `agent list` using the public Herdr 0.7.4 CLI shapes.
-- RED: `node --test test/workflow-herdr.test.js`
-- RED result: 9 failures, including explicit argv mismatches because the adapter appended unsupported `--json` flags.
-- Fix: removed `--json` from the affected wrappers while keeping it on documented worktree create/open and status.
-- GREEN: `node --test test/workflow-herdr.test.js`
-- GREEN result: 13/13 passed.
+## Tests added/updated
+### Added
+- `test/workflow-pi-extensions.test.js`
+  - child extension lifecycle and handoff behavior
+  - coordinator registration, watcher wiring, confirmation flow, and subagent guard behavior
+- `test/workflow-delegation-watcher.test.js`
+  - one in-flight poll
+  - exact-once consumption
+  - wrong-origin suppression
+  - reload race handling
+  - timer cleanup
+  - stale/manual notices
 
-### Critical 2: live `{ id, result }` and `{ id, error }` envelopes
-- Added failing live-envelope tests for status, workspace/tab/pane/agent list/get/create/split/start, and worktree create/open/already-open fixtures shaped like captured Herdr 0.7.4 responses.
-- RED: `node --test test/workflow-herdr.test.js`
-- RED result: worktree and agent normalization failed with missing IDs, and `runInPane` returned the raw `{ id, result }` envelope instead of the unwrapped result.
-- Fix: changed the adapter to unwrap any explicit `result` envelope while preserving explicit API `error` handling and legacy `{ ok: true, result }` compatibility.
-- GREEN: `node --test test/workflow-herdr.test.js`
-- GREEN result: 13/13 passed.
+### Updated
+- `test/workflow-coordinator-policy.test.js`
+  - added assertion that validation never rewrites the incoming subagent request
 
-### Focused verification
-- Ran: `node --test test/workflow-herdr.test.js test/workflow-process.test.js`
-- Result: 20/20 tests passed.
+## Verification run
+Focused:
+```bash
+node --test test/workflow-pi-extensions.test.js test/workflow-delegation-watcher.test.js test/workflow-coordinator-policy.test.js
+```
+Passed.
 
-### Full suite
-- Ran: `npm test`
-- Result: 117/117 tests passed.
+Full:
+```bash
+npm test
+```
+Passed (`361` tests passing).
 
-### Critical 3: plain-text `herdr integration status`
-- Added failing live-shaped text tests for `integration status` using public 0.7.4 output lines such as `pi: current (v5) (/path)` and `copilot: not installed (/path)`.
-- RED: `node --test test/workflow-herdr.test.js`
-- RED result: 3 failures because `integrationStatus()` still routed through JSON parsing, returned `null` for empty output instead of `[]`, and did not surface malformed-line diagnostics.
-- Fix: implemented a dedicated plain-text parser for `integrationStatus()` that returns stable entries `{ name, status, version?, path? }`, allows empty output as `[]`, and rejects malformed nonempty lines with a clear `HERDR` error.
-- GREEN: `node --test test/workflow-herdr.test.js`
-- GREEN result: 16/16 passed.
+Diff hygiene:
+```bash
+git diff --cached --check
+git diff --check
+```
+Passed.
 
-### Focused verification (final)
-- Ran: `node --test test/workflow-herdr.test.js test/workflow-process.test.js`
-- Result: 23/23 tests passed.
+## Self-review notes
+- The live coordinator runtime is wired to local Workflow modules and a real Pi delegation transport path, but process observation is still conservative: the live `/proc` inspection reports existence and cwd identity, not rich idle/settled state. The fake-based remediation coverage for this task passes, but richer live idleness detection may still be desirable in later lifecycle work.
+- No `pi -e`, model, child launch canary, Herdr launch, package install, project trust mutation, fleet UI, watchdog UI, or global Pi state changes were introduced.
+- The implementation keeps child submission, watcher ownership, and origin-session adoption bounded to the task’s safety constraints.
 
-### Full suite (final)
-- Ran: `npm test`
-- Result: 120/120 tests passed.
+## Files changed
+- `.pi/extensions/workflow-delegation-child.ts`
+- `.pi/extensions/workflow-coordinator/index.ts`
+- `src/workflow/delegation-watcher.js`
+- `test/workflow-pi-extensions.test.js`
+- `test/workflow-delegation-watcher.test.js`
+- `test/workflow-coordinator-policy.test.js`
+
+## Follow-up fix RED/GREEN evidence
+### RED
+Command:
+```bash
+node --test test/workflow-pi-extensions.test.js test/workflow-delegation-watcher.test.js test/workflow-coordinator-policy.test.js
+```
+Observed failures before the fix:
+- `workflow_adopt_delegation_result` still filtered lookup to the adopter session, so later-session explicit adoption failed.
+- `workflow_remediate_delegation` accepted invalid `insideFrozenBrief` values past the extension boundary.
+- `workflow_delegation_result` exposed unsanitized raw result metadata in `details`.
+
+### GREEN
+Focused:
+```bash
+node --test test/workflow-pi-extensions.test.js test/workflow-delegation-watcher.test.js test/workflow-coordinator-policy.test.js
+```
+Passed (`11/11`).
+
+Full:
+```bash
+npm test
+```
+Passed (`362/362`).
+
+Diff hygiene:
+```bash
+git diff --check
+```
+Passed.
