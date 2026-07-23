@@ -48,7 +48,19 @@ test("--real requires --keep", async () => {
 test("--real rejects unknown harness", async () => {
   const { code, stderr } = await runSmoke(["--real", "--agent", "unknown", "--keep"], { env: { WORKFLOW_SMOKE_TEST_TTY: "1" } });
   assert.equal(code, 1);
-  assert.match(stderr, /Unknown harness/);
+  assert.match(stderr, /only 'pi' is supported|not implemented/i);
+});
+
+test("--real rejects non-pi agents", async () => {
+  const { code, stderr } = await runSmoke(["--real", "--agent", "claude", "--keep"], { env: { WORKFLOW_SMOKE_TEST_TTY: "1" } });
+  assert.equal(code, 1);
+  assert.match(stderr, /Real canary for 'claude' is not implemented|only 'pi' is supported/i);
+});
+
+test("--real rejects CI environment", async () => {
+  const { code, stderr } = await runSmoke(["--real", "--agent", "pi", "--keep"], { env: { WORKFLOW_SMOKE_TEST_TTY: "1", CI: "true" } });
+  assert.equal(code, 1);
+  assert.match(stderr, /interactive-only|CI/i);
 });
 
 test("--real rejects wrong typed harness confirmation", async () => {

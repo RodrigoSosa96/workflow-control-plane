@@ -17,41 +17,51 @@ function parseArgs(argv) {
 }
 
 async function promptExactHarness(expected, { stdin, stdout }) {
+  stdout.write(`This is a REAL canary. It will start an actual ${expected} harness and may consume tokens/API quota.\n`);
   stdout.write(`Type the exact harness name to confirm: ${expected}\n> `);
   return new Promise((resolve) => {
     stdin.once("data", (data) => resolve(data.toString().trim()));
   });
 }
 
+function isCiEnv(env) {
+  return Boolean(env.CI || env.GITHUB_ACTIONS || env.GITLAB_CI || env.BUILDKITE);
+}
+
+async function assertRealModeAllowed(args, { env, stdin, stdout }) {
+  const hasTty = env.WORKFLOW_SMOKE_TEST_TTY === "1" || (stdin.isTTY && stdout.isTTY);
+  if (!hasTty) {
+    throw new Error("Real canaries require a TTY");
+  }
+  if (!args.keep) {
+    throw new Error("Real canaries require --keep");
+  }
+  if (!args.agent) {
+    throw new Error("Real canaries require --agent <harness>");
+  }
+  if (args.agent !== "pi") {
+    throw new Error(`Real canary for '${args.agent}' is not implemented; only 'pi' is supported`);
+  }
+  if (isCiEnv(env)) {
+    throw new Error("Real canaries are interactive-only and cannot run in CI");
+  }
+  const confirmed = await promptExactHarness(args.agent, { stdin, stdout });
+  if (confirmed !== args.agent) {
+    throw new Error("Real canary was not confirmed");
+  }
+}
+
 async function runSmoke({ args, env, stdin, stdout, stderr }) {
   if (!args.fake && !args.real) {
-    stderr.write("USAGE: smoke-workflow-fixture --fake --keep | --real --agent <pi|claude|codex|opencode> --keep\n");
+    stderr.write("USAGE: smoke-workflow-fixture --fake --keep | --real --agent pi --keep\n");
     return { code: 1 };
   }
 
-  const hasTty = env.WORKFLOW_SMOKE_TEST_TTY === "1" || (stdin.isTTY && stdout.isTTY);
-
   if (args.real) {
-    if (!hasTty) {
-      stderr.write("Real canaries require a TTY\n");
-      return { code: 1 };
-    }
-    if (!args.keep) {
-      stderr.write("Real canaries require --keep\n");
-      return { code: 1 };
-    }
-    if (!args.agent) {
-      stderr.write("Real canaries require --agent <harness>\n");
-      return { code: 1 };
-    }
-    const allowed = new Set(["pi", "claude", "codex", "opencode"]);
-    if (!allowed.has(args.agent)) {
-      stderr.write(`Unknown harness: ${args.agent}\n`);
-      return { code: 1 };
-    }
-    const confirmed = await promptExactHarness(args.agent, { stdin, stdout });
-    if (confirmed !== args.agent) {
-      stderr.write("Real canary was not confirmed\n");
+    try {
+      await assertRealModeAllowed(args, { env, stdin, stdout });
+    } catch (error) {
+      stderr.write(`${error.message}\n`);
       return { code: 1 };
     }
     stderr.write("Real canary mode is not yet implemented. Use --fake for fixture-only smoke.\n");
