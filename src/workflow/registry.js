@@ -336,7 +336,7 @@ function validateLauncherV3(launcher) {
   const agentProfiles = {};
   for (const [profileName, profileValue] of Object.entries(normalized.agent_profiles)) {
     validateString(profileName, "launcher.agent_profiles key");
-    agentProfiles[profileName] = validateAgentProfile(profileName, profileValue);
+    agentProfiles[profileName] = validateAgentProfile(profileName, profileValue, { fixtureMode: normalized.fixture_mode === true });
   }
 
   if (!agentProfiles[normalized.default_agent_profile]) {
@@ -475,7 +475,7 @@ export async function loadRegistry(path, { readFile = defaultReadFile } = {}) {
   return validateRegistry(parsed);
 }
 
-export function validateAgentProfile(name, value) {
+export function validateAgentProfile(name, value, { fixtureMode = false } = {}) {
   if (!isObject(value)) fail("schema", `agent profile ${name} must be an object`);
   const normalized = clone(value);
   if (Object.hasOwn(normalized, "bypassPermissions")) {
@@ -495,7 +495,9 @@ export function validateAgentProfile(name, value) {
 
   normalized.command = validateString(normalized.command, `agent profile ${name}.command`);
   normalized.mode = validateString(normalized.mode, `agent profile ${name}.mode`);
-  const supportedModes = MODES_BY_HARNESS[normalized.harness];
+  const supportedModes = fixtureMode
+    ? new Set([...MODES_BY_HARNESS[normalized.harness], "stream-json"])
+    : MODES_BY_HARNESS[normalized.harness];
   if (!supportedModes.has(normalized.mode)) {
     fail("schema", `agent profile ${name}.mode must be one of ${[...supportedModes].join(", ")} for ${normalized.harness}`);
   }

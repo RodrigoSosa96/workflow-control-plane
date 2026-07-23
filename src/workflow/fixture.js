@@ -15,56 +15,105 @@ function validateChildPath(root, target) {
 }
 
 function buildFixtureRegistry({ root, stateRoot, packageRoot }) {
+  const fixtureSinglePath = join(root, "fixture-single");
+  const fixtureBundlePath = join(root, "fixture-bundle");
   return {
+    version: 3,
     launcher: {
       fixture_mode: true,
       state_root: stateRoot,
+      worktree_root: join(root, "worktrees"),
       control_plane_bin: join(packageRoot, "bin", "workflow.js"),
+      session_template: "{project}-{task}",
+      default_agent_profile: "pi-worker",
+      max_bundle_tickets: 5,
+      delegation: {
+        version: 1,
+        totalInternal: 4,
+        foreground: 3,
+        readOnlyBackground: 3,
+        writersTotal: 1,
+        writersPerCheckout: 1,
+        maxDepth: 1,
+        remediationTurns: 2,
+        allowBackgroundWriters: false,
+      },
+      agent_profiles: {
+        "pi-worker": {
+          harness: "pi",
+          command: "pi",
+          mode: "stream-json",
+          model: null,
+          arguments: [],
+          roles: ["implementer"],
+        },
+        "claude-worker": {
+          harness: "claude",
+          command: "claude",
+          mode: "stream-json",
+          model: null,
+          arguments: [],
+          permission_mode: "manual",
+          roles: ["implementer"],
+        },
+        "codex-worker": {
+          harness: "codex",
+          command: "codex",
+          mode: "stream-json",
+          model: "gpt-5-codex",
+          arguments: [],
+          sandbox: "workspace-write",
+          approval_policy: "on-request",
+          roles: ["implementer"],
+        },
+        "opencode-worker": {
+          harness: "opencode",
+          command: "opencode",
+          mode: "stream-json",
+          model: "claude-sonnet-4-20250514",
+          arguments: [],
+          availability: "fixture-only",
+          roles: ["implementer"],
+        },
+      },
     },
     projects: {
       "fixture-single": {
         label: "Fixture Single",
         kind: "work",
-        repository: join(root, "fixture-single"),
+        path: fixtureSinglePath,
+        repository: "single",
+        base_branch: "main",
+        worktree: {
+          branch_template: "feature/{task}",
+          path_template: "{worktree_root}/{project}/{task}",
+        },
       },
       "fixture-bundle": {
         label: "Fixture Bundle",
-        kind: "group",
-        repository: join(root, "fixture-bundle"),
-      },
-    },
-    agent_profiles: {
-      "pi-worker": {
-        harness: "pi",
-        command: "pi",
-        mode: "stream-json",
-        model: null,
-        arguments: [],
-      },
-      "claude-worker": {
-        harness: "claude",
-        command: "claude",
-        mode: "stream-json",
-        model: null,
-        arguments: [],
-        permission_mode: "manual",
-      },
-      "codex-worker": {
-        harness: "codex",
-        command: "codex",
-        mode: "stream-json",
-        model: "gpt-5-codex",
-        arguments: [],
-        sandbox: "workspace-write",
-        approval_policy: "on-request",
-      },
-      "opencode-worker": {
-        harness: "opencode",
-        command: "opencode",
-        mode: "stream-json",
-        model: "claude-sonnet-4-20250514",
-        arguments: [],
-        availability: "fixture-only",
+        kind: "work",
+        path: fixtureBundlePath,
+        repository: "group",
+        worktree: {
+          branch_template: "feature/{task}",
+          path_template: "{worktree_root}/{project}/{task}",
+        },
+        coordination: {
+          meta_repository: fixtureBundlePath,
+          repos_directory: "repos",
+        },
+        repositories: {
+          backend: {
+            path: join(fixtureBundlePath, "repos", "backend"),
+            base_branch: "main",
+            branch_template: "feature/{task}",
+          },
+          frontend: {
+            path: join(fixtureBundlePath, "repos", "frontend"),
+            base_branch: "main",
+            branch_template: "feature/{task}",
+          },
+        },
       },
     },
   };

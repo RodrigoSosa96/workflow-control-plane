@@ -18,6 +18,16 @@ async function main() {
 
   const assignment = await readFile(join(runDir, "assignment.md"), "utf8");
 
+  const runPath = join(runDir, "run.json");
+  let runTickets = [];
+  try {
+    const runData = JSON.parse(await readFile(runPath, "utf8"));
+    runTickets = (Array.isArray(runData.tickets) ? runData.tickets : [])
+      .map((id) => ({ id, status: "completed", evidence: ["fake-worker-test-passed"] }));
+  } catch {
+    runTickets = [];
+  }
+
   let repoName = "fixture-single";
   if (assignment.includes("fixture-bundle")) repoName = "fixture-bundle";
 
@@ -51,11 +61,15 @@ async function main() {
   await writeFile(
     join(runDir, "handoff-input.json"),
     JSON.stringify({
+      version: 1,
       status: "completed",
       generation: 1,
       summary: "Fake worker completed fixture task",
-      verification: [{ command: "node --test", status: "passed" }],
+      tickets: runTickets,
+      changedFiles: ["src/index.js", "test/index.test.js"],
+      verification: [{ command: "node --test", status: "passed", summary: "tests passed" }],
       concerns: [],
+      decisions: [],
       nextAction: "await-coordinator",
     }, null, 2) + "\n",
   );
