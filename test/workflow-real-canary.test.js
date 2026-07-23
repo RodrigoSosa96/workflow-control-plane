@@ -4,9 +4,25 @@ import { spawn } from "node:child_process";
 import { access, rm } from "node:fs/promises";
 import { createSmokeRunner } from "../scripts/smoke-workflow-fixture.js";
 import { createWorkflowFixture } from "../src/workflow/fixture.js";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+async function fakeFixture(root) {
+  await mkdir(join(root, "fixture-single"), { recursive: true });
+  await writeFile(join(root, "fixture-single", "fixture.js"), 'export const value = "implemented";\n');
+  await writeFile(
+    join(root, "fixture-single", "test.js"),
+    'import { value } from "./fixture.js";\nimport assert from "node:assert/strict";\nimport { test } from "node:test";\n\ntest("fixture value matches expectation", () => {\n  assert.equal(value, "implemented");\n});\n',
+  );
+  return {
+    root,
+    registryPath: join(root, "projects.yaml"),
+    stateRoot: join(root, "state"),
+    packageRoot: "/tmp/fake-package",
+    projects: { "fixture-single": { path: join(root, "fixture-single"), tickets: ["FIX-101", "FIX-102"] } },
+  };
+}
 
 function runSmoke(args, { stdin, env } = {}) {
   return new Promise((resolve) => {
@@ -80,19 +96,14 @@ test("--real rejects CI environment", async () => {
 
 test("real-mode path builds fixture registry launch options", async () => {
   let captured = null;
+  const fixtureRoot = join(tmpdir(), `workflow-canary-launch-test-${Date.now()}`);
   const runner = createSmokeRunner({
     argv: ["--real", "--agent", "pi", "--keep"],
     env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
     stdin: { isTTY: true, once: (_event, handler) => handler("pi\n") },
     stdout: { write: () => {} },
     stderr: { write: () => {} },
-    createWorkflowFixture: async () => ({
-      root: "/tmp/fake-fixture",
-      registryPath: "/tmp/fake-fixture/projects.yaml",
-      stateRoot: "/tmp/fake-fixture/state",
-      packageRoot: "/tmp/fake-package",
-      projects: { "fixture-single": { path: "/tmp/fake-fixture/fixture-single", tickets: ["FIX-101", "FIX-102"] } },
-    }),
+    createWorkflowFixture: async () => fakeFixture(fixtureRoot),
     launchCommand: async (options) => {
       captured = options;
       return {
@@ -100,6 +111,9 @@ test("real-mode path builds fixture registry launch options", async () => {
         execute: async () => ({ status: "running", runId: "11111111-1111-4111-8111-111111111111", runDirectory: "/tmp/run-1" }),
       };
     },
+    resultCommand: async () => ({ status: "completed", result: { verification: [{ command: "node --test", status: "passed" }] } }),
+    workerStatusCommand: async () => ({ workers: [{ phase: "settled", workerId: "worker-1" }] }),
+    readTelemetrySnapshot: async () => ({ phase: "settled", harness: "pi" }),
   });
   const { code } = await runner.run();
   assert.equal(code, 0);
@@ -107,9 +121,81 @@ test("real-mode path builds fixture registry launch options", async () => {
   assert.equal(captured.task, "FIX-101");
   assert.deepEqual(captured.tickets, ["FIX-102"]);
   assert.equal(captured.agentProfile, "pi-worker");
-  assert.equal(captured.registryPath, "/tmp/fake-fixture/projects.yaml");
-  assert.equal(captured.stateRoot, "/tmp/fake-fixture/state");
+  assert.equal(captured.registryPath, join(fixtureRoot, "projects.yaml"));
+  assert.equal(captured.stateRoot, join(fixtureRoot, "state"));
   assert.ok(captured.controlPlaneBin.endsWith("bin/workflow.js"));
+});
+
+test("poll completes on current completed result", async () => {
+  const resultCalls = [];
+  const fixtureRoot = join(tmpdir(), `workflow-canary-poll-test-${Date.now()}`);
+  const runner = createSmokeRunner({
+    argv: ["--real", "--agent", "pi", "--keep"],
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
+    stdin: { isTTY: true, once: (_event, handler) => handler("pi\n") },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    createWorkflowFixture: async () => fakeFixture(fixtureRoot),
+    launchCommand: async () => ({
+      preview: { approvalDigest: "sha256:test" },
+      execute: async () => ({ status: "running", runId: "run-1", runDirectory: join(fixtureRoot, "state", "run-1") }),
+    }),
+    resultCommand: async ({ runId }) => {
+      resultCalls.push(runId);
+      return { status: "completed", result: { verification: [{ command: "node --test", status: "passed" }] } };
+    },
+    workerStatusCommand: async () => ({ workers: [{ phase: "settled" }] }),
+    readTelemetrySnapshot: async () => ({ phase: "settled", harness: "pi" }),
+  });
+  const { code } = await runner.run();
+  assert.equal(code, 0);
+  assert.deepEqual(resultCalls, ["run-1"]);
+});
+
+test("poll stops on needs-input and preserves fixture", async () => {
+  const fixtureRoot = join(tmpdir(), `workflow-canary-needs-input-test-${Date.now()}`);
+  const runner = createSmokeRunner({
+    argv: ["--real", "--agent", "pi", "--keep"],
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
+    stdin: { isTTY: true, once: (_event, handler) => handler("pi\n") },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    createWorkflowFixture: async () => fakeFixture(fixtureRoot),
+    launchCommand: async () => ({
+      preview: { approvalDigest: "sha256:test" },
+      execute: async () => ({ status: "running", runId: "run-1", runDirectory: join(fixtureRoot, "state", "run-1") }),
+    }),
+    resultCommand: async () => ({ status: "needs-input" }),
+    workerStatusCommand: async () => ({ workers: [{ phase: "running" }] }),
+  });
+  const { code } = await runner.run();
+  assert.notEqual(code, 0);
+});
+
+test("completed canary validates telemetry snapshot is bounded", async () => {
+  let inspectedPath = null;
+  const fixtureRoot = join(tmpdir(), `workflow-canary-telemetry-test-${Date.now()}`);
+  const runner = createSmokeRunner({
+    argv: ["--real", "--agent", "pi", "--keep"],
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
+    stdin: { isTTY: true, once: (_event, handler) => handler("pi\n") },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    createWorkflowFixture: async () => fakeFixture(fixtureRoot),
+    launchCommand: async () => ({
+      preview: { approvalDigest: "sha256:test" },
+      execute: async () => ({ status: "running", runId: "run-1", runDirectory: join(fixtureRoot, "state", "run-1") }),
+    }),
+    resultCommand: async () => ({ status: "completed", result: { verification: [{ command: "node --test", status: "passed" }] } }),
+    workerStatusCommand: async () => ({ workers: [{ phase: "settled", workerId: "worker-1" }] }),
+    readTelemetrySnapshot: async (path) => {
+      inspectedPath = path;
+      return { phase: "settled", harness: "pi" };
+    },
+  });
+  const { code } = await runner.run();
+  assert.equal(code, 0);
+  assert.equal(inspectedPath, join(fixtureRoot, "state", "run-1", "telemetry", "workers", "worker-1.json"));
 });
 
 test("--real rejects wrong typed harness confirmation", async () => {

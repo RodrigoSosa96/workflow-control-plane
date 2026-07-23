@@ -6,12 +6,13 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { writeFile, mkdir as mkdirAsync } from "node:fs/promises";
-import { launchCommand as defaultLaunchCommand } from "../src/workflow/commands.js";
+import { launchCommand as defaultLaunchCommand, resultCommand as defaultResultCommand, workerStatusCommand as defaultWorkerStatusCommand } from "../src/workflow/commands.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { lookupExecutable } from "../src/workflow/runtime-config.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { createProcessRunner } from "../src/workflow/process.js";
+import { readFile as defaultReadFile } from "node:fs/promises";
 
 function parseArgs(argv) {
   const args = { fake: false, real: false, keep: false, agent: null };
@@ -89,8 +90,9 @@ async function writePromptFile(root) {
   return promptPath;
 }
 
-async function runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixture, launchCommand }) {
-  if (!args.fake && !args.real) {
+async function runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixture, launchCommand, resultCommand, workerStatusCommand, readTelemetrySnapshot }) {
+  try {
+    if (!args.fake && !args.real) {
     stderr.write("USAGE: smoke-workflow-fixture --fake --keep | --real --agent pi --keep\n");
     return { code: 1 };
   }
@@ -114,6 +116,17 @@ async function runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixtur
     }
     stdout.write(`Run created: ${report.runId}\n`);
     stdout.write(`Run directory: ${report.runDirectory}\n`);
+
+    const poll = await pollCanaryCompletion({ runId: report.runId, fixture, env, stdout, resultCommand, workerStatusCommand });
+    if (poll.outcome !== "completed") {
+      throw new Error(`Canary did not complete: ${poll.outcome}`);
+    }
+    const workerId = poll.status.workers?.[0]?.workerId;
+    if (workerId) {
+      await inspectCanaryTelemetry({ fixture, runId: report.runId, workerId, readTelemetrySnapshot });
+    }
+    await inspectCanaryCompletion({ fixture });
+    stdout.write("Canary completed successfully.\n");
     return { code: 0, fixture, promptPath, runId: report.runId, runDirectory: report.runDirectory };
   }
 
@@ -136,6 +149,10 @@ async function runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixtur
   }
 
   return { code: 0 };
+  } catch (error) {
+    stderr.write(`${error.message}\n`);
+    return { code: 1, error };
+  }
 }
 
 function createLaunchDeps(fixture, env, overrides = {}) {
@@ -176,6 +193,66 @@ async function runWorkflowLaunch({ fixture, promptPath, agent, env, launchComman
   return { preview, report };
 }
 
+const CANARY_TIMEOUT_MS = 10 * 60 * 1000;
+const CANARY_POLL_INTERVAL_MS = 5000;
+
+function canarySleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollCanaryCompletion({ runId, fixture, env, stdout, resultCommand = defaultResultCommand, workerStatusCommand = defaultWorkerStatusCommand }) {
+  const deps = createLaunchDeps(fixture, env);
+  const deadline = Date.now() + CANARY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const result = await resultCommand({ runId, registryPath: fixture.registryPath, stateRoot: fixture.stateRoot }, deps);
+    const status = await workerStatusCommand({ runId, registryPath: fixture.registryPath, stateRoot: fixture.stateRoot }, deps);
+
+    const phase = status.workers?.[0]?.phase ?? "unknown";
+    stdout.write(`[${new Date().toISOString()}] result=${result.status} worker=${phase}\n`);
+
+    if (result.status === "completed") {
+      return { outcome: "completed", result, status };
+    }
+    if (["needs-input", "manual-handoff-required"].includes(result.status) || ["failed", "unknown", "manual-recovery"].includes(phase)) {
+      return { outcome: "terminal", result, status };
+    }
+
+    await canarySleep(CANARY_POLL_INTERVAL_MS);
+  }
+
+  return { outcome: "timeout" };
+}
+
+async function inspectCanaryCompletion({ fixture, readFile = defaultReadFile }) {
+  const fixtureJs = await readFile(join(fixture.projects["fixture-single"].path, "fixture.js"), "utf8");
+  const testJs = await readFile(join(fixture.projects["fixture-single"].path, "test.js"), "utf8");
+  if (!fixtureJs.includes('"implemented"')) {
+    throw new Error("Canary did not change fixture.js to 'implemented'");
+  }
+  if (!testJs.includes('"implemented"')) {
+    throw new Error("Canary did not update test.js to expect 'implemented'");
+  }
+}
+
+async function defaultReadTelemetrySnapshot(snapshotPath, { readFile = defaultReadFile } = {}) {
+  const text = await readFile(snapshotPath, "utf8");
+  const snapshot = JSON.parse(text);
+  if (typeof snapshot.phase !== "string") {
+    throw new Error("Telemetry snapshot is missing bounded phase field");
+  }
+  const json = JSON.stringify(snapshot);
+  if (json.includes("prompt") || json.includes("sessionPath") || json.includes("toolArguments")) {
+    throw new Error("Telemetry snapshot contains disallowed private fields");
+  }
+  return snapshot;
+}
+
+async function inspectCanaryTelemetry({ fixture, runId, workerId, readTelemetrySnapshot = defaultReadTelemetrySnapshot }) {
+  const snapshotPath = join(fixture.stateRoot, runId, "telemetry", "workers", `${workerId}.json`);
+  await readTelemetrySnapshot(snapshotPath);
+}
+
 export function createSmokeRunner(deps = {}) {
   const argv = deps.argv ?? process.argv.slice(2);
   const env = deps.env ?? process.env;
@@ -184,11 +261,25 @@ export function createSmokeRunner(deps = {}) {
   const stderr = deps.stderr ?? process.stderr;
   const createWorkflowFixture = deps.createWorkflowFixture ?? defaultCreateWorkflowFixture;
   const launchCommand = deps.launchCommand ?? defaultLaunchCommand;
+  const resultCommand = deps.resultCommand ?? defaultResultCommand;
+  const workerStatusCommand = deps.workerStatusCommand ?? defaultWorkerStatusCommand;
+  const readTelemetrySnapshot = deps.readTelemetrySnapshot ?? defaultReadTelemetrySnapshot;
 
   return {
     async run() {
       const args = parseArgs(argv);
-      return runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixture, launchCommand });
+      return runSmoke({
+        args,
+        env,
+        stdin,
+        stdout,
+        stderr,
+        createWorkflowFixture,
+        launchCommand,
+        resultCommand,
+        workerStatusCommand,
+        readTelemetrySnapshot,
+      });
     },
   };
 }
