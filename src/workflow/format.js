@@ -223,6 +223,62 @@ function formatReconcile(value) {
   return bound(lines.join("\n"));
 }
 
+function workerMeasurement(value) {
+  if (!value || typeof value !== "object") return "unknown";
+  return value.availability === "reported" && Number.isFinite(value.value)
+    ? String(value.value)
+    : text(value.availability, "unknown");
+}
+
+function publicWorker(worker = {}) {
+  const usage = worker.usage && typeof worker.usage === "object" ? worker.usage : {};
+  return {
+    workerId: worker.workerId ?? null,
+    harness: worker.harness ?? null,
+    profileName: worker.profileName ?? null,
+    phase: worker.phase ?? "unknown",
+    observability: worker.observability ?? "unknown",
+    startedAt: worker.startedAt ?? null,
+    updatedAt: worker.updatedAt ?? null,
+    turns: Number.isInteger(worker.turns) ? worker.turns : 0,
+    tools: worker.tools && typeof worker.tools === "object"
+      ? { count: Number.isInteger(worker.tools.count) ? worker.tools.count : 0, lastName: worker.tools.lastName ?? null }
+      : { count: 0, lastName: null },
+    retries: worker.retries && typeof worker.retries === "object"
+      ? { attempt: Number.isInteger(worker.retries.attempt) ? worker.retries.attempt : 0, maxAttempts: Number.isInteger(worker.retries.maxAttempts) ? worker.retries.maxAttempts : 0 }
+      : { attempt: 0, maxAttempts: 0 },
+    model: worker.model ?? null,
+    thinking: worker.thinking && typeof worker.thinking === "object"
+      ? { availability: worker.thinking.availability ?? "unknown", value: worker.thinking.value ?? null }
+      : { availability: "unknown", value: null },
+    usage: {
+      input: { availability: usage.input?.availability ?? "unknown", value: usage.input?.value ?? null },
+      output: { availability: usage.output?.availability ?? "unknown", value: usage.output?.value ?? null },
+      cacheRead: { availability: usage.cacheRead?.availability ?? "unknown", value: usage.cacheRead?.value ?? null },
+      cacheWrite: { availability: usage.cacheWrite?.availability ?? "unknown", value: usage.cacheWrite?.value ?? null },
+      cost: { availability: usage.cost?.availability ?? "unknown", value: usage.cost?.value ?? null },
+      context: { availability: usage.context?.availability ?? "unknown", value: usage.context?.value ?? null },
+    },
+  };
+}
+
+function publicWorkerResult(value = {}) {
+  return {
+    command: value.command,
+    runId: value.runId ?? null,
+    workers: list(value.workers).map((worker) => publicWorker(worker)),
+  };
+}
+
+function formatWorkers(value) {
+  const result = publicWorkerResult(value);
+  if (!result.workers.length) return `Run: ${text(result.runId)}\nWorkers: none`;
+  return result.workers.map((worker) => [
+    `[${text(worker.harness)} • ${text(worker.workerId)} • ${text(worker.phase)}] model: ${text(worker.model, "not-reported")} | turn ${worker.turns}`,
+    `usage: ${workerMeasurement(worker.usage.input)} input / ${workerMeasurement(worker.usage.output)} output | cost: ${workerMeasurement(worker.usage.cost)}`,
+  ].join("\n")).join("\n");
+}
+
 function formatDelegation(value) {
   const lines = [
     `Run: ${text(value.runId)}`,
@@ -242,6 +298,7 @@ function formatDelegation(value) {
 }
 
 function valueForJson(command, value) {
+  if (command === "worker-status" || command === "worker-watch") return publicWorkerResult(value);
   if (command !== "launch" || !value || typeof value !== "object" || !Object.hasOwn(value, "assignment")) {
     return value;
   }
@@ -296,6 +353,9 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatResult(value);
     case "reconcile":
       return formatReconcile(value);
+    case "worker-status":
+    case "worker-watch":
+      return bound(formatWorkers(value));
     case "delegation-result":
     case "delegation-reconcile":
     case "delegation-remediate":

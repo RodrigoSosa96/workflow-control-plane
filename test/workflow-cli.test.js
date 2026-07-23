@@ -387,6 +387,17 @@ test("parses documented workflow commands and options", () => {
     format: "json",
   });
 
+  assert.deepEqual(parseArgs(["worker", "status", RUN_ID, "--format", "json"]), {
+    command: "worker-status",
+    runId: RUN_ID,
+    format: "json",
+  });
+  assert.deepEqual(parseArgs(["worker", "watch", RUN_ID]), {
+    command: "worker-watch",
+    runId: RUN_ID,
+    format: "compact",
+  });
+
   assert.deepEqual(parseArgs(["handoff", RUN_ID, "--input", "/state/run/handoff-input.json"]), {
     command: "handoff",
     runId: RUN_ID,
@@ -433,6 +444,8 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["result", RUN_ID, "--yes"]), /result does not accept --yes/i);
   assert.throws(() => parseArgs(["result", RUN_ID, "--prompt-file", "/tmp/request.md"]), /result does not accept --prompt-file/i);
   assert.throws(() => parseArgs(["reconcile", "--run", RUN_ID, "--yes"]), /reconcile does not accept --yes/i);
+  assert.throws(() => parseArgs(["worker", "watch", RUN_ID, "--interval", "1"]), /Unknown option|does not accept/i);
+  assert.throws(() => parseArgs(["worker", "status", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["launch", "ocr", "ASANA-123", "--prompt", "SECRET-DO-NOT-LEAK"]), /Unknown option: --prompt/i);
   assert.throws(() => parseArgs(["launch", "ocr", "ASANA-123", "--dry-run"]), /prompt-file/i);
   assert.throws(() => parseArgs(["start", "ocr", "ASANA-123", "--profile", "standard"]), /does not accept --profile/i);
@@ -478,6 +491,49 @@ test("rejects unknown, duplicate, and disallowed options", () => {
       input,
     );
   }
+});
+
+test("main dispatches worker status and finite read-only watch output", async () => {
+  const output = io();
+  const worker = {
+    workerId: DELEGATION_ID,
+    harness: "pi",
+    phase: "running",
+    usage: { input: { availability: "not-reported", value: null } },
+  };
+  const calls = [];
+  const common = {
+    ...output,
+    workerStatusCommand: async (options) => {
+      calls.push({ type: "status", options });
+      return { command: "worker-status", runId: options.runId, workers: [worker] };
+    },
+    workerWatchCommand: async () => (async function* finiteWatch() {
+      yield [worker];
+    }()),
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.workers[0].phase}`,
+  };
+
+  assert.equal(await main(["worker", "status", RUN_ID, "--format", "json"], common), 0);
+  assert.equal(await main(["worker", "watch", RUN_ID], common), 0);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(output.stdout, ["worker-status:json:running", "worker-watch:compact:running"]);
+  assert.deepEqual(output.stderr, []);
+});
+
+test("worker watch redacts telemetry failures before printing them", async () => {
+  const output = io();
+  const exitCode = await main(["worker", "watch", RUN_ID], {
+    ...output,
+    workerWatchCommand: async () => (async function* failingWatch() {
+      throw new WorkflowError("telemetry", "Malformed telemetry at /private/DO-NOT-LEAK");
+    }()),
+  });
+
+  assert.equal(exitCode, 10);
+  assert.deepEqual(output.stdout, []);
+  assert.match(output.stderr.join("\n"), /PREFLIGHT.*telemetry.*manual/i);
+  assert.doesNotMatch(output.stderr.join("\n"), /DO-NOT-LEAK|\/private/);
 });
 
 test("doctor uses the package registry by default and honors WORKFLOW_PROJECTS_FILE", async () => {

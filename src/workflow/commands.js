@@ -14,6 +14,9 @@ import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
 import { RUN_STATES } from "./run-state.js";
 import { createRunStore } from "./run-store.js";
+import { createTelemetryStore } from "./telemetry-store.js";
+import { publicTelemetrySnapshot } from "./telemetry.js";
+import { createWorkerWatch } from "./telemetry-watch.js";
 
 export const RESULT_EXIT_CODES = Object.freeze({
   pending: 20,
@@ -631,6 +634,52 @@ async function storeForCommand(options = {}, deps = {}) {
   const stateRoot = await stateRootForCommand(options, deps);
   const factory = deps.createRunStore ?? createRunStore;
   return factory({ stateRoot });
+}
+
+async function telemetryForCommand(options = {}, deps = {}) {
+  if (deps.telemetry) return deps.telemetry;
+  const store = await storeForCommand(options, deps);
+  const factory = deps.createTelemetryStore ?? createTelemetryStore;
+  return factory({ store });
+}
+
+function workerTelemetryFailure(error) {
+  if (error instanceof WorkflowError && error.category === "telemetry") {
+    throw new WorkflowError("PREFLIGHT", "Worker telemetry is malformed or unavailable; manual recovery required", { exitCode: 10 });
+  }
+  throw error;
+}
+
+export async function workerStatusCommand(options = {}, deps = {}) {
+  const runId = assertPathSafeUuid(options.runId, "run ID");
+  try {
+    const telemetry = await telemetryForCommand(options, deps);
+    const workers = await telemetry.read({ runId });
+    if (!Array.isArray(workers)) throw new WorkflowError("telemetry", "Telemetry store returned invalid snapshots");
+    return {
+      command: "worker-status",
+      runId,
+      workers: workers.map((worker) => publicTelemetrySnapshot(worker)),
+    };
+  } catch (error) {
+    return workerTelemetryFailure(error);
+  }
+}
+
+export async function workerWatchCommand(options = {}, deps = {}) {
+  const runId = assertPathSafeUuid(options.runId, "run ID");
+  try {
+    const telemetry = await telemetryForCommand(options, deps);
+    return createWorkerWatch({
+      runId,
+      telemetry,
+      ...(deps.workerWatchIntervalMs !== undefined ? { intervalMs: deps.workerWatchIntervalMs } : {}),
+      ...(deps.workerWatchSleep ? { sleep: deps.workerWatchSleep } : {}),
+      ...(deps.workerWatchSignal ? { signal: deps.workerWatchSignal } : {}),
+    });
+  } catch (error) {
+    return workerTelemetryFailure(error);
+  }
 }
 
 async function delegationStoresForCommand(options = {}, deps = {}) {

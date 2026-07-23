@@ -22,6 +22,8 @@ import {
   reconcileCommand as defaultReconcileCommand,
   resultCommand as defaultResultCommand,
   statusCommand as defaultStatusCommand,
+  workerStatusCommand as defaultWorkerStatusCommand,
+  workerWatchCommand as defaultWorkerWatchCommand,
 } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { createRunStore } from "../src/workflow/run-store.js";
@@ -44,6 +46,8 @@ Commands:
   workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow result <run-id> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
+  workflow worker status <run-id> [--format compact|json]
+  workflow worker watch <run-id> [--format compact|json]
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
   workflow status <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--agent <profile>] [--format compact|json]
   workflow handoff <run-id> --input <run-dir>/handoff-input.json [--format compact|json]
@@ -258,6 +262,20 @@ export function parseArgs(argv) {
     throw new Error(`Unknown command: ${argv.join(" ")}\n\n${HELP}`);
   }
 
+  if (command === "worker") {
+    const subcommand = positionals[0];
+    if (subcommand !== "status" && subcommand !== "watch") {
+      throw new Error(`Unknown command: ${argv.join(" ")}\n\n${HELP}`);
+    }
+    validateShape(`worker ${subcommand}`, positionals.slice(1), options, { min: 1, max: 1, allowedOptions: [] });
+    assertPathSafeUuidSyntax(positionals[1], `worker ${subcommand} run ID`);
+    return {
+      command: `worker-${subcommand}`,
+      runId: positionals[1],
+      format,
+    };
+  }
+
   if (command === "result") {
     validateShape("result", positionals, options, { min: 1, max: 1, allowedOptions: [] });
     assertPathSafeUuidSyntax(positionals[0], "result run ID");
@@ -352,6 +370,8 @@ function createLiveDependencies(dependencies) {
     reservations: dependencies.reservations,
     roles: dependencies.roles,
     createDelegationServices: dependencies.createDelegationServices,
+    telemetry: dependencies.telemetry,
+    createTelemetryStore: dependencies.createTelemetryStore,
   };
 }
 
@@ -558,6 +578,8 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const doctorCommand = dependencies.doctorCommand ?? defaultDoctorCommand;
   const planCommand = dependencies.planCommand ?? defaultPlanCommand;
   const statusCommand = dependencies.statusCommand ?? defaultStatusCommand;
+  const workerStatusCommand = dependencies.workerStatusCommand ?? defaultWorkerStatusCommand;
+  const workerWatchCommand = dependencies.workerWatchCommand ?? defaultWorkerWatchCommand;
   const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
@@ -645,6 +667,28 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       emit(out, formatWorkflowResult("launch", report, args.format));
       if (report.status === "partial") return 13;
       if (report.status === "failed") return 12;
+      return 0;
+    }
+
+    if (args.command === "worker-status") {
+      const result = await workerStatusCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("worker-status", result, args.format));
+      return 0;
+    }
+
+    if (args.command === "worker-watch") {
+      const controller = new AbortController();
+      const signal = dependencies.workerWatchSignal ?? controller.signal;
+      const onInterrupt = () => controller.abort();
+      if (!dependencies.workerWatchSignal) process.once("SIGINT", onInterrupt);
+      try {
+        const watch = await workerWatchCommand(options, { ...liveDependencies, workerWatchSignal: signal });
+        for await (const workers of watch) {
+          emit(out, formatWorkflowResult("worker-watch", { command: "worker-watch", runId: args.runId, workers }, args.format));
+        }
+      } finally {
+        if (!dependencies.workerWatchSignal) process.removeListener("SIGINT", onInterrupt);
+      }
       return 0;
     }
 
@@ -748,6 +792,10 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       return 64;
     }
 
+    if (error instanceof WorkflowError && error.category === "telemetry") {
+      emit(err, "PREFLIGHT: Worker telemetry is malformed or unavailable; manual recovery required");
+      return 10;
+    }
     const { category, exitCode } = categorizeError(error);
     emit(err, `${category}: ${message}`);
     return exitCode;

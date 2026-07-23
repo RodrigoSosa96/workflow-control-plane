@@ -121,6 +121,35 @@ test("launch run output includes run IDs, state, harness locations, exact comman
   }
 });
 
+test("worker telemetry formatting exposes safe measurements without private identity", () => {
+  const value = {
+    command: "worker-status",
+    runId: RUN_ID,
+    workers: [{
+      workerId: "22222222-2222-4222-8222-222222222222",
+      harness: "pi",
+      profileName: "pi-worker",
+      phase: "running",
+      turns: 2,
+      model: "gpt-5",
+      usage: {
+        input: { availability: "reported", value: 12 },
+        output: { availability: "reported", value: 3 },
+        cost: { availability: "not-reported", value: null },
+      },
+      identity: { sessionPath: "/private/session.jsonl" },
+      rawEvents: [{ prompt: "DO-NOT-LEAK" }],
+    }],
+  };
+  const compact = formatWorkflowResult("worker-status", value, "compact");
+  assert.match(compact, /pi.*running.*turn 2/i);
+  assert.match(compact, /12 input.*3 output.*cost: not-reported/i);
+  assert.doesNotMatch(compact, /DO-NOT-LEAK|\/private/);
+
+  const json = formatWorkflowResult("worker-status", value, "json");
+  assert.doesNotMatch(json, /DO-NOT-LEAK|\/private/);
+});
+
 test("oversized ordinary JSON output remains parseable with an explicit bounded envelope", () => {
   const formatted = formatWorkflowResult("result", {
     command: "result",
