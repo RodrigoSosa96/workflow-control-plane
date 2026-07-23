@@ -67,6 +67,33 @@ test("falls back through project and global defaults with frozen registry-owned 
   });
 });
 
+test("allows the fixture-only OpenCode profile only in a fixture registry", () => {
+  const profile = {
+    harness: "opencode",
+    command: "opencode",
+    mode: "stream-json",
+    roles: ["implementer"],
+    model: null,
+    arguments: [],
+    availability: "fixture-only",
+  };
+  const fixture = registryValue();
+  fixture.launcher.fixture_mode = true;
+  fixture.launcher.agent_profiles["opencode-worker"] = profile;
+  fixture.projects.app.allowed_agent_profiles.push("opencode-worker");
+  const fixtureRegistry = validateRegistry(fixture);
+  assert.equal(fixtureRegistry.launcher.agent_profiles["opencode-worker"].harness, "opencode");
+  assert.equal(resolveAgentProfile({ registry: fixtureRegistry, project: fixtureRegistry.projects.app, requestedProfile: "opencode-worker" }).name, "opencode-worker");
+
+  const real = structuredClone(fixture);
+  delete real.launcher.fixture_mode;
+  const realRegistry = validateRegistry(real);
+  assert.throws(
+    () => resolveAgentProfile({ registry: realRegistry, project: realRegistry.projects.app, requestedProfile: "opencode-worker" }),
+    /fixture-only|fixture/i,
+  );
+});
+
 test("rejects dangerous Claude and Codex profiles", () => {
   const claude = registryValue();
   claude.launcher.agent_profiles["claude-worker"].arguments = ["--dangerously-skip-permissions"];
@@ -199,6 +226,20 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   const bypassHookTrust = registryValue();
   bypassHookTrust.launcher.agent_profiles["codex-worker"].arguments = ["--dangerously-bypass-hook-trust"];
   assert.throws(() => validateRegistry(bypassHookTrust), /dangerously-bypass-hook-trust/i);
+});
+
+test("rejects OpenCode session, transport, and control argument overrides", () => {
+  for (const argument of ["--continue", "-c", "--session=opaque", "-sopaque", "--agent", "--command=run", "--port", "--attach", "--share"]) {
+    assert.throws(() => validateAgentProfile("opencode-worker", {
+      harness: "opencode",
+      command: "opencode",
+      mode: "stream-json",
+      roles: ["implementer"],
+      model: null,
+      arguments: [argument],
+      availability: "fixture-only",
+    }), /continue|session|agent|command|port|attach|share|control|argument/i, argument);
+  }
 });
 
 test("preserves non-security profile arguments", () => {

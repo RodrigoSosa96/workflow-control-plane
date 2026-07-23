@@ -128,6 +128,31 @@ test("builds exact safe argv arrays and run env for Pi, Claude, and Codex profil
   assertRunLaunch(codexSpec, "codex");
 });
 
+test("builds a structured OpenCode run argv without session recovery flags", () => {
+  const spec = buildHarnessLaunch({
+    profileName: "opencode-worker",
+    profile: profile({
+      harness: "opencode",
+      command: "opencode",
+      mode: "stream-json",
+      model: "provider/model",
+      arguments: [],
+      availability: "fixture-only",
+    }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+
+  assert.deepEqual(spec.argv.slice(0, 6), ["opencode", "run", "--format", "json", "--title", SESSION_NAME]);
+  assert.equal(spec.argv.includes("--continue"), false);
+  assert.equal(spec.argv.includes("--session"), false);
+  assert.equal(spec.argv.includes("--model"), true);
+  assert.equal(spec.expected.harness, "opencode");
+  assert.equal(spec.expected.nativeSessionId, null);
+  assertRunLaunch(spec, "opencode");
+});
+
 test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
   const spec = buildHarnessLaunch({
     profileName: "pi-worker",

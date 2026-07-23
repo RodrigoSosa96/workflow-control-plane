@@ -49,6 +49,17 @@ launcher:
       sandbox: workspace-write
       approval_policy: on-request
       arguments: []
+    opencode-worker:
+      harness: opencode
+      command: opencode
+      mode: stream-json
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      arguments: []
+      availability: fixture-only
 projects:
   ocr:
     label: ExampleProject

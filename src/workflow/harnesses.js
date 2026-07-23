@@ -10,7 +10,7 @@ export const WORKFLOW_ENV_KEYS = Object.freeze([
   "WORKFLOW_CONTROL_PLANE_BIN",
 ]);
 
-const HARNESSES = new Set(["pi", "claude", "codex"]);
+const HARNESSES = new Set(["pi", "claude", "codex", "opencode"]);
 
 function assertString(value, context) {
   if (typeof value !== "string" || value.length === 0) {
@@ -102,6 +102,15 @@ function codexArgv({ profile, cwd, run }) {
   return argv;
 }
 
+function opencodeArgv({ profile, sessionName, run }) {
+  const argv = [profile.command, "run", "--format", "json", "--title", sessionName];
+  appendModel(argv, profile.model);
+  argv.push(...profile.arguments);
+  const bootstrap = runBootstrapPrompt(run);
+  if (bootstrap) argv.push(bootstrap);
+  return argv;
+}
+
 export function buildHarnessLaunch({ profileName, profile, sessionName, cwd, run, nativeSessionId: requestedNativeSessionId } = {}) {
   assertString(profileName, "profileName");
   assertProfile(profile);
@@ -118,8 +127,10 @@ export function buildHarnessLaunch({ profileName, profile, sessionName, cwd, run
     argv = piArgv({ profile, sessionName, run, nativeSessionId });
   } else if (profile.harness === "claude") {
     argv = claudeArgv({ profile, cwd, run, nativeSessionId });
-  } else {
+  } else if (profile.harness === "codex") {
     argv = codexArgv({ profile, cwd, run });
+  } else {
+    argv = opencodeArgv({ profile, sessionName, run });
   }
 
   return {

@@ -29,6 +29,12 @@ export function resolveAgentProfile({ registry, project, requestedProfile } = {}
   if (!profile) {
     fail("lookup", `Unknown workflow agent profile: ${name}`, { exitCode: 2, details: { name } });
   }
+  if (profile.availability === "fixture-only" && launcher.fixture_mode !== true) {
+    fail("lookup", `Agent profile ${name} is fixture-only and cannot be selected outside a generated fixture registry`, {
+      exitCode: 2,
+      details: { name },
+    });
+  }
 
   return Object.freeze({ name, source, profile });
 }

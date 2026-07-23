@@ -138,12 +138,12 @@ function commandExecutable(command) {
 }
 
 const AGENT_START_KINDS = new Set(["agent.session.start", "pi.session.start"]);
-const AGENT_HARNESSES = new Set(["pi", "claude", "codex"]);
+const AGENT_HARNESSES = new Set(["pi", "claude", "codex", "opencode"]);
 
 function normalizeAgentHarness(value, context) {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || value.length === 0) {
-    fail("PREFLIGHT", `${context} must be one of pi, claude, or codex`, { [context]: value }, 10);
+    fail("PREFLIGHT", `${context} must be one of pi, claude, codex, or opencode`, { [context]: value }, 10);
   }
   const normalized = value.toLowerCase();
   if (!AGENT_HARNESSES.has(normalized)) {

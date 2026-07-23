@@ -9,8 +9,13 @@ const ALLOWED_SPLITS = new Set(["left", "right", "up", "down"]);
 const ALLOWED_TEMPLATE_PLACEHOLDERS = new Set(["worktree_root", "project", "task", "slug"]);
 const ALLOWED_CHILD_TEMPLATE_PLACEHOLDERS = new Set(["project", "task", "slug", "repository"]);
 const ALLOWED_REPOSITORIES = new Set(["monorepo", "single", "group"]);
-const HARNESSES = new Set(["pi", "claude", "codex"]);
-const MODES = new Set(["interactive"]);
+const HARNESSES = new Set(["pi", "claude", "codex", "opencode"]);
+const MODES_BY_HARNESS = {
+  pi: new Set(["interactive"]),
+  claude: new Set(["interactive"]),
+  codex: new Set(["interactive"]),
+  opencode: new Set(["stream-json"]),
+};
 const CLAUDE_PERMISSION_MODES = new Set(["manual", "acceptEdits", "plan", "auto", "dontAsk"]);
 const CODEX_SANDBOXES = new Set(["read-only", "workspace-write"]);
 const CODEX_APPROVALS = new Set(["untrusted", "on-request"]);
@@ -19,6 +24,7 @@ const PROFILE_FIELDS_BY_HARNESS = {
   pi: COMMON_PROFILE_FIELDS,
   claude: new Set([...COMMON_PROFILE_FIELDS, "permission_mode"]),
   codex: new Set([...COMMON_PROFILE_FIELDS, "sandbox", "approval_policy"]),
+  opencode: new Set([...COMMON_PROFILE_FIELDS, "availability"]),
 };
 const FORBIDDEN_ARGUMENTS = [
   "--dangerously-skip-permissions",
@@ -33,6 +39,15 @@ const RAW_CONTROL_ARGUMENTS = {
     { field: "approval_policy", options: ["--ask-for-approval", "-a"] },
     { field: "profile", options: ["--profile", "-p"] },
     { field: "config", options: ["--config", "-c"] },
+  ],
+  opencode: [
+    { field: "continue", options: ["--continue", "-c"] },
+    { field: "session", options: ["--session", "-s"] },
+    { field: "agent", options: ["--agent"] },
+    { field: "command", options: ["--command"] },
+    { field: "port", options: ["--port"] },
+    { field: "attach", options: ["--attach"] },
+    { field: "share", options: ["--share"] },
   ],
 };
 const LEGACY_STATE_ROOT = join(homedir(), ".local", "state", "workflow-launcher");
@@ -308,6 +323,9 @@ function validateLauncherV3(launcher) {
   normalized.session_template = validateTemplate(normalized.session_template, ALLOWED_TEMPLATE_PLACEHOLDERS, "launcher.session_template");
   normalized.default_agent_profile = validateString(normalized.default_agent_profile, "launcher.default_agent_profile");
   normalized.delegation = validateDelegationPolicy(normalized.delegation, "launcher.delegation");
+  if (normalized.fixture_mode !== undefined && normalized.fixture_mode !== true) {
+    fail("schema", "launcher.fixture_mode may only be true for a generated fixture registry");
+  }
   if (!Number.isInteger(normalized.max_bundle_tickets) || normalized.max_bundle_tickets <= 0) {
     fail("schema", "launcher.max_bundle_tickets must be a positive integer");
   }
@@ -477,8 +495,9 @@ export function validateAgentProfile(name, value) {
 
   normalized.command = validateString(normalized.command, `agent profile ${name}.command`);
   normalized.mode = validateString(normalized.mode, `agent profile ${name}.mode`);
-  if (!MODES.has(normalized.mode)) {
-    fail("schema", `agent profile ${name}.mode must be one of ${[...MODES].join(", ")}`);
+  const supportedModes = MODES_BY_HARNESS[normalized.harness];
+  if (!supportedModes.has(normalized.mode)) {
+    fail("schema", `agent profile ${name}.mode must be one of ${[...supportedModes].join(", ")} for ${normalized.harness}`);
   }
   normalized.roles = validateNonEmptyStringList(normalized.roles, `agent profile ${name}.roles`);
   normalized.model = validateOptionalString(normalized.model, `agent profile ${name}.model`);
@@ -488,6 +507,13 @@ export function validateAgentProfile(name, value) {
     normalized.permission_mode = validateString(normalized.permission_mode, `agent profile ${name}.permission_mode`);
     if (!CLAUDE_PERMISSION_MODES.has(normalized.permission_mode)) {
       fail("schema", `agent profile ${name}.permission_mode must be one of ${[...CLAUDE_PERMISSION_MODES].join(", ")} (received ${normalized.permission_mode})`);
+    }
+  }
+
+  if (normalized.harness === "opencode") {
+    normalized.availability = validateString(normalized.availability, `agent profile ${name}.availability`);
+    if (normalized.availability !== "fixture-only") {
+      fail("schema", `agent profile ${name}.availability must be fixture-only`);
     }
   }
 

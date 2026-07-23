@@ -282,6 +282,36 @@ test("resolves an explicit allowed agent profile without changing primary worktr
   assert.equal(plan.agent.sessionName, "ocr-ASANA-123-discovered-docs");
 });
 
+test("preserves fixture-only OpenCode availability in the approved profile snapshot", () => {
+  const fixtureRegistry = structuredClone(registry);
+  fixtureRegistry.launcher.fixture_mode = true;
+  fixtureRegistry.launcher.agent_profiles["opencode-worker"] = {
+    harness: "opencode",
+    command: "opencode",
+    mode: "stream-json",
+    roles: ["implementer"],
+    model: null,
+    arguments: [],
+    availability: "fixture-only",
+  };
+  fixtureRegistry.projects.ocr.allowed_agent_profiles.push("opencode-worker");
+
+  const plan = planWorkflow({
+    registry: fixtureRegistry,
+    projectAlias: "ocr",
+    task: "FIX-101",
+    feature: "Fixture",
+    agentProfile: "opencode-worker",
+  });
+
+  assert.deepEqual(plan.agent.profile, {
+    mode: "stream-json",
+    model: null,
+    arguments: [],
+    availability: "fixture-only",
+  });
+});
+
 test("rejects missing Acme repository selection", () => {
   assert.throws(
     () => planWorkflow({ registry, projectAlias: "acme", task: "ASANA-456", feature: "Onboarding" }),

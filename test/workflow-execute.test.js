@@ -518,6 +518,28 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   assert.deepEqual(launch.env, launchSpec.env);
 });
 
+test("accepts an exact OpenCode agent identity before Herdr mutation", async () => {
+  const calls = [];
+  const plan = buildPlan({
+    agentHarness: "opencode",
+    agentProfileName: "opencode-worker",
+    agentProfile: { mode: "stream-json", model: null, arguments: [], availability: "fixture-only" },
+  });
+  plan.operations = plan.operations.map((operation) => operation.id === "agent"
+    ? { ...operation, kind: "agent.session.start", command: "opencode" }
+    : operation);
+  const launchSpec = {
+    argv: ["opencode", "run", "--format", "json"],
+    env: { WORKFLOW_RUN_ID: "run-123", WORKFLOW_HARNESS: "opencode" },
+    expected: { profileName: "opencode-worker", harness: "opencode", nativeSessionId: null },
+  };
+
+  const report = await executeStart(plan, fakeAdapters(calls), { buildAgentLaunch: () => launchSpec });
+
+  assert.equal(report.status, "completed");
+  assert.deepEqual(calls.find((call) => call.kind === "herdr.agent.start").argv, launchSpec.argv);
+});
+
 test("rejects a generic Codex start operation without an explicit harness before mutation", async () => {
   const calls = [];
   const plan = buildPlan({

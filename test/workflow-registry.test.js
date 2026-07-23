@@ -211,6 +211,23 @@ test("preserves OCR infrastructure runtime in the canonical v3 registry", async 
   );
 });
 
+test("keeps canonical OpenCode candidate fixture-only and outside project allowlists", async () => {
+  const registry = await loadRegistry(new URL("../projects.yaml", import.meta.url));
+  assert.deepEqual(registry.launcher.agent_profiles["opencode-worker"], {
+    harness: "opencode",
+    command: "opencode",
+    mode: "stream-json",
+    roles: ["coordinator", "implementer", "reviewer"],
+    model: null,
+    arguments: [],
+    availability: "fixture-only",
+  });
+  assert.equal(registry.launcher.fixture_mode, undefined);
+  for (const project of Object.values(registry.projects)) {
+    assert.equal(project.allowed_agent_profiles?.includes("opencode-worker") ?? false, false);
+  }
+});
+
 test("loads a version 2 registry with ordinary and group projects through migration", async () => {
   const registry = await loadRegistry(await registryFile(`
 version: 2

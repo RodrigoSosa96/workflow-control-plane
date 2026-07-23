@@ -49,6 +49,10 @@ function sanitizeAgentProfile(profile) {
     snapshot.approval_policy = profile.approval_policy;
   }
 
+  if (profile.harness === "opencode") {
+    snapshot.availability = profile.availability;
+  }
+
   return snapshot;
 }
 
