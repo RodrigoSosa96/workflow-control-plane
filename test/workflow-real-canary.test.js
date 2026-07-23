@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { access, rm } from "node:fs/promises";
+import { createSmokeRunner } from "../scripts/smoke-workflow-fixture.js";
 
 function runSmoke(args, { stdin, env } = {}) {
   return new Promise((resolve) => {
@@ -19,6 +20,18 @@ function runSmoke(args, { stdin, env } = {}) {
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
+
+test("runner accepts injected env and streams", async () => {
+  const lines = [];
+  const runner = createSmokeRunner({
+    argv: ["--fake"],
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
+    stdout: { write: (chunk) => lines.push(chunk) },
+    stderr: { write: () => {} },
+    stdin: { once: () => {}, isTTY: true },
+  });
+  assert.equal(typeof runner.run, "function");
+});
 
 test("--real requires TTY", async () => {
   const { code, stderr } = await runSmoke(["--real", "--agent", "pi", "--keep"]);
