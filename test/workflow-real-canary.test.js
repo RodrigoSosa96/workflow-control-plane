@@ -78,6 +78,40 @@ test("--real rejects CI environment", async () => {
   assert.match(stderr, /interactive-only|CI/i);
 });
 
+test("real-mode path builds fixture registry launch options", async () => {
+  let captured = null;
+  const runner = createSmokeRunner({
+    argv: ["--real", "--agent", "pi", "--keep"],
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
+    stdin: { isTTY: true, once: (_event, handler) => handler("pi\n") },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    createWorkflowFixture: async () => ({
+      root: "/tmp/fake-fixture",
+      registryPath: "/tmp/fake-fixture/projects.yaml",
+      stateRoot: "/tmp/fake-fixture/state",
+      packageRoot: "/tmp/fake-package",
+      projects: { "fixture-single": { path: "/tmp/fake-fixture/fixture-single", tickets: ["FIX-101", "FIX-102"] } },
+    }),
+    launchCommand: async (options) => {
+      captured = options;
+      return {
+        preview: { approvalDigest: "sha256:test" },
+        execute: async () => ({ status: "running", runId: "11111111-1111-4111-8111-111111111111", runDirectory: "/tmp/run-1" }),
+      };
+    },
+  });
+  const { code } = await runner.run();
+  assert.equal(code, 0);
+  assert.equal(captured.projectAlias, "fixture-single");
+  assert.equal(captured.task, "FIX-101");
+  assert.deepEqual(captured.tickets, ["FIX-102"]);
+  assert.equal(captured.agentProfile, "pi-worker");
+  assert.equal(captured.registryPath, "/tmp/fake-fixture/projects.yaml");
+  assert.equal(captured.stateRoot, "/tmp/fake-fixture/state");
+  assert.ok(captured.controlPlaneBin.endsWith("bin/workflow.js"));
+});
+
 test("--real rejects wrong typed harness confirmation", async () => {
   const { code, stderr } = await runSmoke(["--real", "--agent", "pi", "--keep"], { stdin: "claude\n", env: { WORKFLOW_SMOKE_TEST_TTY: "1" } });
   assert.equal(code, 1);

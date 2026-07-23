@@ -1,11 +1,17 @@
 #!/usr/bin/env node
-import { createWorkflowFixture } from "../src/workflow/fixture.js";
+import { createWorkflowFixture as defaultCreateWorkflowFixture } from "../src/workflow/fixture.js";
 import { cleanupWorkflowFixture } from "../src/workflow/fixture-cleanup.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { writeFile, mkdir as mkdirAsync } from "node:fs/promises";
+import { launchCommand as defaultLaunchCommand } from "../src/workflow/commands.js";
+import { createRunStore } from "../src/workflow/run-store.js";
+import { lookupExecutable } from "../src/workflow/runtime-config.js";
+import { createGitAdapter } from "../src/workflow/git.js";
+import { createHerdrAdapter } from "../src/workflow/herdr.js";
+import { createProcessRunner } from "../src/workflow/process.js";
 
 function parseArgs(argv) {
   const args = { fake: false, real: false, keep: false, agent: null };
@@ -77,12 +83,13 @@ function printCanaryDisclosure(fixture, agent, stdout) {
 }
 
 async function writePromptFile(root) {
+  await mkdirAsync(root, { recursive: true });
   const promptPath = join(root, "canary-prompt.txt");
   await writeFile(promptPath, CANARY_ASSIGNMENT);
   return promptPath;
 }
 
-async function runSmoke({ args, env, stdin, stdout, stderr }) {
+async function runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixture, launchCommand }) {
   if (!args.fake && !args.real) {
     stderr.write("USAGE: smoke-workflow-fixture --fake --keep | --real --agent pi --keep\n");
     return { code: 1 };
@@ -101,7 +108,13 @@ async function runSmoke({ args, env, stdin, stdout, stderr }) {
     });
     printCanaryDisclosure(fixture, args.agent, stdout);
     const promptPath = await writePromptFile(fixture.root);
-    return { fixture, promptPath };
+    const { report } = await runWorkflowLaunch({ fixture, promptPath, agent: args.agent, env, launchCommand });
+    if (report.status !== "running") {
+      throw new Error(`Launch did not reach running state: ${report.status}`);
+    }
+    stdout.write(`Run created: ${report.runId}\n`);
+    stdout.write(`Run directory: ${report.runDirectory}\n`);
+    return { code: 0, fixture, promptPath, runId: report.runId, runDirectory: report.runDirectory };
   }
 
   // Fake mode
@@ -125,17 +138,57 @@ async function runSmoke({ args, env, stdin, stdout, stderr }) {
   return { code: 0 };
 }
 
+function createLaunchDeps(fixture, env, overrides = {}) {
+  const runner = overrides.runner ?? createProcessRunner();
+  const stateRoot = fixture.stateRoot;
+  return {
+    env,
+    runner,
+    stateRoot,
+    registryPath: fixture.registryPath,
+    lookupExecutable: overrides.lookupExecutable ?? ((name) => lookupExecutable(name, { env })),
+    git: overrides.git ?? createGitAdapter({ runner }),
+    herdr: overrides.herdr ?? createHerdrAdapter({ runner }),
+    store: overrides.store ?? createRunStore({ stateRoot }),
+  };
+}
+
+async function runWorkflowLaunch({ fixture, promptPath, agent, env, launchCommand = defaultLaunchCommand }) {
+  const deps = createLaunchDeps(fixture, env);
+  const command = await launchCommand({
+    command: "launch",
+    projectAlias: "fixture-single",
+    task: "FIX-101",
+    tickets: ["FIX-102"],
+    agentProfile: `${agent}-worker`,
+    promptFile: promptPath,
+    registryPath: fixture.registryPath,
+    stateRoot: fixture.stateRoot,
+    controlPlaneBin: join(fixture.packageRoot, "bin", "workflow.js"),
+    dryRun: false,
+    yes: true,
+    approvalDigest: null,
+    format: "json",
+  }, deps);
+
+  const preview = command.preview;
+  const report = await command.execute({ approvalDigest: preview.approvalDigest });
+  return { preview, report };
+}
+
 export function createSmokeRunner(deps = {}) {
   const argv = deps.argv ?? process.argv.slice(2);
   const env = deps.env ?? process.env;
   const stdin = deps.stdin ?? process.stdin;
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
+  const createWorkflowFixture = deps.createWorkflowFixture ?? defaultCreateWorkflowFixture;
+  const launchCommand = deps.launchCommand ?? defaultLaunchCommand;
 
   return {
     async run() {
       const args = parseArgs(argv);
-      return runSmoke({ args, env, stdin, stdout, stderr });
+      return runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixture, launchCommand });
     },
   };
 }
