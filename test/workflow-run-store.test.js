@@ -604,6 +604,38 @@ test("writes a nested private artifact and updates the run under one run lock", 
   assert.equal((await store.read(RUN_ID_1)).delegationBriefPath, relativePath);
 });
 
+test("exclusive private artifact writes reject a duplicate worker launch record", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+  const relativePath = `worker-launches/${RUN_ID_2}.json`;
+
+  await store.writePrivateFile(RUN_ID_1, {
+    relativePath,
+    text: "{\"version\":1}\n",
+    exclusive: true,
+    updater: () => ({ workerLaunches: { [RUN_ID_2]: { digest: "sha256:one" } } }),
+  });
+
+  await assert.rejects(
+    () => store.writePrivateFile(RUN_ID_1, {
+      relativePath,
+      text: "{\"version\":2}\n",
+      exclusive: true,
+      updater: () => ({}),
+    }),
+    /already exists|duplicate|exclusive/i,
+  );
+  assert.equal(await readFile(join(run.directory, relativePath), "utf8"), "{\"version\":1}\n");
+
+  await store.writePrivateFile(RUN_ID_1, {
+    relativePath,
+    text: "{\"version\":2}\n",
+    updater: () => ({}),
+  });
+  assert.equal(await readFile(join(run.directory, relativePath), "utf8"), "{\"version\":2}\n");
+});
+
 test("rejects unsafe private artifact paths without writing outside the run", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });

@@ -1179,11 +1179,13 @@ export async function launchCommand(options = {}, deps = {}) {
   const stateRoot = await stateRootForCommand(options, deps);
   const controlPlaneBin = options.controlPlaneBin ?? deps.controlPlaneBin;
   const store = deps.store ?? (deps.createRunStore ?? createRunStore)({ stateRoot });
+  const registry = deps.registry ?? await loadRegistry(options.registryPath, { fs: deps.fs });
   const command = await createWorkflowLaunchCommand({ ...options, stateRoot, controlPlaneBin }, {
     ...deps,
     store,
     stateRoot,
     controlPlaneBin,
+    registry,
     planCommand: deps.planCommand ?? planCommand,
   });
   return {

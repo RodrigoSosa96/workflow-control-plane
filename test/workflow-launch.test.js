@@ -47,6 +47,24 @@ function profileFor(name = "pi-worker", overrides = {}) {
       ...agentOptions,
     };
   }
+  if (name === "opencode-fixture") {
+    return {
+      name,
+      harness: "opencode",
+      command: "opencode",
+      roles: ["implementer"],
+      profile: {
+        mode: "stream-json",
+        model: "claude-sonnet-4-20250514",
+        arguments: [],
+        sandbox: "workspace-write",
+        approval_policy: "on-request",
+        availability: "fixture-only",
+        ...profileOptions,
+      },
+      ...agentOptions,
+    };
+  }
   return {
     name,
     harness: "pi",
@@ -325,6 +343,18 @@ function createStore(calls, { failUpdateToRunning = null } = {}) {
       assert.equal(runId, RUN_ID);
       if (!run) throw new Error("run not found");
       return { ...run };
+    },
+    async writePrivateFile(runId, { relativePath, text, exclusive = false, updater = () => ({}) } = {}) {
+      calls.push({ kind: "store.writePrivateFile", runId, relativePath, text, exclusive });
+      assert.equal(runId, RUN_ID);
+      assert.ok(run, "run must exist before writePrivateFile");
+      if (exclusive && run.privateArtifacts?.[relativePath]) {
+        throw new Error(`Private artifact already exists and the write is exclusive: ${relativePath}`);
+      }
+      run.privateArtifacts = { ...(run.privateArtifacts ?? {}), [relativePath]: text };
+      const patch = await updater(run);
+      run = { ...run, ...patch };
+      return { runId, path: join(directory, relativePath), writtenAt: "2026-01-01T00:00:02.000Z" };
     },
     snapshot() {
       return run ? { ...run } : null;
@@ -1124,4 +1154,105 @@ test("handoff command reads only run-dir handoff-input.json, verifies WORKFLOW_R
     () => handoffCommand({ runId: RUN_ID, input: canonicalInput, env: { WORKFLOW_RUN_ID: "other-run" } }, { store, fs, submitHandoff: async () => expectedResult }),
     /WORKFLOW_RUN_ID|mismatch/i,
   );
+});
+
+test("fixture stream-json launch writes a private launch record and routes through the supervisor", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "opencode-fixture" });
+  const preview = await previewFor({ agentProfile: "opencode-fixture" }, { calls, planCommand });
+  const store = createStore(calls);
+
+  const registry = {
+    launcher: { fixture_mode: true },
+    profiles: ["opencode-fixture"],
+  };
+
+  let capturedArgv = null;
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    registry,
+    randomUUID: () => "11111111-1111-4111-8111-111111111111",
+    executeStart(plan, adapters, { buildAgentLaunch }) {
+      const launch = buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { ...plan.agent.profile, harness: plan.agent.harness, command: plan.agent.command },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      capturedArgv = launch.argv;
+      calls.push({ kind: "executeStart" });
+      return {
+        status: "completed",
+        operations: [
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "fixture-agent", tabId: "fixture-tab", paneId: "fixture-pane" },
+        ],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  assert.ok(capturedArgv);
+  assert.equal(capturedArgv[0], process.execPath);
+  assert.match(capturedArgv[1], /workflow-worker\.js$/);
+  assert.equal(capturedArgv[2], "--run");
+  assert.equal(capturedArgv[4], "--worker");
+  assert.equal(capturedArgv[5], "11111111-1111-4111-8111-111111111111");
+
+  const writePrivate = calls.find((c) => c.kind === "store.writePrivateFile");
+  assert.ok(writePrivate);
+  assert.equal(writePrivate.runId, RUN_ID);
+  assert.equal(writePrivate.relativePath, "worker-launches/11111111-1111-4111-8111-111111111111.json");
+  const record = JSON.parse(writePrivate.text);
+  assert.equal(record.version, 1);
+  assert.equal(record.harness, "opencode");
+  assert.equal(record.argv[0], "opencode");
+  assert.ok(Array.isArray(record.argv));
+
+  const stored = store.snapshot();
+  assert.equal(stored.fixtureMode, true);
+  assert.equal(stored.workerLaunches["11111111-1111-4111-8111-111111111111"].harness, "opencode");
+});
+
+test("ordinary interactive launch never routes through the supervisor", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+
+  let capturedArgv = null;
+  let caught = null;
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    registry: { launcher: { fixture_mode: false } },
+    executeStart(plan, adapters, { buildAgentLaunch }) {
+      const launch = buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { ...plan.agent.profile, harness: plan.agent.harness, command: plan.agent.command },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      capturedArgv = launch.argv;
+      calls.push({ kind: "executeStart" });
+      return {
+        status: "completed",
+        operations: [
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+        ],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  assert.equal(capturedArgv[0], "codex");
+  assert.equal(calls.some((c) => c.kind === "store.writePrivateFile"), false);
 });

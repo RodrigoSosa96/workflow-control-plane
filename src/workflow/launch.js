@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { join, dirname } from "node:path";
+import { HARNESS_TELEMETRY_VERSIONS } from "./telemetry-adapters.js";
 import { buildAssignmentTemplate } from "./assignment.js";
 import { WorkflowError } from "./errors.js";
 import { executeStart as defaultExecuteStart } from "./execute.js";
@@ -504,6 +505,27 @@ async function updateRun(store, runId, patch) {
   return await store.update(runId, () => patch);
 }
 
+function isFixtureStreamJson(preview, registry) {
+  return registry?.launcher?.fixture_mode === true && preview.reconciliation?.agent?.profile?.mode === "stream-json";
+}
+
+function buildFixtureRecord(directSpec, harnessVersion) {
+  return {
+    version: 1,
+    harness: directSpec.expected.harness,
+    command: directSpec.argv[0],
+    argv: directSpec.argv,
+    cwd: directSpec.cwd ?? null,
+    env: directSpec.env,
+    harnessVersion: harnessVersion ?? "0.0.0",
+  };
+}
+
+function supervisorArgvFor({ controlPlaneBin, runId, workerId }) {
+  const workerBin = join(dirname(controlPlaneBin), "workflow-worker.js");
+  return [process.execPath, workerBin, "--run", runId, "--worker", workerId];
+}
+
 function assertStore(store) {
   if (!store || typeof store.create !== "function" || typeof store.writeAssignment !== "function" || typeof store.update !== "function") {
     fail("PREFLIGHT", "launch execution requires a run store");
@@ -541,6 +563,49 @@ export async function executeLaunch(preview, deps = {}) {
     launchStartedAt: new Date().toISOString(),
   });
 
+  const registry = deps.registry ?? null;
+  const fixtureStreamJson = isFixtureStreamJson(fresh, registry);
+  let workerId = null;
+  let supervisorSpec = null;
+
+  if (fixtureStreamJson) {
+    const launchBuilder = deps.buildAgentLaunch ?? buildHarnessLaunch;
+    const directInput = {
+      profileName: fresh.reconciliation.agent?.profileName ?? fresh.selection.profileName,
+      profile: {
+        ...previewHarnessProfile(fresh.reconciliation),
+        harness: fresh.selection.harness,
+        command: fresh.selection.command,
+      },
+      sessionName: fresh.reconciliation.agent?.sessionName,
+      cwd: fresh.reconciliation.agent?.worktreePath,
+      run,
+    };
+    const directSpec = launchBuilder(directInput);
+    const harness = directSpec.expected.harness;
+    workerId = deps.randomUUID?.() ?? randomUUID();
+    const record = buildFixtureRecord(directSpec, HARNESS_TELEMETRY_VERSIONS[harness]);
+    const recordText = `${JSON.stringify(record)}\n`;
+    const digest = sha256Digest(recordText);
+    await store.writePrivateFile(run.id, {
+      relativePath: `worker-launches/${workerId}.json`,
+      text: recordText,
+      exclusive: true,
+      updater: (current) => ({
+        fixtureMode: true,
+        workerLaunches: {
+          ...(current?.workerLaunches ?? {}),
+          [workerId]: { digest, harness: record.harness },
+        },
+      }),
+    });
+    supervisorSpec = {
+      argv: supervisorArgvFor({ controlPlaneBin, runId: run.id, workerId }),
+      env: directSpec.env,
+      expected: directSpec.expected,
+    };
+  }
+
   let launchExpected = null;
   const launchBuilder = deps.buildAgentLaunch ?? buildHarnessLaunch;
   const executeStart = deps.executeStart ?? defaultExecuteStart;
@@ -552,6 +617,10 @@ export async function executeLaunch(preview, deps = {}) {
   try {
     const rawExecution = await executeStart(planForStart, { git: deps.git, herdr: deps.herdr }, {
       buildAgentLaunch(input) {
+        if (supervisorSpec) {
+          launchExpected = supervisorSpec.expected;
+          return supervisorSpec;
+        }
         const spec = launchBuilder(input);
         launchExpected = spec.expected;
         return spec;

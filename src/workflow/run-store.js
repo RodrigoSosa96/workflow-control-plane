@@ -255,9 +255,12 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     }
   }
 
-  async function writeAtomicText(directory, filename, text) {
+  async function writeAtomicText(directory, filename, text, { exclusive = false } = {}) {
     const normalizedFilename = validatePrivateRelativePath(directory, filename);
     await ensurePrivateParentDirectories(directory, normalizedFilename);
+    if (exclusive && await pathExists(join(directory, normalizedFilename))) {
+      failStore(`Private artifact already exists and the write is exclusive: ${normalizedFilename}`);
+    }
     tempCounter += 1;
     const destination = join(directory, normalizedFilename);
     const tempPath = join(dirname(destination), `.${basename(destination)}.${process.pid}.${tempCounter}.tmp`);
@@ -735,7 +738,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     });
   }
 
-  async function writePrivateFile(runId, { relativePath, text, updater } = {}) {
+  async function writePrivateFile(runId, { relativePath, text, updater, exclusive = false } = {}) {
     if (typeof text !== "string") {
       failStore("writePrivateFile text must be a string");
     }
@@ -754,7 +757,7 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
       if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
         failStore("writePrivateFile updater must return an object");
       }
-      await writeAtomicText(directory, filename, text);
+      await writeAtomicText(directory, filename, text, { exclusive });
       const run = await writeRun(directory, updatedRun(current, patch));
       return { run, path: join(directory, filename), writtenAt: run.updatedAt };
     });

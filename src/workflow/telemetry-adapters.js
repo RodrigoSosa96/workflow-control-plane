@@ -164,6 +164,13 @@ function opencodeEvents(record) {
 
 const PARSERS = Object.freeze({ pi: piEvents, claude: claudeEvents, codex: codexEvents, opencode: opencodeEvents });
 
+export const HARNESS_TELEMETRY_VERSIONS = Object.freeze({
+  pi: "0.80.10",
+  claude: "2.1.218",
+  codex: "0.144.3",
+  opencode: "1.0.126",
+});
+
 export function createTelemetryAdapter({ harness, version } = {}) {
   if (typeof harness !== "string" || !TELEMETRY_HARNESSES.has(harness)) fail("Invalid telemetry harness");
   const supported = typeof version === "string" && SUPPORTED_VERSIONS[harness].has(version);
