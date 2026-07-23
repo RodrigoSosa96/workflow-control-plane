@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createWorkflowFixture } from "../src/workflow/fixture.js";
 import { cleanupWorkflowFixture } from "../src/workflow/fixture-cleanup.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function parseArgs(argv) {
   const args = { fake: false, real: false, keep: false, agent: null };
@@ -59,7 +61,7 @@ async function main(argv) {
 
   // Fake mode
   const fixture = await createWorkflowFixture({
-    root: `/tmp/workflow-smoke-${Date.now()}`,
+    root: join(tmpdir(), `workflow-smoke-${Date.now()}`),
     packageRoot: new URL("..", import.meta.url).pathname,
   });
 

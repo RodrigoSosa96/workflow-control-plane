@@ -24,7 +24,8 @@ async function main() {
     const runData = JSON.parse(await readFile(runPath, "utf8"));
     runTickets = (Array.isArray(runData.tickets) ? runData.tickets : [])
       .map((id) => ({ id, status: "completed", evidence: ["fake-worker-test-passed"] }));
-  } catch {
+  } catch (error) {
+    console.error(`[fake-workflow-agent] could not read ${runPath}: ${error.message}`);
     runTickets = [];
   }
 

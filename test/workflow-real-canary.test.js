@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
+import { access, rm } from "node:fs/promises";
 
 function runSmoke(args, { stdin, env } = {}) {
   return new Promise((resolve) => {
@@ -43,9 +44,29 @@ test("--real rejects wrong typed harness confirmation", async () => {
   assert.match(stderr, /not confirmed/);
 });
 
-test("--fake creates a fixture and respects --keep", async () => {
-  const { code, stdout } = await runSmoke(["--fake", "--keep"]);
+test("--fake creates a fixture and cleans up without --keep", async () => {
+  const { code, stdout } = await runSmoke(["--fake"]);
   assert.equal(code, 0);
   assert.match(stdout, /Fixture created:/);
   assert.match(stdout, /Registry:/);
+
+  const match = stdout.match(/Fixture created:\s*(\S+)/);
+  assert.ok(match, "expected fixture root path in stdout");
+  const fixtureRoot = match[1];
+  await assert.rejects(
+    () => access(fixtureRoot),
+    /ENOENT/,
+    "fixture root should have been cleaned up",
+  );
+});
+
+test("--fake --keep preserves the fixture", async () => {
+  const { code, stdout } = await runSmoke(["--fake", "--keep"]);
+  assert.equal(code, 0);
+  const match = stdout.match(/Fixture created:\s*(\S+)/);
+  assert.ok(match);
+  const fixtureRoot = match[1];
+  await assert.doesNotReject(() => access(fixtureRoot));
+  // Clean up after verifying --keep behavior.
+  await rm(fixtureRoot, { recursive: true, force: true });
 });
