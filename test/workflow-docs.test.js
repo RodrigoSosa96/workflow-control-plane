@@ -19,12 +19,12 @@ test("README documents the workflow launcher commands and safety boundaries", as
   assert.match(readme, /workflow launch ocr ASANA-123 --agent codex-worker --prompt-file request\.md --dry-run/);
   assert.match(readme, /workflow result <run-id>/);
   assert.match(readme, /workflow reconcile \[project\] --run <run-id>/);
-  assert.match(readme, /workflow resume <run-id>/);
-  assert.match(readme, /workflow close <run-id>/);
+  assert.doesNotMatch(readme, /^workflow resume <run-id>$/m);
+  assert.doesNotMatch(readme, /^workflow close <run-id>$/m);
   assert.match(readme, /manual-handoff-required/);
   assert.match(readme, /result-stale/);
   assert.match(readme, /workflow handoff <run-id> --input <run-directory>\/handoff-input\.json/);
-  assert.match(readme, /workflow hooks doctor --format compact/);
+  assert.doesNotMatch(readme, /^workflow hooks doctor --format compact$/m);
   assert.match(readme, /workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes/);
   assert.match(readme, /workflow status ocr ASANA-123 --feature "Discovered Docs"/);
   assert.match(readme, /workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel/);
@@ -98,6 +98,7 @@ test("supervised lifecycle plan defers internal Pi delegation details to the ada
   assert.doesNotMatch(plan, /pi-subagents@0\.34\.0/i);
   assert.doesNotMatch(plan, /\.pi\/settings\.json/i);
   assert.doesNotMatch(plan, /\/subagents-doctor|\/subagents .*details/i);
+  assert.match(plan, /Implementation status:[\s\S]*future plan[\s\S]*no .*CLI command is implemented/i);
 });
 
 test("fixture and canary plan keeps future-facing gates without Pi package smoke leftovers", async () => {

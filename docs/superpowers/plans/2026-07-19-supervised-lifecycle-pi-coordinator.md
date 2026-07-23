@@ -4,6 +4,8 @@
 
 **Goal:** Supervise external Pi/Claude/Codex turns with native lifecycle hooks, generation-aware handoffs, exact-session resume/reconciliation, graceful close, and session-owned result delivery while consuming the separate Workflow-owned Pi delegation adapter for internal work.
 
+**Implementation status:** This document remains a future plan for external hooks, resume, and close. The merged adapter supplies internal advisory delegation only; no `workflow hooks`, `workflow resume`, or `workflow close` CLI command is implemented.
+
 **Architecture:** A harness-neutral lifecycle callback updates the private run store from native SessionStart/UserPromptSubmit/Stop/SessionEnd events. Generated Claude settings, an explicitly installed Codex hook profile, a launched-worker Pi extension, and a Herdr-backed `WorkerTransport` adapt external event shapes. Internal Pi delegation previews, exact private sessions, advisory handoffs, and later-session adoption are owned by the separate Workflow adapter plan and are consumed here only through its stable contracts.
 
 **Tech Stack:** Node.js 24 ES modules, `node:test`, Pi extension API 0.80+, Claude Code hooks 2.1+, Codex hooks 0.144+, Herdr 0.7.4.

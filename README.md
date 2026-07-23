@@ -50,7 +50,7 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 - The launcher follows a no-cleanup policy: failed or partial launches preserve worktrees, Herdr tabs/panes, run directories, and the fallback workspace for manual recovery.
 - Acme bundle planning must name the selected repositories explicitly with `--repos`.
 - Real Acme meta-repository setup remains a separate explicit checkpoint after disposable verification; the launcher branch must not initialize or modify the real work project automatically.
-- `workflow hooks doctor`, `workflow resume`, and `workflow close` operate only on exact recorded worker identity; they never guess a recent session, scrape a terminal, or inject a result into another Pi session automatically.
+- Native lifecycle hooks, exact external resume, and explicit close remain planned downstream work. They are not commands available in this release; if implemented, they will operate only on exact recorded worker identity and will never guess a recent session, scrape a terminal, or inject a result into another Pi session automatically.
 - No external or internal lane performs automatic cleanup, reservation release, or process kill; preserved resources remain available for manual inspection.
 
 ### Two-lane operator model
@@ -80,7 +80,6 @@ Run these from this repository after the design and implementation plan are appr
 
 ```bash
 workflow doctor ocr
-workflow hooks doctor --format compact
 workflow plan ocr ASANA-123 --feature "Discovered Docs"
 workflow start ocr ASANA-123 --feature "Discovered Docs" --yes
 workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --dry-run
@@ -89,8 +88,6 @@ workflow launch ocr ASANA-123 --agent codex-worker --prompt-file request.md --dr
 workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --approval-digest sha256:<digest> --yes
 workflow result <run-id>
 workflow reconcile [project] --run <run-id>
-workflow resume <run-id>
-workflow close <run-id>
 workflow handoff <run-id> --input <run-directory>/handoff-input.json
 workflow delegation result <run-id> <delegation-id>
 workflow delegation reconcile <run-id> <delegation-id>
