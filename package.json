@@ -19,7 +19,10 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.js",
+    "fixture:create": "node scripts/workflow-fixture.js create --keep",
+    "fixture:inspect": "node scripts/workflow-fixture.js inspect",
+    "smoke:fixture": "node scripts/smoke-workflow-fixture.js"
   },
   "engines": {
     "node": ">=20"
