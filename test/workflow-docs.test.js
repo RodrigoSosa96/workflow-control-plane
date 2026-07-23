@@ -44,6 +44,9 @@ test("README documents the workflow launcher commands and safety boundaries", as
   assert.match(readme, /read-only foreground\/background fixtures|read-only foreground\/background/i);
   assert.match(readme, /exact recorded worker identity/i);
   assert.match(readme, /does not install or use `?pi-subagents`?|does not install `?pi-subagents`?/i);
+  assert.match(readme, /npm run smoke:fixture -- --real --agent pi --keep/);
+  assert.match(readme, /Real canaries require a TTY|TTY-only/i);
+  assert.match(readme, /Type the exact harness name/);
 });
 
 test("README documents the workflow-owned Pi delegation adapter boundaries", async () => {

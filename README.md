@@ -119,6 +119,27 @@ External exit `0` means a current terminal result was available; exit `20` means
 
 If the origin Pi session closes before an advisory delegation result is consumed, the result stays pending. A later coordinator session must explicitly adopt it; no cross-session result injection occurs automatically.
 
+## Real harness canaries (interactive only)
+
+Real canaries start an actual harness session and may consume API tokens. They are never run in CI or by `npm test`.
+
+```bash
+# Pi real canary — requires TTY, --keep, and typed confirmation
+npm run smoke:fixture -- --real --agent pi --keep
+```
+
+Before starting, the script prints the fixture root, registry, tickets, exact assignment, and a token-cost warning. Real canaries require a TTY, `--keep`, and typed confirmation. Type the exact harness name (`pi`) to confirm. On failure or timeout the fixture root and run directory are preserved for inspection.
+
+Inspection commands for a preserved canary:
+
+```bash
+WORKFLOW_PROJECTS_FILE=<fixture-registry> workflow result <run-id>
+WORKFLOW_PROJECTS_FILE=<fixture-registry> workflow reconcile --run <run-id>
+WORKFLOW_PROJECTS_FILE=<fixture-registry> workflow worker status <run-id>
+```
+
+Replace `<fixture-registry>` and `<run-id>` with the paths printed by the script.
+
 ## Asana workflow CLI
 
 The repository includes a zero-dependency, read-only Asana CLI. It discovers workspaces, projects, current sections, assignees, and full ticket context without injecting MCP tool schemas into every model request.

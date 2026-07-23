@@ -9,6 +9,7 @@
 **Tech Stack:** Node.js 24 ES modules, `node:test`, temporary Git repositories, Herdr 0.7.4, Pi/Claude/Codex CLIs, existing Workflow Launcher and native lifecycle hooks.
 
 > **Amendment — two-lane delegation:** Complete the two-lane foundation and revised lifecycle/coordinator implementation before this plan. Fixtures must validate the same private delegation state, prepared-request guard, reservation capacity, and exact transport contracts used in production paths.
+> **Amendment (2026-07-23):** The real Pi canary command `npm run smoke:fixture -- --real --agent pi --keep` is implemented with TTY, `--keep`, typed-confirmation, and CI-detection gates. It remains opt-in and requires explicit per-run user approval before execution. Claude/Codex/OpenCode real canaries remain future work.
 
 ## Global Constraints
 
