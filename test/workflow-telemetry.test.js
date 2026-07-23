@@ -79,6 +79,14 @@ test("preserves provider-reported model and thinking metadata", () => {
   assert.equal(next.model, "gpt-5");
   assert.deepEqual(next.thinking, { availability: "reported", value: true });
   assert.deepEqual(publicTelemetrySnapshot(next).thinking, { availability: "reported", value: true });
+
+  const level = applyTelemetryEvent(snapshot(), normalizeTelemetryEvent({
+    type: "model",
+    harness: "pi",
+    model: "gpt-5",
+    thinking: "high",
+  }));
+  assert.deepEqual(publicTelemetrySnapshot(level).thinking, { availability: "reported", value: "high" });
 });
 
 test("rejects unbounded or transcript-bearing telemetry input without echoing it", () => {

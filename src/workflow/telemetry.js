@@ -79,10 +79,10 @@ function optionalTimestamp(value) {
   return new Date(value).toISOString();
 }
 
-function optionalBoolean(value, context) {
+function optionalThinking(value) {
   if (value === undefined) return undefined;
-  if (typeof value !== "boolean") fail(`Invalid telemetry ${context}`);
-  return value;
+  if (typeof value === "boolean") return value;
+  return assertSafeName(value, "thinking");
 }
 
 function normalizedBase(input, allowed) {
@@ -134,7 +134,7 @@ export function normalizeTelemetryEvent(input) {
       const event = normalizedBase(input, EVENT_FIELDS.model);
       const normalized = { ...event };
       if (input.model !== undefined) normalized.model = assertSafeName(input.model, "model");
-      if (input.thinking !== undefined) normalized.thinking = optionalBoolean(input.thinking, "thinking");
+      if (input.thinking !== undefined) normalized.thinking = optionalThinking(input.thinking);
       if (normalized.model === undefined && normalized.thinking === undefined) fail("Telemetry model must report a measurement");
       return Object.freeze(normalized);
     }
@@ -216,7 +216,7 @@ export function assertTelemetrySnapshot(value) {
   assertPlainObject(value.thinking, "telemetry snapshot thinking");
   if (!MEASUREMENT_AVAILABILITY.has(value.thinking.availability)) fail("Invalid telemetry measurement");
   if (value.thinking.availability === "reported" && typeof value.thinking.value !== "boolean") {
-    fail("Invalid telemetry measurement");
+    assertSafeName(value.thinking.value, "thinking");
   }
   if (value.thinking.availability !== "reported" && value.thinking.value !== null) fail("Invalid telemetry measurement");
 
