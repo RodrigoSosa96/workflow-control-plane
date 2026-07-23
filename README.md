@@ -10,6 +10,7 @@ This directory stores project metadata and reusable workflow prompts. Applicatio
 - Superpowers Pi package: `git:github.com/obra/superpowers`
 - Project registry: `projects.yaml`
 - Project-local Pi prompts: `.pi/prompts/`
+- Pi worker observability widget: `.pi/extensions/workflow-worker-observability.ts` (packaged; loaded only by Workflow-launched Pi workers)
 
 After changing Pi resources, run `/reload` in an existing Pi session or restart Pi.
 

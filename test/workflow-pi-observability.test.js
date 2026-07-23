@@ -1,0 +1,223 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { createWorkflowWorkerObservabilityExtension } from "../.pi/extensions/workflow-worker-observability.ts";
+import { createRunStore } from "../src/workflow/run-store.js";
+
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+
+function createFakePi() {
+  const handlers = {};
+  return {
+    on(event, handler) {
+      handlers[event] = handler;
+    },
+    async emit(event, payload, ctx) {
+      const handler = handlers[event];
+      if (handler) return await handler(payload, ctx);
+    },
+    get handlers() {
+      return handlers;
+    },
+  };
+}
+
+function createContext({ mode = "tui", hasUI = true } = {}) {
+  const widgetCalls = [];
+  const statusCalls = [];
+  return {
+    mode,
+    hasUI,
+    ui: {
+      setWidget(id, lines) {
+        widgetCalls.push({ id, lines });
+      },
+      setStatus(id, text) {
+        statusCalls.push({ id, text });
+      },
+      theme: { fg: (_color, text) => text },
+    },
+    sessionManager: { getSessionFile: () => "/tmp/session.json" },
+    get widgetCalls() {
+      return widgetCalls;
+    },
+    get statusCalls() {
+      return statusCalls;
+    },
+  };
+}
+
+async function tempStateRoot() {
+  return await mkdtemp(join(tmpdir(), "workflow-pi-obs-"));
+}
+
+async function createFixtureRun(stateRoot, runId) {
+  const store = createRunStore({ stateRoot });
+  return await store.create({
+    runId,
+    state: "planned",
+    generation: 1,
+    projectAlias: "fixture",
+    task: "TASK-1",
+    harness: "pi",
+    profileName: "pi-worker",
+    stateRoot,
+    controlPlaneBin: "/bin/workflow.js",
+  });
+}
+
+test("extension stays inert without required Pi env", async () => {
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {},
+  })(pi);
+  assert.deepEqual(Object.keys(pi.handlers), []);
+});
+
+test("extension stays inert when harness is not pi", async () => {
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "claude",
+      WORKFLOW_STATE_ROOT: "/state",
+      WORKFLOW_CONTROL_PLANE_BIN: "/bin/workflow.js",
+    },
+  })(pi);
+  assert.deepEqual(Object.keys(pi.handlers), []);
+});
+
+test("records lifecycle, tool, usage, and model through Pi events and renders redacted widget", async () => {
+  const stateRoot = await tempStateRoot();
+  await createFixtureRun(stateRoot, RUN_ID);
+
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: stateRoot,
+      WORKFLOW_CONTROL_PLANE_BIN: "/bin/workflow.js",
+      WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
+      WORKFLOW_GENERATION: "1",
+    },
+  })(pi);
+
+  const ctx = createContext();
+
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+  await pi.emit("turn_start", { turnIndex: 1 }, ctx);
+  await pi.emit("tool_execution_start", { toolName: "bash" }, ctx);
+  await pi.emit("tool_execution_end", { toolCallId: "call-1" }, ctx);
+  await pi.emit(
+    "message_end",
+    {
+      message: {
+        role: "assistant",
+        model: "gpt-4",
+        usage: { input_tokens: 100, output_tokens: 50, cost: { total: 0.002 } },
+      },
+    },
+    ctx,
+  );
+  await pi.emit("agent_settled", {}, ctx);
+  await pi.emit("session_shutdown", { reason: "quit" }, ctx);
+
+  // Widget cleared on shutdown
+  const lastWidget = ctx.widgetCalls.at(-1);
+  assert.equal(lastWidget.id, "workflow-worker-observability");
+  assert.equal(lastWidget.lines, undefined);
+
+  const lastStatus = ctx.statusCalls.at(-1);
+  assert.equal(lastStatus.id, "workflow-worker-observability");
+  assert.equal(lastStatus.text, undefined);
+
+  // Verify telemetry persisted
+  const store = createRunStore({ stateRoot });
+  const telemetry = (await import("../src/workflow/telemetry-store.js")).createTelemetryStore({ store });
+  const snapshots = await telemetry.read({ runId: RUN_ID });
+  assert.equal(snapshots.length, 1);
+  const snapshot = snapshots[0];
+  assert.equal(snapshot.phase, "settled");
+  assert.equal(snapshot.harness, "pi");
+  assert.equal(snapshot.model, "gpt-4");
+
+  // Verify widget lines did not leak private data
+  const widgetPayload = JSON.stringify(ctx.widgetCalls);
+  assert.equal(widgetPayload.includes(RUN_ID), false);
+  assert.equal(widgetPayload.includes("gpt-4") || widgetPayload.includes("bash"), true);
+
+  await rm(stateRoot, { recursive: true, force: true });
+});
+
+test("does not render widget in json/print mode but still records telemetry", async () => {
+  const stateRoot = await tempStateRoot();
+  await createFixtureRun(stateRoot, RUN_ID);
+
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: stateRoot,
+      WORKFLOW_CONTROL_PLANE_BIN: "/bin/workflow.js",
+      WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
+      WORKFLOW_GENERATION: "1",
+    },
+  })(pi);
+
+  const ctx = createContext({ mode: "json", hasUI: false });
+
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+  await pi.emit("agent_settled", {}, ctx);
+
+  assert.equal(ctx.widgetCalls.length, 0);
+  assert.equal(ctx.statusCalls.length, 0);
+
+  const store = createRunStore({ stateRoot });
+  const telemetry = (await import("../src/workflow/telemetry-store.js")).createTelemetryStore({ store });
+  const snapshots = await telemetry.read({ runId: RUN_ID });
+  assert.equal(snapshots.length, 1);
+
+  await rm(stateRoot, { recursive: true, force: true });
+});
+
+test("ignores non-assistant message_end without crashing", async () => {
+  const stateRoot = await tempStateRoot();
+  await createFixtureRun(stateRoot, RUN_ID);
+
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: stateRoot,
+      WORKFLOW_CONTROL_PLANE_BIN: "/bin/workflow.js",
+      WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
+      WORKFLOW_GENERATION: "1",
+    },
+  })(pi);
+
+  const ctx = createContext();
+
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+  await pi.emit(
+    "message_end",
+    {
+      message: { role: "user", content: "hello" },
+    },
+    ctx,
+  );
+  await pi.emit("agent_settled", {}, ctx);
+
+  const store = createRunStore({ stateRoot });
+  const telemetry = (await import("../src/workflow/telemetry-store.js")).createTelemetryStore({ store });
+  const snapshots = await telemetry.read({ runId: RUN_ID });
+  const snapshot = snapshots[0];
+  assert.equal(snapshot?.phase, "settled");
+  assert.equal(snapshot?.model, null);
+
+  await rm(stateRoot, { recursive: true, force: true });
+});

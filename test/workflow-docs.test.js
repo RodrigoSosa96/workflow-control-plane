@@ -27,6 +27,7 @@ test("README documents the workflow launcher commands and safety boundaries", as
   assert.doesNotMatch(readme, /^workflow hooks doctor --format compact$/m);
   assert.match(readme, /workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes/);
   assert.match(readme, /workflow status ocr ASANA-123 --feature "Discovered Docs"/);
+  assert.match(readme, /workflow-worker-observability/i);
   assert.match(readme, /workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel/);
   assert.match(readme, /read-only/i);
   assert.match(readme, /requires explicit confirmation or --yes/i);
