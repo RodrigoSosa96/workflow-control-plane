@@ -1,9 +1,4 @@
 import { assertWorkerTransport } from "./worker-transport.js";
-import { WorkflowError } from "./errors.js";
-
-function fail(message, details) {
-  throw new WorkflowError("close", message, { details });
-}
 
 export async function closeWorker({ store, transport, runId }) {
   assertWorkerTransport(transport);
