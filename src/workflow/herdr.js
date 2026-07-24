@@ -227,6 +227,10 @@ function parseIntegrationStatusResult(result, context) {
   });
 }
 
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function pushOption(args, flag, value) {
   if (value === undefined || value === null || value === "") return;
   args.push(flag, String(value));
@@ -486,8 +490,8 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
       return normalizePaneResult(await invoke("pane", "split", args, { cwd }));
     },
 
-    // `pane run` takes the command variadically, so a trusted argv is passed through
-    // unchanged rather than being flattened into a quoted shell string.
+    // `pane run` types its command into the pane's shell rather than executing argv
+    // directly, so each element is quoted to survive word splitting and globbing.
     async runInPane({ paneId, command, argv }) {
       if (argv !== undefined) {
         if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
@@ -496,7 +500,7 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
         if (typeof paneId !== "string" || !paneId) {
           fail("PREFLIGHT", "runInPane requires a pane ID", { paneId }, 10);
         }
-        return await invoke("pane", "run", [paneId, ...argv]);
+        return await invoke("pane", "run", [paneId, argv.map(shellQuote).join(" ")]);
       }
       if (typeof command !== "string" || !command.trim()) {
         fail("PREFLIGHT", "runInPane requires a trusted registry command string", { paneId, command }, 10);

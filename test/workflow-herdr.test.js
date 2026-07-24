@@ -892,7 +892,7 @@ test("runs trusted pane commands as a single argument and rejects untrusted shap
   );
 });
 
-test("runs a trusted argv in a pane without shell quoting", async () => {
+test("quotes a trusted argv so the pane shell cannot split or glob it", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -900,12 +900,7 @@ test("runs a trusted argv in a pane without shell quoting", async () => {
           "pane",
           "run",
           "w2:p3",
-          "/usr/bin/node",
-          "/repo/bin/workflow-worker.js",
-          "--run",
-          "d46f8572-de27-465e-baf8-1ceafb850d62",
-          "--worker",
-          "efda9946-5b8c-4662-af12-7022f54bb257",
+          "'/usr/bin/node' '/repo dir/bin/workflow-worker.js' '--run' 'd46f8572-de27-465e-baf8-1ceafb850d62'",
         ]);
         assert.deepEqual(options, { allowFailure: true });
       },
@@ -919,15 +914,27 @@ test("runs a trusted argv in a pane without shell quoting", async () => {
       paneId: "w2:p3",
       argv: [
         "/usr/bin/node",
-        "/repo/bin/workflow-worker.js",
+        "/repo dir/bin/workflow-worker.js",
         "--run",
         "d46f8572-de27-465e-baf8-1ceafb850d62",
-        "--worker",
-        "efda9946-5b8c-4662-af12-7022f54bb257",
       ],
     }),
     { accepted: true },
   );
+});
+
+test("escapes embedded single quotes when quoting pane argv", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args }) => {
+        assert.deepEqual(args, ["pane", "run", "w2:p3", "'node' '/repo/it'\\''s/worker.js'"]);
+      },
+      stdout: cliResult({ accepted: true }, "cli:pane:run"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  await herdr.runInPane({ paneId: "w2:p3", argv: ["node", "/repo/it's/worker.js"] });
 });
 
 test("rejects untrusted argv shapes before running anything in a pane", async () => {
