@@ -8,7 +8,7 @@ const CAPABILITIES = Object.freeze({
   opencode: Object.freeze({ model: false, usage: false, cost: false, context: false, session: false }),
 });
 const SUPPORTED_VERSIONS = Object.freeze({
-  pi: new Set(["0.80.10"]),
+  pi: new Set(["0.80.10", "0.81.1"]),
   claude: new Set(["2.1.218"]),
   codex: new Set(["0.144.3"]),
   opencode: new Set(["1.0.126"]),
@@ -23,6 +23,10 @@ function fail(message) {
 function plainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+
+// A recognized protocol event that reports nothing measurable. Distinct from unknown:
+// ignoring records no telemetry, whereas unknown pins the worker snapshot to unknown.
+const IGNORE_EVENT = Symbol("telemetry-ignore");
 
 function unknown(harness) {
   return [normalizeTelemetryEvent({ type: "lifecycle", harness, phase: "unknown" })];
@@ -65,6 +69,15 @@ function usageEvent(harness, usage, { cost, context } = {}) {
 
 function piEvents(record) {
   switch (record.type) {
+    // Real Pi stream events that carry no telemetry measurement; recognized but ignored.
+    case "session":
+    case "message_start":
+    case "message_update":
+    case "turn_end":
+    case "agent_end":
+    case "queue_update":
+    case "auto_retry_end":
+      return IGNORE_EVENT;
     case "agent_start":
     case "turn_start":
       return [lifecycle("pi", "running")];
@@ -165,7 +178,7 @@ function opencodeEvents(record) {
 const PARSERS = Object.freeze({ pi: piEvents, claude: claudeEvents, codex: codexEvents, opencode: opencodeEvents });
 
 export const HARNESS_TELEMETRY_VERSIONS = Object.freeze({
-  pi: "0.80.10",
+  pi: "0.81.1",
   claude: "2.1.218",
   codex: "0.144.3",
   opencode: "1.0.126",
@@ -179,13 +192,16 @@ export function createTelemetryAdapter({ harness, version } = {}) {
   return Object.freeze({
     consume(record) {
       if (!supported || !plainObject(record) || typeof record.type !== "string") return unknown(harness);
+      let events;
       try {
-        const events = parser(record);
-        if (!Array.isArray(events) || events.length === 0) return unknown(harness);
-        return events;
+        events = parser(record);
       } catch (_error) {
         return unknown(harness);
       }
+      // A recognized no-measurement event records nothing, without degrading the snapshot.
+      if (events === IGNORE_EVENT) return [];
+      if (!Array.isArray(events) || events.length === 0) return unknown(harness);
+      return events;
     },
     capabilities() {
       return { ...(supported ? CAPABILITIES[harness] : EMPTY_CAPABILITIES) };

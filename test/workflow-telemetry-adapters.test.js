@@ -108,3 +108,28 @@ test("never retains text, tool arguments, opaque IDs, or malformed nested fields
     }]);
   }
 });
+
+test("ignores Pi protocol events that carry no measurement instead of degrading to unknown", () => {
+  const pi = createTelemetryAdapter({ harness: "pi", version: "0.81.1" });
+
+  // These events are part of Pi's real stream but report nothing measurable. Treating
+  // them as unknown pins the worker snapshot to unknown for the rest of the run, so they
+  // must be ignored (no telemetry event) rather than degraded.
+  for (const type of ["session", "message_start", "message_update", "turn_end", "agent_end"]) {
+    assert.deepEqual(pi.consume({ type }), [], `expected ${type} to be ignored`);
+  }
+
+  // Recognized measurement events still map through.
+  assert.deepEqual(pi.consume({ type: "agent_start" }), [{ type: "lifecycle", harness: "pi", phase: "running" }]);
+  assert.deepEqual(pi.consume({ type: "turn_start" }), [{ type: "lifecycle", harness: "pi", phase: "running" }]);
+  assert.deepEqual(pi.consume({ type: "agent_settled" }), [{ type: "lifecycle", harness: "pi", phase: "settled" }]);
+
+  // A genuinely unknown event still degrades, fail-closed.
+  assert.deepEqual(pi.consume({ type: "totally_unknown_event" }), [{ type: "lifecycle", harness: "pi", phase: "unknown" }]);
+});
+
+test("supports the installed Pi version", () => {
+  const pi = createTelemetryAdapter({ harness: "pi", version: "0.81.1" });
+  assert.deepEqual(pi.consume({ type: "agent_start" }), [{ type: "lifecycle", harness: "pi", phase: "running" }]);
+  assert.deepEqual(pi.capabilities(), { model: true, usage: true, cost: true, context: true, session: false });
+});
