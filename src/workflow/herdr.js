@@ -483,7 +483,7 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       pushOption(args, "--kind", kind);
       pushOption(args, "--pane", paneId);
       pushOption(args, "--timeout", timeout);
-      pushFocus(args, focus);
+      if (focus) args.push("--focus");
       args.push("--", ...argv);
 
       return normalizeAgentResult(await invoke("agent", "start", args));
