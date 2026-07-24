@@ -122,6 +122,42 @@ test("records bounded unknown telemetry for invalid JSON and oversized lines wit
   assert.equal(JSON.stringify(telemetry.events).includes("xxx"), false);
 });
 
+test("an oversized benign event does not pin the snapshot to unknown", async () => {
+  const telemetry = memoryTelemetry();
+  // Pi emits the full accumulated message on each delta, so a long assistant message makes
+  // message_update exceed the line cap. It must be ignored, not degraded, or the rest of
+  // the run's telemetry is lost.
+  const oversized = `{"type":"message_update","assistantMessageEvent":{"delta":"${"x".repeat(70 * 1024)}"}}`;
+  const bytes = Buffer.from(`{"type":"agent_start"}\n${oversized}\n{"type":"agent_settled"}\n`, "utf8");
+  const { spawn } = fakeSpawn({ stdoutChunks: [bytes] });
+
+  const result = await supervisor({ telemetry, spawn }).run({
+    runId: RUN_ID,
+    workerId: WORKER_ID,
+    launch: fixtureLaunch({ harness: "pi", command: "pi", argv: ["--print", "--mode", "json"], harnessVersion: "0.81.1" }),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(telemetry.events.some((event) => event.phase === "unknown"), false);
+  assert.equal(telemetry.events.at(-1).phase, "settled");
+  assert.equal(JSON.stringify(telemetry.events).includes("xxx"), false);
+});
+
+test("an oversized unrecognized event still degrades to unknown, fail-closed", async () => {
+  const telemetry = memoryTelemetry();
+  const oversized = `{"type":"mystery_event","pad":"${"x".repeat(70 * 1024)}"}`;
+  const { spawn } = fakeSpawn({ stdoutChunks: [Buffer.from(`{"type":"agent_start"}\n${oversized}\n`, "utf8")] });
+
+  await supervisor({ telemetry, spawn }).run({
+    runId: RUN_ID,
+    workerId: WORKER_ID,
+    launch: fixtureLaunch({ harness: "pi", command: "pi", argv: ["--print", "--mode", "json"], harnessVersion: "0.81.1" }),
+  });
+
+  assert.equal(telemetry.events.some((event) => event.phase === "unknown"), true);
+  assert.equal(JSON.stringify(telemetry.events).includes("xxx"), false);
+});
+
 test("records failed on nonzero exit and on spawn error, and never writes a handoff", async () => {
   const telemetry = memoryTelemetry();
   const { spawn } = fakeSpawn({ exitCode: 7 });

@@ -45,6 +45,13 @@ export function validateLaunchRecord(record) {
   return record;
 }
 
+// Cheaply reads the leading "type" of a JSON object line without parsing the whole line,
+// used to classify oversized lines that are unsafe to JSON.parse.
+function extractLeadingType(line) {
+  const match = /^\s*\{\s*"type"\s*:\s*"([^"\\]{1,64})"/.exec(line.slice(0, 256));
+  return match ? match[1] : null;
+}
+
 async function* decodeLfJsonl(stdout) {
   const decoder = new StringDecoder("utf8");
   let buffer = "";
@@ -72,6 +79,7 @@ export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, 
     function lifecycle(phase, at) {
       return { type: "lifecycle", harness: launch.harness, phase, ...(at ? { at } : {}) };
     }
+    const unknownEvents = [lifecycle("unknown")];
 
     const startedAt = clock();
     await telemetry.record({ runId, workerId, event: lifecycle("starting", startedAt) });
@@ -110,23 +118,29 @@ export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, 
     const streamPromise = (async () => {
       const decodeStream = decodeLfJsonl(child.stdout);
       for await (const line of decodeStream) {
-        if (line.length > MAX_LINE_LENGTH) {
-          await telemetry.record({ runId, workerId, event: lifecycle("unknown") });
-          continue;
-        }
-        let record;
-        try {
-          record = JSON.parse(line);
-        } catch {
-          await telemetry.record({ runId, workerId, event: lifecycle("unknown") });
-          continue;
-        }
         let events;
-        try {
-          events = adapter.consume(record);
-        } catch {
-          await telemetry.record({ runId, workerId, event: lifecycle("unknown") });
-          continue;
+        if (line.length > MAX_LINE_LENGTH) {
+          // A streaming harness emits its full accumulated message on each delta, so a
+          // benign event (message_update) can exceed the cap in a long run. Parsing a
+          // huge line is unsafe, so classify it by type alone and let the adapter decide
+          // whether it is ignorable; only genuinely unrecognized types degrade to unknown.
+          const type = extractLeadingType(line);
+          events = type ? adapter.consume({ type }) : unknownEvents;
+        } else {
+          let record;
+          try {
+            record = JSON.parse(line);
+          } catch {
+            events = unknownEvents;
+            record = null;
+          }
+          if (record !== null) {
+            try {
+              events = adapter.consume(record);
+            } catch {
+              events = unknownEvents;
+            }
+          }
         }
         for (const event of events) {
           // Adapter events are already normalized against the telemetry schema.
