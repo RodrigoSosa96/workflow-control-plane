@@ -456,6 +456,55 @@ test("throws a HERDR error on live API error envelopes", async () => {
   );
 });
 
+test("surfaces the herdr error envelope when it is written to stderr instead of stdout", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: cliError(
+            { code: "agent_pane_not_found", message: "agent target pane wK:p2 not found" },
+            "cli:agent:start",
+          ),
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({ name: "fixture-single-FIX-101", paneId: "wK:p2", kind: "pi", argv: ["pi", "--name", "x"] }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "HERDR");
+      assert.match(error.message, /agent target pane wK:p2 not found/);
+      assert.equal(error.details.code, "agent_pane_not_found");
+      return true;
+    },
+  );
+});
+
+test("keeps the generic exit-code failure when stderr holds no herdr envelope", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return { code: 1, stdout: "", stderr: "segfault" };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.listAgents(),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "HERDR");
+      assert.match(error.message, /exit code 1/);
+      assert.equal(error.details.stderr, "segfault");
+      return true;
+    },
+  );
+});
+
 test("throws a HERDR error on malformed JSON output", async () => {
   const herdr = createHerdrAdapter({
     runner: {
@@ -719,6 +768,76 @@ test("creates tabs and panes with explicit focus flags and live parsed IDs", asy
   assert.deepEqual(pane, { paneId: "w2:p3" });
 });
 
+test("forwards workflow env to the split pane so the agent inherits the run context", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "pane",
+          "split",
+          "w2:p2",
+          "--direction",
+          "down",
+          "--cwd",
+          "/repo/.worktrees/FIX-101",
+          "--env",
+          "WORKFLOW_RUN_ID=run-1",
+          "--env",
+          "WORKFLOW_RUN_DIR=/state/runs/run-1",
+          "--env",
+          "WORKFLOW_GENERATION=1",
+          "--env",
+          "WORKFLOW_HARNESS=pi",
+          "--env",
+          "WORKFLOW_STATE_ROOT=/state",
+          "--env",
+          "WORKFLOW_CONTROL_PLANE_BIN=/repo/bin/workflow.js",
+          "--no-focus",
+        ]);
+        assert.deepEqual(options, { allowFailure: true, cwd: "/repo/.worktrees/FIX-101" });
+      },
+      stdout: cliResult({
+        type: "pane_split",
+        pane: { pane_id: "w2:p3", tab_id: "w2:t2", workspace_id: "w2" },
+      }, "cli:pane:split"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const pane = await herdr.splitPane({
+    paneId: "w2:p2",
+    direction: "down",
+    cwd: "/repo/.worktrees/FIX-101",
+    env: {
+      WORKFLOW_RUN_ID: "run-1",
+      WORKFLOW_RUN_DIR: "/state/runs/run-1",
+      WORKFLOW_GENERATION: "1",
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: "/state",
+      WORKFLOW_CONTROL_PLANE_BIN: "/repo/bin/workflow.js",
+    },
+    focus: false,
+  });
+
+  assert.deepEqual(pane, { paneId: "w2:p3" });
+});
+
+test("rejects non-workflow env keys before splitting a pane", async () => {
+  const fixture = fixtureRunner([]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  await assert.rejects(
+    herdr.splitPane({
+      paneId: "w2:p2",
+      direction: "down",
+      cwd: "/repo/.worktrees/FIX-101",
+      env: { PATH: "/usr/bin" },
+    }),
+    (error) => error instanceof WorkflowError && error.category === "PREFLIGHT",
+  );
+  assert.equal(fixture.calls.length, 0);
+});
+
 test("renames tabs and panes, preserving literal labels without unsupported json flags", async () => {
   const fixture = fixtureRunner([
     {
@@ -771,6 +890,68 @@ test("runs trusted pane commands as a single argument and rejects untrusted shap
       return true;
     },
   );
+});
+
+test("quotes a trusted argv so the pane shell cannot split or glob it", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "pane",
+          "run",
+          "w2:p3",
+          "'/usr/bin/node' '/repo dir/bin/workflow-worker.js' '--run' 'd46f8572-de27-465e-baf8-1ceafb850d62'",
+        ]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ accepted: true }, "cli:pane:run"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(
+    await herdr.runInPane({
+      paneId: "w2:p3",
+      argv: [
+        "/usr/bin/node",
+        "/repo dir/bin/workflow-worker.js",
+        "--run",
+        "d46f8572-de27-465e-baf8-1ceafb850d62",
+      ],
+    }),
+    { accepted: true },
+  );
+});
+
+test("escapes embedded single quotes when quoting pane argv", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args }) => {
+        assert.deepEqual(args, ["pane", "run", "w2:p3", "'node' '/repo/it'\\''s/worker.js'"]);
+      },
+      stdout: cliResult({ accepted: true }, "cli:pane:run"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  await herdr.runInPane({ paneId: "w2:p3", argv: ["node", "/repo/it's/worker.js"] });
+});
+
+test("rejects untrusted argv shapes before running anything in a pane", async () => {
+  const fixture = fixtureRunner([]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  for (const argv of [[], ["node", ""], ["node", 42]]) {
+    await assert.rejects(
+      herdr.runInPane({ paneId: "w2:p3", argv }),
+      (error) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.category, "PREFLIGHT");
+        return true;
+      },
+    );
+  }
+  assert.equal(fixture.calls.length, 0);
 });
 
 test("gets pane process-info through the public cli and unwraps the live envelope", async () => {
@@ -855,7 +1036,7 @@ test("gets pane process-info from live foreground_processes contract", async () 
   });
 });
 
-test("starts an agent with explicit focus flags and live argv after --", async () => {
+test("starts an agent with live argv after --, dropping the executable herdr supplies itself", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -869,9 +1050,7 @@ test("starts an agent with explicit focus flags and live argv after --", async (
           "w2:p9",
           "--timeout",
           "30000",
-          "--no-focus",
           "--",
-          "pi",
           "--name",
           "ocr-ASANA-123-discovered-docs",
         ]);
@@ -915,9 +1094,7 @@ test("starts an agent when the live contract omits agent_id", async () => {
           "pi",
           "--pane",
           "w2:p9",
-          "--no-focus",
           "--",
-          "pi",
           "--name",
           "ocr-ASANA-123-discovered-docs",
         ]);
@@ -964,9 +1141,7 @@ test("starts an agent with a non-pi harness kind", async () => {
           "codex",
           "--pane",
           "w2:p10",
-          "--focus",
           "--",
-          "codex",
           "-C",
           "/repo/.worktrees/ASANA-123-discovered-docs",
         ]);
@@ -987,7 +1162,6 @@ test("starts an agent with a non-pi harness kind", async () => {
     paneId: "w2:p10",
     kind: "codex",
     argv: ["codex", "-C", "/repo/.worktrees/ASANA-123-discovered-docs"],
-    focus: true,
   });
 
   assert.deepEqual(result, {
@@ -995,6 +1169,174 @@ test("starts an agent with a non-pi harness kind", async () => {
     tabId: "w2:t1",
     paneId: "w2:p10",
   });
+});
+
+test("waits for a freshly split pane to reach its shell prompt before starting the agent", async () => {
+  let attempts = 0;
+  const slept = [];
+  const herdr = createHerdrAdapter({
+    sleep: async (ms) => { slept.push(ms); },
+    runner: {
+      async run() {
+        attempts += 1;
+        if (attempts < 3) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: cliError(
+              { code: "agent_pane_busy", message: "agent target pane w2:p9 is not an available shell" },
+              "cli:agent:start",
+            ),
+          };
+        }
+        return {
+          code: 0,
+          stdout: cliResult({
+            type: "agent_started",
+            agent: { agent_id: "a9" },
+            tab: { tab_id: "w2:t1" },
+            pane: { pane_id: "w2:p9" },
+          }, "cli:agent:start"),
+          stderr: "",
+        };
+      },
+    },
+  });
+
+  const result = await herdr.startAgent({
+    name: "fixture-single-fix-101",
+    paneId: "w2:p9",
+    kind: "pi",
+    argv: ["pi", "--name", "x"],
+  });
+
+  assert.equal(result.agentId, "a9");
+  assert.equal(attempts, 3);
+  assert.equal(slept.length, 2);
+});
+
+test("gives up waiting for a busy pane and surfaces the herdr error", async () => {
+  let attempts = 0;
+  const herdr = createHerdrAdapter({
+    sleep: async () => {},
+    runner: {
+      async run() {
+        attempts += 1;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: cliError(
+            { code: "agent_pane_busy", message: "agent target pane w2:p9 is not an available shell" },
+            "cli:agent:start",
+          ),
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({
+      name: "fixture-single-fix-101",
+      paneId: "w2:p9",
+      kind: "pi",
+      argv: ["pi", "--name", "x"],
+      paneReadyTimeout: 1000,
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.details.code, "agent_pane_busy");
+      return true;
+    },
+  );
+  assert.ok(attempts > 1, `expected retries, got ${attempts}`);
+});
+
+test("does not retry agent start failures unrelated to pane readiness", async () => {
+  let attempts = 0;
+  const herdr = createHerdrAdapter({
+    sleep: async () => {},
+    runner: {
+      async run() {
+        attempts += 1;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: cliError({ code: "invalid_agent_name", message: "agent name must start with a lowercase letter" }, "cli:agent:start"),
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({ name: "BAD", paneId: "w2:p9", kind: "pi", argv: ["pi", "--name", "x"] }),
+    (error) => error.details.code === "invalid_agent_name",
+  );
+  assert.equal(attempts, 1);
+});
+
+test("rejects argv whose executable does not match the agent kind", async () => {
+  const calls = [];
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run(command, args, options) {
+        calls.push({ command, args, options });
+        return { code: 0, stdout: cliResult(null), stderr: "" };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({
+      name: "ocr-ASANA-123-discovered-docs",
+      paneId: "w2:p9",
+      kind: "pi",
+      argv: ["codex", "--name", "x"],
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /kind/i);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("accepts an absolute executable path whose basename matches the kind", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args }) => {
+        assert.deepEqual(args, [
+          "agent",
+          "start",
+          "ocr-ASANA-123-discovered-docs",
+          "--kind",
+          "pi",
+          "--pane",
+          "w2:p9",
+          "--",
+          "--name",
+          "x",
+        ]);
+      },
+      stdout: cliResult({
+        type: "agent_started",
+        agent: { agent_id: "a11" },
+        tab: { tab_id: "w2:t1" },
+        pane: { pane_id: "w2:p9" },
+      }, "cli:agent:start"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.startAgent({
+    name: "ocr-ASANA-123-discovered-docs",
+    paneId: "w2:p9",
+    kind: "pi",
+    argv: ["/usr/local/bin/pi", "--name", "x"],
+  });
+
+  assert.equal(result.agentId, "a11");
 });
 
 test("startAgent requires paneId and kind", async () => {

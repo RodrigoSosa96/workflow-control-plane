@@ -1,5 +1,14 @@
 import { realpath as defaultRealpath } from "node:fs/promises";
 import { basename, resolve } from "node:path";
+import { herdrAgentName } from "./naming.js";
+
+// Herdr registers agents under the derived herdr-safe name, so matching a running
+// agent has to use the same derivation the launcher used.
+function plannedAgentName(plan) {
+  if (typeof plan?.agent?.agentName === "string" && plan.agent.agentName) return plan.agent.agentName;
+  const sessionName = plan?.agent?.sessionName;
+  return typeof sessionName === "string" && sessionName ? herdrAgentName(sessionName) : null;
+}
 
 function normalizeBranch(value) {
   if (typeof value !== "string") return null;
@@ -230,7 +239,9 @@ function writerMatchesPlannedAgent(writer, plan) {
   if (expectedRunId) return writer.runId === expectedRunId;
   const expectedNativeSessionId = plannedNativeSessionId(plan);
   if (expectedNativeSessionId) return writer.nativeSessionId === expectedNativeSessionId;
-  return writer.name === plan.agent?.sessionName;
+  // Writer names come either from a Herdr agent registration or from a terminal
+  // title, so accept both the readable session name and the Herdr-safe name.
+  return writer.name === plan.agent?.sessionName || writer.name === plannedAgentName(plan);
 }
 
 function summarizeWriter(writer) {
@@ -600,7 +611,7 @@ async function classifyTabIdentity(planned, actual, actualPanes, loadAgents, wor
     const expectedHarness = plan.agent?.harness ?? "pi";
     const matchingAgents = actualAgents.filter((agent) => (
       agent.tab_id === actual.tab_id
-        && agent.name === plan.agent.sessionName
+        && agent.name === plannedAgentName(plan)
         && (!agentHarness(agent) || agentHarness(agent) === expectedHarness)
     ));
     const agentMatches = [];

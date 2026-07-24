@@ -65,15 +65,35 @@ function unwrapHerdrPayload(payload, context) {
   return payload;
 }
 
+// Herdr writes its JSON error envelope to stderr, so a failed command usually leaves stdout empty.
+function extractStderrEnvelope(stderr) {
+  const trimmed = stderr?.trim();
+  if (!trimmed) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+
+  const error = payload?.error ?? (payload?.ok === false ? payload : null);
+  if (!error || typeof error !== "object") return null;
+  return error;
+}
+
 function parseJsonResult(result, context) {
   const stdout = result.stdout?.trim() ?? "";
 
   if (!stdout) {
     if (result.code && result.code !== 0) {
+      const envelope = extractStderrEnvelope(result.stderr);
       fail(
         "HERDR",
-        `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
+        envelope?.message
+          ?? `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
         {
+          ...(envelope?.code ? { code: envelope.code } : {}),
           stdout: result.stdout,
           stderr: result.stderr,
           command: context.binary,
@@ -207,6 +227,10 @@ function parseIntegrationStatusResult(result, context) {
   });
 }
 
+function shellQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function pushOption(args, flag, value) {
   if (value === undefined || value === null || value === "") return;
   args.push(flag, String(value));
@@ -219,16 +243,16 @@ function pushFocus(args, focus = false) {
 function normalizeWorkflowEnv(env = {}) {
   if (env === undefined || env === null) return [];
   if (typeof env !== "object" || Array.isArray(env)) {
-    fail("PREFLIGHT", "startAgent env must be a workflow env object", { env }, 10);
+    fail("PREFLIGHT", "workflow env must be a workflow env object", { env }, 10);
   }
 
   const entries = [];
   for (const [key, value] of Object.entries(env)) {
     if (!WORKFLOW_ENV_KEYS.has(key)) {
-      fail("PREFLIGHT", `startAgent env contains non-workflow key ${key}`, { key }, 10);
+      fail("PREFLIGHT", `workflow env contains non-workflow key ${key}`, { key }, 10);
     }
     if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
-      fail("PREFLIGHT", `startAgent env ${key} must be a non-empty string`, { key }, 10);
+      fail("PREFLIGHT", `workflow env ${key} must be a non-empty string`, { key }, 10);
     }
     entries.push(`${key}=${value}`);
   }
@@ -332,7 +356,16 @@ function normalizePaneProcessInfo(value) {
   };
 }
 
-export function createHerdrAdapter({ runner, binary = "herdr" }) {
+// `pane split` returns before the new pane reaches its interactive shell prompt, and
+// `agent start` rejects an unready pane outright rather than waiting for it.
+const PANE_READY_TIMEOUT_MS = 10000;
+const PANE_READY_POLL_MS = 250;
+
+function defaultSleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSleep }) {
   async function run(area, command, args = [], { cwd } = {}) {
     const fullArgs = command ? [area, command, ...args] : [area, ...args];
     const result = await runner.run(binary, fullArgs, {
@@ -446,15 +479,29 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       return await invoke("pane", "rename", [paneId, label]);
     },
 
-    async splitPane({ paneId, direction, ratio, cwd, focus = false }) {
+    async splitPane({ paneId, direction, ratio, cwd, env, focus = false }) {
       const args = [paneId, "--direction", direction];
       pushOption(args, "--ratio", ratio);
       pushOption(args, "--cwd", cwd);
+      for (const entry of normalizeWorkflowEnv(env)) {
+        args.push("--env", entry);
+      }
       pushFocus(args, focus);
       return normalizePaneResult(await invoke("pane", "split", args, { cwd }));
     },
 
-    async runInPane({ paneId, command }) {
+    // `pane run` types its command into the pane's shell rather than executing argv
+    // directly, so each element is quoted to survive word splitting and globbing.
+    async runInPane({ paneId, command, argv }) {
+      if (argv !== undefined) {
+        if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
+          fail("PREFLIGHT", "runInPane requires argv from a trusted source", { paneId, argv }, 10);
+        }
+        if (typeof paneId !== "string" || !paneId) {
+          fail("PREFLIGHT", "runInPane requires a pane ID", { paneId }, 10);
+        }
+        return await invoke("pane", "run", [paneId, argv.map(shellQuote).join(" ")]);
+      }
       if (typeof command !== "string" || !command.trim()) {
         fail("PREFLIGHT", "runInPane requires a trusted registry command string", { paneId, command }, 10);
       }
@@ -468,7 +515,9 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       return normalizePaneProcessInfo(await invoke("pane", "process-info", ["--pane", paneId]));
     },
 
-    async startAgent({ name, paneId, kind, argv, focus = false, timeout } = {}) {
+    // Herdr types the canonical executable for --kind itself, so argv[0] is dropped and only
+    // the remaining arguments are passed after --. `agent start` has no focus flag.
+    async startAgent({ name, paneId, kind, argv, timeout, paneReadyTimeout = PANE_READY_TIMEOUT_MS } = {}) {
       if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
         fail("PREFLIGHT", "startAgent requires argv from a trusted source", { name, paneId, kind, argv }, 10);
       }
@@ -479,14 +528,32 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
         fail("PREFLIGHT", "startAgent requires an agent kind", { name, paneId, kind }, 10);
       }
 
+      const executable = argv[0].slice(argv[0].lastIndexOf("/") + 1);
+      if (executable !== kind) {
+        fail(
+          "PREFLIGHT",
+          `startAgent argv executable ${executable} does not match the agent kind ${kind}`,
+          { name, paneId, kind, executable },
+          10,
+        );
+      }
+
       const args = [name];
       pushOption(args, "--kind", kind);
       pushOption(args, "--pane", paneId);
       pushOption(args, "--timeout", timeout);
-      pushFocus(args, focus);
-      args.push("--", ...argv);
+      args.push("--", ...argv.slice(1));
 
-      return normalizeAgentResult(await invoke("agent", "start", args));
+      let waited = 0;
+      for (;;) {
+        try {
+          return normalizeAgentResult(await invoke("agent", "start", args));
+        } catch (error) {
+          if (error?.details?.code !== "agent_pane_busy" || waited >= paneReadyTimeout) throw error;
+          await sleep(PANE_READY_POLL_MS);
+          waited += PANE_READY_POLL_MS;
+        }
+      }
     },
   };
 }

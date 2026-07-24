@@ -11,7 +11,7 @@ function fail(category, message, details, exitCode = 10) {
   throw new WorkflowError(category, message, { details, exitCode });
 }
 
-function sha256Digest(text) {
+export function sha256Digest(text) {
   return `sha256:${createHash("sha256").update(text).digest("hex")}`;
 }
 
@@ -514,8 +514,9 @@ function buildFixtureRecord(directSpec, harnessVersion) {
     version: 1,
     harness: directSpec.expected.harness,
     command: directSpec.argv[0],
-    argv: directSpec.argv,
-    cwd: directSpec.cwd ?? null,
+    // The supervisor spawns command + argv, so argv must not repeat the executable.
+    argv: directSpec.argv.slice(1),
+    cwd: directSpec.expected.cwd ?? null,
     env: directSpec.env,
     harnessVersion: harnessVersion ?? "0.0.0",
   };
@@ -600,6 +601,9 @@ export async function executeLaunch(preview, deps = {}) {
       }),
     });
     supervisorSpec = {
+      // Not an interactive harness, so it is run as a process in the agent pane
+      // rather than attached through Herdr's agent registry.
+      supervisor: true,
       argv: supervisorArgvFor({ controlPlaneBin, runId: run.id, workerId }),
       env: directSpec.env,
       expected: directSpec.expected,

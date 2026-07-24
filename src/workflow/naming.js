@@ -1,6 +1,11 @@
+import { createHash } from "node:crypto";
 import { WorkflowError } from "./errors.js";
 
 const MAX_LABEL_LENGTH = 32;
+// Herdr requires agent names to start with a lowercase letter and hold only
+// lowercase letters, digits, "-" or "_", within 1-32 characters.
+const MAX_AGENT_NAME_LENGTH = 32;
+const AGENT_NAME_DIGEST_LENGTH = 6;
 const SAFE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
 const WINDOWS_ABSOLUTE_RE = /^[A-Za-z]:[\\/]/;
 const PLACEHOLDER_RE = /\{([^{}]+)\}/g;
@@ -55,6 +60,30 @@ function boundLabel(value, maxLength = MAX_LABEL_LENGTH) {
 
 export function slugify(value) {
   return sanitizeSlug(value, "slug");
+}
+
+function agentNameDigest(value) {
+  return createHash("sha256").update(value).digest("hex").slice(0, AGENT_NAME_DIGEST_LENGTH);
+}
+
+// Derives the Herdr agent registry name from a session name. Session names stay
+// readable and keep their ticket casing; only the Herdr boundary uses this form,
+// so it must be deterministic to keep reconciliation matching a running agent.
+export function herdrAgentName(sessionName) {
+  const normalized = text(sessionName, "sessionName")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[^a-z]+/, "")
+    .replace(/[-_]+$/, "");
+
+  if (!normalized) return `agent-${agentNameDigest(sessionName)}`;
+  if (normalized.length <= MAX_AGENT_NAME_LENGTH) return normalized;
+
+  const head = normalized
+    .slice(0, MAX_AGENT_NAME_LENGTH - AGENT_NAME_DIGEST_LENGTH - 1)
+    .replace(/[-_]+$/, "");
+  return `${head}-${agentNameDigest(sessionName)}`;
 }
 
 export function normalizeTask(value) {

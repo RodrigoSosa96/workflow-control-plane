@@ -277,7 +277,7 @@ test("classifies a compatible ordinary plan from Git and Herdr facts", async () 
         {
           tab_id: "w1:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -314,7 +314,7 @@ test("matches selected Codex ownership with generic harness evidence", async () 
           profileName: "codex-worker",
           tab_id: `${workspaceId}:t1`,
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -830,7 +830,7 @@ test("treats symlinked planned and actual worktree paths as the same canonical c
         {
           tab_id: "w-symlink:t1",
           workspace_id: "w-symlink",
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: "/real/ocr-discovered-docs",
           agent_status: "working",
         },
@@ -983,7 +983,7 @@ test("marks a missing runtime tab as incomplete without inventing compatibility 
         {
           tab_id: "w2:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -1365,7 +1365,7 @@ test("does not treat a runtime pane command as compatible evidence when process-
         {
           tab_id: "w-runtime-no-process-info:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -1433,7 +1433,7 @@ test("does not treat a runtime pane with the right label but wrong command as co
         {
           tab_id: "w-wrong-runtime-command:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -1508,7 +1508,7 @@ test("classifies runtime processes from pane process-info instead of stale pane 
         {
           tab_id: "w-runtime-process-info:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -1582,7 +1582,7 @@ test("does not treat a runtime pane as compatible when process-info executable m
         {
           tab_id: "w-runtime-executable-mismatch:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },
@@ -1662,7 +1662,7 @@ test("preserves compatible runtime siblings while only missing processes remain 
         {
           tab_id: "w-runtime-siblings:t1",
           workspace_id: workspaceId,
-          name: plan.agent.sessionName,
+          name: plan.agent.agentName,
           cwd: plan.agent.worktreePath,
           agent_status: "working",
         },

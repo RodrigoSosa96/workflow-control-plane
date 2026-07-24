@@ -71,6 +71,9 @@ function expectedLaunch({ profileName, profile, sessionName, cwd, nativeSessionI
 function piArgv({ profile, sessionName, run, nativeSessionId }) {
   const argv = [profile.command, "--name", sessionName];
   if (run) argv.push("--session-id", nativeSessionId);
+  // A supervised run reads Pi's LF-delimited JSON events from stdout, so Pi must emit
+  // them and exit instead of holding an interactive session open.
+  if (profile.mode === "stream-json") argv.push("--print", "--mode", "json");
   appendModel(argv, profile.model);
   argv.push(...profile.arguments);
   const bootstrap = runBootstrapPrompt(run);

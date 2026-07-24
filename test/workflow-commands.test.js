@@ -536,7 +536,7 @@ test("status reports actual state and the safe next command without attempting r
       {
         tab_id: "w1:t1",
         workspace_id: "w1",
-        name: "ocr-ASANA-123-discovered-docs",
+        name: "ocr-asana-123-discovered-docs",
         cwd: workspacePath,
         agent_status: "working",
       },

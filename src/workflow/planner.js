@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { WorkflowError } from "./errors.js";
-import { expandTemplate, slugify, boundLabel } from "./naming.js";
+import { expandTemplate, herdrAgentName, slugify, boundLabel } from "./naming.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { resolveProject } from "./registry.js";
 import { normalizeTicketBundle } from "./tickets.js";
@@ -74,6 +74,7 @@ function buildAgent({ selectedAgent, sessionName, worktreePath, tabLabel }) {
   return {
     command: selectedAgent.profile.command,
     sessionName,
+    agentName: herdrAgentName(sessionName),
     tabLabel,
     worktreePath,
     profileName: selectedAgent.name,

@@ -550,6 +550,27 @@ async function resolveBootstrapContext(plan, worktreeOperation, ensured, herdr) 
   };
 }
 
+// A fixture supervisor is an ordinary process, not an interactive harness, so Herdr
+// cannot attach it with `agent start --kind <harness>`. Run it in the prepared pane
+// instead and report the same shape an attached agent would produce.
+async function startAgentProcess({ herdr, plan, launch, paneId, tabId }) {
+  if (launch.supervisor === true) {
+    if (typeof herdr.runInPane !== "function") {
+      fail("PREFLIGHT", "Starting a workflow supervisor requires a Herdr adapter with runInPane", { paneId }, 10);
+    }
+    await herdr.runInPane({ paneId, argv: launch.argv });
+    return { agentId: null, tabId, paneId };
+  }
+
+  return await herdr.startAgent({
+    name: plan.agent.agentName,
+    paneId,
+    kind: plan.agent.harness ?? "pi",
+    argv: launch.argv,
+    timeout: 30000,
+  });
+}
+
 async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent, expectedHarness }) {
   if (typeof herdr.listTabs !== "function" || typeof herdr.listPanes !== "function") {
     return false;
@@ -719,13 +740,12 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
       env: launch.env,
       focus: false,
     });
-    const startedAgent = await herdr.startAgent({
-      name: plan.agent.sessionName,
+    const startedAgent = await startAgentProcess({
+      herdr,
+      plan,
+      launch,
       paneId: agentPane.paneId,
-      kind: plan.agent.harness ?? "pi",
-      argv: launch.argv,
-      focus: false,
-      timeout: 30000,
+      tabId: agentTabId,
     });
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
@@ -938,13 +958,12 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       env: launch.env,
       focus: false,
     });
-    const startedAgent = await herdr.startAgent({
-      name: plan.agent.sessionName,
+    const startedAgent = await startAgentProcess({
+      herdr,
+      plan,
+      launch,
       paneId: agentPane.paneId,
-      kind: plan.agent.harness ?? "pi",
-      argv: launch.argv,
-      focus: false,
-      timeout: 30000,
+      tabId: coordinatorTabId,
     });
 
     report.operations.push(buildOperationReport(agentOperation, "created", {

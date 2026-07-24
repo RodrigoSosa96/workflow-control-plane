@@ -127,7 +127,7 @@ async function runSmoke({ args, env, stdin, stdout, stderr, createWorkflowFixtur
     if (workerId) {
       await inspectCanaryTelemetry({ fixture, runId: report.runId, workerId, readTelemetrySnapshot });
     }
-    await inspectCanaryCompletion({ fixture });
+    await inspectCanaryCompletion({ fixture, runDirectory: report.runDirectory });
     stdout.write("Canary completed successfully.\n");
     return { code: 0, fixture, promptPath, runId: report.runId, runDirectory: report.runDirectory };
   }
@@ -228,9 +228,19 @@ async function pollCanaryCompletion({ runId, fixture, env, stdout, resultCommand
   return { outcome: "timeout" };
 }
 
-async function inspectCanaryCompletion({ fixture, readFile = defaultReadFile }) {
-  const fixtureJs = await readFile(join(fixture.projects["fixture-single"].path, "fixture.js"), "utf8");
-  const testJs = await readFile(join(fixture.projects["fixture-single"].path, "test.js"), "utf8");
+export async function inspectCanaryCompletion({ fixture, runDirectory, readFile = defaultReadFile }) {
+  // The agent works in the per-ticket worktree, never the base checkout, so the edit has
+  // to be verified there. run.json records the worktree path the launch actually created.
+  let targetPath = fixture?.projects?.["fixture-single"]?.path;
+  if (runDirectory) {
+    const run = JSON.parse(await readFile(join(runDirectory, "run.json"), "utf8"));
+    const primary = run.repositories?.find((repository) => repository.id === "primary") ?? run.repositories?.[0];
+    if (primary?.path) targetPath = primary.path;
+  }
+  if (!targetPath) throw new Error("Canary could not resolve the worktree to inspect");
+
+  const fixtureJs = await readFile(join(targetPath, "fixture.js"), "utf8");
+  const testJs = await readFile(join(targetPath, "test.js"), "utf8");
   if (!fixtureJs.includes('"implemented"')) {
     throw new Error("Canary did not change fixture.js to 'implemented'");
   }

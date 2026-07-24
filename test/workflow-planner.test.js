@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { expandTemplate, normalizeTask, slugify } from "../src/workflow/naming.js";
+import { expandTemplate, herdrAgentName, normalizeTask, slugify } from "../src/workflow/naming.js";
 import { planWorkflow } from "../src/workflow/planner.js";
 
 function hasFunctionDeep(value) {
@@ -153,6 +153,7 @@ test("plans an ordinary native Herdr worktree", () => {
   assert.equal(plan.worktrees[0].branch, "feature/ASANA-123/discovered-docs");
   assert.equal(plan.agent.command, "pi");
   assert.equal(plan.agent.sessionName, "ocr-ASANA-123-discovered-docs");
+  assert.equal(plan.agent.agentName, "ocr-asana-123-discovered-docs");
   assert.equal(plan.agent.profileName, "pi-worker");
   assert.equal(plan.agent.selectionSource, "project");
   assert.equal(plan.agent.harness, "pi");
@@ -396,4 +397,31 @@ test("rejects unknown Acme repository aliases", () => {
     }),
     /Unknown workflow repository/i,
   );
+});
+
+test("herdrAgentName lowercases session names so Herdr accepts them", () => {
+  assert.equal(herdrAgentName("ocr-ASANA-123-discovered-docs"), "ocr-asana-123-discovered-docs");
+  assert.equal(herdrAgentName("fixture-single-FIX-101"), "fixture-single-fix-101");
+});
+
+test("herdrAgentName caps names at the 32 character Herdr limit", () => {
+  const long = "acme-ASANA-1234567-some-long-feature-slug";
+  const name = herdrAgentName(long);
+
+  assert.ok(name.length <= 32, `${name} is ${name.length} characters`);
+  assert.match(name, /^[a-z][a-z0-9_-]*$/);
+  assert.ok(name.startsWith("acme-asana-1234567"));
+});
+
+test("herdrAgentName stays deterministic and distinguishes names that share a prefix", () => {
+  const first = "acme-ASANA-1234567-some-long-feature-slug-alpha";
+  const second = "acme-ASANA-1234567-some-long-feature-slug-beta";
+
+  assert.equal(herdrAgentName(first), herdrAgentName(first));
+  assert.notEqual(herdrAgentName(first), herdrAgentName(second));
+});
+
+test("herdrAgentName always produces a name starting with a lowercase letter", () => {
+  assert.match(herdrAgentName("123-456"), /^[a-z][a-z0-9_-]*$/);
+  assert.match(herdrAgentName("---"), /^[a-z][a-z0-9_-]*$/);
 });
