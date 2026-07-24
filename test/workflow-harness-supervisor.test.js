@@ -4,6 +4,7 @@ import { Readable } from "node:stream";
 import { test } from "node:test";
 import { createHarnessSupervisor } from "../src/workflow/harness-supervisor.js";
 import { createTelemetryAdapter } from "../src/workflow/telemetry-adapters.js";
+import { normalizeTelemetryEvent } from "../src/workflow/telemetry.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const WORKER_ID = "22222222-2222-4222-8222-222222222222";
@@ -44,13 +45,17 @@ function fakeSpawn({ stdoutChunks = [], exitCode = 0, spawnError } = {}) {
   return { calls, spawn };
 }
 
+// The real telemetry store normalizes every event and rejects fields outside the schema,
+// so a fake that just collects them would let the supervisor emit events that only fail
+// against a live worker.
 function memoryTelemetry() {
   const events = [];
   return {
     events,
     async record({ event }) {
-      events.push(event);
-      return event;
+      const normalized = normalizeTelemetryEvent(event);
+      events.push(normalized);
+      return normalized;
     },
   };
 }

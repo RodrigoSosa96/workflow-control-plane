@@ -66,17 +66,15 @@ export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, 
   async function run({ runId, workerId, launch }) {
     validateLaunchRecord(launch);
 
+    // A telemetry event carries only its own schema fields. The run and worker identity
+    // are routing arguments of record(), and the harness version, the exit code and the
+    // reason a line was skipped are not part of the event contract.
+    function lifecycle(phase, at) {
+      return { type: "lifecycle", harness: launch.harness, phase, ...(at ? { at } : {}) };
+    }
+
     const startedAt = clock();
-    const firstEvent = {
-      type: "lifecycle",
-      phase: "starting",
-      harness: launch.harness,
-      version: launch.harnessVersion,
-      startedAt,
-      runId,
-      workerId,
-    };
-    await telemetry.record({ runId, workerId, event: firstEvent });
+    await telemetry.record({ runId, workerId, event: lifecycle("starting", startedAt) });
 
     const adapter = createAdapter({ harness: launch.harness, version: launch.harnessVersion });
     const child = spawnChild(launch.command, launch.argv, {
@@ -103,79 +101,36 @@ export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, 
     try {
       await Promise.race([spawnedPromise, spawnErrorPromise]);
     } catch (error) {
-      await telemetry.record({ runId, workerId, event: {
-        type: "lifecycle",
-        phase: "failed",
-        harness: launch.harness,
-        version: launch.harnessVersion,
-        runId,
-        workerId,
-      } });
+      await telemetry.record({ runId, workerId, event: lifecycle("failed") });
       throw error;
     }
 
-    const runningPromise = telemetry.record({ runId, workerId, event: {
-      type: "lifecycle",
-      phase: "running",
-      harness: launch.harness,
-      version: launch.harnessVersion,
-      runId,
-      workerId,
-    } });
+    const runningPromise = telemetry.record({ runId, workerId, event: lifecycle("running") });
 
     const streamPromise = (async () => {
       const decodeStream = decodeLfJsonl(child.stdout);
       for await (const line of decodeStream) {
         if (line.length > MAX_LINE_LENGTH) {
-          await telemetry.record({ runId, workerId, event: {
-            type: "lifecycle",
-            phase: "unknown",
-            reason: "oversized_line",
-            harness: launch.harness,
-            version: launch.harnessVersion,
-            runId,
-            workerId,
-          } });
+          await telemetry.record({ runId, workerId, event: lifecycle("unknown") });
           continue;
         }
         let record;
         try {
           record = JSON.parse(line);
         } catch {
-          await telemetry.record({ runId, workerId, event: {
-            type: "lifecycle",
-            phase: "unknown",
-            reason: "invalid_json",
-            harness: launch.harness,
-            version: launch.harnessVersion,
-            runId,
-            workerId,
-          } });
+          await telemetry.record({ runId, workerId, event: lifecycle("unknown") });
           continue;
         }
         let events;
         try {
           events = adapter.consume(record);
         } catch {
-          await telemetry.record({ runId, workerId, event: {
-            type: "lifecycle",
-            phase: "unknown",
-            reason: "adapter_failure",
-            harness: launch.harness,
-            version: launch.harnessVersion,
-            runId,
-            workerId,
-          } });
+          await telemetry.record({ runId, workerId, event: lifecycle("unknown") });
           continue;
         }
         for (const event of events) {
-          await telemetry.record({ runId, workerId, event: {
-            ...event,
-            runId,
-            workerId,
-            harness: launch.harness,
-            version: launch.harnessVersion,
-          } });
+          // Adapter events are already normalized against the telemetry schema.
+          await telemetry.record({ runId, workerId, event });
         }
       }
     })();
@@ -192,15 +147,7 @@ export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, 
 
     const exitCode = await closePromise;
     const phase = exitCode === 0 ? "settled" : "failed";
-    await telemetry.record({ runId, workerId, event: {
-      type: "lifecycle",
-      phase,
-      exitCode: exitCode === null ? null : exitCode,
-      harness: launch.harness,
-      version: launch.harnessVersion,
-      runId,
-      workerId,
-    } });
+    await telemetry.record({ runId, workerId, event: lifecycle(phase) });
 
     return { pid: pid ?? null, startedAt, exitCode };
   }
