@@ -65,15 +65,35 @@ function unwrapHerdrPayload(payload, context) {
   return payload;
 }
 
+// Herdr writes its JSON error envelope to stderr, so a failed command usually leaves stdout empty.
+function extractStderrEnvelope(stderr) {
+  const trimmed = stderr?.trim();
+  if (!trimmed) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+
+  const error = payload?.error ?? (payload?.ok === false ? payload : null);
+  if (!error || typeof error !== "object") return null;
+  return error;
+}
+
 function parseJsonResult(result, context) {
   const stdout = result.stdout?.trim() ?? "";
 
   if (!stdout) {
     if (result.code && result.code !== 0) {
+      const envelope = extractStderrEnvelope(result.stderr);
       fail(
         "HERDR",
-        `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
+        envelope?.message
+          ?? `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
         {
+          ...(envelope?.code ? { code: envelope.code } : {}),
           stdout: result.stdout,
           stderr: result.stderr,
           command: context.binary,
@@ -219,16 +239,16 @@ function pushFocus(args, focus = false) {
 function normalizeWorkflowEnv(env = {}) {
   if (env === undefined || env === null) return [];
   if (typeof env !== "object" || Array.isArray(env)) {
-    fail("PREFLIGHT", "startAgent env must be a workflow env object", { env }, 10);
+    fail("PREFLIGHT", "workflow env must be a workflow env object", { env }, 10);
   }
 
   const entries = [];
   for (const [key, value] of Object.entries(env)) {
     if (!WORKFLOW_ENV_KEYS.has(key)) {
-      fail("PREFLIGHT", `startAgent env contains non-workflow key ${key}`, { key }, 10);
+      fail("PREFLIGHT", `workflow env contains non-workflow key ${key}`, { key }, 10);
     }
     if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
-      fail("PREFLIGHT", `startAgent env ${key} must be a non-empty string`, { key }, 10);
+      fail("PREFLIGHT", `workflow env ${key} must be a non-empty string`, { key }, 10);
     }
     entries.push(`${key}=${value}`);
   }
@@ -446,10 +466,13 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       return await invoke("pane", "rename", [paneId, label]);
     },
 
-    async splitPane({ paneId, direction, ratio, cwd, focus = false }) {
+    async splitPane({ paneId, direction, ratio, cwd, env, focus = false }) {
       const args = [paneId, "--direction", direction];
       pushOption(args, "--ratio", ratio);
       pushOption(args, "--cwd", cwd);
+      for (const entry of normalizeWorkflowEnv(env)) {
+        args.push("--env", entry);
+      }
       pushFocus(args, focus);
       return normalizePaneResult(await invoke("pane", "split", args, { cwd }));
     },

@@ -456,6 +456,55 @@ test("throws a HERDR error on live API error envelopes", async () => {
   );
 });
 
+test("surfaces the herdr error envelope when it is written to stderr instead of stdout", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: cliError(
+            { code: "agent_pane_not_found", message: "agent target pane wK:p2 not found" },
+            "cli:agent:start",
+          ),
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({ name: "fixture-single-FIX-101", paneId: "wK:p2", kind: "pi", argv: ["--name", "x"] }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "HERDR");
+      assert.match(error.message, /agent target pane wK:p2 not found/);
+      assert.equal(error.details.code, "agent_pane_not_found");
+      return true;
+    },
+  );
+});
+
+test("keeps the generic exit-code failure when stderr holds no herdr envelope", async () => {
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run() {
+        return { code: 1, stdout: "", stderr: "segfault" };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.listAgents(),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "HERDR");
+      assert.match(error.message, /exit code 1/);
+      assert.equal(error.details.stderr, "segfault");
+      return true;
+    },
+  );
+});
+
 test("throws a HERDR error on malformed JSON output", async () => {
   const herdr = createHerdrAdapter({
     runner: {
@@ -717,6 +766,76 @@ test("creates tabs and panes with explicit focus flags and live parsed IDs", asy
 
   assert.deepEqual(tab, { tabId: "w2:t2", paneId: "w2:p2" });
   assert.deepEqual(pane, { paneId: "w2:p3" });
+});
+
+test("forwards workflow env to the split pane so the agent inherits the run context", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "pane",
+          "split",
+          "w2:p2",
+          "--direction",
+          "down",
+          "--cwd",
+          "/repo/.worktrees/FIX-101",
+          "--env",
+          "WORKFLOW_RUN_ID=run-1",
+          "--env",
+          "WORKFLOW_RUN_DIR=/state/runs/run-1",
+          "--env",
+          "WORKFLOW_GENERATION=1",
+          "--env",
+          "WORKFLOW_HARNESS=pi",
+          "--env",
+          "WORKFLOW_STATE_ROOT=/state",
+          "--env",
+          "WORKFLOW_CONTROL_PLANE_BIN=/repo/bin/workflow.js",
+          "--no-focus",
+        ]);
+        assert.deepEqual(options, { allowFailure: true, cwd: "/repo/.worktrees/FIX-101" });
+      },
+      stdout: cliResult({
+        type: "pane_split",
+        pane: { pane_id: "w2:p3", tab_id: "w2:t2", workspace_id: "w2" },
+      }, "cli:pane:split"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const pane = await herdr.splitPane({
+    paneId: "w2:p2",
+    direction: "down",
+    cwd: "/repo/.worktrees/FIX-101",
+    env: {
+      WORKFLOW_RUN_ID: "run-1",
+      WORKFLOW_RUN_DIR: "/state/runs/run-1",
+      WORKFLOW_GENERATION: "1",
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: "/state",
+      WORKFLOW_CONTROL_PLANE_BIN: "/repo/bin/workflow.js",
+    },
+    focus: false,
+  });
+
+  assert.deepEqual(pane, { paneId: "w2:p3" });
+});
+
+test("rejects non-workflow env keys before splitting a pane", async () => {
+  const fixture = fixtureRunner([]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  await assert.rejects(
+    herdr.splitPane({
+      paneId: "w2:p2",
+      direction: "down",
+      cwd: "/repo/.worktrees/FIX-101",
+      env: { PATH: "/usr/bin" },
+    }),
+    (error) => error instanceof WorkflowError && error.category === "PREFLIGHT",
+  );
+  assert.equal(fixture.calls.length, 0);
 });
 
 test("renames tabs and panes, preserving literal labels without unsupported json flags", async () => {
