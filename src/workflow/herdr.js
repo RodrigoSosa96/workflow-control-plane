@@ -352,7 +352,16 @@ function normalizePaneProcessInfo(value) {
   };
 }
 
-export function createHerdrAdapter({ runner, binary = "herdr" }) {
+// `pane split` returns before the new pane reaches its interactive shell prompt, and
+// `agent start` rejects an unready pane outright rather than waiting for it.
+const PANE_READY_TIMEOUT_MS = 10000;
+const PANE_READY_POLL_MS = 250;
+
+function defaultSleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSleep }) {
   async function run(area, command, args = [], { cwd } = {}) {
     const fullArgs = command ? [area, command, ...args] : [area, ...args];
     const result = await runner.run(binary, fullArgs, {
@@ -493,7 +502,7 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
 
     // Herdr types the canonical executable for --kind itself, so argv[0] is dropped and only
     // the remaining arguments are passed after --. `agent start` has no focus flag.
-    async startAgent({ name, paneId, kind, argv, timeout } = {}) {
+    async startAgent({ name, paneId, kind, argv, timeout, paneReadyTimeout = PANE_READY_TIMEOUT_MS } = {}) {
       if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
         fail("PREFLIGHT", "startAgent requires argv from a trusted source", { name, paneId, kind, argv }, 10);
       }
@@ -520,7 +529,16 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       pushOption(args, "--timeout", timeout);
       args.push("--", ...argv.slice(1));
 
-      return normalizeAgentResult(await invoke("agent", "start", args));
+      let waited = 0;
+      for (;;) {
+        try {
+          return normalizeAgentResult(await invoke("agent", "start", args));
+        } catch (error) {
+          if (error?.details?.code !== "agent_pane_busy" || waited >= paneReadyTimeout) throw error;
+          await sleep(PANE_READY_POLL_MS);
+          waited += PANE_READY_POLL_MS;
+        }
+      }
     },
   };
 }

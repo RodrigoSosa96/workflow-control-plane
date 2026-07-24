@@ -720,7 +720,7 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
       focus: false,
     });
     const startedAgent = await herdr.startAgent({
-      name: plan.agent.sessionName,
+      name: plan.agent.agentName,
       paneId: agentPane.paneId,
       kind: plan.agent.harness ?? "pi",
       argv: launch.argv,
@@ -938,7 +938,7 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       focus: false,
     });
     const startedAgent = await herdr.startAgent({
-      name: plan.agent.sessionName,
+      name: plan.agent.agentName,
       paneId: agentPane.paneId,
       kind: plan.agent.harness ?? "pi",
       argv: launch.argv,

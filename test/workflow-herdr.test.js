@@ -1109,6 +1109,109 @@ test("starts an agent with a non-pi harness kind", async () => {
   });
 });
 
+test("waits for a freshly split pane to reach its shell prompt before starting the agent", async () => {
+  let attempts = 0;
+  const slept = [];
+  const herdr = createHerdrAdapter({
+    sleep: async (ms) => { slept.push(ms); },
+    runner: {
+      async run() {
+        attempts += 1;
+        if (attempts < 3) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: cliError(
+              { code: "agent_pane_busy", message: "agent target pane w2:p9 is not an available shell" },
+              "cli:agent:start",
+            ),
+          };
+        }
+        return {
+          code: 0,
+          stdout: cliResult({
+            type: "agent_started",
+            agent: { agent_id: "a9" },
+            tab: { tab_id: "w2:t1" },
+            pane: { pane_id: "w2:p9" },
+          }, "cli:agent:start"),
+          stderr: "",
+        };
+      },
+    },
+  });
+
+  const result = await herdr.startAgent({
+    name: "fixture-single-fix-101",
+    paneId: "w2:p9",
+    kind: "pi",
+    argv: ["pi", "--name", "x"],
+  });
+
+  assert.equal(result.agentId, "a9");
+  assert.equal(attempts, 3);
+  assert.equal(slept.length, 2);
+});
+
+test("gives up waiting for a busy pane and surfaces the herdr error", async () => {
+  let attempts = 0;
+  const herdr = createHerdrAdapter({
+    sleep: async () => {},
+    runner: {
+      async run() {
+        attempts += 1;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: cliError(
+            { code: "agent_pane_busy", message: "agent target pane w2:p9 is not an available shell" },
+            "cli:agent:start",
+          ),
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({
+      name: "fixture-single-fix-101",
+      paneId: "w2:p9",
+      kind: "pi",
+      argv: ["pi", "--name", "x"],
+      paneReadyTimeout: 1000,
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.details.code, "agent_pane_busy");
+      return true;
+    },
+  );
+  assert.ok(attempts > 1, `expected retries, got ${attempts}`);
+});
+
+test("does not retry agent start failures unrelated to pane readiness", async () => {
+  let attempts = 0;
+  const herdr = createHerdrAdapter({
+    sleep: async () => {},
+    runner: {
+      async run() {
+        attempts += 1;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: cliError({ code: "invalid_agent_name", message: "agent name must start with a lowercase letter" }, "cli:agent:start"),
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({ name: "BAD", paneId: "w2:p9", kind: "pi", argv: ["pi", "--name", "x"] }),
+    (error) => error.details.code === "invalid_agent_name",
+  );
+  assert.equal(attempts, 1);
+});
+
 test("rejects argv whose executable does not match the agent kind", async () => {
   const calls = [];
   const herdr = createHerdrAdapter({
