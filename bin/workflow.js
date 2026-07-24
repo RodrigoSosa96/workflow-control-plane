@@ -576,7 +576,7 @@ function categorizeError(error) {
   if (error instanceof WorkflowError) {
     if (error.category === "USAGE") return { category: "USAGE", exitCode: 64 };
     if (error.category === "CONFLICT") return { category: "CONFLICT", exitCode: 11 };
-    if (["PREFLIGHT", "delegation", "delegation-reservation", "delegation-service"].includes(error.category)) {
+    if (["PREFLIGHT", "delegation", "delegation-reservation", "delegation-service", "resume", "close"].includes(error.category)) {
       return { category: "PREFLIGHT", exitCode: 10 };
     }
     if (error.category === "HANDOFF") return { category: "HANDOFF", exitCode: 10 };

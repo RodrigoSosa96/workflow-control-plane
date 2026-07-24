@@ -1679,6 +1679,24 @@ test("maps conflict and preflight workflow errors to stable categories", async (
     },
   }), 10);
   assert.deepEqual(delegationService.stderr, ["PREFLIGHT: exact worker must be idle"]);
+
+  const resume = io();
+  assert.equal(await main(["resume", RUN_ID], {
+    ...resume,
+    resumeCommand: async () => {
+      throw new WorkflowError("resume", "Run has no exact session identity to resume");
+    },
+  }), 10);
+  assert.deepEqual(resume.stderr, ["PREFLIGHT: Run has no exact session identity to resume"]);
+
+  const close = io();
+  assert.equal(await main(["close", RUN_ID], {
+    ...close,
+    closeCommand: async () => {
+      throw new WorkflowError("close", "close requires a worker transport");
+    },
+  }), 10);
+  assert.deepEqual(close.stderr, ["PREFLIGHT: close requires a worker transport"]);
 });
 
 test("bounds formatted output before printing", async () => {
