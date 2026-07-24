@@ -77,6 +77,8 @@ function piEvents(record) {
     case "agent_end":
     case "queue_update":
     case "auto_retry_end":
+    case "tool_execution_update":
+    case "tool_execution_end":
       return IGNORE_EVENT;
     case "agent_start":
     case "turn_start":
@@ -99,7 +101,10 @@ function piEvents(record) {
         maxAttempts: ownNumber(record, "maxAttempts", "retry"),
       })];
     case "message_end": {
-      if (!plainObject(record.message) || record.message.role !== "assistant") fail("Invalid Pi assistant message");
+      // Only an assistant message reports model or usage. A user message_end echoes the
+      // prompt, and an assistant message may close without measurement; both are ignored
+      // rather than failed, so they cannot pin the snapshot to unknown.
+      if (!plainObject(record.message) || record.message.role !== "assistant") return IGNORE_EVENT;
       const events = [];
       if (record.message.model !== undefined) {
         events.push(normalizeTelemetryEvent({ type: "model", harness: "pi", model: record.message.model }));
@@ -109,7 +114,7 @@ function piEvents(record) {
         const cost = plainObject(usage?.cost) ? ownNumber(usage.cost, "total", "cost") : undefined;
         events.push(usageEvent("pi", usage, { cost }));
       }
-      if (!events.length) fail("Invalid Pi assistant message");
+      if (!events.length) return IGNORE_EVENT;
       return events;
     }
     case "response": {

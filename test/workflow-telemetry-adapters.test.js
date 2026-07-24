@@ -115,9 +115,21 @@ test("ignores Pi protocol events that carry no measurement instead of degrading 
   // These events are part of Pi's real stream but report nothing measurable. Treating
   // them as unknown pins the worker snapshot to unknown for the rest of the run, so they
   // must be ignored (no telemetry event) rather than degraded.
-  for (const type of ["session", "message_start", "message_update", "turn_end", "agent_end"]) {
+  for (const type of [
+    "session", "message_start", "message_update", "turn_end", "agent_end",
+    "tool_execution_update", "tool_execution_end", "queue_update", "auto_retry_end",
+  ]) {
     assert.deepEqual(pi.consume({ type }), [], `expected ${type} to be ignored`);
   }
+
+  // A user message_end echoes the prompt and carries no measurement; only assistant
+  // message_end reports model and usage. Neither may degrade the snapshot.
+  assert.deepEqual(pi.consume({ type: "message_end", message: { role: "user", content: [] } }), []);
+  assert.deepEqual(pi.consume({ type: "message_end", message: { role: "assistant", content: [] } }), []);
+  assert.deepEqual(
+    pi.consume({ type: "message_end", message: { role: "assistant", model: "kimi", usage: { input: 1, output: 2 } } }).map((event) => event.type),
+    ["model", "usage"],
+  );
 
   // Recognized measurement events still map through.
   assert.deepEqual(pi.consume({ type: "agent_start" }), [{ type: "lifecycle", harness: "pi", phase: "running" }]);
