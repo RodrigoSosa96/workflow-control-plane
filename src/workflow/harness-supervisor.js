@@ -62,7 +62,7 @@ async function* decodeLfJsonl(stdout) {
   if (final.length > 0) yield final;
 }
 
-export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, createAdapter, clock = () => new Date().toISOString() }) {
+export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, createAdapter, clock = () => new Date().toISOString(), baseEnv = process.env }) {
   async function run({ runId, workerId, launch }) {
     validateLaunchRecord(launch);
 
@@ -81,7 +81,10 @@ export function createHarnessSupervisor({ spawn: spawnChild = spawn, telemetry, 
     const adapter = createAdapter({ harness: launch.harness, version: launch.harnessVersion });
     const child = spawnChild(launch.command, launch.argv, {
       cwd: launch.cwd,
-      env: launch.env,
+      // Passing only the workflow variables would replace the environment outright,
+      // leaving the harness without PATH, HOME or provider credentials. Inherit the
+      // surrounding environment and let the run's own identity take precedence.
+      env: { ...baseEnv, ...launch.env },
       shell: false,
       stdio: ["ignore", "pipe", "ignore"],
     });

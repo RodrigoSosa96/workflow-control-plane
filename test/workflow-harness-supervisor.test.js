@@ -55,10 +55,11 @@ function memoryTelemetry() {
   };
 }
 
-function supervisor({ telemetry, spawn }) {
+function supervisor({ telemetry, spawn, baseEnv = { PATH: "/usr/bin", HOME: "/home/dev" } }) {
   return createHarnessSupervisor({
     telemetry,
     spawn,
+    baseEnv,
     createAdapter: createTelemetryAdapter,
     clock: () => "2026-07-23T00:00:00.000Z",
   });
@@ -76,7 +77,12 @@ test("streams chunk-split LF JSONL into normalized telemetry and settles on exit
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.pid, 4321);
-  assert.deepEqual(calls[0].options, { cwd: "/fixture/worktree", env: { WORKFLOW_RUN_ID: RUN_ID, WORKFLOW_STATE_ROOT: "/state" }, shell: false, stdio: ["ignore", "pipe", "ignore"] });
+  assert.deepEqual(calls[0].options, {
+    cwd: "/fixture/worktree",
+    env: { PATH: "/usr/bin", HOME: "/home/dev", WORKFLOW_RUN_ID: RUN_ID, WORKFLOW_STATE_ROOT: "/state" },
+    shell: false,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
   assert.equal(telemetry.events[0].phase, "starting");
   assert.equal(telemetry.events.some((event) => event.phase === "running"), true);
   assert.equal(telemetry.events.at(-1).phase, "settled");
@@ -145,4 +151,25 @@ test("rejects malformed frozen launch records before spawning", async () => {
   }
   assert.equal(calls.length, 0);
   assert.equal(telemetry.events.length, 0);
+});
+
+test("the harness inherits the surrounding environment so it can resolve its binary and credentials", async () => {
+  const telemetry = memoryTelemetry();
+  const { calls, spawn } = fakeSpawn({ stdoutChunks: [] });
+
+  await supervisor({
+    telemetry,
+    spawn,
+    baseEnv: { PATH: "/usr/bin", HOME: "/home/dev", ANTHROPIC_API_KEY: "secret", WORKFLOW_RUN_ID: "stale-run" },
+  }).run({ runId: RUN_ID, workerId: WORKER_ID, launch: fixtureLaunch() });
+
+  const env = calls[0].options.env;
+  // Replacing the environment outright leaves the harness without PATH, HOME or any
+  // provider credentials, so it cannot even be resolved, let alone authenticate.
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.HOME, "/home/dev");
+  assert.equal(env.ANTHROPIC_API_KEY, "secret");
+  // The run's own identity still wins over anything inherited from the shell.
+  assert.equal(env.WORKFLOW_RUN_ID, RUN_ID);
+  assert.equal(env.WORKFLOW_STATE_ROOT, "/state");
 });
