@@ -70,3 +70,40 @@ test("rejects a non-positive-integer generation", async () => {
     (error) => error instanceof WorkflowError && error.category === "lifecycle",
   );
 });
+
+test("stop with a valid handoff completes without continuation", async () => {
+  const store = fakeStore({ state: RUN_STATES.RUNNING, generation: 1, stopAttempts: 0 });
+  const lifecycle = createLifecycle({ store, clock: () => "t1" });
+  const { run, action } = await lifecycle.onStop({ runId: "r1", generation: 1, hasValidHandoff: true });
+  assert.equal(action, "none");
+  assert.equal(run.state, RUN_STATES.COMPLETED);
+});
+
+test("stop without a handoff queues up to two continuations then requires manual handoff", async () => {
+  const store = fakeStore({ state: RUN_STATES.RUNNING, generation: 1, stopAttempts: 0 });
+  const lifecycle = createLifecycle({ store, clock: () => "t1" });
+  const first = await lifecycle.onStop({ runId: "r1", generation: 1, hasValidHandoff: false });
+  assert.equal(first.action, "continue");
+  assert.equal(first.run.stopAttempts, 1);
+  const second = await lifecycle.onStop({ runId: "r1", generation: 1, hasValidHandoff: false });
+  assert.equal(second.action, "continue");
+  assert.equal(second.run.stopAttempts, 2);
+  const third = await lifecycle.onStop({ runId: "r1", generation: 1, hasValidHandoff: false });
+  assert.equal(third.action, "manual");
+  assert.equal(third.run.state, RUN_STATES.MANUAL_HANDOFF_REQUIRED);
+});
+
+test("stop with a stale generation is treated as missing (no state change)", async () => {
+  const store = fakeStore({ state: RUN_STATES.RUNNING, generation: 2, stopAttempts: 0 });
+  const lifecycle = createLifecycle({ store, clock: () => "t1" });
+  const { action, run } = await lifecycle.onStop({ runId: "r1", generation: 1, hasValidHandoff: false });
+  assert.equal(action, "none");
+  assert.equal(run.generation, 2);
+});
+
+test("session end from a non-terminal state interrupts; terminal states are preserved", async () => {
+  const running = fakeStore({ state: RUN_STATES.RUNNING, generation: 1 });
+  assert.equal((await createLifecycle({ store: running, clock: () => "t" }).onSessionEnd({ runId: "r1" })).state, RUN_STATES.INTERRUPTED);
+  const done = fakeStore({ state: RUN_STATES.COMPLETED, generation: 1 });
+  assert.equal((await createLifecycle({ store: done, clock: () => "t" }).onSessionEnd({ runId: "r1" })).state, RUN_STATES.COMPLETED);
+});
