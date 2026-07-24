@@ -14,6 +14,8 @@ import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { readFile as defaultReadFile } from "node:fs/promises";
 
+const readPromptFile = defaultReadFile;
+
 function parseArgs(argv) {
   const args = { fake: false, real: false, keep: false, agent: null };
   for (let i = 0; i < argv.length; i++) {
@@ -170,7 +172,8 @@ function createLaunchDeps(fixture, env, overrides = {}) {
   };
 }
 
-async function runWorkflowLaunch({ fixture, promptPath, agent, env, launchCommand = defaultLaunchCommand }) {
+async function runWorkflowLaunch({ fixture, promptPath, agent, env, launchCommand = defaultLaunchCommand, readFile = defaultReadFile }) {
+  const request = await readFile(promptPath, "utf8");
   const deps = createLaunchDeps(fixture, env);
   const command = await launchCommand({
     command: "launch",
@@ -179,6 +182,7 @@ async function runWorkflowLaunch({ fixture, promptPath, agent, env, launchComman
     tickets: ["FIX-102"],
     agentProfile: `${agent}-worker`,
     promptFile: promptPath,
+    request,
     registryPath: fixture.registryPath,
     stateRoot: fixture.stateRoot,
     controlPlaneBin: join(fixture.packageRoot, "bin", "workflow.js"),

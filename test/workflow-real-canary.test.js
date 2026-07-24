@@ -124,6 +124,8 @@ test("real-mode path builds fixture registry launch options", async () => {
   assert.equal(captured.registryPath, join(fixtureRoot, "projects.yaml"));
   assert.equal(captured.stateRoot, join(fixtureRoot, "state"));
   assert.ok(captured.controlPlaneBin.endsWith("bin/workflow.js"));
+  assert.ok(captured.request);
+  assert.match(captured.request, /controlled Workflow canary/);
 });
 
 test("poll completes on current completed result", async () => {
