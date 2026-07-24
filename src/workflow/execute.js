@@ -408,14 +408,21 @@ function resolveAgentTabId(plan, fallbackTabId) {
   return actualTabId ?? fallbackTabId ?? null;
 }
 
+function resolveAgentTabPaneId(plan, fallbackPaneId) {
+  const tab = plan.tabs?.find((item) => item.label === plan.agent.tabLabel);
+  const actualPaneId = getPaneId(tab?.actual);
+  return actualPaneId ?? fallbackPaneId ?? null;
+}
+
 function ensureStartShape({ herdr, worktreeOperation, workspaceOperation, agentTabOperation, agentOperation }) {
   if (!herdr) {
     fail("PREFLIGHT", "executeStart requires a Herdr adapter", {}, 10);
   }
   if (typeof herdr.ensureNativeWorktree !== "function"
     || typeof herdr.renameTab !== "function"
+    || typeof herdr.splitPane !== "function"
     || typeof herdr.startAgent !== "function") {
-    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, and agent methods", {}, 10);
+    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, split, and agent methods", {}, 10);
   }
   if (!worktreeOperation || !workspaceOperation || !agentTabOperation || !agentOperation) {
     fail("PREFLIGHT", "executeStart requires ordinary start operations for worktree, workspace, agent-tab, and agent", {
@@ -628,8 +635,9 @@ function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorT
   if (typeof herdr.ensureNativeWorktree !== "function"
     || typeof herdr.renameTab !== "function"
     || typeof herdr.createTab !== "function"
+    || typeof herdr.splitPane !== "function"
     || typeof herdr.startAgent !== "function") {
-    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, and agent methods", {}, 10);
+    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, split, and agent methods", {}, 10);
   }
   if (!metaWorktreeOperation || !coordinatorTabOperation || !agentOperation || childWorktreeOperations.length === 0 || childTabOperations.length === 0) {
     fail("PREFLIGHT", "executeStart requires group start operations for meta worktree, child worktrees, coordinator tab, child tabs, and agent", {
@@ -674,18 +682,20 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
 
     let agentTabStatus = "reused";
     let agentTabId = resolveAgentTabId(plan, bootstrapContext?.tabId ?? null);
+    let agentTabPaneId = resolveAgentTabPaneId(plan, bootstrapContext?.paneId ?? null);
 
     if (agentTabOperation.reconciliation?.status !== "compatible") {
       currentOperation = agentTabOperation;
-      if (!agentTabId) {
+      if (!agentTabId || !agentTabPaneId) {
         bootstrapContext = await resolveBootstrapContext(plan, worktreeOperation, ensured, herdr);
         agentTabId = bootstrapContext.tabId;
+        agentTabPaneId = bootstrapContext.paneId;
       }
       await herdr.renameTab({ tabId: agentTabId, label: plan.agent.tabLabel });
       agentTabStatus = "created";
     }
 
-    report.operations.push(buildOperationReport(agentTabOperation, agentTabStatus, { tabId: agentTabId }));
+    report.operations.push(buildOperationReport(agentTabOperation, agentTabStatus, { tabId: agentTabId, paneId: agentTabPaneId }));
     completedIds.add(agentTabOperation.id);
 
     if (agentOperation.reconciliation?.status === "compatible") {
@@ -702,13 +712,20 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
       cwd: plan.agent.worktreePath,
       run: plan.run ?? null,
     });
-    const startedAgent = await herdr.startAgent({
-      name: plan.agent.sessionName,
+    const agentPane = await herdr.splitPane({
+      paneId: agentTabPaneId,
+      direction: "down",
       cwd: plan.agent.worktreePath,
-      tabId: agentTabId,
-      argv: launch.argv,
       env: launch.env,
       focus: false,
+    });
+    const startedAgent = await herdr.startAgent({
+      name: plan.agent.sessionName,
+      paneId: agentPane.paneId,
+      kind: plan.agent.harness ?? "pi",
+      argv: launch.argv,
+      focus: false,
+      timeout: 30000,
     });
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
@@ -847,19 +864,21 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
     }
 
     let coordinatorTabId = resolveTabId(plan, plan.agent.tabLabel, bootstrapContext?.tabId ?? null);
+    let coordinatorTabPaneId = getPaneId(plan.tabs?.find((item) => item.label === plan.agent.tabLabel)?.actual) ?? bootstrapContext?.paneId ?? null;
     let coordinatorTabStatus = "reused";
 
     if (coordinatorTabOperation.reconciliation?.status !== "compatible") {
       currentOperation = coordinatorTabOperation;
-      if (!coordinatorTabId) {
+      if (!coordinatorTabId || !coordinatorTabPaneId) {
         bootstrapContext = await resolveBootstrapContext(plan, metaWorktreeOperation, ensured, herdr);
         coordinatorTabId = bootstrapContext.tabId;
+        coordinatorTabPaneId = bootstrapContext.paneId;
       }
       await herdr.renameTab({ tabId: coordinatorTabId, label: plan.agent.tabLabel });
       coordinatorTabStatus = "created";
     }
 
-    report.operations.push(buildOperationReport(coordinatorTabOperation, coordinatorTabStatus, { tabId: coordinatorTabId }));
+    report.operations.push(buildOperationReport(coordinatorTabOperation, coordinatorTabStatus, { tabId: coordinatorTabId, paneId: coordinatorTabPaneId }));
     completedIds.add(coordinatorTabOperation.id);
 
     let workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? getWorkspaceId(plan.workspace?.actual);
@@ -867,6 +886,7 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       bootstrapContext = await resolveBootstrapContext(plan, metaWorktreeOperation, ensured, herdr);
       workspaceId = bootstrapContext.workspaceId;
       coordinatorTabId ??= bootstrapContext.tabId;
+      coordinatorTabPaneId ??= bootstrapContext.paneId;
     }
 
     for (const operation of childTabOperations) {
@@ -911,13 +931,20 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       cwd: plan.agent.worktreePath,
       run: plan.run ?? null,
     });
-    const startedAgent = await herdr.startAgent({
-      name: plan.agent.sessionName,
+    const agentPane = await herdr.splitPane({
+      paneId: coordinatorTabPaneId,
+      direction: "down",
       cwd: plan.agent.worktreePath,
-      tabId: coordinatorTabId,
-      argv: launch.argv,
       env: launch.env,
       focus: false,
+    });
+    const startedAgent = await herdr.startAgent({
+      name: plan.agent.sessionName,
+      paneId: agentPane.paneId,
+      kind: plan.agent.harness ?? "pi",
+      argv: launch.argv,
+      focus: false,
+      timeout: 30000,
     });
 
     report.operations.push(buildOperationReport(agentOperation, "created", {

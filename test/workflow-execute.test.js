@@ -204,11 +204,13 @@ function buildWorkspaceState({
 
 function createHerdr(calls, {
   ensureResult = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1", disposition: "created" },
+  splitResult = { paneId: "w1:p2" },
   startResult = { agentId: "a1", tabId: "w1:t1", paneId: "w1:p2" },
   failRename = null,
   failStart = null,
   failListTabs = null,
   failListPanes = null,
+  failSplit = null,
   workspaces,
   tabs,
   panes,
@@ -250,8 +252,13 @@ function createHerdr(calls, {
       if (failRename) throw failRename;
       return { tab_id: tabId, label };
     },
-    async startAgent({ name, cwd, tabId, argv, env, focus }) {
-      calls.push({ kind: "herdr.agent.start", name, cwd, tabId, argv, env, focus });
+    async splitPane({ paneId, direction, cwd, env, focus }) {
+      calls.push({ kind: "herdr.pane.split", paneId, direction, cwd, env, focus });
+      if (failSplit) throw failSplit;
+      return splitResult;
+    },
+    async startAgent({ name, paneId, kind, argv, focus }) {
+      calls.push({ kind: "herdr.agent.start", name, paneId, harnessKind: kind, argv, focus });
       if (failStart) throw failStart;
       return startResult;
     },
@@ -457,6 +464,7 @@ test("creates native worktree and starts a named Pi session without a prompt", a
   assert.deepEqual(calls.map((call) => call.kind), [
     "herdr.worktree.create",
     "herdr.tab.rename",
+    "herdr.pane.split",
     "herdr.agent.start",
     "herdr.tab.list",
     "herdr.pane.list",
@@ -500,10 +508,11 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   });
 
   assert.equal(report.status, "completed");
-  assert.deepEqual(calls.map((call) => call.kind).slice(0, 4), [
+  assert.deepEqual(calls.map((call) => call.kind).slice(0, 5), [
     "herdr.worktree.create",
     "herdr.tab.rename",
     "launch.builder",
+    "herdr.pane.split",
     "herdr.agent.start",
   ]);
   const builderCall = calls.find((call) => call.kind === "launch.builder");
@@ -513,9 +522,15 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   assert.equal(builderCall.input.cwd, workspacePath);
   assert.deepEqual(builderCall.input.run, plan.run);
 
+  const split = calls.find((call) => call.kind === "herdr.pane.split");
+  assert.equal(split.paneId, "w1:p1");
+  assert.equal(split.cwd, workspacePath);
+  assert.deepEqual(split.env, launchSpec.env);
+
   const launch = calls.find((call) => call.kind === "herdr.agent.start");
   assert.deepEqual(launch.argv, launchSpec.argv);
-  assert.deepEqual(launch.env, launchSpec.env);
+  assert.equal(launch.harnessKind, "codex");
+  assert.equal(launch.paneId, "w1:p2");
 });
 
 test("accepts an exact OpenCode agent identity before Herdr mutation", async () => {
@@ -537,7 +552,10 @@ test("accepts an exact OpenCode agent identity before Herdr mutation", async () 
   const report = await executeStart(plan, fakeAdapters(calls), { buildAgentLaunch: () => launchSpec });
 
   assert.equal(report.status, "completed");
-  assert.deepEqual(calls.find((call) => call.kind === "herdr.agent.start").argv, launchSpec.argv);
+  const launch = calls.find((call) => call.kind === "herdr.agent.start");
+  assert.deepEqual(launch.argv, launchSpec.argv);
+  assert.equal(launch.harnessKind, "opencode");
+  assert.equal(launch.paneId, "w1:p2");
 });
 
 test("rejects a generic Codex start operation without an explicit harness before mutation", async () => {
@@ -694,6 +712,7 @@ test("reopens a closed workspace before renaming the bootstrap tab and starting 
   assert.deepEqual(calls.map((call) => call.kind), [
     "herdr.worktree.open",
     "herdr.tab.rename",
+    "herdr.pane.split",
     "herdr.agent.start",
     "herdr.tab.list",
     "herdr.pane.list",
@@ -761,10 +780,12 @@ test("recovers a partial rerun from live Herdr workspace facts when open reconci
     "herdr.tab.list",
     "herdr.pane.list",
     "herdr.tab.rename",
+    "herdr.pane.split",
     "herdr.agent.start",
   ]);
   assert.equal(calls.find((call) => call.kind === "herdr.tab.rename").tabId, "w1:t7");
-  assert.equal(calls.find((call) => call.kind === "herdr.agent.start").tabId, "w1:t7");
+  assert.equal(calls.find((call) => call.kind === "herdr.pane.split").paneId, "w1:p9");
+  assert.equal(calls.find((call) => call.kind === "herdr.agent.start").paneId, "w1:p2");
   assert.deepEqual(report.operations.map((operation) => operation.status), [
     "reused",
     "reused",
@@ -802,6 +823,7 @@ test("retains the bootstrap shell when the Pi pane safety condition is not met",
   assert.deepEqual(calls.map((call) => call.kind), [
     "herdr.worktree.create",
     "herdr.tab.rename",
+    "herdr.pane.split",
     "herdr.agent.start",
     "herdr.tab.list",
     "herdr.pane.list",
@@ -909,6 +931,7 @@ test("retains the bootstrap shell and still succeeds when post-start close safet
   assert.deepEqual(calls.map((call) => call.kind), [
     "herdr.worktree.create",
     "herdr.tab.rename",
+    "herdr.pane.split",
     "herdr.agent.start",
     "herdr.tab.list",
   ]);

@@ -163,6 +163,9 @@ function createHerdr({ statusResult, integrations = [], workspaces = [], tabs = 
     async createTab() {
       throw new Error("createTab must not be called by read-only commands");
     },
+    async splitPane() {
+      throw new Error("splitPane must not be called by read-only commands");
+    },
     async startAgent() {
       throw new Error("startAgent must not be called by read-only commands");
     },

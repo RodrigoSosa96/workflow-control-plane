@@ -468,29 +468,25 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       return normalizePaneProcessInfo(await invoke("pane", "process-info", ["--pane", paneId]));
     },
 
-    async startAgent({ name, cwd, workspaceId, tabId, split, argv, env = {}, focus = false }) {
+    async startAgent({ name, paneId, kind, argv, focus = false, timeout } = {}) {
       if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
-        fail("PREFLIGHT", "startAgent requires argv from a trusted source", {
-          name,
-          cwd,
-          workspaceId,
-          tabId,
-          split,
-          argv,
-        }, 10);
+        fail("PREFLIGHT", "startAgent requires argv from a trusted source", { name, paneId, kind, argv }, 10);
       }
-      const envEntries = normalizeWorkflowEnv(env);
+      if (typeof paneId !== "string" || !paneId) {
+        fail("PREFLIGHT", "startAgent requires a pane ID", { name, paneId, kind }, 10);
+      }
+      if (typeof kind !== "string" || !kind) {
+        fail("PREFLIGHT", "startAgent requires an agent kind", { name, paneId, kind }, 10);
+      }
 
       const args = [name];
-      pushOption(args, "--cwd", cwd);
-      pushOption(args, "--workspace", workspaceId);
-      pushOption(args, "--tab", tabId);
-      pushOption(args, "--split", split);
+      pushOption(args, "--kind", kind);
+      pushOption(args, "--pane", paneId);
+      pushOption(args, "--timeout", timeout);
       pushFocus(args, focus);
-      for (const entry of envEntries) args.push("--env", entry);
       args.push("--", ...argv);
 
-      return normalizeAgentResult(await invoke("agent", "start", args, { cwd }));
+      return normalizeAgentResult(await invoke("agent", "start", args));
     },
   };
 }

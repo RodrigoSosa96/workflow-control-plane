@@ -38,8 +38,9 @@ function fakeHerdr({ harness = "pi" } = {}) {
   return {
     async ensureNativeWorktree() { return { workspaceId: "ws-1", worktreePath: "/tmp", tabId: "tab-1", paneId: "pane-1" }; },
     async renameTab() {},
-    async createTab() { return { tabId: "tab-1" }; },
-    async startAgent() { return { agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" }; },
+    async createTab() { return { tabId: "tab-1", paneId: "pane-1" }; },
+    async splitPane() { return { paneId: "pane-2" }; },
+    async startAgent() { return { agentId: "agent-1", tabId: "tab-1", paneId: "pane-2" }; },
     async listWorkspaces() { return { workspaces: [] }; },
     async listTabs() { return { tabs: [] }; },
     async listPanes() { return { panes: [] }; },

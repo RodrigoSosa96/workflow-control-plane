@@ -252,31 +252,38 @@ function createFakeHerdr({ repoKey }) {
       const { tab, pane } = makeTab(workspace, { label, cwd });
       return { tabId: tab.tab_id, paneId: pane.pane_id };
     },
-    async startAgent({ name, cwd, tabId, argv, focus }) {
-      calls.push({ kind: "herdr.agent.start", name, cwd, tabId, argv, focus });
-      const workspace = [...workspacesByPath.values()].find((candidate) => candidate.tabs.some((tab) => tab.tab_id === tabId));
-      if (!workspace) throw new Error(`Unknown tab for agent start: ${tabId}`);
+    async splitPane({ paneId, direction, cwd, env, focus }) {
+      calls.push({ kind: "herdr.pane.split", paneId, direction, cwd, env, focus });
+      const workspace = [...workspacesByPath.values()].find((candidate) => candidate.panes.some((pane) => pane.pane_id === paneId));
+      if (!workspace) throw new Error(`Unknown pane for split: ${paneId}`);
       const pane = {
         pane_id: `${workspace.workspace_id}:p${paneCounter++}`,
-        tab_id: tabId,
+        tab_id: workspace.active_tab_id,
         workspace_id: workspace.workspace_id,
         cwd,
         foreground_cwd: cwd,
-        agent: "pi",
-        agent_status: "working",
       };
+      workspace.panes.push(pane);
+      return { paneId: pane.pane_id };
+    },
+    async startAgent({ name, paneId, kind, argv, focus }) {
+      calls.push({ kind: "herdr.agent.start", name, paneId, harnessKind: kind, argv, focus });
+      const workspace = [...workspacesByPath.values()].find((candidate) => candidate.panes.some((pane) => pane.pane_id === paneId));
+      if (!workspace) throw new Error(`Unknown pane for agent start: ${paneId}`);
+      const pane = workspace.panes.find((candidate) => candidate.pane_id === paneId);
+      pane.agent = kind;
+      pane.agent_status = "working";
       const agent = {
         agent_id: `a${agentCounter++}`,
         workspace_id: workspace.workspace_id,
-        tab_id: tabId,
+        tab_id: pane.tab_id,
         pane_id: pane.pane_id,
         name,
-        cwd,
+        cwd: pane.cwd,
       };
-      workspace.panes.push(pane);
       workspace.agents.push(agent);
-      workspace.active_tab_id = tabId;
-      return { agentId: agent.agent_id, tabId, paneId: pane.pane_id };
+      workspace.active_tab_id = pane.tab_id;
+      return { agentId: agent.agent_id, tabId: pane.tab_id, paneId: pane.pane_id };
     },
     async closePane({ paneId }) {
       calls.push({ kind: "herdr.pane.close", paneId });
