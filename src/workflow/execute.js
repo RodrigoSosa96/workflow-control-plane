@@ -724,7 +724,6 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
       paneId: agentPane.paneId,
       kind: plan.agent.harness ?? "pi",
       argv: launch.argv,
-      focus: false,
       timeout: 30000,
     });
 
@@ -943,7 +942,6 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       paneId: agentPane.paneId,
       kind: plan.agent.harness ?? "pi",
       argv: launch.argv,
-      focus: false,
       timeout: 30000,
     });
 

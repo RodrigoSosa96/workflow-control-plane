@@ -491,7 +491,9 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
       return normalizePaneProcessInfo(await invoke("pane", "process-info", ["--pane", paneId]));
     },
 
-    async startAgent({ name, paneId, kind, argv, focus = false, timeout } = {}) {
+    // Herdr types the canonical executable for --kind itself, so argv[0] is dropped and only
+    // the remaining arguments are passed after --. `agent start` has no focus flag.
+    async startAgent({ name, paneId, kind, argv, timeout } = {}) {
       if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
         fail("PREFLIGHT", "startAgent requires argv from a trusted source", { name, paneId, kind, argv }, 10);
       }
@@ -502,12 +504,21 @@ export function createHerdrAdapter({ runner, binary = "herdr" }) {
         fail("PREFLIGHT", "startAgent requires an agent kind", { name, paneId, kind }, 10);
       }
 
+      const executable = argv[0].slice(argv[0].lastIndexOf("/") + 1);
+      if (executable !== kind) {
+        fail(
+          "PREFLIGHT",
+          `startAgent argv executable ${executable} does not match the agent kind ${kind}`,
+          { name, paneId, kind, executable },
+          10,
+        );
+      }
+
       const args = [name];
       pushOption(args, "--kind", kind);
       pushOption(args, "--pane", paneId);
       pushOption(args, "--timeout", timeout);
-      if (focus) args.push("--focus");
-      args.push("--", ...argv);
+      args.push("--", ...argv.slice(1));
 
       return normalizeAgentResult(await invoke("agent", "start", args));
     },

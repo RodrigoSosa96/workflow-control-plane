@@ -473,7 +473,7 @@ test("surfaces the herdr error envelope when it is written to stderr instead of 
   });
 
   await assert.rejects(
-    herdr.startAgent({ name: "fixture-single-FIX-101", paneId: "wK:p2", kind: "pi", argv: ["--name", "x"] }),
+    herdr.startAgent({ name: "fixture-single-FIX-101", paneId: "wK:p2", kind: "pi", argv: ["pi", "--name", "x"] }),
     (error) => {
       assert.ok(error instanceof WorkflowError);
       assert.equal(error.category, "HERDR");
@@ -974,7 +974,7 @@ test("gets pane process-info from live foreground_processes contract", async () 
   });
 });
 
-test("starts an agent with explicit focus flags and live argv after --", async () => {
+test("starts an agent with live argv after --, dropping the executable herdr supplies itself", async () => {
   const fixture = fixtureRunner([
     {
       assert: ({ args, options }) => {
@@ -989,7 +989,6 @@ test("starts an agent with explicit focus flags and live argv after --", async (
           "--timeout",
           "30000",
           "--",
-          "pi",
           "--name",
           "ocr-ASANA-123-discovered-docs",
         ]);
@@ -1034,7 +1033,6 @@ test("starts an agent when the live contract omits agent_id", async () => {
           "--pane",
           "w2:p9",
           "--",
-          "pi",
           "--name",
           "ocr-ASANA-123-discovered-docs",
         ]);
@@ -1081,9 +1079,7 @@ test("starts an agent with a non-pi harness kind", async () => {
           "codex",
           "--pane",
           "w2:p10",
-          "--focus",
           "--",
-          "codex",
           "-C",
           "/repo/.worktrees/ASANA-123-discovered-docs",
         ]);
@@ -1104,7 +1100,6 @@ test("starts an agent with a non-pi harness kind", async () => {
     paneId: "w2:p10",
     kind: "codex",
     argv: ["codex", "-C", "/repo/.worktrees/ASANA-123-discovered-docs"],
-    focus: true,
   });
 
   assert.deepEqual(result, {
@@ -1112,6 +1107,71 @@ test("starts an agent with a non-pi harness kind", async () => {
     tabId: "w2:t1",
     paneId: "w2:p10",
   });
+});
+
+test("rejects argv whose executable does not match the agent kind", async () => {
+  const calls = [];
+  const herdr = createHerdrAdapter({
+    runner: {
+      async run(command, args, options) {
+        calls.push({ command, args, options });
+        return { code: 0, stdout: cliResult(null), stderr: "" };
+      },
+    },
+  });
+
+  await assert.rejects(
+    herdr.startAgent({
+      name: "ocr-ASANA-123-discovered-docs",
+      paneId: "w2:p9",
+      kind: "pi",
+      argv: ["codex", "--name", "x"],
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /kind/i);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("accepts an absolute executable path whose basename matches the kind", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args }) => {
+        assert.deepEqual(args, [
+          "agent",
+          "start",
+          "ocr-ASANA-123-discovered-docs",
+          "--kind",
+          "pi",
+          "--pane",
+          "w2:p9",
+          "--",
+          "--name",
+          "x",
+        ]);
+      },
+      stdout: cliResult({
+        type: "agent_started",
+        agent: { agent_id: "a11" },
+        tab: { tab_id: "w2:t1" },
+        pane: { pane_id: "w2:p9" },
+      }, "cli:agent:start"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.startAgent({
+    name: "ocr-ASANA-123-discovered-docs",
+    paneId: "w2:p9",
+    kind: "pi",
+    argv: ["/usr/local/bin/pi", "--name", "x"],
+  });
+
+  assert.equal(result.agentId, "a11");
 });
 
 test("startAgent requires paneId and kind", async () => {
