@@ -2,25 +2,35 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { access, rm } from "node:fs/promises";
-import { createSmokeRunner } from "../scripts/smoke-workflow-fixture.js";
+import { createSmokeRunner, inspectCanaryCompletion } from "../scripts/smoke-workflow-fixture.js";
 import { createWorkflowFixture } from "../src/workflow/fixture.js";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 async function fakeFixture(root) {
-  await mkdir(join(root, "fixture-single"), { recursive: true });
-  await writeFile(join(root, "fixture-single", "fixture.js"), 'export const value = "implemented";\n');
-  await writeFile(
-    join(root, "fixture-single", "test.js"),
-    'import { value } from "./fixture.js";\nimport assert from "node:assert/strict";\nimport { test } from "node:test";\n\ntest("fixture value matches expectation", () => {\n  assert.equal(value, "implemented");\n});\n',
-  );
+  const sourcePath = join(root, "fixture-single");
+  const worktreePath = join(root, "worktrees", "fixture-single", "FIX-101");
+  const runDirectory = join(root, "state", "run-1");
+  await mkdir(sourcePath, { recursive: true });
+  await mkdir(worktreePath, { recursive: true });
+  await mkdir(runDirectory, { recursive: true });
+
+  // The base checkout is never edited; the agent does its work in the per-ticket worktree.
+  await writeFile(join(sourcePath, "fixture.js"), 'export const value = "initial";\n');
+  await writeFile(join(sourcePath, "test.js"), 'import { value } from "./fixture.js";\nimport assert from "node:assert/strict";\nimport { test } from "node:test";\n\ntest("fixture value matches expectation", () => {\n  assert.equal(value, "initial");\n});\n');
+  await writeFile(join(worktreePath, "fixture.js"), 'export const value = "implemented";\n');
+  await writeFile(join(worktreePath, "test.js"), 'import { value } from "./fixture.js";\nimport assert from "node:assert/strict";\nimport { test } from "node:test";\n\ntest("fixture value matches expectation", () => {\n  assert.equal(value, "implemented");\n});\n');
+  await writeFile(join(runDirectory, "run.json"), JSON.stringify({
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/FIX-101" }],
+  }));
+
   return {
     root,
     registryPath: join(root, "projects.yaml"),
     stateRoot: join(root, "state"),
     packageRoot: "/tmp/fake-package",
-    projects: { "fixture-single": { path: join(root, "fixture-single"), tickets: ["FIX-101", "FIX-102"] } },
+    projects: { "fixture-single": { path: sourcePath, tickets: ["FIX-101", "FIX-102"] } },
   };
 }
 
@@ -62,6 +72,52 @@ test("fixture single repo contains canary edit target and test", async () => {
   const testJs = await readFile(join(fixture.projects["fixture-single"].path, "test.js"), "utf8");
   assert.match(fixtureJs, /export const value = "initial"/);
   assert.match(testJs, /assert\.equal\(value, "initial"\)/);
+});
+
+test("completion inspection reads the per-ticket worktree, not the untouched source checkout", async () => {
+  const root = join(tmpdir(), `workflow-canary-worktree-${Date.now()}`);
+  const sourcePath = join(root, "fixture-single");
+  const worktreePath = join(root, "worktrees", "fixture-single", "FIX-101");
+  const runDirectory = join(root, "state", "run-1");
+  await mkdir(sourcePath, { recursive: true });
+  await mkdir(worktreePath, { recursive: true });
+  await mkdir(runDirectory, { recursive: true });
+
+  // The base checkout is never edited; the agent works only in its worktree.
+  await writeFile(join(sourcePath, "fixture.js"), 'export const value = "initial";\n');
+  await writeFile(join(sourcePath, "test.js"), 'assert.equal(value, "initial");\n');
+  await writeFile(join(worktreePath, "fixture.js"), 'export const value = "implemented";\n');
+  await writeFile(join(worktreePath, "test.js"), 'assert.equal(value, "implemented");\n');
+  await writeFile(join(runDirectory, "run.json"), JSON.stringify({
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/FIX-101" }],
+  }));
+
+  const fixture = { projects: { "fixture-single": { path: sourcePath } } };
+
+  // Must pass by reading the worktree; reading the source would still say "initial".
+  await inspectCanaryCompletion({ fixture, runDirectory });
+
+  await rm(root, { recursive: true, force: true });
+});
+
+test("completion inspection fails when the worktree edit is missing", async () => {
+  const root = join(tmpdir(), `workflow-canary-worktree-miss-${Date.now()}`);
+  const worktreePath = join(root, "worktrees", "fixture-single", "FIX-101");
+  const runDirectory = join(root, "state", "run-1");
+  await mkdir(worktreePath, { recursive: true });
+  await mkdir(runDirectory, { recursive: true });
+  await writeFile(join(worktreePath, "fixture.js"), 'export const value = "initial";\n');
+  await writeFile(join(worktreePath, "test.js"), 'assert.equal(value, "initial");\n');
+  await writeFile(join(runDirectory, "run.json"), JSON.stringify({
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/FIX-101" }],
+  }));
+
+  await assert.rejects(
+    inspectCanaryCompletion({ fixture: { projects: {} }, runDirectory }),
+    /did not change fixture\.js/i,
+  );
+
+  await rm(root, { recursive: true, force: true });
 });
 
 test("--real requires TTY", async () => {
@@ -108,7 +164,7 @@ test("real-mode path builds fixture registry launch options", async () => {
       captured = options;
       return {
         preview: { approvalDigest: "sha256:test" },
-        execute: async () => ({ status: "running", runId: "11111111-1111-4111-8111-111111111111", runDirectory: "/tmp/run-1" }),
+        execute: async () => ({ status: "running", runId: "11111111-1111-4111-8111-111111111111", runDirectory: join(fixtureRoot, "state", "run-1") }),
       };
     },
     resultCommand: async () => ({ status: "completed", result: { verification: [{ command: "node --test", status: "passed" }] } }),
