@@ -486,7 +486,18 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
       return normalizePaneResult(await invoke("pane", "split", args, { cwd }));
     },
 
-    async runInPane({ paneId, command }) {
+    // `pane run` takes the command variadically, so a trusted argv is passed through
+    // unchanged rather than being flattened into a quoted shell string.
+    async runInPane({ paneId, command, argv }) {
+      if (argv !== undefined) {
+        if (!Array.isArray(argv) || argv.length === 0 || argv.some((value) => typeof value !== "string" || value.length === 0)) {
+          fail("PREFLIGHT", "runInPane requires argv from a trusted source", { paneId, argv }, 10);
+        }
+        if (typeof paneId !== "string" || !paneId) {
+          fail("PREFLIGHT", "runInPane requires a pane ID", { paneId }, 10);
+        }
+        return await invoke("pane", "run", [paneId, ...argv]);
+      }
       if (typeof command !== "string" || !command.trim()) {
         fail("PREFLIGHT", "runInPane requires a trusted registry command string", { paneId, command }, 10);
       }

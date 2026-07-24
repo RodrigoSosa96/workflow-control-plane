@@ -262,6 +262,11 @@ function createHerdr(calls, {
       if (failStart) throw failStart;
       return startResult;
     },
+    async runInPane({ paneId, command, argv }) {
+      calls.push({ kind: "herdr.pane.run", paneId, command, argv });
+      if (failStart) throw failStart;
+      return { accepted: true };
+    },
     async closePane({ paneId }) {
       calls.push({ kind: "herdr.pane.close", paneId });
       return { pane_id: paneId, closed: true };
@@ -556,6 +561,33 @@ test("accepts an exact OpenCode agent identity before Herdr mutation", async () 
   assert.deepEqual(launch.argv, launchSpec.argv);
   assert.equal(launch.harnessKind, "opencode");
   assert.equal(launch.paneId, "w1:p2");
+});
+
+test("runs a fixture supervisor in the prepared pane instead of attaching it as a Herdr agent", async () => {
+  const calls = [];
+  const plan = buildPlan();
+  const launchSpec = {
+    supervisor: true,
+    argv: ["/usr/bin/node", "/repo/bin/workflow-worker.js", "--run", "run-123", "--worker", "worker-1"],
+    env: { WORKFLOW_RUN_ID: "run-123", WORKFLOW_HARNESS: "pi" },
+    expected: { profileName: "pi-worker", harness: "pi", nativeSessionId: null },
+  };
+
+  const report = await executeStart(plan, fakeAdapters(calls), { buildAgentLaunch: () => launchSpec });
+
+  assert.equal(report.status, "completed");
+  assert.equal(calls.find((call) => call.kind === "herdr.agent.start"), undefined);
+
+  const split = calls.find((call) => call.kind === "herdr.pane.split");
+  assert.equal(split.env.WORKFLOW_RUN_ID, "run-123");
+
+  const run = calls.find((call) => call.kind === "herdr.pane.run");
+  assert.equal(run.paneId, "w1:p2");
+  assert.deepEqual(run.argv, launchSpec.argv);
+
+  const agentOperation = report.operations.find((operation) => operation.id === "agent");
+  assert.equal(agentOperation.status, "created");
+  assert.equal(agentOperation.paneId, "w1:p2");
 });
 
 test("rejects a generic Codex start operation without an explicit harness before mutation", async () => {

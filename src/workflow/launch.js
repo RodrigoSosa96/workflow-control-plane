@@ -600,6 +600,9 @@ export async function executeLaunch(preview, deps = {}) {
       }),
     });
     supervisorSpec = {
+      // Not an interactive harness, so it is run as a process in the agent pane
+      // rather than attached through Herdr's agent registry.
+      supervisor: true,
       argv: supervisorArgvFor({ controlPlaneBin, runId: run.id, workerId }),
       env: directSpec.env,
       expected: directSpec.expected,

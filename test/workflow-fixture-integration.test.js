@@ -41,6 +41,7 @@ function fakeHerdr({ harness = "pi" } = {}) {
     async createTab() { return { tabId: "tab-1", paneId: "pane-1" }; },
     async splitPane() { return { paneId: "pane-2" }; },
     async startAgent() { return { agentId: "agent-1", tabId: "tab-1", paneId: "pane-2" }; },
+    async runInPane() { return { accepted: true }; },
     async listWorkspaces() { return { workspaces: [] }; },
     async listTabs() { return { tabs: [] }; },
     async listPanes() { return { panes: [] }; },

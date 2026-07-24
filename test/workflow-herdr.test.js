@@ -892,6 +892,61 @@ test("runs trusted pane commands as a single argument and rejects untrusted shap
   );
 });
 
+test("runs a trusted argv in a pane without shell quoting", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, [
+          "pane",
+          "run",
+          "w2:p3",
+          "/usr/bin/node",
+          "/repo/bin/workflow-worker.js",
+          "--run",
+          "d46f8572-de27-465e-baf8-1ceafb850d62",
+          "--worker",
+          "efda9946-5b8c-4662-af12-7022f54bb257",
+        ]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ accepted: true }, "cli:pane:run"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(
+    await herdr.runInPane({
+      paneId: "w2:p3",
+      argv: [
+        "/usr/bin/node",
+        "/repo/bin/workflow-worker.js",
+        "--run",
+        "d46f8572-de27-465e-baf8-1ceafb850d62",
+        "--worker",
+        "efda9946-5b8c-4662-af12-7022f54bb257",
+      ],
+    }),
+    { accepted: true },
+  );
+});
+
+test("rejects untrusted argv shapes before running anything in a pane", async () => {
+  const fixture = fixtureRunner([]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  for (const argv of [[], ["node", ""], ["node", 42]]) {
+    await assert.rejects(
+      herdr.runInPane({ paneId: "w2:p3", argv }),
+      (error) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.category, "PREFLIGHT");
+        return true;
+      },
+    );
+  }
+  assert.equal(fixture.calls.length, 0);
+});
+
 test("gets pane process-info through the public cli and unwraps the live envelope", async () => {
   const fixture = fixtureRunner([
     {
