@@ -38,7 +38,7 @@ export function createWorkflowWorkerObservabilityExtension({
   return function workflowWorkerObservability(pi: ExtensionAPI) {
     const store = createRunStore({ stateRoot });
     const telemetry = createTelemetryStore({ store });
-    const adapter = createTelemetryAdapter({ harness: "pi", version: "0.80.10" });
+    const adapter = createTelemetryAdapter({ harness: "pi", version: "0.81.1" });
 
     async function updateWidget(ctx: any) {
       const snapshots = await telemetry.read({ runId });
