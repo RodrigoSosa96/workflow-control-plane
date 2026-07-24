@@ -153,6 +153,43 @@ test("builds a structured OpenCode run argv without session recovery flags", () 
   assertRunLaunch(spec, "opencode");
 });
 
+test("asks Pi for the non-interactive JSON event stream in stream-json mode", () => {
+  const spec = buildHarnessLaunch({
+    profileName: "pi-worker",
+    profile: profile({ mode: "stream-json" }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+
+  // The supervisor reads LF-delimited JSON from stdout, so Pi has to be told to emit it
+  // and to exit rather than hold an interactive TUI open.
+  assert.deepEqual(spec.argv.slice(0, 7), [
+    "pi",
+    "--name",
+    SESSION_NAME,
+    "--session-id",
+    spec.expected.nativeSessionId,
+    "--print",
+    "--mode",
+  ]);
+  assert.equal(spec.argv[7], "json");
+  assertRunLaunch(spec, "pi");
+});
+
+test("keeps interactive Pi starts free of the JSON stream flags", () => {
+  const spec = buildHarnessLaunch({
+    profileName: "pi-worker",
+    profile: profile({ mode: "interactive" }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+
+  assert.equal(spec.argv.includes("--print"), false);
+  assert.equal(spec.argv.includes("--mode"), false);
+});
+
 test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
   const spec = buildHarnessLaunch({
     profileName: "pi-worker",

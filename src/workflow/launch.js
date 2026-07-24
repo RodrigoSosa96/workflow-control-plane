@@ -11,7 +11,7 @@ function fail(category, message, details, exitCode = 10) {
   throw new WorkflowError(category, message, { details, exitCode });
 }
 
-function sha256Digest(text) {
+export function sha256Digest(text) {
   return `sha256:${createHash("sha256").update(text).digest("hex")}`;
 }
 
