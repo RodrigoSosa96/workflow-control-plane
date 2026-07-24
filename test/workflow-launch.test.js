@@ -1210,8 +1210,14 @@ test("fixture stream-json launch writes a private launch record and routes throu
   const record = JSON.parse(writePrivate.text);
   assert.equal(record.version, 1);
   assert.equal(record.harness, "opencode");
-  assert.equal(record.argv[0], "opencode");
   assert.ok(Array.isArray(record.argv));
+  // The supervisor spawns command + argv, so argv carries only the arguments; repeating
+  // the executable would pass it to the harness as its own first positional argument.
+  assert.equal(record.command, "opencode");
+  assert.equal(record.argv[0], "run");
+  // A launch record without a cwd is rejected by the supervisor before it spawns.
+  assert.equal(typeof record.cwd, "string");
+  assert.ok(record.cwd.length > 0);
 
   const stored = store.snapshot();
   assert.equal(stored.fixtureMode, true);

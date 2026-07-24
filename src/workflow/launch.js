@@ -514,8 +514,9 @@ function buildFixtureRecord(directSpec, harnessVersion) {
     version: 1,
     harness: directSpec.expected.harness,
     command: directSpec.argv[0],
-    argv: directSpec.argv,
-    cwd: directSpec.cwd ?? null,
+    // The supervisor spawns command + argv, so argv must not repeat the executable.
+    argv: directSpec.argv.slice(1),
+    cwd: directSpec.expected.cwd ?? null,
     env: directSpec.env,
     harnessVersion: harnessVersion ?? "0.0.0",
   };
