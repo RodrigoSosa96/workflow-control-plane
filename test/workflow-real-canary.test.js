@@ -174,6 +174,31 @@ test("poll stops on needs-input and preserves fixture", async () => {
   assert.notEqual(code, 0);
 });
 
+test("poll continues through unknown worker phase", async () => {
+  const fixtureRoot = join(tmpdir(), `workflow-canary-unknown-phase-test-${Date.now()}`);
+  let calls = 0;
+  const runner = createSmokeRunner({
+    argv: ["--real", "--agent", "pi", "--keep"],
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1" },
+    stdin: { isTTY: true, once: (_event, handler) => handler("pi\n") },
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+    createWorkflowFixture: async () => fakeFixture(fixtureRoot),
+    launchCommand: async () => ({
+      preview: { approvalDigest: "sha256:test" },
+      execute: async () => ({ status: "running", runId: "run-1", runDirectory: join(fixtureRoot, "state", "run-1") }),
+    }),
+    resultCommand: async () => {
+      calls += 1;
+      return { status: calls >= 2 ? "completed" : "pending" };
+    },
+    workerStatusCommand: async () => ({ workers: [{ phase: "unknown" }] }),
+  });
+  const { code } = await runner.run();
+  assert.equal(code, 0);
+  assert.ok(calls >= 2);
+});
+
 test("completed canary validates telemetry snapshot is bounded", async () => {
   let inspectedPath = null;
   const fixtureRoot = join(tmpdir(), `workflow-canary-telemetry-test-${Date.now()}`);

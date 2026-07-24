@@ -218,7 +218,7 @@ async function pollCanaryCompletion({ runId, fixture, env, stdout, resultCommand
     if (result.status === "completed") {
       return { outcome: "completed", result, status };
     }
-    if (["needs-input", "manual-handoff-required"].includes(result.status) || ["failed", "unknown", "manual-recovery"].includes(phase)) {
+    if (["needs-input", "manual-handoff-required", "result-stale", "failed"].includes(result.status) || ["failed", "manual-recovery"].includes(phase)) {
       return { outcome: "terminal", result, status };
     }
 
