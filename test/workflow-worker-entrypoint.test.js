@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { main, parseArgs } from "../bin/workflow-worker.js";
+import { sha256Digest } from "../src/workflow/launch.js";
 
 // Importing the entrypoint is the point of this file: a missing export in any of its
 // imports is a load-time SyntaxError that no other suite would catch, and it leaves the
@@ -70,4 +74,83 @@ test("refuses a run that is not in fixture mode", async () => {
 
   assert.equal(code, 1);
   assert.match(stderr.text(), /fixture mode/i);
+});
+
+// Drives the real telemetry store and the real launch-record verification, with only the
+// run store and the harness spawn faked. Faking the telemetry store too would hide the
+// entrypoint constructing it with the wrong arguments, which is invisible until a live
+// worker dies in its pane.
+test("builds a real telemetry store and hands it to the supervisor", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "workflow-worker-entrypoint-"));
+  const runDirectory = join(stateRoot, RUN_ID);
+  await mkdir(join(runDirectory, "worker-launches"), { recursive: true });
+
+  const recordText = JSON.stringify({
+    version: 1,
+    harness: "pi",
+    command: "pi",
+    argv: ["pi", "--name", "fixture", "--print", "--mode", "json"],
+    cwd: null,
+    env: { WORKFLOW_RUN_ID: RUN_ID },
+    harnessVersion: "0.80.10",
+  });
+  await writeFile(join(runDirectory, "worker-launches", `${WORKER_ID}.json`), recordText);
+
+  const run = {
+    id: RUN_ID,
+    directory: runDirectory,
+    fixtureMode: true,
+    workerLaunches: { [WORKER_ID]: { digest: sha256Digest(recordText), harness: "pi" } },
+  };
+  const store = {
+    async read() { return run; },
+    async writePrivateFile() {},
+    async appendEvent() {},
+  };
+
+  let received = null;
+  const stderr = collector();
+  const code = await main(["node", "workflow-worker.js", "--run", RUN_ID, "--worker", WORKER_ID], {
+    env: { WORKFLOW_STATE_ROOT: stateRoot },
+    stderr,
+    spawn: () => {},
+    createStore: () => store,
+    createSupervisor: (options) => {
+      received = options;
+      return { async run() { return { exitCode: 0 }; } };
+    },
+  });
+
+  assert.equal(stderr.text(), "");
+  assert.equal(code, 0);
+  assert.equal(typeof received.telemetry.record, "function");
+});
+
+test("refuses a launch record whose digest does not match the run", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "workflow-worker-entrypoint-"));
+  const runDirectory = join(stateRoot, RUN_ID);
+  await mkdir(join(runDirectory, "worker-launches"), { recursive: true });
+  await writeFile(join(runDirectory, "worker-launches", `${WORKER_ID}.json`), JSON.stringify({ harness: "pi" }));
+
+  const stderr = collector();
+  let spawned = 0;
+  const code = await main(["node", "workflow-worker.js", "--run", RUN_ID, "--worker", WORKER_ID], {
+    env: { WORKFLOW_STATE_ROOT: stateRoot },
+    stderr,
+    spawn: () => { spawned += 1; },
+    createStore: () => ({
+      async read() {
+        return {
+          id: RUN_ID,
+          directory: runDirectory,
+          fixtureMode: true,
+          workerLaunches: { [WORKER_ID]: { digest: "sha256:0000", harness: "pi" } },
+        };
+      },
+    }),
+  });
+
+  assert.equal(code, 1);
+  assert.match(stderr.text(), /digest mismatch/i);
+  assert.equal(spawned, 0);
 });

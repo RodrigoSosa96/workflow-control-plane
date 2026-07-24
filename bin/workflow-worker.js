@@ -69,7 +69,7 @@ export async function main(rawArgv = process.argv, { spawn: spawnChild = spawn, 
       fail(`Launch record harness mismatch: expected ${launchMeta.harness}`);
     }
 
-    const telemetry = createTelemetry({ runId, stateRoot });
+    const telemetry = createTelemetry({ store });
     const supervisor = createSupervisor({ spawn: spawnChild, telemetry, createAdapter: createTelemetryAdapter });
     const result = await supervisor.run({ runId, workerId, launch: record });
     return result.exitCode ?? 1;
