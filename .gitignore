@@ -7,3 +7,6 @@ coverage/
 .pi/npm/
 .pi/sessions/
 .pi-subagents/
+
+# SDD scratch (subagent-driven-development working files)
+.superpowers/
