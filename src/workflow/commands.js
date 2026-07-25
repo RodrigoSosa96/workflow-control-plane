@@ -1194,6 +1194,13 @@ function scopedRunStore(store, runId, run) {
     async read(requestedId) {
       return requestedId === runId ? run : await store.read(requestedId);
     },
+    // Only executeResume's confirmed-relaunch path calls update (a foreground write triggered
+    // by the user's `resume --yes`), to persist the relaunched pi-session's new pane/tab
+    // identity. Delegates straight to the real run store; requestedId is not special-cased the
+    // way read() is, since there is no cached run object to shortcut against.
+    async update(requestedId, updater) {
+      return await store.update(requestedId, updater);
+    },
   };
 }
 

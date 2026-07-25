@@ -12,16 +12,24 @@ function transportIdentity() {
   return { kind: "pi-session", sessionId: "s1" };
 }
 
+// resume/close stay read-only except for one case: executeResume's confirmed-relaunch path
+// persists the relaunched pi-session's new pane/tab identity (a foreground write triggered by
+// the user's own `resume --yes`, not a background writer). updates[] lets tests assert that
+// write happened only on that path, and never on focus/needs-confirmation/close.
 function storeFor(run) {
   const calls = [];
+  const updates = [];
   return {
     calls,
+    updates,
     async read(runId) {
       calls.push(runId);
       return structuredClone(run);
     },
-    async update() {
-      assert.fail("resume/close commands must stay read-only");
+    async update(runId, updater) {
+      const patch = await updater(structuredClone(run));
+      updates.push({ runId, patch });
+      return { ...structuredClone(run), ...patch };
     },
   };
 }
@@ -86,6 +94,7 @@ test("resumeCommand builds the pi-session transport from the live Herdr adapter 
   assert.deepEqual(result, { command: "resume", runId: RUN_ID, action: "focused", identity });
   assert.deepEqual(focusCalls, [{ tabId: identity.tabId }]);
   assert.deepEqual(store.calls, [RUN_ID]);
+  assert.deepEqual(store.updates, []);
 });
 
 test("resumeCommand reports needs-confirmation for a dead pi-session and relaunches only when confirmed", async () => {
@@ -99,11 +108,13 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
     },
   };
 
+  const pendingStore = storeFor({ id: RUN_ID, transportIdentity: identity });
   const pending = await resumeCommand(
     { runId: RUN_ID, confirmed: false },
-    { store: storeFor({ id: RUN_ID, transportIdentity: identity }), herdr: deadHerdr },
+    { store: pendingStore, herdr: deadHerdr },
   );
   assert.deepEqual(pending, { command: "resume", runId: RUN_ID, action: "needs-confirmation", plan: "relaunch", identity });
+  assert.deepEqual(pendingStore.updates, []);
 
   const tabCalls = [];
   const startCalls = [];
@@ -123,15 +134,24 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
     return "/usr/bin/pi";
   };
 
+  const relaunchStore = storeFor({ id: RUN_ID, transportIdentity: identity });
   const relaunched = await resumeCommand(
     { runId: RUN_ID, confirmed: true },
-    { store: storeFor({ id: RUN_ID, transportIdentity: identity }), herdr: relaunchHerdr, lookupExecutable },
+    { store: relaunchStore, herdr: relaunchHerdr, lookupExecutable },
   );
 
+  const newIdentity = { ...identity, paneId: "w3:p1", tabId: "w3:t1" };
   assert.equal(relaunched.action, "relaunched");
-  assert.deepEqual(relaunched.identity, { ...identity, paneId: "w3:p1", tabId: "w3:t1" });
+  assert.deepEqual(relaunched.identity, newIdentity);
   assert.deepEqual(tabCalls, [{ workspaceId: identity.workspaceId, cwd: identity.cwd, label: "resume-s1", focus: true }]);
   assert.deepEqual(startCalls, [{ name: "resume-s1", paneId: "w3:p1", kind: "pi", argv: ["/usr/bin/pi", "--session-id", "s1"], timeout: 30000 }]);
+
+  // The confirmed relaunch must persist the new pane/tab identity — same sessionId, new
+  // paneId/tabId — so the next resume observes the live pane instead of the dead one.
+  assert.equal(relaunchStore.updates.length, 1);
+  assert.equal(relaunchStore.updates[0].runId, RUN_ID);
+  assert.deepEqual(relaunchStore.updates[0].patch, { transportIdentity: newIdentity });
+  assert.equal(relaunchStore.updates[0].patch.transportIdentity.sessionId, identity.sessionId);
 });
 
 test("resumeCommand surfaces the resume-category error for a run with no transport identity", async () => {
@@ -177,6 +197,7 @@ test("closeCommand builds the pi-session transport from the live Herdr adapter a
   assert.deepEqual(result, { command: "close", runId: RUN_ID, closed: true });
   assert.deepEqual(sendKeysCalls, [{ target: identity.paneId, keys: ["ctrl+d"] }]);
   assert.deepEqual(store.calls, [RUN_ID]);
+  assert.deepEqual(store.updates, []);
 });
 
 test("closeCommand refuses an active pi-session worker with reason 'working' and never sends exit keys", async () => {
@@ -194,6 +215,7 @@ test("closeCommand refuses an active pi-session worker with reason 'working' and
   const result = await closeCommand({ runId: RUN_ID }, { store, herdr });
 
   assert.deepEqual(result, { command: "close", runId: RUN_ID, closed: false, reason: "working" });
+  assert.deepEqual(store.updates, []);
 });
 
 test("closeCommand requires a worker transport when a pi-session identity has no Herdr adapter available", async () => {
