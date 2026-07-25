@@ -35,5 +35,5 @@ export async function executeResume({ store, transport, herdr, runId, confirmed 
     const result = await relaunch(plan.identity);
     return { action: "relaunched", identity: result?.identity ?? plan.identity };
   }
-  throw new WorkflowError("resume", `Cannot resume: ${plan.reason ?? plan.action}`, { details: { runId } });
+  fail(`Cannot resume: ${plan.reason ?? plan.action}`, { runId });
 }
