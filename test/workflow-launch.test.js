@@ -632,7 +632,7 @@ test("approval digest binds request, selected profile permissions, tickets, repo
       },
     },
   });
-  const volatileOnly = await previewFor({ runId: "not-bound", createdAt: "2099-01-01T00:00:00.000Z" });
+  const volatileOnly = await previewFor({ runId: "not-bound", createdAt: "2099-01-01T00:00:00.000Z", dryRun: true });
 
   for (const other of [
     changedRequest,

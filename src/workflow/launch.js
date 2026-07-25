@@ -39,6 +39,7 @@ const VOLATILE_EXECUTION_OPTION_KEYS = new Set([
   "approvalDigest",
   "command",
   "yes",
+  "dryRun",
   "format",
   "runId",
   "createdAt",
