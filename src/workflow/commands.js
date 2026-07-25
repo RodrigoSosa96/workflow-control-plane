@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { closeWorker as defaultCloseWorker } from "./close.js";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
 import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./delegation-handoff.js";
@@ -12,6 +13,7 @@ import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
+import { planResume as defaultPlanResume } from "./resume.js";
 import { RUN_STATES } from "./run-state.js";
 import { createRunStore } from "./run-store.js";
 import { createTelemetryStore } from "./telemetry-store.js";
@@ -1172,6 +1174,37 @@ export async function reconcileCommand(options = {}, deps = {}) {
     nextActions,
     cleanup: "none",
     repairs: [],
+  };
+}
+
+function assertWorkerTransportDependency(deps, command) {
+  if (!deps.transport) delegationError("PREFLIGHT", `${command} requires a worker transport`, 10);
+  return deps.transport;
+}
+
+export async function resumeCommand(options = {}, deps = {}) {
+  const runId = assertRunId(options.runId);
+  const store = await storeForCommand(options, deps);
+  const transport = assertWorkerTransportDependency(deps, "resume");
+  const planResume = deps.planResume ?? defaultPlanResume;
+  const plan = await planResume({ store, transport, runId });
+  return {
+    command: "resume",
+    runId,
+    ...plan,
+  };
+}
+
+export async function closeCommand(options = {}, deps = {}) {
+  const runId = assertRunId(options.runId);
+  const store = await storeForCommand(options, deps);
+  const transport = assertWorkerTransportDependency(deps, "close");
+  const closeWorker = deps.closeWorker ?? defaultCloseWorker;
+  const outcome = await closeWorker({ store, transport, runId });
+  return {
+    command: "close",
+    runId,
+    ...outcome,
   };
 }
 

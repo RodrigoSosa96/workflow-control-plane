@@ -190,6 +190,30 @@ test("keeps interactive Pi starts free of the JSON stream flags", () => {
   assert.equal(spec.argv.includes("--mode"), false);
 });
 
+test("pi interactive argv loads the workflow worker extensions", () => {
+  const spec = buildHarnessLaunch({
+    profileName: "pi-worker",
+    profile: profile({ mode: "interactive" }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+  const joined = spec.argv.join(" ");
+  assert.match(joined, /--extension .*workflow-worker-lifecycle/);
+  assert.match(joined, /--extension .*workflow-worker-observability/);
+});
+
+test("pi stream-json argv does not load the interactive-only workflow worker extensions", () => {
+  const spec = buildHarnessLaunch({
+    profileName: "pi-worker",
+    profile: profile({ mode: "stream-json" }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+  });
+  assert.equal(spec.argv.includes("--extension"), false);
+});
+
 test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
   const spec = buildHarnessLaunch({
     profileName: "pi-worker",

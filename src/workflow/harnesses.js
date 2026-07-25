@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { HANDOFF_COMMAND } from "./assignment.js";
+
+const CONTROL_PLANE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const PI_WORKER_EXTENSIONS = [
+  join(CONTROL_PLANE_ROOT, ".pi/extensions/workflow-worker-lifecycle.ts"),
+  join(CONTROL_PLANE_ROOT, ".pi/extensions/workflow-worker-observability.ts"),
+];
 
 export const WORKFLOW_ENV_KEYS = Object.freeze([
   "WORKFLOW_RUN_ID",
@@ -74,6 +82,12 @@ function piArgv({ profile, sessionName, run, nativeSessionId }) {
   // A supervised run reads Pi's LF-delimited JSON events from stdout, so Pi must emit
   // them and exit instead of holding an interactive session open.
   if (profile.mode === "stream-json") argv.push("--print", "--mode", "json");
+  // The headless supervisor path (stream-json) already derives lifecycle/telemetry
+  // state by parsing Pi's stdout event stream, so loading these extensions there
+  // would double-write state. Only interactive runs need them wired via --extension.
+  if (run && profile.mode === "interactive") {
+    for (const ext of PI_WORKER_EXTENSIONS) argv.push("--extension", ext);
+  }
   appendModel(argv, profile.model);
   argv.push(...profile.arguments);
   const bootstrap = runBootstrapPrompt(run);

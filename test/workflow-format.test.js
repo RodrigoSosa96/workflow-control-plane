@@ -197,3 +197,46 @@ test("result and reconcile compact output are bounded and machine JSON stays det
     '{\n  "a": {\n    "x": 1,\n    "y": 2\n  },\n  "z": 1\n}',
   );
 });
+
+test("resume and close compact output render a short human line; JSON output is untouched", () => {
+  const focusResume = formatWorkflowResult("resume", {
+    command: "resume",
+    runId: RUN_ID,
+    action: "focus",
+    identity: { paneId: "pane-1" },
+  }, "compact");
+  assert.match(focusResume, new RegExp(`Run: ${RUN_ID}`));
+  assert.match(focusResume, /resume: focus/);
+
+  const refuseResume = formatWorkflowResult("resume", {
+    command: "resume",
+    runId: RUN_ID,
+    action: "refuse",
+    reason: "dead",
+  }, "compact");
+  assert.match(refuseResume, /resume: refuse/);
+  assert.match(refuseResume, /Reason: dead/);
+
+  const closedResult = formatWorkflowResult("close", {
+    command: "close",
+    runId: RUN_ID,
+    closed: true,
+  }, "compact");
+  assert.match(closedResult, new RegExp(`Run: ${RUN_ID}`));
+  assert.match(closedResult, /close: closed/);
+  assert.doesNotMatch(closedResult, /close: closed \S/);
+
+  const refusedResult = formatWorkflowResult("close", {
+    command: "close",
+    runId: RUN_ID,
+    closed: false,
+    reason: "working",
+  }, "compact");
+  assert.match(refusedResult, /close: refused working/);
+
+  const resumeValue = { command: "resume", runId: RUN_ID, action: "relaunch", identity: { paneId: "pane-9" } };
+  assert.deepEqual(JSON.parse(formatWorkflowResult("resume", resumeValue, "json")), resumeValue);
+
+  const closeValue = { command: "close", runId: RUN_ID, closed: false, reason: "identity-unconfirmed" };
+  assert.deepEqual(JSON.parse(formatWorkflowResult("close", closeValue, "json")), closeValue);
+});

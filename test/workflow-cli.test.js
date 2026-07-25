@@ -304,6 +304,8 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow launch <project> <primary-ticket> .*--prompt-file <path>/);
   assert.match(result.stdout, /workflow result <run-id>/);
   assert.match(result.stdout, /workflow reconcile \[project\] --run <run-id>/);
+  assert.match(result.stdout, /workflow resume <run-id>/);
+  assert.match(result.stdout, /workflow close <run-id>/);
   assert.match(result.stdout, /workflow runtime <project> <task> .*--tickets <csv>/);
   assert.match(result.stdout, /workflow status <project> <task> .*--tickets <csv>/);
   assert.match(result.stdout, /workflow delegation result <run-id> <delegation-id>/);
@@ -387,6 +389,18 @@ test("parses documented workflow commands and options", () => {
     format: "json",
   });
 
+  assert.deepEqual(parseArgs(["resume", RUN_ID]), {
+    command: "resume",
+    runId: RUN_ID,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["close", RUN_ID, "--format", "json"]), {
+    command: "close",
+    runId: RUN_ID,
+    format: "json",
+  });
+
   assert.deepEqual(parseArgs(["worker", "status", RUN_ID, "--format", "json"]), {
     command: "worker-status",
     runId: RUN_ID,
@@ -444,6 +458,10 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["result", RUN_ID, "--yes"]), /result does not accept --yes/i);
   assert.throws(() => parseArgs(["result", RUN_ID, "--prompt-file", "/tmp/request.md"]), /result does not accept --prompt-file/i);
   assert.throws(() => parseArgs(["reconcile", "--run", RUN_ID, "--yes"]), /reconcile does not accept --yes/i);
+  assert.throws(() => parseArgs(["resume", RUN_ID, "--yes"]), /resume does not accept --yes/i);
+  assert.throws(() => parseArgs(["resume", "../not-a-run"]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["close", RUN_ID, "--yes"]), /close does not accept --yes/i);
+  assert.throws(() => parseArgs(["close", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["worker", "watch", RUN_ID, "--interval", "1"]), /Unknown option|does not accept/i);
   assert.throws(() => parseArgs(["worker", "status", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["launch", "ocr", "ASANA-123", "--prompt", "SECRET-DO-NOT-LEAK"]), /Unknown option: --prompt/i);
@@ -1304,6 +1322,65 @@ test("reconcile is read-only, accepts --run, and emits exact safe next actions",
   assert.deepEqual(output.stderr, []);
 });
 
+test("resume and close subcommands dispatch to their commands read-only until confirmed, wired with the live Pi delegation transport", async () => {
+  const calls = [];
+  const output = io();
+  const fakeTransport = Object.freeze({
+    async start() {
+      throw new Error("resume/close wiring must not start a delegation");
+    },
+    async observeExact() {
+      throw new Error("resume/close wiring must not observe directly; the command owns observation");
+    },
+    async deliverFollowUp() {
+      throw new Error("resume/close wiring must not deliver a follow-up");
+    },
+    async requestGracefulClose() {
+      throw new Error("resume/close wiring must not request a graceful close");
+    },
+  });
+  const transportCalls = [];
+  const sharedDependencies = {
+    ...output,
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async (name) => {
+      assert.equal(name, "pi");
+      return "/usr/bin/pi";
+    },
+    spawnDelegationChild: async () => {
+      assert.fail("resume/close must not spawn a Pi process");
+    },
+    inspectDelegationProcess: async () => {
+      assert.fail("resume/close must not inspect a process directly");
+    },
+    createPiDelegationTransport: (options) => {
+      transportCalls.push(options);
+      return fakeTransport;
+    },
+    resumeCommand: async (options, deps) => {
+      calls.push(["resume", options.runId]);
+      assert.equal(deps.transport, fakeTransport);
+      return { command: "resume", runId: options.runId, action: "focus" };
+    },
+    closeCommand: async (options, deps) => {
+      calls.push(["close", options.runId]);
+      assert.equal(deps.transport, fakeTransport);
+      return { command: "close", runId: options.runId, closed: false, reason: "working" };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action ?? value.reason}`,
+  };
+
+  assert.equal(await main(["resume", RUN_ID], sharedDependencies), 0);
+  assert.equal(await main(["close", RUN_ID], sharedDependencies), 0);
+
+  assert.deepEqual(calls, [["resume", RUN_ID], ["close", RUN_ID]]);
+  assert.deepEqual(output.stdout, ["resume:focus", "close:working"]);
+  assert.deepEqual(output.stderr, []);
+  assert.equal(transportCalls.length, 2);
+  assert.equal(transportCalls[0].piCommand, "/usr/bin/pi");
+  assert.equal(transportCalls[0].stateRoot, "/state/workflow");
+});
+
 test("main prints compact and json output for read-only commands", async () => {
   const output = io();
   const calls = [];
@@ -1602,6 +1679,24 @@ test("maps conflict and preflight workflow errors to stable categories", async (
     },
   }), 10);
   assert.deepEqual(delegationService.stderr, ["PREFLIGHT: exact worker must be idle"]);
+
+  const resume = io();
+  assert.equal(await main(["resume", RUN_ID], {
+    ...resume,
+    resumeCommand: async () => {
+      throw new WorkflowError("resume", "Run has no exact session identity to resume");
+    },
+  }), 10);
+  assert.deepEqual(resume.stderr, ["PREFLIGHT: Run has no exact session identity to resume"]);
+
+  const close = io();
+  assert.equal(await main(["close", RUN_ID], {
+    ...close,
+    closeCommand: async () => {
+      throw new WorkflowError("close", "close requires a worker transport");
+    },
+  }), 10);
+  assert.deepEqual(close.stderr, ["PREFLIGHT: close requires a worker transport"]);
 });
 
 test("bounds formatted output before printing", async () => {

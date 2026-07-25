@@ -534,36 +534,82 @@ if (run) {
 Run: `node --test test/workflow-harnesses.test.js`
 Expected: PASS.
 
-- [ ] **Step 5: Write the extension contract test**
+> **Task 1 findings drive this design (verified against Pi 0.81.1):** hook
+> `agent_start` (one per work cycle — NOT `turn_start`, which fires multiple times
+> per tool call), `agent_settled` (idle stop), `session_shutdown` (session end).
+> Pi exposes NO `streamingBehavior`/`stop_hook_active` field, so the extension
+> distinguishes a user follow-up from its own queued continuation with local state:
+> a `pendingContinuation` flag set when it queues a continuation and consumed by
+> the next `agent_start`; and a `startedOnce` flag so the first `agent_start`
+> confirms the launch generation while a later user `agent_start` is a follow-up
+> (generation = current + 1, read from the store). `store` is injectable for tests.
+
+- [ ] **Step 5: Write the extension contract tests**
 
 ```js
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createWorkflowWorkerLifecycleExtension } from "../.pi/extensions/workflow-worker-lifecycle.ts";
 
-test("agent_settled without a handoff queues at most two continuations then falls back", async () => {
-  const sent = [];
-  const lifecycleCalls = [];
-  const fakeLifecycle = {
-    onPrompt: async (a) => { lifecycleCalls.push(["prompt", a]); },
-    onStop: async () => {
-      lifecycleCalls.push(["stop"]);
-      const n = lifecycleCalls.filter((c) => c[0] === "stop").length;
-      return { action: n <= 2 ? "continue" : "manual" };
-    },
-    onSessionEnd: async () => {},
+function fakePi() {
+  return {
+    handlers: {},
+    sent: [],
+    on(name, fn) { this.handlers[name] = fn; },
+    sendUserMessage(msg, opts) { this.sent.push({ msg, opts }); },
   };
-  const ext = createWorkflowWorkerLifecycleExtension({
-    env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "pi", WORKFLOW_GENERATION: "1" },
-    lifecycle: fakeLifecycle,
-    hasValidHandoff: async () => false,
+}
+
+function makeExt({ life, run, hasValidHandoff = async () => false }) {
+  const store = { async read() { return { id: "r1", ...run }; } };
+  return createWorkflowWorkerLifecycleExtension({
+    env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "pi", WORKFLOW_STATE_ROOT: "/x" },
+    lifecycle: life, store, hasValidHandoff,
   });
-  const pi = { handlers: {}, on(name, fn) { this.handlers[name] = fn; }, sendUserMessage(m) { sent.push(m); } };
-  ext(pi);
-  await pi.handlers.agent_settled({}, { hasUI: false });
-  await pi.handlers.agent_settled({}, { hasUI: false });
-  await pi.handlers.agent_settled({}, { hasUI: false });
-  assert.equal(sent.length, 2);
+}
+
+test("agent_settled without a handoff queues at most two continuations then falls back", async () => {
+  const stop = ["continue", "continue", "manual"]; let i = 0;
+  const life = { onPrompt: async () => {}, onStop: async () => ({ action: stop[i++] }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 1, state: "running" } })(pi);
+  await pi.handlers.agent_settled({}, {});
+  await pi.handlers.agent_settled({}, {});
+  await pi.handlers.agent_settled({}, {});
+  assert.equal(pi.sent.length, 2);
+  assert.equal(pi.sent[0].opts.deliverAs, "followUp");
+});
+
+test("a queued continuation is tagged source=continuation and reuses the generation", async () => {
+  const calls = [];
+  const life = { onPrompt: async (a) => calls.push(a), onStop: async () => ({ action: "continue" }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 1, state: "running" } })(pi);
+  await pi.handlers.agent_start({}, {});
+  assert.deepEqual(calls.at(-1), { runId: "r1", generation: 1, source: "user" });
+  await pi.handlers.agent_settled({}, {});   // queues a continuation → sets pendingContinuation
+  await pi.handlers.agent_start({}, {});     // the continuation's own agent_start
+  assert.deepEqual(calls.at(-1), { runId: "r1", generation: 1, source: "continuation" });
+});
+
+test("a user follow-up after the first cycle increments the generation", async () => {
+  const calls = [];
+  const life = { onPrompt: async (a) => calls.push(a), onStop: async () => ({ action: "none" }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 1, state: "completed" }, hasValidHandoff: async () => true })(pi);
+  await pi.handlers.agent_start({}, {});     // first start → confirms gen 1
+  assert.equal(calls.at(-1).generation, 1);
+  await pi.handlers.agent_start({}, {});     // user follow-up → gen 2
+  assert.deepEqual(calls.at(-1), { runId: "r1", generation: 2, source: "user" });
+});
+
+test("session_shutdown ends the session at the current generation", async () => {
+  const ended = [];
+  const life = { onPrompt: async () => {}, onStop: async () => ({ action: "none" }), onSessionEnd: async (a) => ended.push(a) };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 2, state: "running" } })(pi);
+  await pi.handlers.session_shutdown({ reason: "quit" }, {});
+  assert.deepEqual(ended.at(-1), { runId: "r1", generation: 2 });
 });
 ```
 
@@ -574,30 +620,60 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createRunStore } from "../../src/workflow/run-store.js";
 import { createLifecycle } from "../../src/workflow/lifecycle.js";
 
+function continuationPrompt(runId: string, generation: number): string {
+  return `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}.`;
+}
+
 export function createWorkflowWorkerLifecycleExtension({
   env = process.env as Record<string, string | undefined>,
   lifecycle,
   hasValidHandoff,
+  store: injectedStore,
 } = {} as any) {
   const runId = env.WORKFLOW_RUN_ID;
   if (!runId || env.WORKFLOW_HARNESS !== "pi") return (_pi: ExtensionAPI) => {};
-  const generation = Number(env.WORKFLOW_GENERATION ?? "1");
-  const store = createRunStore({ stateRoot: env.WORKFLOW_STATE_ROOT });
+  const store = injectedStore ?? createRunStore({ stateRoot: env.WORKFLOW_STATE_ROOT });
   const life = lifecycle ?? createLifecycle({ store });
-  const validHandoff = hasValidHandoff ?? (async () => await handoffExists(store, runId, generation));
+  const validHandoff = hasValidHandoff ?? (async (gen: number) => await handoffExists(store, runId, gen));
+
+  // Pi 0.81.1 emits no field distinguishing a user follow-up from our own queued
+  // continuation (both are just agent_start), so we track it locally.
+  let pendingContinuation = false;
+  let startedOnce = false;
 
   return function workflowWorkerLifecycle(pi: ExtensionAPI) {
-    pi.on("agent_start", async () => { await life.onPrompt({ runId, generation, source: "user" }); });
+    pi.on("agent_start", async () => {
+      const current = await store.read(runId);
+      const source = pendingContinuation ? "continuation" : "user";
+      pendingContinuation = false;
+      // The first start confirms the launch generation; a later user start is a
+      // follow-up that increments it. A continuation reuses the current generation.
+      const generation = source === "user" && startedOnce ? current.generation + 1 : current.generation;
+      startedOnce = true;
+      await life.onPrompt({ runId, generation, source });
+    });
+
     pi.on("agent_settled", async () => {
-      const { action } = await life.onStop({ runId, generation, hasValidHandoff: await validHandoff() });
+      const current = await store.read(runId);
+      const { action } = await life.onStop({
+        runId,
+        generation: current.generation,
+        hasValidHandoff: await validHandoff(current.generation),
+      });
       if (action === "continue") {
-        pi.sendUserMessage(
-          `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}.`,
-          { deliverAs: "followUp", triggerTurn: true },
-        );
+        // Set the flag BEFORE sending, so the agent_start this triggers is tagged.
+        pendingContinuation = true;
+        pi.sendUserMessage(continuationPrompt(runId, current.generation), {
+          deliverAs: "followUp",
+          triggerTurn: true,
+        });
       }
     });
-    pi.on("session_shutdown", async () => { await life.onSessionEnd({ runId, generation }); });
+
+    pi.on("session_shutdown", async () => {
+      const current = await store.read(runId);
+      await life.onSessionEnd({ runId, generation: current.generation });
+    });
   };
 }
 
@@ -608,7 +684,6 @@ async function handoffExists(store: any, runId: string, generation: number): Pro
 
 export default createWorkflowWorkerLifecycleExtension();
 ```
-Note: refine `source: "user"` vs `"continuation"` per Task 1 findings — if Pi exposes `stop_hook_active`/`streamingBehavior` on the event, use it to tag our own queued continuations so they do not increment the generation.
 
 - [ ] **Step 7: Run tests**
 

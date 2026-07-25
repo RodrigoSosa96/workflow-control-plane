@@ -11,6 +11,7 @@ import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { ASSIGNMENT_LIMITS } from "../src/workflow/assignment.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import {
+  closeCommand as defaultCloseCommand,
   delegationHandoffCommand as defaultDelegationHandoffCommand,
   delegationReconcileCommand as defaultDelegationReconcileCommand,
   delegationRemediateCommand as defaultDelegationRemediateCommand,
@@ -21,6 +22,7 @@ import {
   planCommand as defaultPlanCommand,
   reconcileCommand as defaultReconcileCommand,
   resultCommand as defaultResultCommand,
+  resumeCommand as defaultResumeCommand,
   statusCommand as defaultStatusCommand,
   workerStatusCommand as defaultWorkerStatusCommand,
   workerWatchCommand as defaultWorkerWatchCommand,
@@ -46,6 +48,8 @@ Commands:
   workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow result <run-id> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
+  workflow resume <run-id> [--format compact|json]
+  workflow close <run-id> [--format compact|json]
   workflow worker status <run-id> [--format compact|json]
   workflow worker watch <run-id> [--format compact|json]
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
@@ -294,6 +298,26 @@ export function parseArgs(argv) {
       command,
       ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
       runId: options.run,
+      format,
+    };
+  }
+
+  if (command === "resume") {
+    validateShape("resume", positionals, options, { min: 1, max: 1, allowedOptions: [] });
+    assertPathSafeUuidSyntax(positionals[0], "resume run ID");
+    return {
+      command,
+      runId: positionals[0],
+      format,
+    };
+  }
+
+  if (command === "close") {
+    validateShape("close", positionals, options, { min: 1, max: 1, allowedOptions: [] });
+    assertPathSafeUuidSyntax(positionals[0], "close run ID");
+    return {
+      command,
+      runId: positionals[0],
       format,
     };
   }
@@ -552,7 +576,7 @@ function categorizeError(error) {
   if (error instanceof WorkflowError) {
     if (error.category === "USAGE") return { category: "USAGE", exitCode: 64 };
     if (error.category === "CONFLICT") return { category: "CONFLICT", exitCode: 11 };
-    if (["PREFLIGHT", "delegation", "delegation-reservation", "delegation-service"].includes(error.category)) {
+    if (["PREFLIGHT", "delegation", "delegation-reservation", "delegation-service", "resume", "close"].includes(error.category)) {
       return { category: "PREFLIGHT", exitCode: 10 };
     }
     if (error.category === "HANDOFF") return { category: "HANDOFF", exitCode: 10 };
@@ -583,6 +607,8 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
+  const resumeCommand = dependencies.resumeCommand ?? defaultResumeCommand;
+  const closeCommand = dependencies.closeCommand ?? defaultCloseCommand;
   const delegationResultCommand = dependencies.delegationResultCommand ?? defaultDelegationResultCommand;
   const delegationReconcileCommand = dependencies.delegationReconcileCommand ?? defaultDelegationReconcileCommand;
   const delegationRemediateCommand = dependencies.delegationRemediateCommand ?? defaultDelegationRemediateCommand;
@@ -701,6 +727,20 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (args.command === "reconcile") {
       const result = await reconcileCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("reconcile", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "resume") {
+      const commandDependencies = await withLiveDelegationTransport(options, liveDependencies, dependencies);
+      const result = await resumeCommand(options, commandDependencies);
+      emit(out, formatWorkflowResult("resume", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "close") {
+      const commandDependencies = await withLiveDelegationTransport(options, liveDependencies, dependencies);
+      const result = await closeCommand(options, commandDependencies);
+      emit(out, formatWorkflowResult("close", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

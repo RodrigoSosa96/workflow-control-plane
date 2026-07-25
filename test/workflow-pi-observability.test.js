@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createWorkflowWorkerObservabilityExtension } from "../.pi/extensions/workflow-worker-observability.ts";
+import { createWorkflowWorkerObservabilityExtension, buildObservabilityLines } from "../.pi/extensions/workflow-worker-observability.ts";
 import { createRunStore } from "../src/workflow/run-store.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -220,4 +220,43 @@ test("ignores non-assistant message_end without crashing", async () => {
   assert.equal(snapshot?.model, null);
 
   await rm(stateRoot, { recursive: true, force: true });
+});
+
+test("widget renders measurement values, never [object Object], for tokens and cost", () => {
+  const snapshot = {
+    phase: "settled",
+    harness: "pi",
+    model: "kimi-k2.7-code",
+    usage: {
+      input: { availability: "reported", value: 36765 },
+      output: { availability: "reported", value: 1621 },
+      cost: { availability: "reported", value: 0.037 },
+    },
+    tools: { lastName: "bash" },
+  };
+  const text = buildObservabilityLines("0244f07e-1bd7-49d0-abef-2eaafbd3a288", snapshot).join("\n");
+  assert.equal(text.includes("[object Object]"), false);
+  assert.match(text, /Tokens: in=36765 out=1621/);
+  assert.match(text, /Cost: \$0\.037/);
+  assert.match(text, /settled \| pi/);
+  assert.match(text, /Tool: bash/);
+});
+
+test("widget omits not-reported measurements", () => {
+  const snapshot = {
+    phase: "running",
+    harness: "pi",
+    usage: {
+      input: { availability: "not-reported", value: null },
+      cost: { availability: "not-reported", value: null },
+    },
+  };
+  const text = buildObservabilityLines("run-xyz", snapshot).join("\n");
+  assert.equal(text.includes("Cost"), false);
+  assert.equal(text.includes("Tokens"), false);
+  assert.equal(text.includes("[object Object]"), false);
+});
+
+test("widget shows starting when there is no snapshot", () => {
+  assert.match(buildObservabilityLines("run12345abc", null).join("\n"), /starting \| pi/);
 });
