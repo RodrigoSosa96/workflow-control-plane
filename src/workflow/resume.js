@@ -25,7 +25,13 @@ export async function planResume({ store, transport, runId }) {
 export async function executeResume({ store, transport, herdr, runId, confirmed = false, relaunch }) {
   const plan = await planResume({ store, transport, runId });
   if (plan.action === "focus") {
-    if (herdr && typeof herdr.focusTab === "function" && plan.identity?.tabId) {
+    // Focus Pi's own pane, not just its tab. The launch retains a bootstrap shell pane above the
+    // agent pane, so `tab focus` would raise the tab but leave the empty shell as the active pane
+    // (observed: resume landed on "the panel above Pi"). `agent focus <paneId>` brings the agent
+    // pane itself forward. Fall back to tab focus only if we somehow lack a paneId.
+    if (herdr && typeof herdr.focusAgent === "function" && plan.identity?.paneId) {
+      await herdr.focusAgent({ target: plan.identity.paneId });
+    } else if (herdr && typeof herdr.focusTab === "function" && plan.identity?.tabId) {
       await herdr.focusTab({ tabId: plan.identity.tabId });
     }
     return { action: "focused", identity: plan.identity };

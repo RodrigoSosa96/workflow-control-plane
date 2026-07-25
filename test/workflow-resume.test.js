@@ -27,9 +27,11 @@ test("a run with no transportIdentity is refused with a resume-category Workflow
   await assert.rejects(promise, (err) => err instanceof WorkflowError && err.category === "resume");
 });
 
-test("executeResume focuses a live session and gates relaunch on confirmation", async () => {
+test("executeResume focuses the live agent pane and gates relaunch on confirmation", async () => {
   const focus = [];
-  const herdr = { async focusTab(a) { focus.push(a); } };
+  // Focus the agent's PANE (herdr agent focus), not just its tab: the launch retains a
+  // bootstrap shell pane above Pi, so `tab focus` lands the cursor on the empty shell.
+  const herdr = { async focusAgent(a) { focus.push(a); } };
   const liveTransport = { start(){}, deliverFollowUp(){}, requestGracefulClose(){}, async observeExact() { return { state: "idle", identity: { paneId: "w2:p9" } }; } };
   const store = { async read() { return { id: "r1", transportIdentity: { kind: "pi-session", tabId: "w2:t1", paneId: "w2:p9", sessionId: "s1" } }; } };
   let relaunchCalls = 0;
@@ -38,7 +40,7 @@ test("executeResume focuses a live session and gates relaunch on confirmation", 
   const focused = await executeResume({ store, transport: liveTransport, herdr, runId: "r1", confirmed: false, relaunch });
   assert.equal(focused.action, "focused");
   assert.equal(focus.length, 1);
-  assert.deepEqual(focus[0], { tabId: "w2:t1" });
+  assert.deepEqual(focus[0], { target: "w2:p9" });
 
   const deadTransport = { start(){}, deliverFollowUp(){}, requestGracefulClose(){}, async observeExact() { return { state: "missing", identity: {} }; } };
   const pending = await executeResume({ store, transport: deadTransport, herdr, runId: "r1", confirmed: false, relaunch });
@@ -59,7 +61,7 @@ test("executeResume persists the new identity after a confirmed relaunch, but ne
       updateCalls.push({ runId, patch: await updater({ id: "r1", transportIdentity: oldIdentity }) });
     },
   };
-  const herdr = { async focusTab() {} };
+  const herdr = { async focusAgent() {} };
 
   // Focus path (live session): must not persist.
   const liveTransport = { start(){}, deliverFollowUp(){}, requestGracefulClose(){}, async observeExact() { return { state: "idle", identity: oldIdentity }; } };

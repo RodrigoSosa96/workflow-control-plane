@@ -568,8 +568,19 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
       return await invoke("agent", "send-keys", [target, ...keys]);
     },
 
-    // There is no pane-focus-by-id; Herdr only supports focusing a tab. `pane focus` is
-    // directional (next/prev) and must not be used here.
+    // Focus a specific agent by its target (the pane id, same target `agent send-keys` takes).
+    // `agent focus` brings the agent's OWN pane forward — unlike `tab focus`, which only raises
+    // the tab and leaves the retained bootstrap shell pane (above Pi) as the active pane.
+    // `pane focus` is directional (next/prev) and cannot target a pane by id, so it is not used.
+    async focusAgent({ target } = {}) {
+      if (typeof target !== "string" || !target) {
+        fail("PREFLIGHT", "focusAgent requires an agent target", { target }, 10);
+      }
+      return await invoke("agent", "focus", [target]);
+    },
+
+    // Kept as a fallback for callers that only hold a tab id; prefer focusAgent, which focuses
+    // the agent's pane rather than just raising the tab.
     async focusTab({ tabId } = {}) {
       if (typeof tabId !== "string" || !tabId) {
         fail("PREFLIGHT", "focusTab requires a tab id", { tabId }, 10);

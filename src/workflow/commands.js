@@ -1271,10 +1271,17 @@ async function relaunchPiSession(identity, deps) {
     argv,
     timeout: 30000,
   });
+  const newPaneId = started.paneId ?? agentPane.paneId;
+  // Focus the resumed agent pane, not the fresh tab's empty root pane. createTab -> splitPane
+  // leaves an empty shell pane above Pi (same shape as launch), and createTab/splitPane focus
+  // lands on that shell; without this the relaunch surfaces the empty panel (observed).
+  if (typeof herdr.focusAgent === "function") {
+    await herdr.focusAgent({ target: newPaneId });
+  }
   return {
     identity: {
       ...identity,
-      paneId: started.paneId ?? agentPane.paneId,
+      paneId: newPaneId,
       tabId: started.tabId ?? tab.tabId,
     },
   };

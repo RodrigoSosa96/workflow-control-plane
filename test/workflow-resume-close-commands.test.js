@@ -86,7 +86,7 @@ test("resumeCommand builds the pi-session transport from the live Herdr adapter 
     async agentSendKeys() {
       assert.fail("resume must never send exit keys");
     },
-    async focusTab(args) {
+    async focusAgent(args) {
       focusCalls.push(args);
     },
   };
@@ -100,7 +100,7 @@ test("resumeCommand builds the pi-session transport from the live Herdr adapter 
   assert.equal(built.length, 1);
   assert.equal(built[0].herdr, herdr);
   assert.deepEqual(result, { command: "resume", runId: RUN_ID, action: "focused", identity });
-  assert.deepEqual(focusCalls, [{ tabId: identity.tabId }]);
+  assert.deepEqual(focusCalls, [{ target: identity.paneId }]);
   assert.deepEqual(store.calls, [RUN_ID]);
   assert.deepEqual(store.updates, []);
 });
@@ -127,6 +127,7 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   const tabCalls = [];
   const splitCalls = [];
   const startCalls = [];
+  const relaunchFocusCalls = [];
   const relaunchHerdr = {
     ...deadHerdr,
     async createTab(args) {
@@ -140,6 +141,9 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
     async startAgent(args) {
       startCalls.push(args);
       return { agentId: "agent-9", tabId: "w3:t1", paneId: "w3:p1" };
+    },
+    async focusAgent(args) {
+      relaunchFocusCalls.push(args);
     },
   };
   const lookupExecutable = async (name) => {
@@ -207,6 +211,9 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   // starting a fresh assignment.
   assert.equal(startCalls[0].argv.some((value) => /assignment\.md|handoff-input\.json/.test(value)), false);
 
+  // The relaunch focuses the resumed agent pane, not the fresh tab's empty root pane.
+  assert.deepEqual(relaunchFocusCalls, [{ target: "w3:p1" }]);
+
   // The confirmed relaunch must persist the new pane/tab identity — same sessionId, new
   // paneId/tabId — so the next resume observes the live pane instead of the dead one.
   assert.equal(relaunchStore.updates.length, 1);
@@ -256,6 +263,7 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
   const tabCalls = [];
   const splitCalls = [];
   const startCalls = [];
+  const relaunchFocusCalls = [];
   const relaunchHerdr = {
     ...deadHerdr,
     async createTab(args) {
@@ -269,6 +277,9 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
     async startAgent(args) {
       startCalls.push(args);
       return { agentId: "agent-9", tabId: "w3:t1", paneId: "w3:p1" };
+    },
+    async focusAgent(args) {
+      relaunchFocusCalls.push(args);
     },
   };
   const lookupExecutable = async (name) => {
