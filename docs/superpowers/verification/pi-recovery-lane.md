@@ -44,10 +44,31 @@ Launch an interactive Pi with the sub-project #1 procedure
   `herdr tab focus <tab_id>` and confirm it brings the agent's tab to the
   foreground. (Fallback: `herdr workspace focus <workspace_id>`.)
 
-## Findings (fill in)
+## Findings (probe complete, 2026-07-25, Herdr 0.7.5 / Pi 0.81.1)
 
-- send-keys TARGET that works (pane id / session id):
-- exit key sequence that cleanly closes an idle Pi:
-- `pi --session-id <exact>` resumes the native session? (yes/no):
-- `herdr tab focus <tabId>` brings the tab forward? (yes/no):
-- anything unexpected:
+- **send-keys TARGET:** the **pane id** (e.g. `w1T:p2`). `agent send-keys <pane_id> <key>` works.
+- **exit key:** `ctrl+d` (with `+`; tmux-style `C-d` is rejected as `unsupported key`).
+  `herdr agent send-keys w1T:p2 ctrl+d` returned `{type:"ok"}` and the agent left
+  `agent list` — Pi exited gracefully. So `requestGracefulClose` = observe idle →
+  `agentSendKeys({ target: paneId, keys: ["ctrl+d"] })`.
+- **resume:** YES. `herdr agent start … --kind pi --pane <new> -- --session-id <UUID>
+  --extension …` resumed the native session (history intact). The launch passes the
+  **UUID** as `--session-id`; Herdr's `agent_session` reports `kind: "path"`, `value`
+  the `.jsonl` path ending in `_<UUID>.jsonl`. So `observeExact` must match the UUID
+  **inside** the path (`value.endsWith(sessionId + ".jsonl")`) or key off `pane_id` —
+  NOT `value === sessionId`.
+- **tab focus:** YES. `herdr tab focus <tab_id>` (single arg — the tab id, not pane id)
+  brings the tab to the foreground. So `focusTab({ tabId })` = `tab focus <tabId>`.
+- **Unexpected:** none. Note: closing a Pi pane with `ctrl+d` leaves the pane as a
+  bare shell (Pi exits, the pane stays), and resume creates a NEW pane in the same
+  tab — so a resumed run's tab can show leftover shell panes alongside the live Pi.
+  Cosmetic; the live Pi is unambiguous via `agent list`.
+
+## Consequences for Tasks 2/3
+
+- Task 2 `agentSendKeys({ target, keys })` → `agent send-keys <target> <keys...>`;
+  transport passes `target = identity.paneId`, `keys = ["ctrl+d"]`.
+- Task 2 `focusTab({ tabId })` → `tab focus <tabId>`.
+- Task 3 `observeExact`: find the agent by `pane_id === identity.paneId`, then confirm
+  the session by `agent_session.value.endsWith(identity.sessionId + ".jsonl")` (the
+  value is a path, not the bare UUID). `agent_status` idle → `idle`, working → `active`.
