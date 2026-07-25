@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createWorkflowWorkerLifecycleExtension } from "../.pi/extensions/workflow-worker-lifecycle.ts";
+import { createWorkflowWorkerLifecycleExtension, handoffExists } from "../.pi/extensions/workflow-worker-lifecycle.ts";
 
 function fakePi() {
   return {
@@ -68,11 +68,31 @@ test("a user follow-up after the first cycle increments the generation", async (
   assert.deepEqual(calls.at(-1), { runId: "r1", generation: 2, source: "user" });
 });
 
-test("session_shutdown ends the session at the current generation", async () => {
+test("session_shutdown ends the session (no generation, per the real onSessionEnd contract)", async () => {
   const ended = [];
   const life = { onPrompt: async () => {}, onStop: async () => ({ action: "none" }), onSessionEnd: async (a) => ended.push(a) };
   const pi = fakePi();
   makeExt({ life, run: { generation: 2, state: "running" } })(pi);
   await pi.handlers.session_shutdown({ reason: "quit" }, {});
-  assert.deepEqual(ended.at(-1), { runId: "r1", generation: 2 });
+  assert.deepEqual(ended.at(-1), { runId: "r1" });
+});
+
+test("handoffExists is true when the run is completed at the given generation", async () => {
+  const store = { async read() { return { state: "completed", generation: 1 }; } };
+  assert.equal(await handoffExists(store, "r1", 1), true);
+});
+
+test("handoffExists is false when the run is not completed", async () => {
+  const store = { async read() { return { state: "running", generation: 1 }; } };
+  assert.equal(await handoffExists(store, "r1", 1), false);
+});
+
+test("handoffExists is false when the generation does not match", async () => {
+  const store = { async read() { return { state: "completed", generation: 2 }; } };
+  assert.equal(await handoffExists(store, "r1", 1), false);
+});
+
+test("handoffExists is false when the store returns no run", async () => {
+  const store = { async read() { return null; } };
+  assert.equal(await handoffExists(store, "r1", 1), false);
 });

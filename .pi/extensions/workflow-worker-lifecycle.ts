@@ -53,13 +53,12 @@ export function createWorkflowWorkerLifecycleExtension({
     });
 
     pi.on("session_shutdown", async () => {
-      const current = await store.read(runId);
-      await life.onSessionEnd({ runId, generation: current.generation });
+      await life.onSessionEnd({ runId });
     });
   };
 }
 
-async function handoffExists(store: any, runId: string, generation: number): Promise<boolean> {
+export async function handoffExists(store: any, runId: string, generation: number): Promise<boolean> {
   const run = await store.read(runId);
   return Boolean(run && run.state === "completed" && run.generation === generation);
 }
