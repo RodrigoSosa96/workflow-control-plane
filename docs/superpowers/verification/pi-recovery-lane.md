@@ -86,7 +86,7 @@ token use is minimal.
 - Fixture root: `/tmp/workflow-recovery-e2e-1784958220726`
 - Registry: `…/projects.yaml` (pi-worker → `mode: interactive`)
 - Prompt: `…/recovery-prompt.txt` (greet once, then wait — no edits, no handoff)
-- Approval digest: `sha256:f07556a22de8a97afaabaf1355048c913457c2af698c64f64b6205801be693dc`
+- Approval digest: `sha256:039926a2e696540dc7e999253cfe68b23337f5e5cdb0cc129417645e5173a8be`
 
 > Only `WORKFLOW_PROJECTS_FILE` is needed — `resume`/`close` resolve the run store
 > from the registry's `state_root` (`storeForCommand` → `stateRootForCommand`).
@@ -101,9 +101,21 @@ F=/tmp/workflow-recovery-e2e-1784958220726
 cd /home/you/projects/personal/workflows/.worktrees/pi-recovery-lane
 
 WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js launch fixture-single FIX-101 \
-  --yes --approval-digest sha256:f07556a22de8a97afaabaf1355048c913457c2af698c64f64b6205801be693dc \
+  --yes --approval-digest sha256:039926a2e696540dc7e999253cfe68b23337f5e5cdb0cc129417645e5173a8be \
   --prompt-file $F/recovery-prompt.txt
 ```
+
+> **Robust human/TTY alternative (no digest):** drop `--yes --approval-digest` and
+> confirm interactively — the CLI prints the preview, asks
+> `Proceed with workflow launch? [y/N]`, and uses its own freshly-computed digest,
+> so there is no stale-digest risk:
+> ```bash
+> WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js launch fixture-single FIX-101 \
+>   --prompt-file $F/recovery-prompt.txt   # then type: y
+> ```
+> The digest above must come from the **CLI** `--dry-run` (the fallback command
+> below), not from a programmatic `launchCommand` call — the two serialize options
+> differently and produce different digests.
 
 Note the printed **run id** (call it `R`). Confirm the interactive session captured
 the recovery identity (this is what makes the whole lane work; the probe already
