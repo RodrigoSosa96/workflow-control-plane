@@ -56,13 +56,17 @@ The first real e2e found and fixed a launch bug, and verified most of the lane:
   `transportIdentity: null` even after it completed, which made `resume`/`close`
   return `no-identity`. Now the identity is persisted first via a state-less merge.
   See `docs/superpowers/verification/pi-recovery-lane.md` for the full diagnosis.
-- **Verified live (via backfilled identity against a real idle Pi session):**
-  `resume` live → focused; `close` idle → closed:true (ctrl+d, agent exits);
-  `resume` dead (no `--yes`) → needs-confirmation. The transport/resume/close code
-  is confirmed against a real Pi.
-- **Still pending a fresh e2e:** (a) identity survives to `completed` after the fix;
-  (b) `resume --yes` relaunch resumes native history + reloads extensions +
-  re-points identity at the new pane; (c) next `resume` focuses the new tab.
+- **FIXED (`d761d85`) — resume focused the wrong pane.** `tab focus` raised the tab
+  but left the retained bootstrap shell pane (above Pi) active. Switched to
+  `herdr agent focus <paneId>`, which focuses Pi's own pane.
+- **FIXED (`5c491cc`) — `resume --yes` opened an empty pane.** The relaunch agent name
+  `resume-<full sessionId>` was 43 chars; Herdr caps agent names at 32, so
+  `agent start` failed and Pi never started. Named it `resume-<sessionId first block>`.
+- **Full cycle verified live (run `ff81022c`):** launch → identity survives to
+  completed → resume focuses Pi → close idle → resume dead → `resume --yes` resumes
+  the **real session with full history** (confirmed via `herdr pane read`) → resume
+  focuses the new pane. The recovery lane works end-to-end. Details in
+  `docs/superpowers/verification/pi-recovery-lane.md`.
 
 ## Related, still-open (not blocking recovery)
 

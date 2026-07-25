@@ -225,10 +225,14 @@ launch bug** the unit tests could not see, plus verified the lane's own logic.
   it focused the **empty shell pane above Pi**, not Pi (it used `tab focus`).
   **FIXED (`d761d85`):** resume now uses `herdr agent focus <paneId>` to focus Pi's
   own pane. Re-verify in the next e2e.
-- **BUG FOUND + FIXED — relaunch surfaced the empty panel.** `resume --yes` relaunched
-  into a fresh tab whose empty root pane was focused instead of the resumed Pi pane
-  (same shell-above-Pi shape). FIXED (`d761d85`): the relaunch now `agent focus`es the
-  new agent pane after start. Re-verify the native history + widget reload in the e2e.
+- **BUG FOUND + FIXED — `resume --yes` opened an EMPTY pane.** Two causes: (a) the
+  relaunch focused the fresh tab's empty root pane, not Pi — fixed by `agent focus`
+  after start (`d761d85`); and, the real culprit, (b) the relaunch agent name was
+  `resume-<full sessionId>` = 43 chars, which `herdr agent start` rejects (names are
+  1-32 chars, `[a-z][a-z0-9_-]*`), so **Pi never started** and the tab held only empty
+  panes. Fixed (`5c491cc`) by naming the agent `resume-<sessionId first block>`
+  (≤32 chars); the exact `--session-id` still drives the resume. The relaunch tests
+  used a fake `s1` id (short name) and missed it; a real-UUID regression test was added.
 - **2. close IDLE → closed:true ✅** verified live: sent `ctrl+d` to the pane, Pi
   exited gracefully, the agent left `agent list`.
 - **3. resume DEAD (no --yes) → needs-confirmation ✅** verified live: `plan:
@@ -238,12 +242,26 @@ launch bug** the unit tests could not see, plus verified the lane's own logic.
   commands against the live session — so the lane's transport/resume/close code is
   confirmed against a real Pi, independent of the launch bug now fixed.
 
-### Still to verify with a fresh e2e (after the fix)
+### Full cycle verified live (2026-07-25, after all three fixes)
 
-- [ ] **0. Identity survives to completion:** after a fresh `launch`, once the run
-  reaches `completed`, `transportIdentity.kind == "pi-session"` is still present
-  (this is the exact bug that was fixed).
-- [ ] **4. resume --yes → relaunched:** native history resumed? widget reloaded?
-  identity re-pointed at the new pane?
-- [ ] **5. resume again → focused new tab.**
-- [ ] **Unexpected:**
+All steps confirmed against a real interactive Pi session (run `ff81022c`, session
+`d263185e`), reading pane content directly to check history — not just command output:
+
+- [x] **0. Identity survives to completion:** the launch persisted
+  `transportIdentity` and it remained present after the run reached `completed`.
+- [x] **1. resume LIVE → focused** the Pi pane itself (via `agent focus`).
+- [x] **2. close IDLE → closed:true**, agent left `agent list`.
+- [x] **3. resume DEAD (no --yes) → needs-confirmation**, nothing relaunched.
+- [x] **4. resume --yes → relaunched:** the new agent came up on the **same** session
+  file `…_d263185e….jsonl`, and `herdr pane read` showed the **full 55-line history**
+  (handoff JSON, prior reasoning) — a true resume, not an empty session. Identity was
+  re-pointed at the new pane (`w23:pA`/`w23:t5`).
+- [x] **5. resume again → focused the new pane** (`action: focused`, pane `w23:pA`).
+
+Three bugs were found and fixed by this e2e (`88289fe`, `d761d85`, `5c491cc`); none
+were catchable by the unit tests as written (faked `executeStart`; fake short session
+id; no live focus/resume check). The recovery lane now works end-to-end.
+
+Note: failed relaunch attempts (before `5c491cc`) can leave empty shell panes/tabs in
+the fixture workspace — cosmetic; drop the fixture (`rm -rf $F`) or close the
+workspace to clear them.
