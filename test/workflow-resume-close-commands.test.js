@@ -222,6 +222,44 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   assert.equal(relaunchStore.updates[0].patch.transportIdentity.sessionId, identity.sessionId);
 });
 
+test("relaunch gives Herdr a valid agent name for a real UUID session id (<=32 chars)", async () => {
+  // Real Pi session ids are 36-char UUIDs, so `resume-<sessionId>` is 43 chars — Herdr rejects
+  // agent names over 32 chars / outside [a-z][a-z0-9_-]*, and `agent start` fails, leaving the
+  // relaunch with empty panes and no Pi (observed live: "reabrir lo hizo vacío"). Earlier tests
+  // only used a fake "s1" id, which stayed under the limit and hid this.
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "pi-session", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const startCalls = [];
+  const tabCalls = [];
+  const herdr = {
+    async listAgents() { return { agents: [] }; },
+    async agentSendKeys() { assert.fail("resume must never send exit keys"); },
+    async createTab(args) { tabCalls.push(args); return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane() { return { paneId: "w3:p1" }; },
+    async startAgent(args) { startCalls.push(args); return { agentId: "a9", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent() {},
+  };
+  const store = storeFor({
+    id: RUN_ID,
+    transportIdentity: identity,
+    directory: RUN_DIRECTORY,
+    generation: 1,
+    stateRoot: RUN_STATE_ROOT,
+    controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+  });
+  const lookupExecutable = async () => "/usr/bin/pi";
+
+  const result = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store, herdr, lookupExecutable });
+  assert.equal(result.action, "relaunched");
+
+  assert.equal(startCalls.length, 1);
+  assert.ok(startCalls[0].name.length <= 32, `agent name too long (${startCalls[0].name.length}): ${startCalls[0].name}`);
+  assert.match(startCalls[0].name, /^[a-z][a-z0-9_-]{0,31}$/);
+  // The tab label matches the agent name, and the FULL session id still drives the resume.
+  assert.equal(tabCalls[0].label, startCalls[0].name);
+  assert.ok(startCalls[0].argv.includes(sessionId), "relaunch must pass the exact session id");
+});
+
 test("resumeCommand resolves its own run store from stateRoot (registry state_root, no injected store) and completes a confirmed relaunch", async (t) => {
   // Reproduces the CLI's registry-configured path: WORKFLOW_STATE_ROOT is unset, so
   // `deps.store` is never populated, and `state_root` reaches commands.js only as a plain

@@ -1240,14 +1240,20 @@ async function relaunchPiSession(identity, deps) {
 
   const run = await deps.store.read(identity.runId);
   const env = runEnv(run, "pi");
-  const sessionName = `resume-${identity.sessionId}`;
+  // Herdr agent names are limited to 1-32 chars ([a-z][a-z0-9_-]*). A full session UUID makes
+  // `resume-<uuid>` 43 chars, which `herdr agent start` rejects — so the relaunch would create
+  // the tab + split pane but never start Pi, and the user sees an empty panel on reopen. Use the
+  // session id's first block (matching the tab label). The resume is driven by the exact
+  // `--session-id` below, not by this display name, so shortening it is safe.
+  const shortSessionId = String(identity.sessionId ?? "").slice(0, 8) || "session";
+  const sessionName = `resume-${shortSessionId}`;
 
   // A fresh tab (no env — Herdr's createTab has no env parameter) gives us a root pane to
   // split from, exactly like the interactive launch's bootstrap pane.
   const tab = await herdr.createTab({
     workspaceId: identity.workspaceId,
     cwd: identity.cwd,
-    label: `resume-${String(identity.sessionId ?? "").slice(0, 8)}`,
+    label: sessionName,
     focus: true,
   });
   // The WORKFLOW_* env goes on the split pane, exactly as the interactive launch's agent pane.
