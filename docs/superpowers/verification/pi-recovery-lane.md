@@ -57,8 +57,12 @@ Launch an interactive Pi with the sub-project #1 procedure
   the `.jsonl` path ending in `_<UUID>.jsonl`. So `observeExact` must match the UUID
   **inside** the path (`value.endsWith(sessionId + ".jsonl")`) or key off `pane_id` —
   NOT `value === sessionId`.
-- **tab focus:** YES. `herdr tab focus <tab_id>` (single arg — the tab id, not pane id)
-  brings the tab to the foreground. So `focusTab({ tabId })` = `tab focus <tabId>`.
+- **tab focus:** `herdr tab focus <tab_id>` raises the tab, but the Task 7 e2e showed
+  it leaves the retained bootstrap **shell pane (above Pi)** as the active pane, so the
+  cursor lands on the empty shell, not Pi. **Corrected:** use `herdr agent focus
+  <target>` (target = pane id, same as send-keys), which focuses the agent's own pane.
+  `focusAgent({ target: paneId })` is now the resume focus command; `focusTab` is a
+  fallback. (`d761d85`.)
 - **Unexpected:** none. Note: closing a Pi pane with `ctrl+d` leaves the pane as a
   bare shell (Pi exits, the pane stays), and resume creates a NEW pane in the same
   tab — so a resumed run's tab can show leftover shell panes alongside the live Pi.
@@ -217,10 +221,14 @@ launch bug** the unit tests could not see, plus verified the lane's own logic.
   never throws on a transition. The prior identity unit test faked `executeStart`
   with the identity pre-attached, so it never exercised this path; a race test was
   added. **A fresh e2e is needed to confirm identity now survives to `completed`.**
-- **1. resume LIVE → focused ✅** verified live: returned `action: "focused"` and
-  invoked `herdr tab focus <tabId>`. (`focused` on the agent stays false because
-  focus is tab-level and the active pane in the tab is the retained bootstrap
-  shell pane, not the agent pane — cosmetic; `tab focus` itself works.)
+- **1. resume LIVE → focused** returned `action: "focused"`, but the live e2e showed
+  it focused the **empty shell pane above Pi**, not Pi (it used `tab focus`).
+  **FIXED (`d761d85`):** resume now uses `herdr agent focus <paneId>` to focus Pi's
+  own pane. Re-verify in the next e2e.
+- **BUG FOUND + FIXED — relaunch surfaced the empty panel.** `resume --yes` relaunched
+  into a fresh tab whose empty root pane was focused instead of the resumed Pi pane
+  (same shell-above-Pi shape). FIXED (`d761d85`): the relaunch now `agent focus`es the
+  new agent pane after start. Re-verify the native history + widget reload in the e2e.
 - **2. close IDLE → closed:true ✅** verified live: sent `ctrl+d` to the pane, Pi
   exited gracefully, the agent left `agent list`.
 - **3. resume DEAD (no --yes) → needs-confirmation ✅** verified live: `plan:
