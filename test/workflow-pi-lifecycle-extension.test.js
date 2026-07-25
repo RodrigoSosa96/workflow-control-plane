@@ -96,3 +96,36 @@ test("handoffExists is false when the store returns no run", async () => {
   const store = { async read() { return null; } };
   assert.equal(await handoffExists(store, "r1", 1), false);
 });
+
+// Fix 2 (whole-branch review): each pi.on(...) handler runs fire-and-forget inside
+// Pi, so a throw would be an unhandled rejection on a normal path. Defense in depth
+// alongside Fix 1's canTransition guard: a lifecycle bookkeeping error must never
+// crash the worker.
+test("agent_start swallows a lifecycle throw instead of rejecting", async () => {
+  const life = { onPrompt: async () => { throw new Error("boom"); }, onStop: async () => ({ action: "none" }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 1, state: "running" } })(pi);
+  await assert.doesNotReject(() => pi.handlers.agent_start({}, {}));
+});
+
+test("agent_settled swallows a lifecycle throw instead of rejecting", async () => {
+  const life = { onPrompt: async () => {}, onStop: async () => { throw new Error("boom"); }, onSessionEnd: async () => {} };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 1, state: "running" } })(pi);
+  await assert.doesNotReject(() => pi.handlers.agent_settled({}, {}));
+});
+
+test("agent_settled swallows a rejecting sendUserMessage instead of throwing", async () => {
+  const life = { onPrompt: async () => {}, onStop: async () => ({ action: "continue" }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  pi.sendUserMessage = async () => { throw new Error("send failed"); };
+  makeExt({ life, run: { generation: 1, state: "running" } })(pi);
+  await assert.doesNotReject(() => pi.handlers.agent_settled({}, {}));
+});
+
+test("session_shutdown swallows a lifecycle throw instead of rejecting", async () => {
+  const life = { onPrompt: async () => {}, onStop: async () => ({ action: "none" }), onSessionEnd: async () => { throw new Error("boom"); } };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 1, state: "running" } })(pi);
+  await assert.doesNotReject(() => pi.handlers.session_shutdown({ reason: "quit" }, {}));
+});

@@ -223,6 +223,18 @@ function formatReconcile(value) {
   return bound(lines.join("\n"));
 }
 
+function formatResume(value) {
+  const lines = [`Run: ${text(value.runId)}`, `resume: ${text(value.action)}`];
+  if (value.reason) lines.push(`Reason: ${value.reason}`);
+  return bound(lines.join("\n"));
+}
+
+function formatClose(value) {
+  const status = value.closed ? "closed" : "refused";
+  const lines = [`Run: ${text(value.runId)}`, `close: ${status}${value.reason ? ` ${value.reason}` : ""}`];
+  return bound(lines.join("\n"));
+}
+
 function workerMeasurement(value) {
   if (!value || typeof value !== "object") return "unknown";
   return value.availability === "reported" && Number.isFinite(value.value)
@@ -353,6 +365,10 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatResult(value);
     case "reconcile":
       return formatReconcile(value);
+    case "resume":
+      return formatResume(value);
+    case "close":
+      return formatClose(value);
     case "worker-status":
     case "worker-watch":
       return bound(formatWorkers(value));

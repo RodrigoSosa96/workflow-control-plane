@@ -25,35 +25,49 @@ export function createWorkflowWorkerLifecycleExtension({
 
   return function workflowWorkerLifecycle(pi: ExtensionAPI) {
     pi.on("agent_start", async () => {
-      const current = await store.read(runId);
-      const source = pendingContinuation ? "continuation" : "user";
-      pendingContinuation = false;
-      // The first start confirms the launch generation; a later user start is a
-      // follow-up that increments it. A continuation reuses the current generation.
-      const generation = source === "user" && startedOnce ? current.generation + 1 : current.generation;
-      startedOnce = true;
-      await life.onPrompt({ runId, generation, source });
+      try {
+        const current = await store.read(runId);
+        const source = pendingContinuation ? "continuation" : "user";
+        pendingContinuation = false;
+        // The first start confirms the launch generation; a later user start is a
+        // follow-up that increments it. A continuation reuses the current generation.
+        const generation = source === "user" && startedOnce ? current.generation + 1 : current.generation;
+        startedOnce = true;
+        await life.onPrompt({ runId, generation, source });
+      } catch {
+        // Swallow: a lifecycle bookkeeping error must never crash the worker. This
+        // handler runs inside Pi's fire-and-forget pi.on(...) dispatch, so a throw
+        // here would surface as an unhandled rejection on a normal path.
+      }
     });
 
     pi.on("agent_settled", async () => {
-      const current = await store.read(runId);
-      const { action } = await life.onStop({
-        runId,
-        generation: current.generation,
-        hasValidHandoff: await validHandoff(current.generation),
-      });
-      if (action === "continue") {
-        // Set the flag BEFORE sending, so the agent_start this triggers is tagged.
-        pendingContinuation = true;
-        pi.sendUserMessage(continuationPrompt(runId, current.generation), {
-          deliverAs: "followUp",
-          triggerTurn: true,
+      try {
+        const current = await store.read(runId);
+        const { action } = await life.onStop({
+          runId,
+          generation: current.generation,
+          hasValidHandoff: await validHandoff(current.generation),
         });
+        if (action === "continue") {
+          // Set the flag BEFORE sending, so the agent_start this triggers is tagged.
+          pendingContinuation = true;
+          await pi.sendUserMessage(continuationPrompt(runId, current.generation), {
+            deliverAs: "followUp",
+            triggerTurn: true,
+          });
+        }
+      } catch {
+        // Swallow: a lifecycle bookkeeping error must never crash the worker.
       }
     });
 
     pi.on("session_shutdown", async () => {
-      await life.onSessionEnd({ runId });
+      try {
+        await life.onSessionEnd({ runId });
+      } catch {
+        // Swallow: a lifecycle bookkeeping error must never crash the worker.
+      }
     });
   };
 }

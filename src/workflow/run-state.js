@@ -102,3 +102,10 @@ export function transitionRun(run, nextState, patch = {}) {
 export function isRunState(value) {
   return STATE_VALUES.has(value);
 }
+
+// Non-throwing counterpart to transitionRun's legality check. Callers that must not
+// let an illegal transition throw (e.g. fire-and-forget event handlers) can decide
+// what to do about it themselves instead of relying on a caught exception.
+export function canTransition(from, to) {
+  return ALLOWED[from]?.has(to) ?? false;
+}

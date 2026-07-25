@@ -2,13 +2,22 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createLifecycle } from "../src/workflow/lifecycle.js";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { RUN_STATES } from "../src/workflow/run-state.js";
+import { RUN_STATES, transitionRun } from "../src/workflow/run-state.js";
 
+// Mirrors run-store.js's updatedRun: an update that changes state is routed through
+// transitionRun (so illegal transitions throw exactly as the real store does); an
+// update that keeps the same state is a plain merge (transitionRun forbids same-state
+// "transitions" outright, and the real store never calls it in that case either).
 function fakeStore(initial) {
   let run = { id: "r1", state: RUN_STATES.LAUNCHING, generation: 1, stateHistory: [], updatedAt: "t0", ...initial };
   return {
     async read() { return { ...run }; },
-    async update(_id, updater) { run = { ...run, ...updater({ ...run }) }; return { ...run }; },
+    async update(_id, updater) {
+      const patch = await updater({ ...run });
+      const { state: requestedState = run.state, ...fields } = patch;
+      run = requestedState === run.state ? { ...run, ...fields } : transitionRun(run, requestedState, fields);
+      return { ...run };
+    },
     _get: () => run,
   };
 }
@@ -106,4 +115,42 @@ test("session end from a non-terminal state interrupts; terminal states are pres
   assert.equal((await createLifecycle({ store: running, clock: () => "t" }).onSessionEnd({ runId: "r1" })).state, RUN_STATES.INTERRUPTED);
   const done = fakeStore({ state: RUN_STATES.COMPLETED, generation: 1 });
   assert.equal((await createLifecycle({ store: done, clock: () => "t" }).onSessionEnd({ runId: "r1" })).state, RUN_STATES.COMPLETED);
+});
+
+// Fix 1 (whole-branch review): onSessionEnd/onStop must never let run-state.js's
+// transitionRun throw on an illegal transition — these handlers run inside the Pi
+// extension's fire-and-forget pi.on(...) callbacks, where a throw becomes an
+// unhandled rejection on a normal path (worker hands off blocked -> user hits
+// Ctrl-D -> session_shutdown -> onSessionEnd tries blocked -> interrupted, which
+// ALLOWED[blocked] = {running, result-stale} forbids).
+test("onSessionEnd on a blocked run does not throw and leaves the run unchanged", async () => {
+  const store = fakeStore({ state: RUN_STATES.BLOCKED, generation: 1 });
+  const lifecycle = createLifecycle({ store, clock: () => "t" });
+  const run = await lifecycle.onSessionEnd({ runId: "r1" });
+  assert.equal(run.state, RUN_STATES.BLOCKED);
+});
+
+test("onSessionEnd on a failed run does not throw and leaves the run unchanged", async () => {
+  const store = fakeStore({ state: RUN_STATES.FAILED, generation: 1 });
+  const lifecycle = createLifecycle({ store, clock: () => "t" });
+  const run = await lifecycle.onSessionEnd({ runId: "r1" });
+  assert.equal(run.state, RUN_STATES.FAILED);
+});
+
+// needs-input -> interrupted is legal per run-state.js's ALLOWED table (unlike
+// blocked/failed), so canTransition permits it and onSessionEnd proceeds normally;
+// this asserts the guard does not over-block a legal transition.
+test("onSessionEnd on a needs-input run does not throw and interrupts (a legal transition)", async () => {
+  const store = fakeStore({ state: RUN_STATES.NEEDS_INPUT, generation: 1 });
+  const lifecycle = createLifecycle({ store, clock: () => "t" });
+  const run = await lifecycle.onSessionEnd({ runId: "r1" });
+  assert.equal(run.state, RUN_STATES.INTERRUPTED);
+});
+
+test("onStop with a valid handoff on a failed run does not throw and does not complete", async () => {
+  const store = fakeStore({ state: RUN_STATES.FAILED, generation: 1, stopAttempts: 0 });
+  const lifecycle = createLifecycle({ store, clock: () => "t" });
+  const { run, action } = await lifecycle.onStop({ runId: "r1", generation: 1, hasValidHandoff: true });
+  assert.equal(action, "none");
+  assert.equal(run.state, RUN_STATES.FAILED);
 });
