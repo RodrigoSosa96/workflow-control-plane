@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { closeWorker as defaultCloseWorker } from "./close.js";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
@@ -8,12 +8,14 @@ import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./del
 import { createDelegationReservationStore } from "./delegation-reservations.js";
 import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
+import { PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
+import { createPiSessionTransport } from "./pi-session-transport.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
-import { planResume as defaultPlanResume } from "./resume.js";
+import { executeResume as defaultExecuteResume } from "./resume.js";
 import { RUN_STATES } from "./run-state.js";
 import { createRunStore } from "./run-store.js";
 import { createTelemetryStore } from "./telemetry-store.js";
@@ -1182,25 +1184,144 @@ function assertWorkerTransportDependency(deps, command) {
   return deps.transport;
 }
 
+// resume/close operate on the top-level run's own transportIdentity, which is only ever
+// absent or `kind: "pi-session"` (see execute.js/launch.js — delegation identities live
+// under run.delegations[id], a separate field). A pi-session identity always needs the
+// session transport (built here from the live Herdr adapter); anything else falls back to
+// whatever worker transport the caller already injected (e.g. the CLI's delegation
+// transport), preserving the prior behavior for runs with no exact session identity.
+function scopedRunStore(store, runId, run) {
+  return {
+    async read(requestedId) {
+      return requestedId === runId ? run : await store.read(requestedId);
+    },
+    // Only executeResume's confirmed-relaunch path calls update (a foreground write triggered
+    // by the user's `resume --yes`), to persist the relaunched pi-session's new pane/tab
+    // identity. Delegates straight to the real run store; requestedId is not special-cased the
+    // way read() is, since there is no cached run object to shortcut against.
+    async update(requestedId, updater) {
+      return await store.update(requestedId, updater);
+    },
+  };
+}
+
+function transportForRun(run, deps, command) {
+  if (run?.transportIdentity?.kind === "pi-session") {
+    if (!deps.herdr) delegationError("PREFLIGHT", `${command} requires a worker transport`, 10);
+    const createSessionTransport = deps.createSessionTransport ?? createPiSessionTransport;
+    return createSessionTransport({ herdr: deps.herdr });
+  }
+  return assertWorkerTransportDependency(deps, command);
+}
+
+// Relaunch a dead pi-session so it comes back exactly as the interactive launch left it:
+// same native session (`--session-id <exact>`, never `--last`/`--continue`) AND the same
+// lifecycle/observability extensions and WORKFLOW_* env the interactive start wired up (see
+// execute.js's executeOrdinaryStart/executeGroupStart: createTab -> splitPane({ env }) ->
+// startAgent). A pane from herdr.createTab carries no env and no extensions on its own, so
+// skipping the split-with-env step here would resume the native history with the widget and
+// telemetry/lifecycle wiring silently dead. pi-session-transport.js deliberately does not
+// implement this itself (its start/deliverFollowUp are stubs) — relaunch is owned by resume.
+async function relaunchPiSession(identity, deps) {
+  const herdr = deps.herdr;
+  if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.splitPane !== "function" || typeof herdr.startAgent !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab, splitPane, and startAgent", 10);
+  }
+  if (typeof deps.lookupExecutable !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a lookupExecutable dependency", 10);
+  }
+  if (!deps.store || typeof deps.store.read !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a run store to rebuild the workflow environment", 10);
+  }
+  const piCommand = await deps.lookupExecutable("pi");
+  if (!piCommand || !isAbsolute(piCommand)) {
+    delegationError("PREFLIGHT", "Pi executable must resolve to an absolute path to relaunch a session", 10);
+  }
+
+  const run = await deps.store.read(identity.runId);
+  const env = runEnv(run, "pi");
+  // Herdr agent names are limited to 1-32 chars ([a-z][a-z0-9_-]*). A full session UUID makes
+  // `resume-<uuid>` 43 chars, which `herdr agent start` rejects — so the relaunch would create
+  // the tab + split pane but never start Pi, and the user sees an empty panel on reopen. Use the
+  // session id's first block (matching the tab label). The resume is driven by the exact
+  // `--session-id` below, not by this display name, so shortening it is safe.
+  const shortSessionId = String(identity.sessionId ?? "").slice(0, 8) || "session";
+  const sessionName = `resume-${shortSessionId}`;
+
+  // A fresh tab (no env — Herdr's createTab has no env parameter) gives us a root pane to
+  // split from, exactly like the interactive launch's bootstrap pane.
+  const tab = await herdr.createTab({
+    workspaceId: identity.workspaceId,
+    cwd: identity.cwd,
+    label: sessionName,
+    focus: true,
+  });
+  // The WORKFLOW_* env goes on the split pane, exactly as the interactive launch's agent pane.
+  const agentPane = await herdr.splitPane({
+    paneId: tab.paneId,
+    direction: "down",
+    cwd: identity.cwd,
+    env,
+    focus: true,
+  });
+
+  const argv = [piCommand, "--name", sessionName, "--session-id", identity.sessionId];
+  for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);
+  // No bootstrap prompt: a resume continues the existing session instead of starting a fresh
+  // assignment.
+
+  const started = await herdr.startAgent({
+    name: sessionName,
+    paneId: agentPane.paneId,
+    kind: "pi",
+    argv,
+    timeout: 30000,
+  });
+  const newPaneId = started.paneId ?? agentPane.paneId;
+  // Focus the resumed agent pane, not the fresh tab's empty root pane. createTab -> splitPane
+  // leaves an empty shell pane above Pi (same shape as launch), and createTab/splitPane focus
+  // lands on that shell; without this the relaunch surfaces the empty panel (observed).
+  if (typeof herdr.focusAgent === "function") {
+    await herdr.focusAgent({ target: newPaneId });
+  }
+  return {
+    identity: {
+      ...identity,
+      paneId: newPaneId,
+      tabId: started.tabId ?? tab.tabId,
+    },
+  };
+}
+
 export async function resumeCommand(options = {}, deps = {}) {
   const runId = assertRunId(options.runId);
   const store = await storeForCommand(options, deps);
-  const transport = assertWorkerTransportDependency(deps, "resume");
-  const planResume = deps.planResume ?? defaultPlanResume;
-  const plan = await planResume({ store, transport, runId });
+  const run = await store.read(runId);
+  const transport = transportForRun(run, deps, "resume");
+  const executeResume = deps.executeResume ?? defaultExecuteResume;
+  const relaunch = deps.relaunch ?? ((identity) => relaunchPiSession(identity, { ...deps, store }));
+  const result = await executeResume({
+    store: scopedRunStore(store, runId, run),
+    transport,
+    herdr: deps.herdr,
+    runId,
+    confirmed: Boolean(options.confirmed),
+    relaunch,
+  });
   return {
     command: "resume",
     runId,
-    ...plan,
+    ...result,
   };
 }
 
 export async function closeCommand(options = {}, deps = {}) {
   const runId = assertRunId(options.runId);
   const store = await storeForCommand(options, deps);
-  const transport = assertWorkerTransportDependency(deps, "close");
+  const run = await store.read(runId);
+  const transport = transportForRun(run, deps, "close");
   const closeWorker = deps.closeWorker ?? defaultCloseWorker;
-  const outcome = await closeWorker({ store, transport, runId });
+  const outcome = await closeWorker({ store: scopedRunStore(store, runId, run), transport, runId });
   return {
     command: "close",
     runId,

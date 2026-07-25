@@ -9,6 +9,8 @@ export async function closeWorker({ store, transport, runId }) {
   if (observation.state !== "idle") {
     return { closed: false, reason: observation.state === "active" ? "working" : "identity-unconfirmed" };
   }
-  await transport.requestGracefulClose(identity);
-  return { closed: true };
+  const result = await transport.requestGracefulClose(identity);
+  return result?.requested === true
+    ? { closed: true }
+    : { closed: false, reason: "close-not-confirmed" };
 }

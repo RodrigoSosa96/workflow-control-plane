@@ -48,7 +48,7 @@ Commands:
   workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow result <run-id> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
-  workflow resume <run-id> [--format compact|json]
+  workflow resume <run-id> [--yes] [--format compact|json]
   workflow close <run-id> [--format compact|json]
   workflow worker status <run-id> [--format compact|json]
   workflow worker watch <run-id> [--format compact|json]
@@ -303,11 +303,12 @@ export function parseArgs(argv) {
   }
 
   if (command === "resume") {
-    validateShape("resume", positionals, options, { min: 1, max: 1, allowedOptions: [] });
+    validateShape("resume", positionals, options, { min: 1, max: 1, allowedOptions: ["yes"] });
     assertPathSafeUuidSyntax(positionals[0], "resume run ID");
     return {
       command,
       runId: positionals[0],
+      ...(options.yes ? { yes: true } : {}),
       format,
     };
   }
@@ -732,7 +733,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
 
     if (args.command === "resume") {
       const commandDependencies = await withLiveDelegationTransport(options, liveDependencies, dependencies);
-      const result = await resumeCommand(options, commandDependencies);
+      const result = await resumeCommand({ ...options, confirmed: Boolean(options.yes) }, commandDependencies);
       emit(out, formatWorkflowResult("resume", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }

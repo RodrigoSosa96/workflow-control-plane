@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createPiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
+import { createPiSessionTransport } from "../src/workflow/pi-session-transport.js";
 import { assertWorkerTransport, createFakeWorkerTransport } from "../src/workflow/worker-transport.js";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,6 +31,17 @@ test("pi delegation transport satisfies the worker transport contract", () => {
     controlPlaneBin: "/control/bin/workflow",
     childExtensionPath: join(projectRoot, ".pi", "extensions", "workflow-delegation-child.ts"),
     agentDirectory: join(projectRoot, ".pi", "agents"),
+  });
+
+  assert.equal(assertWorkerTransport(transport), transport);
+});
+
+test("pi session transport satisfies the worker transport contract", () => {
+  const transport = createPiSessionTransport({
+    herdr: {
+      async listAgents() { return { agents: [] }; },
+      async agentSendKeys() { return { sent: true }; },
+    },
   });
 
   assert.equal(assertWorkerTransport(transport), transport);

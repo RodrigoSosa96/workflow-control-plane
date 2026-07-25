@@ -635,6 +635,20 @@ export async function executeLaunch(preview, deps = {}) {
     const isRunning = completedLaunchWithCreatedAgent(execution);
     const hasCreatedAgent = createdSelectedAgent(execution);
     const session = hasCreatedAgent ? sessionPatch(execution, launchExpected ?? {}) : {};
+    const agentOp = agentOperationReport(execution);
+
+    // Persist the transport identity FIRST, as a dedicated state-less merge. The interactive
+    // worker's own lifecycle extension advances the run state concurrently with this launcher,
+    // so the state-bearing write below can race it, hit an illegal transition, throw, and be
+    // swallowed — silently dropping the identity and permanently breaking `resume`/`close`
+    // (observed live: a CLI launch that completed still had transportIdentity: null). A patch
+    // with no `state` field takes the store's same-state merge path, which never throws on a
+    // transition, so the identity survives regardless of who wins the race. The identity is a
+    // fact the moment the agent op is created — independent of whether the launch reports running.
+    if (agentOp?.sessionIdentity?.sessionId) {
+      await updateRun(store, run.id, { transportIdentity: cloneData(agentOp.sessionIdentity) });
+    }
+
     await updateRun(store, run.id, {
       state: isRunning ? RUN_STATES.RUNNING : RUN_STATES.FAILED,
       harness: fresh.selection.harness,

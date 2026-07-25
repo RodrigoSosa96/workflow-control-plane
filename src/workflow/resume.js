@@ -21,3 +21,33 @@ export async function planResume({ store, transport, runId }) {
       return { action: "refuse", identity, reason: observation.state };
   }
 }
+
+export async function executeResume({ store, transport, herdr, runId, confirmed = false, relaunch }) {
+  const plan = await planResume({ store, transport, runId });
+  if (plan.action === "focus") {
+    // Focus Pi's own pane, not just its tab. The launch retains a bootstrap shell pane above the
+    // agent pane, so `tab focus` would raise the tab but leave the empty shell as the active pane
+    // (observed: resume landed on "the panel above Pi"). `agent focus <paneId>` brings the agent
+    // pane itself forward. Fall back to tab focus only if we somehow lack a paneId.
+    if (herdr && typeof herdr.focusAgent === "function" && plan.identity?.paneId) {
+      await herdr.focusAgent({ target: plan.identity.paneId });
+    } else if (herdr && typeof herdr.focusTab === "function" && plan.identity?.tabId) {
+      await herdr.focusTab({ tabId: plan.identity.tabId });
+    }
+    return { action: "focused", identity: plan.identity };
+  }
+  if (plan.action === "relaunch") {
+    if (!confirmed) return { action: "needs-confirmation", plan: "relaunch", identity: plan.identity };
+    const result = await relaunch(plan.identity);
+    const identity = result?.identity ?? plan.identity;
+    // Persist the new pane/tab identity so the next resume observes the live pane instead of
+    // the dead one; this is a foreground write triggered by the user's confirmed `--yes`, not
+    // a background writer. Only fires on a confirmed relaunch that actually returned an
+    // identity — never on focus or needs-confirmation.
+    if (result?.identity && typeof store.update === "function") {
+      await store.update(runId, () => ({ transportIdentity: identity }));
+    }
+    return { action: "relaunched", identity };
+  }
+  fail(`Cannot resume: ${plan.reason ?? plan.action}`, { runId });
+}

@@ -1339,6 +1339,63 @@ test("accepts an absolute executable path whose basename matches the kind", asyn
   assert.equal(result.agentId, "a11");
 });
 
+test("agentSendKeys sends the exit keys to the target via the public cli", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["agent", "send-keys", "w2:p9", "C-d"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ sent: true }, "cli:agent:send-keys"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+  assert.deepEqual(await herdr.agentSendKeys({ target: "w2:p9", keys: ["C-d"] }), { sent: true });
+});
+
+test("agentSendKeys sends multiple keys in order", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["agent", "send-keys", "w1T:p2", "ctrl+d"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ sent: true }, "cli:agent:send-keys"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+  assert.deepEqual(await herdr.agentSendKeys({ target: "w1T:p2", keys: ["ctrl+d"] }), { sent: true });
+});
+
+test("agentSendKeys rejects a missing target or empty keys", async () => {
+  const herdr = createHerdrAdapter({ runner: fixtureRunner([]).runner });
+  await assert.rejects(herdr.agentSendKeys({ target: "", keys: ["C-d"] }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.agentSendKeys({ target: "w2:p9", keys: [] }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.agentSendKeys({ target: "w2:p9", keys: ["ok", ""] }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.agentSendKeys({ target: "w2:p9", keys: [42] }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.agentSendKeys({}), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+});
+
+test("focusTab focuses the target tab via the public cli", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["tab", "focus", "w2:t1"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ focused: true }, "cli:tab:focus"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+  assert.deepEqual(await herdr.focusTab({ tabId: "w2:t1" }), { focused: true });
+});
+
+test("focusTab rejects a missing tab id", async () => {
+  const herdr = createHerdrAdapter({ runner: fixtureRunner([]).runner });
+  await assert.rejects(herdr.focusTab({ tabId: "" }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.focusTab({}), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+});
+
 test("startAgent requires paneId and kind", async () => {
   const calls = [];
   const herdr = createHerdrAdapter({

@@ -555,5 +555,37 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
         }
       }
     },
+
+    // Herdr's exit key syntax is `ctrl+d`, not tmux-style `C-d` — the caller supplies the
+    // probed key strings verbatim and this only validates shape, not key syntax.
+    async agentSendKeys({ target, keys } = {}) {
+      if (typeof target !== "string" || !target) {
+        fail("PREFLIGHT", "agentSendKeys requires a target id", { target }, 10);
+      }
+      if (!Array.isArray(keys) || keys.length === 0 || keys.some((k) => typeof k !== "string" || !k)) {
+        fail("PREFLIGHT", "agentSendKeys requires non-empty key strings", { target, keys }, 10);
+      }
+      return await invoke("agent", "send-keys", [target, ...keys]);
+    },
+
+    // Focus a specific agent by its target (the pane id, same target `agent send-keys` takes).
+    // `agent focus` brings the agent's OWN pane forward — unlike `tab focus`, which only raises
+    // the tab and leaves the retained bootstrap shell pane (above Pi) as the active pane.
+    // `pane focus` is directional (next/prev) and cannot target a pane by id, so it is not used.
+    async focusAgent({ target } = {}) {
+      if (typeof target !== "string" || !target) {
+        fail("PREFLIGHT", "focusAgent requires an agent target", { target }, 10);
+      }
+      return await invoke("agent", "focus", [target]);
+    },
+
+    // Kept as a fallback for callers that only hold a tab id; prefer focusAgent, which focuses
+    // the agent's pane rather than just raising the tab.
+    async focusTab({ tabId } = {}) {
+      if (typeof tabId !== "string" || !tabId) {
+        fail("PREFLIGHT", "focusTab requires a tab id", { tabId }, 10);
+      }
+      return await invoke("tab", "focus", [tabId]);
+    },
   };
 }
