@@ -30,6 +30,21 @@ brainstorm → spec → plan cycle.
    real graceful-close transport exists, honor its result (closed only if actually
    requested/terminated); today `requestGracefulClose` is a manual-only stub.
 
+## Surfaced by the Task 8 interactive run (2026-07-25)
+
+- **Launch report says `partial`/`failed` with `Tab: unknown` / `Pane: unknown`
+  for an interactive run that actually succeeds.** In the Task 8 autonomous run
+  the launch printed `Launch status: partial` / `State: failed` and could not
+  resolve the agent tab/pane, yet the run went `planned → launching → running →
+  completed` and the handoff was accepted. The interactive `agent start` path
+  does not surface the started tab/pane back into the launch report the way the
+  supervisor path does, so the launch under-reports success. Fix the interactive
+  launch report to record the real tab/pane and not mark the run failed when the
+  agent actually started.
+- **`observability widget cost/tokens display** — FIXED on this branch
+  (`buildObservabilityLines`): the widget printed measurement objects as
+  `$[object Object]` and never showed tokens. Kept here for the record.
+
 ## Smaller hardening / polish
 
 5. **`lifecycle.js` no-op writes.** `onStop`/`onSessionEnd` call `store.update`

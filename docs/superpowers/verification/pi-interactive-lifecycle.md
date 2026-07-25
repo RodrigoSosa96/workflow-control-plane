@@ -135,14 +135,36 @@ transport, not an interactive session transport — see
 `docs/superpowers/plans/2026-07-25-pi-interactive-lifecycle-followups.md`). Skip
 resume/close in this pass.
 
-### Findings (fill in)
+### Findings (autonomous run completed 2026-07-25, run 0244f07e)
 
-- Extensions loaded (widget shown, no import errors)?:
-- Autonomous: reached `completed` and `result` returned the handoff?:
-- Telemetry phase advanced (not stuck unknown)?:
-- Assisted: generation incremented to 2 and prior result archived?:
-- Any Herdr `agent start --kind pi` launch errors?:
-- Anything unexpected:
+- **Extensions loaded?** YES — the observability widget rendered in the pane
+  (`Workflow 0244f07e… | running/settled | pi`, Model, Tool). No `.ts`/import
+  errors. This confirms Pi loads a `.ts` extension by absolute path with relative
+  `.js` imports — the top runtime risk. ✅
+- **Autonomous reached `completed` and returned the handoff?** YES. Pi edited
+  `fixture.js` → `implemented`, updated `test.js`, ran the tests, submitted the
+  handoff (status `completed`, ticket `FIX-101` only — correctly ignored FIX-102
+  as out of scope). stateHistory: `planned → launching → running → completed`,
+  generation 1. `results/generation-1.json` present. ✅
+- **Telemetry phase advanced (not stuck unknown)?** YES — `phase settled`,
+  `observability reported`, `cost 0.037`. The lifecycle extension drove the run
+  state; the observability extension recorded telemetry. ✅
+- **Assisted (follow-up → generation 2)?** NOT YET RUN — the operator ended the
+  session after the autonomous handoff without typing a follow-up. Optional
+  next pass.
+- **Two bugs found:**
+  1. Widget showed `Cost: $[object Object]` and never showed tokens — FIXED on
+     this branch (`buildObservabilityLines`).
+  2. Launch report said `partial`/`failed` with `Tab/Pane: unknown` although the
+     run completed successfully — the interactive launch under-reports the started
+     tab/pane. Tracked as a follow-up.
+- **Herdr `agent start --kind pi`:** the pane launched and Pi ran; the only issue
+  was the report's tab/pane resolution above, not the launch itself.
+
+### Also fixed while running Task 8
+
+- The CLI `--dry-run → --yes` flow failed with `Stale approval digest` because
+  `dryRun` leaked into the approval digest. FIXED (`launch.js` volatile keys).
 
 ## Findings (completed 2026-07-24, Pi 0.81.1)
 
