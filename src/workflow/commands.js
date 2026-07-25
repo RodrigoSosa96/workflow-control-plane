@@ -1286,7 +1286,7 @@ export async function resumeCommand(options = {}, deps = {}) {
   const run = await store.read(runId);
   const transport = transportForRun(run, deps, "resume");
   const executeResume = deps.executeResume ?? defaultExecuteResume;
-  const relaunch = deps.relaunch ?? ((identity) => relaunchPiSession(identity, deps));
+  const relaunch = deps.relaunch ?? ((identity) => relaunchPiSession(identity, { ...deps, store }));
   const result = await executeResume({
     store: scopedRunStore(store, runId, run),
     transport,

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { closeCommand, resumeCommand } from "../src/workflow/commands.js";
 import { createPiSessionTransport } from "../src/workflow/pi-session-transport.js";
 import { PI_WORKER_EXTENSIONS } from "../src/workflow/harnesses.js";
 import { WorkflowError } from "../src/workflow/errors.js";
+import { createRunStore } from "../src/workflow/run-store.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const RUN_DIRECTORY = "/state/runs/11111111-1111-4111-8111-111111111111";
@@ -209,6 +213,103 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   assert.equal(relaunchStore.updates[0].runId, RUN_ID);
   assert.deepEqual(relaunchStore.updates[0].patch, { transportIdentity: newIdentity });
   assert.equal(relaunchStore.updates[0].patch.transportIdentity.sessionId, identity.sessionId);
+});
+
+test("resumeCommand resolves its own run store from stateRoot (registry state_root, no injected store) and completes a confirmed relaunch", async (t) => {
+  // Reproduces the CLI's registry-configured path: WORKFLOW_STATE_ROOT is unset, so
+  // `deps.store` is never populated, and `state_root` reaches commands.js only as a plain
+  // `stateRoot` value (mirroring projects.yaml's launcher.state_root, resolved upstream by
+  // stateRootForCommand). `storeForCommand` then builds its own store via `createRunStore`.
+  // No test above exercises this: every other case injects `deps.store` directly, which is
+  // exactly what masks the bug -- relaunch's closure only breaks when it has to fall back to
+  // storeForCommand's resolved store instead of a pre-supplied one.
+  const root = await mkdtemp(join(tmpdir(), "workflow-resume-registry-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateRoot = join(root, "state");
+
+  const identity = { kind: "pi-session", runId: RUN_ID, sessionId: "s1", paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+
+  // Seed the run on disk through the real store, exactly as `workflow launch` would have.
+  const seedStore = createRunStore({ stateRoot });
+  await seedStore.create({
+    runId: RUN_ID,
+    transportIdentity: identity,
+    generation: 2,
+    stateRoot: RUN_STATE_ROOT,
+    controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+  });
+
+  const deadHerdr = {
+    async listAgents() {
+      return { agents: [] };
+    },
+    async agentSendKeys() {
+      assert.fail("resume must never send exit keys");
+    },
+  };
+
+  // No `store` in deps anywhere below -- only `stateRoot`, exactly as the CLI passes it when
+  // the registry (not WORKFLOW_STATE_ROOT) supplies state_root.
+  const pending = await resumeCommand({ runId: RUN_ID, confirmed: false }, { stateRoot, herdr: deadHerdr });
+  assert.deepEqual(pending, { command: "resume", runId: RUN_ID, action: "needs-confirmation", plan: "relaunch", identity });
+
+  const tabCalls = [];
+  const splitCalls = [];
+  const startCalls = [];
+  const relaunchHerdr = {
+    ...deadHerdr,
+    async createTab(args) {
+      tabCalls.push(args);
+      return { tabId: "w3:t1", paneId: "w3:p0" };
+    },
+    async splitPane(args) {
+      splitCalls.push(args);
+      return { paneId: "w3:p1" };
+    },
+    async startAgent(args) {
+      startCalls.push(args);
+      return { agentId: "agent-9", tabId: "w3:t1", paneId: "w3:p1" };
+    },
+  };
+  const lookupExecutable = async (name) => {
+    assert.equal(name, "pi");
+    return "/usr/bin/pi";
+  };
+
+  // The reproduction: a confirmed relaunch, still with no `deps.store`. Before the fix, the
+  // relaunch closure closes over the raw `deps` (whose `.store` is undefined here) instead of
+  // the store `storeForCommand` resolved a few lines above in resumeCommand, so
+  // relaunchPiSession throws "requires a run store" even though resume just successfully read
+  // the run through that very store.
+  const relaunched = await resumeCommand(
+    { runId: RUN_ID, confirmed: true },
+    { stateRoot, herdr: relaunchHerdr, lookupExecutable },
+  );
+
+  const newIdentity = { ...identity, paneId: "w3:p1", tabId: "w3:t1" };
+  assert.equal(relaunched.action, "relaunched");
+  assert.deepEqual(relaunched.identity, newIdentity);
+  assert.deepEqual(tabCalls, [{ workspaceId: identity.workspaceId, cwd: identity.cwd, label: "resume-s1", focus: true }]);
+
+  // The env rebuilt for the relaunch pane must come from the run this resolved store read --
+  // proof relaunchPiSession actually received a working store rather than failing preflight.
+  const expectedEnv = {
+    WORKFLOW_RUN_ID: RUN_ID,
+    WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
+    WORKFLOW_GENERATION: "2",
+    WORKFLOW_HARNESS: "pi",
+    WORKFLOW_STATE_ROOT: RUN_STATE_ROOT,
+    WORKFLOW_CONTROL_PLANE_BIN: RUN_CONTROL_PLANE_BIN,
+  };
+  assert.equal(splitCalls.length, 1);
+  assert.deepEqual(splitCalls[0].env, expectedEnv);
+  assert.equal(startCalls.length, 1);
+
+  // The confirmed relaunch's persistence write must have landed through the resolved store:
+  // verify it via a second, independent store instance pointed at the same stateRoot.
+  const verifyStore = createRunStore({ stateRoot });
+  const persisted = await verifyStore.read(RUN_ID);
+  assert.deepEqual(persisted.transportIdentity, newIdentity);
 });
 
 test("resumeCommand surfaces the resume-category error for a run with no transport identity", async () => {
