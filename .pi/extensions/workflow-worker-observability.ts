@@ -22,6 +22,33 @@ function readEnv(source: Record<string, string | undefined>) {
   return env;
 }
 
+// Builds the widget lines from a public telemetry snapshot. Kept pure and exported
+// so it is unit-tested directly. Usage measurements are { availability, value }
+// objects, so their `.value` must be read — printing the object yields "[object Object]".
+export function buildObservabilityLines(runId: string, snapshot: any): string[] {
+  const lines: string[] = [];
+  if (!snapshot) {
+    lines.push(`Workflow ${runId.slice(0, 8)}… | starting | pi`);
+    return lines;
+  }
+  lines.push(`Workflow ${runId.slice(0, 8)}… | ${snapshot.phase} | ${snapshot.harness}`);
+  if (snapshot.model) lines.push(`Model: ${snapshot.model}`);
+  const reported = (m: any): number | undefined =>
+    m && m.availability === "reported" && typeof m.value === "number" ? m.value : undefined;
+  if (snapshot.usage) {
+    const inputTokens = reported(snapshot.usage.input);
+    const outputTokens = reported(snapshot.usage.output);
+    const cost = reported(snapshot.usage.cost);
+    const parts: string[] = [];
+    if (inputTokens !== undefined) parts.push(`in=${inputTokens}`);
+    if (outputTokens !== undefined) parts.push(`out=${outputTokens}`);
+    if (parts.length) lines.push(`Tokens: ${parts.join(" ")}`);
+    if (cost !== undefined) lines.push(`Cost: $${cost}`);
+  }
+  if (snapshot.tools?.lastName) lines.push(`Tool: ${snapshot.tools.lastName}`);
+  return lines;
+}
+
 export function createWorkflowWorkerObservabilityExtension({
   env = process.env as Record<string, string | undefined>,
 } = {}) {
@@ -43,27 +70,11 @@ export function createWorkflowWorkerObservabilityExtension({
     async function updateWidget(ctx: any) {
       const snapshots = await telemetry.read({ runId });
       const raw = snapshots[0] ?? null;
-      const lines: string[] = [];
-      if (raw) {
-        const snapshot = publicTelemetrySnapshot(raw);
-        lines.push(`Workflow ${runId.slice(0, 8)}… | ${snapshot.phase} | ${snapshot.harness}`);
-        if (snapshot.model) lines.push(`Model: ${snapshot.model}`);
-        if (snapshot.usage) {
-          const t = snapshot.usage.tokens;
-          const c = snapshot.usage.cost;
-          const parts: string[] = [];
-          if (t?.input !== undefined) parts.push(`in=${t.input}`);
-          if (t?.output !== undefined) parts.push(`out=${t.output}`);
-          if (parts.length) lines.push(`Tokens: ${parts.join(" ")}`);
-          if (c !== undefined) lines.push(`Cost: $${c}`);
-        }
-        if (snapshot.tools?.lastName) lines.push(`Tool: ${snapshot.tools.lastName}`);
-      } else {
-        lines.push(`Workflow ${runId.slice(0, 8)}… | starting | pi`);
-      }
+      const snapshot = raw ? publicTelemetrySnapshot(raw) : null;
+      const lines = buildObservabilityLines(runId, snapshot);
       if (ctx.hasUI) {
         ctx.ui.setWidget("workflow-worker-observability", lines);
-        ctx.ui.setStatus("workflow-worker-observability", `pi ${raw ? publicTelemetrySnapshot(raw).phase : "starting"}`);
+        ctx.ui.setStatus("workflow-worker-observability", `pi ${snapshot ? snapshot.phase : "starting"}`);
       }
     }
 
