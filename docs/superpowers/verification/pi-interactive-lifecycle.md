@@ -64,12 +64,85 @@ leaves doubt about the real extension (vs. the probe). Requires a real run in th
 state store; skip unless you want the extra signal. If you want it, tell me and
 I'll generate the exact env + a seeded run.
 
-## Experiment 3 — Full interactive `workflow launch` (LATER, this is Task 8)
+## Task 8 — Full interactive `workflow launch` end-to-end (REQUIRED before merge)
 
-Running an end-to-end interactive `workflow launch` (which surfaces any Herdr
-`agent start --kind pi` interactive-launch bugs) needs a fixture registry with
-`mode: interactive`. That belongs to Task 8 (end-to-end verification), after the
-lifecycle extension exists. Not required to unblock Task 6.
+Prepared fixture (already generated + patched to `mode: interactive`, prompt written,
+approval digest computed):
+
+- Fixture: `/tmp/workflow-smoke-1784945292112`
+- Registry: `/tmp/workflow-smoke-1784945292112/projects.yaml` (pi-worker → `mode: interactive`)
+- Prompt: `/tmp/workflow-smoke-1784945292112/canary-prompt.txt`
+- Approval digest: `sha256:6d4b8b863c4310bec35ca3e563fd7839f5e33a425cc16a669495aca003b75e2d`
+
+> If you regenerate the fixture or the digest is rejected, re-run the dry-run to
+> get a fresh digest:
+> `WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js launch fixture-single FIX-101 --dry-run --prompt-file $F/canary-prompt.txt`
+
+Dry-run already confirmed the interactive lane is selected (op `agent.session.start`,
+argv `pi --name … --session-id …`, NOT the supervisor) and both extensions are wired
+via `--extension`.
+
+### Autonomous run
+
+```bash
+F=/tmp/workflow-smoke-1784945292112
+cd /home/you/projects/personal/workflows/.worktrees/pi-interactive-lifecycle
+
+WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js launch fixture-single FIX-101 \
+  --yes --approval-digest sha256:6d4b8b863c4310bec35ca3e563fd7839f5e33a425cc16a669495aca003b75e2d \
+  --prompt-file $F/canary-prompt.txt
+```
+
+This creates a Herdr workspace + pane running interactive Pi with the two workflow
+extensions. Note the **run id** it prints. Then, in Herdr, open the agent pane and check:
+
+1. **Extension load (the top runtime risk):** does the observability widget appear,
+   and are there NO Pi errors about failing to load
+   `workflow-worker-lifecycle.ts` / `workflow-worker-observability.ts` or their
+   relative `.js` imports? (If it errors here, the extension needs different
+   packaging — see the follow-ups doc.)
+2. **Pi does the work:** it reads the assignment, edits `fixture.js`, runs the
+   tests, and runs the handoff command.
+3. **State + telemetry from outside the pane:**
+
+```bash
+WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js status fixture-single FIX-101
+WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js result <run-id>
+cat $F/state/<run-id>/telemetry/workers/*.json   # phase should not be stuck on unknown
+```
+
+Expected: status shows the run `running` then terminal; `result` returns the
+handoff; final state `completed`; telemetry `phase` advances (running → … → settled)
+with `observability: reported`.
+
+### Assisted run (follow-up → generation)
+
+In the Pi pane, after it settles, type a follow-up (e.g. `now also add a comment to fixture.js`).
+Then check the run's telemetry/state:
+
+```bash
+cat $F/state/<run-id>/run.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('state', d['state'], 'generation', d.get('generation'))"
+```
+
+Expected: `generation` incremented (2), state back to `running`, and the prior
+`result.json` archived (look for `$F/state/<run-id>/results/generation-1.json`).
+
+### Not validated here (follow-ups)
+
+`workflow resume` / `workflow close` are NOT functional against real runs yet
+(transportIdentity is not captured at launch and the CLI wires the delegation
+transport, not an interactive session transport — see
+`docs/superpowers/plans/2026-07-25-pi-interactive-lifecycle-followups.md`). Skip
+resume/close in this pass.
+
+### Findings (fill in)
+
+- Extensions loaded (widget shown, no import errors)?:
+- Autonomous: reached `completed` and `result` returned the handoff?:
+- Telemetry phase advanced (not stuck unknown)?:
+- Assisted: generation incremented to 2 and prior result archived?:
+- Any Herdr `agent start --kind pi` launch errors?:
+- Anything unexpected:
 
 ## Findings (completed 2026-07-24, Pi 0.81.1)
 
