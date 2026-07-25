@@ -68,11 +68,21 @@ The first real e2e found and fixed a launch bug, and verified most of the lane:
   focuses the new pane. The recovery lane works end-to-end. Details in
   `docs/superpowers/verification/pi-recovery-lane.md`.
 
+## Also fixed during Task 7 re-test
+
+- **FIXED (`5c5e89f`) — readiness-timeout under load dropped the run + identity.**
+  `herdr agent start` blocks up to a readiness timeout; under load an interactive Pi
+  exceeded the old 30s, so Herdr returned "timed out waiting for agent startup" even
+  though Pi started — the agent op became `failed` (no `sessionIdentity`) and the run
+  went `partial/failed` with `transportIdentity: null`. Raised the timeout to 90s and
+  added recovery: on that timeout, consult `agent list` and, if the agent is in the
+  pane we started it in, treat it as started so the identity is captured.
+
 ## Related, still-open (not blocking recovery)
 
-- **Interactive launch reports `partial`/`failed` though the run succeeds.** Same
-  root race, plus the post-start bootstrap-pane cleanup (`herdr.closePane`, not
-  wrapped in try) can throw and downgrade a successful start. Cosmetic — the run
-  completes and (now) keeps its identity — but the launch report and `launchStatus`
-  are misleading. Carried over from the sub-project #1 follow-ups; a full fix
+- **Interactive launch can still report `partial`/`failed` though the run succeeds.**
+  The post-start bootstrap-pane cleanup (`herdr.closePane`, not wrapped in try) can
+  throw and downgrade a successful start, and the run-state write can still lose the
+  race. Cosmetic now — the identity is persisted regardless (state-less write) and the
+  worker drives the run — but `launchStatus`/the report remain misleading. A full fix
   decouples launch metadata/state the same way the identity write was decoupled.
