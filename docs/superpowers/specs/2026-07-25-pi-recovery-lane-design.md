@@ -88,7 +88,7 @@ is new and isolated.
    `requestGracefulClose`) over a Herdr adapter, for identities of
    `kind: "pi-session"`:
    - `observeExact({ sessionId, paneId, cwd, … })`: read `herdr agent list`; find
-     the agent whose `agent_session.value === sessionId` and `pane_id === paneId`.
+     the agent whose `agent_session.value` path ends in `_<sessionId>.jsonl` (Herdr reports the session as a path, not the bare UUID) and `pane_id === paneId`.
      Absent → `missing`. Present with a different `cwd`/session → `mismatch`.
      Present and `agent_status === "idle"` → `idle`; `working` → `active`. Any
      Herdr error → `unknown`. Never reads terminal text.
