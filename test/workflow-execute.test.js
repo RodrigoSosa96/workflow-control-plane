@@ -211,6 +211,7 @@ function createHerdr(calls, {
   failListTabs = null,
   failListPanes = null,
   failSplit = null,
+  agentsAfterStart = null,
   workspaces,
   tabs,
   panes,
@@ -261,6 +262,10 @@ function createHerdr(calls, {
       calls.push({ kind: "herdr.agent.start", name, paneId, harnessKind: kind, argv, focus });
       if (failStart) throw failStart;
       return startResult;
+    },
+    async listAgents() {
+      calls.push({ kind: "herdr.agent.list" });
+      return { agents: agentsAfterStart ?? [] };
     },
     async runInPane({ paneId, command, argv }) {
       calls.push({ kind: "herdr.pane.run", paneId, command, argv });
@@ -501,6 +506,59 @@ test("an interactive start reports a pi-session identity with session, pane, and
   assert.equal(agentOp.sessionIdentity.workspaceId, "w1");
   assert.equal(agentOp.sessionIdentity.cwd, plan.agent.worktreePath);
   assert.equal(agentOp.sessionIdentity.runId, undefined);
+});
+
+test("an interactive start recovers the identity when Herdr's readiness wait times out but Pi actually started", async () => {
+  // Herdr's `agent start` readiness wait can time out under load even though Pi started (the pane
+  // + session exist). That must not fail the launch or drop the transport identity, or resume/
+  // close can never re-find the live session. If the agent is present in the pane we started it
+  // in, treat it as started.
+  const calls = [];
+  const plan = buildPlan();
+  const launchSpec = {
+    argv: ["pi", "--name", sessionName, "--session-id", "sess-1"],
+    env: {},
+    expected: { harness: "pi", nativeSessionId: "sess-1", cwd: plan.agent.worktreePath },
+  };
+
+  const report = await executeStart(plan, {
+    git: {},
+    herdr: createHerdr(calls, {
+      failStart: new Error("timed out waiting for agent startup"),
+      agentsAfterStart: [{ agent: "pi", pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "idle" }],
+    }),
+  }, { buildAgentLaunch: () => launchSpec });
+
+  const agentOp = report.operations.find((operation) => operation.id === "agent");
+  assert.equal(agentOp.status, "created");
+  assert.equal(agentOp.sessionIdentity.kind, "pi-session");
+  assert.equal(agentOp.sessionIdentity.sessionId, "sess-1");
+  assert.equal(agentOp.sessionIdentity.paneId, "w1:p2");
+  assert.equal(agentOp.sessionIdentity.tabId, "w1:t1");
+  assert.ok(calls.some((call) => call.kind === "herdr.agent.list"), "recovery must consult agent list");
+});
+
+test("an interactive start still fails when the readiness timeout leaves no agent in the pane", async () => {
+  const calls = [];
+  const plan = buildPlan();
+  const launchSpec = {
+    argv: ["pi", "--name", sessionName, "--session-id", "sess-1"],
+    env: {},
+    expected: { harness: "pi", nativeSessionId: "sess-1", cwd: plan.agent.worktreePath },
+  };
+
+  const report = await executeStart(plan, {
+    git: {},
+    herdr: createHerdr(calls, {
+      failStart: new Error("timed out waiting for agent startup"),
+      agentsAfterStart: [],
+    }),
+  }, { buildAgentLaunch: () => launchSpec });
+
+  assert.notEqual(report.status, "completed");
+  const agentOp = report.operations.find((operation) => operation.id === "agent");
+  assert.equal(agentOp.status, "failed");
+  assert.equal(agentOp.sessionIdentity, undefined);
 });
 
 test("uses an injected launch builder immediately before Herdr agent start", async () => {

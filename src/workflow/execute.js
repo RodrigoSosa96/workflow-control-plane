@@ -553,6 +553,11 @@ async function resolveBootstrapContext(plan, worktreeOperation, ensured, herdr) 
 // A fixture supervisor is an ordinary process, not an interactive harness, so Herdr
 // cannot attach it with `agent start --kind <harness>`. Run it in the prepared pane
 // instead and report the same shape an attached agent would produce.
+// Herdr's `agent start` blocks until the agent reports "ready", up to this timeout. Under load an
+// interactive Pi (model init + extensions) can take a while, so keep this generous — a spurious
+// readiness timeout used to fail the whole launch and drop the transport identity.
+const AGENT_START_TIMEOUT_MS = 90000;
+
 async function startAgentProcess({ herdr, plan, launch, paneId, tabId }) {
   if (launch.supervisor === true) {
     if (typeof herdr.runInPane !== "function") {
@@ -562,13 +567,45 @@ async function startAgentProcess({ herdr, plan, launch, paneId, tabId }) {
     return { agentId: null, tabId, paneId };
   }
 
-  return await herdr.startAgent({
-    name: plan.agent.agentName,
+  try {
+    return await herdr.startAgent({
+      name: plan.agent.agentName,
+      paneId,
+      kind: plan.agent.harness ?? "pi",
+      argv: launch.argv,
+      timeout: AGENT_START_TIMEOUT_MS,
+    });
+  } catch (error) {
+    // Herdr's readiness wait can time out even though Pi actually started (the pane + session
+    // exist) — it was just slow to report ready under load. Losing the launch to that also drops
+    // the transport identity, permanently breaking resume/close. If the agent is present in the
+    // pane we started it in, treat it as started so the identity is still captured. Any other
+    // failure (or a truly absent agent) propagates unchanged.
+    const recovered = await recoverStartedAgent({ herdr, error, paneId, tabId });
+    if (recovered) return recovered;
+    throw error;
+  }
+}
+
+function isAgentStartupTimeout(error) {
+  return /timed out waiting for agent startup/iu.test(String(error?.message ?? ""));
+}
+
+async function recoverStartedAgent({ herdr, error, paneId, tabId }) {
+  if (!isAgentStartupTimeout(error) || typeof herdr.listAgents !== "function") return null;
+  let agents;
+  try {
+    agents = listValue(await herdr.listAgents(), "agents");
+  } catch {
+    return null;
+  }
+  const match = agents.find((agent) => getPaneId(agent) === paneId);
+  if (!match) return null;
+  return {
+    agentId: match.agentId ?? match.agent_id ?? null,
+    tabId: getTabId(match) ?? tabId,
     paneId,
-    kind: plan.agent.harness ?? "pi",
-    argv: launch.argv,
-    timeout: 30000,
-  });
+  };
 }
 
 async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent, expectedHarness }) {
