@@ -149,9 +149,12 @@ resume/close in this pass.
 - **Telemetry phase advanced (not stuck unknown)?** YES — `phase settled`,
   `observability reported`, `cost 0.037`. The lifecycle extension drove the run
   state; the observability extension recorded telemetry. ✅
-- **Assisted (follow-up → generation 2)?** NOT YET RUN — the operator ended the
-  session after the autonomous handoff without typing a follow-up. Optional
-  next pass.
+- **Assisted (follow-up → generation 2)?** YES. Typing a follow-up into the idle
+  pane raised the run to `generation 2` and archived the prior result:
+  `results/` holds both `generation-1.json` (intact, not overwritten) and
+  `generation-2.json`. The second cycle also reached `completed`. This confirms
+  the core invariant: a user follow-up always increments the generation and
+  archives the prior result. ✅
 - **Two bugs found:**
   1. Widget showed `Cost: $[object Object]` and never showed tokens — FIXED on
      this branch (`buildObservabilityLines`).
