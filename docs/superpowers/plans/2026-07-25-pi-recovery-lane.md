@@ -89,8 +89,8 @@ git commit -m "docs(verify): recovery-lane Herdr command probe"
 **Files:** Modify `src/workflow/herdr.js`; Test `test/workflow-herdr.test.js`
 
 **Interfaces:**
-- Consumes: the `run(area, command, args)` / `invoke` helpers already in `herdr.js`, and the probed argv from Task 1.
-- Produces: `herdr.agentSendKeys({ target, keys })` → wraps `herdr agent send-keys <target> <keys...>`; `herdr.focusPane({ paneId })` → wraps the probed focus command. Both return the parsed CLI result.
+- Consumes: the `run(area, command, args)` / `invoke` helpers already in `herdr.js`, and the probed argv (Task 1 confirmed: `agent send-keys <TARGET> <KEY>...`; focus-by-id is `tab focus <tabId>`, NOT `pane focus`).
+- Produces: `herdr.agentSendKeys({ target, keys })` → wraps `herdr agent send-keys <target> <keys...>`; `herdr.focusTab({ tabId })` → wraps `herdr tab focus <tabId>`. Both return the parsed CLI result. This task ALSO updates `executeResume` in `resume.js` to call `herdr.focusTab({ tabId: plan.identity.tabId })` instead of the placeholder `focusPane({ paneId })` (adjust that test's fake to `focusTab`).
 
 - [ ] **Step 1: Write the failing test for `agentSendKeys`**
 
@@ -135,12 +135,11 @@ async agentSendKeys({ target, keys } = {}) {
   return await invoke("agent", "send-keys", [target, ...keys]);
 },
 
-async focusPane({ paneId } = {}) {
-  if (typeof paneId !== "string" || !paneId) {
-    fail("PREFLIGHT", "focusPane requires a pane id", { paneId }, 10);
+async focusTab({ tabId } = {}) {
+  if (typeof tabId !== "string" || !tabId) {
+    fail("PREFLIGHT", "focusTab requires a tab id", { tabId }, 10);
   }
-  // Command shape per Task 1 probe; adjust area/command if focus is a tab/workspace op.
-  return await invoke("pane", "focus", [paneId]);
+  return await invoke("tab", "focus", [tabId]);
 },
 ```
 
