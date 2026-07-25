@@ -199,12 +199,43 @@ WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js close $R || true
 rm -rf $F
 ```
 
-### Findings (fill in and hand back)
+### Findings (Task 7, 2026-07-25, Herdr 0.7.5 / Pi 0.81.1)
 
-- [ ] **0. Identity captured?** `transportIdentity.kind == "pi-session"` on the run:
-- [ ] **1. resume LIVE → focused** + tab came forward:
-- [ ] **2. close IDLE → closed:true** + agent left `agent list`:
-- [ ] **3. resume DEAD (no --yes) → needs-confirmation**, nothing relaunched:
-- [ ] **4. resume --yes → relaunched**: native history resumed? widget reloaded? identity re-pointed at new pane?
-- [ ] **5. resume again → focused new tab**:
+First real e2e ran the recovery lane against a live interactive Pi and **found a
+launch bug** the unit tests could not see, plus verified the lane's own logic.
+
+- **BUG FOUND + FIXED — launch did not persist `transportIdentity`.** A CLI
+  `workflow launch` that ran to completion left `transportIdentity: null`, so
+  `resume`/`close` would return `no-identity` — the recovery lane was dead on
+  arrival for real runs. Root cause: the launcher wrote run state + identity in one
+  `updateRun`, and the interactive worker's own lifecycle extension advances the run
+  state concurrently, so that combined write can lose the race, hit an illegal
+  transition, throw, and be swallowed — dropping the identity. Proven by an
+  instrumented run: a direct-call launch that *won* the race kept the identity; the
+  CLI run that *lost* it did not (same code, different timing). Fixed in `88289fe`
+  by persisting `transportIdentity` first via a dedicated **state-less** merge that
+  never throws on a transition. The prior identity unit test faked `executeStart`
+  with the identity pre-attached, so it never exercised this path; a race test was
+  added. **A fresh e2e is needed to confirm identity now survives to `completed`.**
+- **1. resume LIVE → focused ✅** verified live: returned `action: "focused"` and
+  invoked `herdr tab focus <tabId>`. (`focused` on the agent stays false because
+  focus is tab-level and the active pane in the tab is the retained bootstrap
+  shell pane, not the agent pane — cosmetic; `tab focus` itself works.)
+- **2. close IDLE → closed:true ✅** verified live: sent `ctrl+d` to the pane, Pi
+  exited gracefully, the agent left `agent list`.
+- **3. resume DEAD (no --yes) → needs-confirmation ✅** verified live: `plan:
+  relaunch`, nothing relaunched.
+- Steps 1–3 were verified by backfilling the correct identity into the run (which
+  the buggy launch failed to persist) and running the real `resume`/`close`
+  commands against the live session — so the lane's transport/resume/close code is
+  confirmed against a real Pi, independent of the launch bug now fixed.
+
+### Still to verify with a fresh e2e (after the fix)
+
+- [ ] **0. Identity survives to completion:** after a fresh `launch`, once the run
+  reaches `completed`, `transportIdentity.kind == "pi-session"` is still present
+  (this is the exact bug that was fixed).
+- [ ] **4. resume --yes → relaunched:** native history resumed? widget reloaded?
+  identity re-pointed at the new pane?
+- [ ] **5. resume again → focused new tab.**
 - [ ] **Unexpected:**

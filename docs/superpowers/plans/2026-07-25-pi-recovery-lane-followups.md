@@ -45,11 +45,30 @@
    record — consistent with recovery being scoped to launch runs, but worth a
    comment so a future reader doesn't expect `start`-created runs to be resumable.
 
-## Runtime verification still pending
+## Runtime verification (Task 7, in progress 2026-07-25)
 
-- **Task 7 (interactive e2e, human/TTY):** launch → `close` idle (send-keys
-  ctrl+d) → `resume` live (tab focus) → `resume` dead (needs-confirmation →
-  `--yes` relaunch → session resumes WITH extensions → next `resume` focuses the
-  new pane). The three predictable-failure risks the review raised are already
-  resolved in code (extensions+env reload on relaunch; relaunch store dependency
-  satisfied in the registry-configured case).
+The first real e2e found and fixed a launch bug, and verified most of the lane:
+
+- **FIXED (`88289fe`) — launch dropped `transportIdentity` on a race.** The
+  interactive worker's lifecycle extension advances the run state concurrently with
+  the launcher, so the launcher's combined state+identity `updateRun` could lose the
+  race, throw an illegal transition, and be swallowed — leaving the run with
+  `transportIdentity: null` even after it completed, which made `resume`/`close`
+  return `no-identity`. Now the identity is persisted first via a state-less merge.
+  See `docs/superpowers/verification/pi-recovery-lane.md` for the full diagnosis.
+- **Verified live (via backfilled identity against a real idle Pi session):**
+  `resume` live → focused; `close` idle → closed:true (ctrl+d, agent exits);
+  `resume` dead (no `--yes`) → needs-confirmation. The transport/resume/close code
+  is confirmed against a real Pi.
+- **Still pending a fresh e2e:** (a) identity survives to `completed` after the fix;
+  (b) `resume --yes` relaunch resumes native history + reloads extensions +
+  re-points identity at the new pane; (c) next `resume` focuses the new tab.
+
+## Related, still-open (not blocking recovery)
+
+- **Interactive launch reports `partial`/`failed` though the run succeeds.** Same
+  root race, plus the post-start bootstrap-pane cleanup (`herdr.closePane`, not
+  wrapped in try) can throw and downgrade a successful start. Cosmetic — the run
+  completes and (now) keeps its identity — but the launch report and `launchStatus`
+  are misleading. Carried over from the sub-project #1 follow-ups; a full fix
+  decouples launch metadata/state the same way the identity write was decoupled.
