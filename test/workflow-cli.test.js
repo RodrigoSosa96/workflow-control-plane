@@ -395,6 +395,13 @@ test("parses documented workflow commands and options", () => {
     format: "compact",
   });
 
+  assert.deepEqual(parseArgs(["resume", RUN_ID, "--yes"]), {
+    command: "resume",
+    runId: RUN_ID,
+    yes: true,
+    format: "compact",
+  });
+
   assert.deepEqual(parseArgs(["close", RUN_ID, "--format", "json"]), {
     command: "close",
     runId: RUN_ID,
@@ -458,7 +465,6 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["result", RUN_ID, "--yes"]), /result does not accept --yes/i);
   assert.throws(() => parseArgs(["result", RUN_ID, "--prompt-file", "/tmp/request.md"]), /result does not accept --prompt-file/i);
   assert.throws(() => parseArgs(["reconcile", "--run", RUN_ID, "--yes"]), /reconcile does not accept --yes/i);
-  assert.throws(() => parseArgs(["resume", RUN_ID, "--yes"]), /resume does not accept --yes/i);
   assert.throws(() => parseArgs(["resume", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["close", RUN_ID, "--yes"]), /close does not accept --yes/i);
   assert.throws(() => parseArgs(["close", "../not-a-run"]), /path-safe|UUID/i);
@@ -1358,7 +1364,7 @@ test("resume and close subcommands dispatch to their commands read-only until co
       return fakeTransport;
     },
     resumeCommand: async (options, deps) => {
-      calls.push(["resume", options.runId]);
+      calls.push(["resume", options.runId, options.confirmed]);
       assert.equal(deps.transport, fakeTransport);
       return { command: "resume", runId: options.runId, action: "focus" };
     },
@@ -1373,12 +1379,35 @@ test("resume and close subcommands dispatch to their commands read-only until co
   assert.equal(await main(["resume", RUN_ID], sharedDependencies), 0);
   assert.equal(await main(["close", RUN_ID], sharedDependencies), 0);
 
-  assert.deepEqual(calls, [["resume", RUN_ID], ["close", RUN_ID]]);
+  assert.deepEqual(calls, [["resume", RUN_ID, false], ["close", RUN_ID]]);
   assert.deepEqual(output.stdout, ["resume:focus", "close:working"]);
   assert.deepEqual(output.stderr, []);
   assert.equal(transportCalls.length, 2);
   assert.equal(transportCalls[0].piCommand, "/usr/bin/pi");
   assert.equal(transportCalls[0].stateRoot, "/state/workflow");
+});
+
+test("resume --yes passes confirmed: true through to resumeCommand; without it, confirmed is false", async () => {
+  const output = io();
+  const confirmedValues = [];
+  const sharedDependencies = {
+    ...output,
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async () => "/usr/bin/pi",
+    createPiDelegationTransport: () => Object.freeze({
+      async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {},
+    }),
+    resumeCommand: async (options) => {
+      confirmedValues.push(options.confirmed);
+      return { command: "resume", runId: options.runId, action: "needs-confirmation" };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  };
+
+  assert.equal(await main(["resume", RUN_ID], sharedDependencies), 0);
+  assert.equal(await main(["resume", RUN_ID, "--yes"], sharedDependencies), 0);
+
+  assert.deepEqual(confirmedValues, [false, true]);
 });
 
 test("main prints compact and json output for read-only commands", async () => {

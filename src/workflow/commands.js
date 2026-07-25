@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { closeWorker as defaultCloseWorker } from "./close.js";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
@@ -9,11 +9,12 @@ import { createDelegationReservationStore } from "./delegation-reservations.js";
 import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
+import { createPiSessionTransport } from "./pi-session-transport.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
-import { planResume as defaultPlanResume } from "./resume.js";
+import { executeResume as defaultExecuteResume } from "./resume.js";
 import { RUN_STATES } from "./run-state.js";
 import { createRunStore } from "./run-store.js";
 import { createTelemetryStore } from "./telemetry-store.js";
@@ -1182,25 +1183,96 @@ function assertWorkerTransportDependency(deps, command) {
   return deps.transport;
 }
 
+// resume/close operate on the top-level run's own transportIdentity, which is only ever
+// absent or `kind: "pi-session"` (see execute.js/launch.js — delegation identities live
+// under run.delegations[id], a separate field). A pi-session identity always needs the
+// session transport (built here from the live Herdr adapter); anything else falls back to
+// whatever worker transport the caller already injected (e.g. the CLI's delegation
+// transport), preserving the prior behavior for runs with no exact session identity.
+function scopedRunStore(store, runId, run) {
+  return {
+    async read(requestedId) {
+      return requestedId === runId ? run : await store.read(requestedId);
+    },
+  };
+}
+
+function transportForRun(run, deps, command) {
+  if (run?.transportIdentity?.kind === "pi-session") {
+    if (!deps.herdr) delegationError("PREFLIGHT", `${command} requires a worker transport`, 10);
+    const createSessionTransport = deps.createSessionTransport ?? createPiSessionTransport;
+    return createSessionTransport({ herdr: deps.herdr });
+  }
+  return assertWorkerTransportDependency(deps, command);
+}
+
+// Minimal relaunch for a dead pi-session: open a fresh pane in the identity's workspace/cwd
+// and start `pi --session-id <exact>` there via the Herdr adapter, resuming the exact native
+// session rather than starting a new one. pi-session-transport.js deliberately does not
+// implement this itself (its start/deliverFollowUp are stubs) — relaunch is owned by resume.
+async function relaunchPiSession(identity, deps) {
+  const herdr = deps.herdr;
+  if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.startAgent !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab and startAgent", 10);
+  }
+  if (typeof deps.lookupExecutable !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a lookupExecutable dependency", 10);
+  }
+  const piCommand = await deps.lookupExecutable("pi");
+  if (!piCommand || !isAbsolute(piCommand)) {
+    delegationError("PREFLIGHT", "Pi executable must resolve to an absolute path to relaunch a session", 10);
+  }
+  const tab = await herdr.createTab({
+    workspaceId: identity.workspaceId,
+    cwd: identity.cwd,
+    label: `resume-${String(identity.sessionId ?? "").slice(0, 8)}`,
+    focus: true,
+  });
+  const started = await herdr.startAgent({
+    name: `resume-${identity.sessionId}`,
+    paneId: tab.paneId,
+    kind: "pi",
+    argv: [piCommand, "--session-id", identity.sessionId],
+    timeout: 30000,
+  });
+  return {
+    identity: {
+      ...identity,
+      paneId: started.paneId ?? tab.paneId,
+      tabId: started.tabId ?? tab.tabId,
+    },
+  };
+}
+
 export async function resumeCommand(options = {}, deps = {}) {
   const runId = assertRunId(options.runId);
   const store = await storeForCommand(options, deps);
-  const transport = assertWorkerTransportDependency(deps, "resume");
-  const planResume = deps.planResume ?? defaultPlanResume;
-  const plan = await planResume({ store, transport, runId });
+  const run = await store.read(runId);
+  const transport = transportForRun(run, deps, "resume");
+  const executeResume = deps.executeResume ?? defaultExecuteResume;
+  const relaunch = deps.relaunch ?? ((identity) => relaunchPiSession(identity, deps));
+  const result = await executeResume({
+    store: scopedRunStore(store, runId, run),
+    transport,
+    herdr: deps.herdr,
+    runId,
+    confirmed: Boolean(options.confirmed),
+    relaunch,
+  });
   return {
     command: "resume",
     runId,
-    ...plan,
+    ...result,
   };
 }
 
 export async function closeCommand(options = {}, deps = {}) {
   const runId = assertRunId(options.runId);
   const store = await storeForCommand(options, deps);
-  const transport = assertWorkerTransportDependency(deps, "close");
+  const run = await store.read(runId);
+  const transport = transportForRun(run, deps, "close");
   const closeWorker = deps.closeWorker ?? defaultCloseWorker;
-  const outcome = await closeWorker({ store, transport, runId });
+  const outcome = await closeWorker({ store: scopedRunStore(store, runId, run), transport, runId });
   return {
     command: "close",
     runId,
