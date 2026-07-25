@@ -8,6 +8,7 @@ import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./del
 import { createDelegationReservationStore } from "./delegation-reservations.js";
 import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
+import { PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { createPiSessionTransport } from "./pi-session-transport.js";
 import { planWorkflow } from "./planner.js";
@@ -1213,39 +1214,67 @@ function transportForRun(run, deps, command) {
   return assertWorkerTransportDependency(deps, command);
 }
 
-// Minimal relaunch for a dead pi-session: open a fresh pane in the identity's workspace/cwd
-// and start `pi --session-id <exact>` there via the Herdr adapter, resuming the exact native
-// session rather than starting a new one. pi-session-transport.js deliberately does not
+// Relaunch a dead pi-session so it comes back exactly as the interactive launch left it:
+// same native session (`--session-id <exact>`, never `--last`/`--continue`) AND the same
+// lifecycle/observability extensions and WORKFLOW_* env the interactive start wired up (see
+// execute.js's executeOrdinaryStart/executeGroupStart: createTab -> splitPane({ env }) ->
+// startAgent). A pane from herdr.createTab carries no env and no extensions on its own, so
+// skipping the split-with-env step here would resume the native history with the widget and
+// telemetry/lifecycle wiring silently dead. pi-session-transport.js deliberately does not
 // implement this itself (its start/deliverFollowUp are stubs) — relaunch is owned by resume.
 async function relaunchPiSession(identity, deps) {
   const herdr = deps.herdr;
-  if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.startAgent !== "function") {
-    delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab and startAgent", 10);
+  if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.splitPane !== "function" || typeof herdr.startAgent !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab, splitPane, and startAgent", 10);
   }
   if (typeof deps.lookupExecutable !== "function") {
     delegationError("PREFLIGHT", "resume relaunch requires a lookupExecutable dependency", 10);
+  }
+  if (!deps.store || typeof deps.store.read !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a run store to rebuild the workflow environment", 10);
   }
   const piCommand = await deps.lookupExecutable("pi");
   if (!piCommand || !isAbsolute(piCommand)) {
     delegationError("PREFLIGHT", "Pi executable must resolve to an absolute path to relaunch a session", 10);
   }
+
+  const run = await deps.store.read(identity.runId);
+  const env = runEnv(run, "pi");
+  const sessionName = `resume-${identity.sessionId}`;
+
+  // A fresh tab (no env — Herdr's createTab has no env parameter) gives us a root pane to
+  // split from, exactly like the interactive launch's bootstrap pane.
   const tab = await herdr.createTab({
     workspaceId: identity.workspaceId,
     cwd: identity.cwd,
     label: `resume-${String(identity.sessionId ?? "").slice(0, 8)}`,
     focus: true,
   });
-  const started = await herdr.startAgent({
-    name: `resume-${identity.sessionId}`,
+  // The WORKFLOW_* env goes on the split pane, exactly as the interactive launch's agent pane.
+  const agentPane = await herdr.splitPane({
     paneId: tab.paneId,
+    direction: "down",
+    cwd: identity.cwd,
+    env,
+    focus: true,
+  });
+
+  const argv = [piCommand, "--name", sessionName, "--session-id", identity.sessionId];
+  for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);
+  // No bootstrap prompt: a resume continues the existing session instead of starting a fresh
+  // assignment.
+
+  const started = await herdr.startAgent({
+    name: sessionName,
+    paneId: agentPane.paneId,
     kind: "pi",
-    argv: [piCommand, "--session-id", identity.sessionId],
+    argv,
     timeout: 30000,
   });
   return {
     identity: {
       ...identity,
-      paneId: started.paneId ?? tab.paneId,
+      paneId: started.paneId ?? agentPane.paneId,
       tabId: started.tabId ?? tab.tabId,
     },
   };

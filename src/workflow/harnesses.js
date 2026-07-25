@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { HANDOFF_COMMAND } from "./assignment.js";
 
 const CONTROL_PLANE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const PI_WORKER_EXTENSIONS = [
+export const PI_WORKER_EXTENSIONS = [
   join(CONTROL_PLANE_ROOT, ".pi/extensions/workflow-worker-lifecycle.ts"),
   join(CONTROL_PLANE_ROOT, ".pi/extensions/workflow-worker-observability.ts"),
 ];
@@ -48,7 +48,7 @@ function appendModel(argv, model) {
   }
 }
 
-function runEnv(run, harness) {
+export function runEnv(run, harness) {
   if (!run) return {};
   const env = {
     WORKFLOW_RUN_ID: assertString(run.id, "run.id"),

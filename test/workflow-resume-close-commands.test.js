@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { closeCommand, resumeCommand } from "../src/workflow/commands.js";
 import { createPiSessionTransport } from "../src/workflow/pi-session-transport.js";
+import { PI_WORKER_EXTENSIONS } from "../src/workflow/harnesses.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const RUN_DIRECTORY = "/state/runs/11111111-1111-4111-8111-111111111111";
+const RUN_STATE_ROOT = "/state/runs";
+const RUN_CONTROL_PLANE_BIN = "/control/bin/workflow";
 
 // run.transportIdentity is only ever absent or `kind: "pi-session"` (delegation identities
 // live under run.delegations[id], never on the top-level run) — see commands.js.
@@ -117,12 +121,17 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   assert.deepEqual(pendingStore.updates, []);
 
   const tabCalls = [];
+  const splitCalls = [];
   const startCalls = [];
   const relaunchHerdr = {
     ...deadHerdr,
     async createTab(args) {
       tabCalls.push(args);
-      return { tabId: "w3:t1", paneId: "w3:p1" };
+      return { tabId: "w3:t1", paneId: "w3:p0" };
+    },
+    async splitPane(args) {
+      splitCalls.push(args);
+      return { paneId: "w3:p1" };
     },
     async startAgent(args) {
       startCalls.push(args);
@@ -134,7 +143,26 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
     return "/usr/bin/pi";
   };
 
-  const relaunchStore = storeFor({ id: RUN_ID, transportIdentity: identity });
+  // relaunch must reload the workflow env from the run the identity belongs to, so the
+  // stored run needs the same fields runEnv()/buildHarnessLaunch() require in production.
+  const relaunchRun = {
+    id: RUN_ID,
+    transportIdentity: identity,
+    directory: RUN_DIRECTORY,
+    generation: 2,
+    stateRoot: RUN_STATE_ROOT,
+    controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+  };
+  const expectedEnv = {
+    WORKFLOW_RUN_ID: RUN_ID,
+    WORKFLOW_RUN_DIR: RUN_DIRECTORY,
+    WORKFLOW_GENERATION: "2",
+    WORKFLOW_HARNESS: "pi",
+    WORKFLOW_STATE_ROOT: RUN_STATE_ROOT,
+    WORKFLOW_CONTROL_PLANE_BIN: RUN_CONTROL_PLANE_BIN,
+  };
+
+  const relaunchStore = storeFor(relaunchRun);
   const relaunched = await resumeCommand(
     { runId: RUN_ID, confirmed: true },
     { store: relaunchStore, herdr: relaunchHerdr, lookupExecutable },
@@ -143,8 +171,37 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   const newIdentity = { ...identity, paneId: "w3:p1", tabId: "w3:t1" };
   assert.equal(relaunched.action, "relaunched");
   assert.deepEqual(relaunched.identity, newIdentity);
+
+  // A fresh tab is opened with no env (matching Herdr's createTab, which has no env param).
   assert.deepEqual(tabCalls, [{ workspaceId: identity.workspaceId, cwd: identity.cwd, label: "resume-s1", focus: true }]);
-  assert.deepEqual(startCalls, [{ name: "resume-s1", paneId: "w3:p1", kind: "pi", argv: ["/usr/bin/pi", "--session-id", "s1"], timeout: 30000 }]);
+
+  // The WORKFLOW_* env is carried by the split pane under that tab — exactly like the
+  // interactive launch (createTab -> splitPane({ env }) -> startAgent) in execute.js.
+  assert.equal(splitCalls.length, 1);
+  assert.equal(splitCalls[0].paneId, "w3:p0");
+  assert.equal(splitCalls[0].cwd, identity.cwd);
+  assert.deepEqual(splitCalls[0].env, expectedEnv);
+
+  // argv must resume the exact session (--session-id, no --last/--continue) and reload both
+  // workflow extensions, or the resumed pane's widget/telemetry/lifecycle wiring is dead.
+  assert.equal(startCalls.length, 1);
+  assert.equal(startCalls[0].paneId, "w3:p1");
+  assert.equal(startCalls[0].kind, "pi");
+  assert.equal(startCalls[0].timeout, 30000);
+  assert.deepEqual(startCalls[0].argv, [
+    "/usr/bin/pi",
+    "--name",
+    "resume-s1",
+    "--session-id",
+    "s1",
+    "--extension",
+    PI_WORKER_EXTENSIONS[0],
+    "--extension",
+    PI_WORKER_EXTENSIONS[1],
+  ]);
+  // No bootstrap prompt is appended — a resume continues the existing session rather than
+  // starting a fresh assignment.
+  assert.equal(startCalls[0].argv.some((value) => /assignment\.md|handoff-input\.json/.test(value)), false);
 
   // The confirmed relaunch must persist the new pane/tab identity — same sessionId, new
   // paneId/tabId — so the next resume observes the live pane instead of the dead one.
