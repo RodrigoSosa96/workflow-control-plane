@@ -29,15 +29,16 @@ test("a run with no transportIdentity is refused with a resume-category Workflow
 
 test("executeResume focuses a live session and gates relaunch on confirmation", async () => {
   const focus = [];
-  const herdr = { async focusPane(a) { focus.push(a); } };
+  const herdr = { async focusTab(a) { focus.push(a); } };
   const liveTransport = { start(){}, deliverFollowUp(){}, requestGracefulClose(){}, async observeExact() { return { state: "idle", identity: { paneId: "w2:p9" } }; } };
-  const store = { async read() { return { id: "r1", transportIdentity: { kind: "pi-session", paneId: "w2:p9", sessionId: "s1" } }; } };
+  const store = { async read() { return { id: "r1", transportIdentity: { kind: "pi-session", tabId: "w2:t1", paneId: "w2:p9", sessionId: "s1" } }; } };
   let relaunchCalls = 0;
   const relaunch = async () => { relaunchCalls += 1; return { identity: { sessionId: "s1" } }; };
 
   const focused = await executeResume({ store, transport: liveTransport, herdr, runId: "r1", confirmed: false, relaunch });
   assert.equal(focused.action, "focused");
   assert.equal(focus.length, 1);
+  assert.deepEqual(focus[0], { tabId: "w2:t1" });
 
   const deadTransport = { start(){}, deliverFollowUp(){}, requestGracefulClose(){}, async observeExact() { return { state: "missing", identity: {} }; } };
   const pending = await executeResume({ store, transport: deadTransport, herdr, runId: "r1", confirmed: false, relaunch });

@@ -555,5 +555,26 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
         }
       }
     },
+
+    // Herdr's exit key syntax is `ctrl+d`, not tmux-style `C-d` — the caller supplies the
+    // probed key strings verbatim and this only validates shape, not key syntax.
+    async agentSendKeys({ target, keys } = {}) {
+      if (typeof target !== "string" || !target) {
+        fail("PREFLIGHT", "agentSendKeys requires a target id", { target }, 10);
+      }
+      if (!Array.isArray(keys) || keys.length === 0 || keys.some((k) => typeof k !== "string" || !k)) {
+        fail("PREFLIGHT", "agentSendKeys requires non-empty key strings", { target, keys }, 10);
+      }
+      return await invoke("agent", "send-keys", [target, ...keys]);
+    },
+
+    // There is no pane-focus-by-id; Herdr only supports focusing a tab. `pane focus` is
+    // directional (next/prev) and must not be used here.
+    async focusTab({ tabId } = {}) {
+      if (typeof tabId !== "string" || !tabId) {
+        fail("PREFLIGHT", "focusTab requires a tab id", { tabId }, 10);
+      }
+      return await invoke("tab", "focus", [tabId]);
+    },
   };
 }

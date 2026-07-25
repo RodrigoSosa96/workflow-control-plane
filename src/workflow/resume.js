@@ -25,8 +25,8 @@ export async function planResume({ store, transport, runId }) {
 export async function executeResume({ store, transport, herdr, runId, confirmed = false, relaunch }) {
   const plan = await planResume({ store, transport, runId });
   if (plan.action === "focus") {
-    if (herdr && typeof herdr.focusPane === "function" && plan.identity?.paneId) {
-      await herdr.focusPane({ paneId: plan.identity.paneId });
+    if (herdr && typeof herdr.focusTab === "function" && plan.identity?.tabId) {
+      await herdr.focusTab({ tabId: plan.identity.tabId });
     }
     return { action: "focused", identity: plan.identity };
   }
