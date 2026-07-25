@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { closeWorker } from "../src/workflow/close.js";
 
-function deps({ state, transportIdentity } = {}) {
+function deps({ state, transportIdentity, requested = true } = {}) {
   const identity = transportIdentity === undefined
     ? { kind: "pi-session", sessionId: "s1" }
     : transportIdentity;
@@ -15,7 +15,7 @@ function deps({ state, transportIdentity } = {}) {
     transport: {
       start() {}, deliverFollowUp() {},
       async observeExact(id) { observeCalls.push(id); return { state, identity }; },
-      async requestGracefulClose(id) { calls.push(id); return { closed: true }; },
+      async requestGracefulClose(id) { calls.push(id); return { requested, identity }; },
     },
   };
 }
@@ -25,6 +25,13 @@ test("idle worker: closes and reports no reason", async () => {
   const result = await closeWorker({ ...idle, runId: "r1" });
   assert.deepEqual(result, { closed: true });
   assert.equal(idle.calls.length, 1);
+});
+
+test("idle worker whose transport does not confirm the close: reports closed false with reason", async () => {
+  const notConfirmed = deps({ state: "idle", requested: false });
+  const result = await closeWorker({ ...notConfirmed, runId: "r1" });
+  assert.deepEqual(result, { closed: false, reason: "close-not-confirmed" });
+  assert.equal(notConfirmed.calls.length, 1);
 });
 
 test("active worker: refuses with reason 'working' and never requests close", async () => {

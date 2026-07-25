@@ -21,3 +21,19 @@ export async function planResume({ store, transport, runId }) {
       return { action: "refuse", identity, reason: observation.state };
   }
 }
+
+export async function executeResume({ store, transport, herdr, runId, confirmed = false, relaunch }) {
+  const plan = await planResume({ store, transport, runId });
+  if (plan.action === "focus") {
+    if (herdr && typeof herdr.focusPane === "function" && plan.identity?.paneId) {
+      await herdr.focusPane({ paneId: plan.identity.paneId });
+    }
+    return { action: "focused", identity: plan.identity };
+  }
+  if (plan.action === "relaunch") {
+    if (!confirmed) return { action: "needs-confirmation", plan: "relaunch", identity: plan.identity };
+    const result = await relaunch(plan.identity);
+    return { action: "relaunched", identity: result?.identity ?? plan.identity };
+  }
+  throw new WorkflowError("resume", `Cannot resume: ${plan.reason ?? plan.action}`, { details: { runId } });
+}
