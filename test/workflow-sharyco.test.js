@@ -356,6 +356,13 @@ test("creates selected child worktrees inside one Acme task workspace", async (t
   assert.equal(after.agent.status, "compatible");
   assert.equal((await herdr.listAgents()).agents.length, 1);
   assert.equal((await herdr.listAgents()).agents[0].cwd, metaWorktree);
+
+  const agentOp = report.operations.find((operation) => operation.id === "agent");
+  assert.equal(agentOp.sessionIdentity.kind, "pi-session");
+  assert.equal(agentOp.sessionIdentity.workspaceId, workspaceId);
+  assert.equal(agentOp.sessionIdentity.tabId, agentOp.tabId);
+  assert.equal(agentOp.sessionIdentity.paneId, agentOp.paneId);
+  assert.equal(agentOp.sessionIdentity.cwd, metaWorktree);
 });
 
 test("creates three selected Acme child worktrees in deterministic order", async (t) => {

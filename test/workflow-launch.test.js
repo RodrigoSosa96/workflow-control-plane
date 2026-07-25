@@ -886,6 +886,50 @@ test("confirmed launch writes the run and assignment, starts exactly one selecte
   assert.equal(storedRun.nativeSessionId, launchSpec.expected.nativeSessionId);
 });
 
+test("an interactive launch persists the pi-session transport identity onto the run", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+  const sessionIdentity = {
+    kind: "pi-session",
+    runId: RUN_ID,
+    sessionId: "sess-1",
+    paneId: "pane-1",
+    tabId: "tab-1",
+    workspaceId: "w1",
+    cwd: "/wt/ocr",
+  };
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [
+        { id: "worktree", kind: "herdr.worktree.ensure", status: "created" },
+        {
+          id: "agent",
+          kind: "agent.session.start",
+          status: "created",
+          agentId: "agent-1",
+          tabId: "tab-1",
+          paneId: "pane-1",
+          sessionIdentity,
+        },
+      ],
+      guidance: [],
+      notes: [],
+    }),
+  });
+
+  assert.equal(report.status, "running");
+  const storedRun = store.snapshot();
+  assert.deepEqual(storedRun.transportIdentity, sessionIdentity);
+});
+
 test("partial environment or agent startup failures preserve the run and return exact reconcile recovery", async () => {
   const calls = [];
   const planCommand = planCommandFactory(calls);
@@ -1222,6 +1266,7 @@ test("fixture stream-json launch writes a private launch record and routes throu
   const stored = store.snapshot();
   assert.equal(stored.fixtureMode, true);
   assert.equal(stored.workerLaunches["11111111-1111-4111-8111-111111111111"].harness, "opencode");
+  assert.equal(stored.transportIdentity, undefined);
 });
 
 test("ordinary interactive launch never routes through the supervisor", async () => {

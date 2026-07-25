@@ -748,15 +748,26 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
       tabId: agentTabId,
     });
 
+    const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
+    const sessionIdentity = launch.supervisor === true ? null : {
+      kind: "pi-session",
+      runId: plan.run?.id,
+      sessionId: launch.expected?.nativeSessionId ?? null,
+      paneId: startedAgent.paneId,
+      tabId: startedAgent.tabId,
+      workspaceId,
+      cwd: plan.agent.worktreePath,
+    };
+
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
       tabId: startedAgent.tabId,
       paneId: startedAgent.paneId,
+      ...(sessionIdentity ? { sessionIdentity } : {}),
     }));
     completedIds.add(agentOperation.id);
 
     if (bootstrapCreatedFromReturnedRootPane && typeof herdr.closePane === "function") {
-      const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
       const bootstrapPaneId = bootstrapContext?.paneId ?? ensured.result?.paneId ?? null;
       const expectedTabId = agentTabId ?? bootstrapContext?.tabId ?? ensured.result?.tabId ?? null;
       let canClose = false;
@@ -966,10 +977,21 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       tabId: coordinatorTabId,
     });
 
+    const sessionIdentity = launch.supervisor === true ? null : {
+      kind: "pi-session",
+      runId: plan.run?.id,
+      sessionId: launch.expected?.nativeSessionId ?? null,
+      paneId: startedAgent.paneId,
+      tabId: startedAgent.tabId,
+      workspaceId,
+      cwd: plan.agent.worktreePath,
+    };
+
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
       tabId: startedAgent.tabId,
       paneId: startedAgent.paneId,
+      ...(sessionIdentity ? { sessionIdentity } : {}),
     }));
     completedIds.add(agentOperation.id);
 

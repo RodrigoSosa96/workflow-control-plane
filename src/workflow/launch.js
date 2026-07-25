@@ -635,6 +635,7 @@ export async function executeLaunch(preview, deps = {}) {
     const isRunning = completedLaunchWithCreatedAgent(execution);
     const hasCreatedAgent = createdSelectedAgent(execution);
     const session = hasCreatedAgent ? sessionPatch(execution, launchExpected ?? {}) : {};
+    const agentOp = agentOperationReport(execution);
     await updateRun(store, run.id, {
       state: isRunning ? RUN_STATES.RUNNING : RUN_STATES.FAILED,
       harness: fresh.selection.harness,
@@ -643,6 +644,7 @@ export async function executeLaunch(preview, deps = {}) {
       launchOperations: cloneData(execution?.operations ?? []),
       launchNotes: cloneData(execution?.notes ?? []),
       ...(hasCreatedAgent ? session : {}),
+      ...(agentOp?.sessionIdentity?.sessionId ? { transportIdentity: cloneData(agentOp.sessionIdentity) } : {}),
       ...(!isRunning && execution?.error ? { launchError: cloneData(execution.error) } : {}),
     });
 
