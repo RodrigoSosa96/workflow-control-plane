@@ -132,6 +132,7 @@ function previewHarnessProfile(plan = {}) {
 
 function previewLaunchSpec(plan = {}, selection = {}, executionOptions = {}) {
   const runId = "<generated-run-id>";
+  const directory = join(executionOptions.stateRoot, runId);
   return buildHarnessLaunch({
     profileName: selection.profileName,
     profile: previewHarnessProfile(plan),
@@ -139,12 +140,19 @@ function previewLaunchSpec(plan = {}, selection = {}, executionOptions = {}) {
     cwd: plan.agent?.worktreePath,
     run: {
       id: runId,
-      directory: join(executionOptions.stateRoot, runId),
+      directory,
       generation: 1,
       stateRoot: executionOptions.stateRoot,
       controlPlaneBin: executionOptions.controlPlaneBin,
     },
     nativeSessionId: "<generated-native-session-id>",
+    // The approval digest and the persisted run.launchArgv audit record must reflect the exact
+    // argv executeLaunch will actually run, including --settings — otherwise an approved preview
+    // would not cover the flag that runs (a real Claude session settings file). No real run
+    // directory exists yet at preview time, so only the path is included here; the file itself is
+    // written later, once executeLaunch has a real run.directory (see isClaudeInteractiveAgent
+    // usage there).
+    ...(isClaudeInteractiveAgent(plan) ? { settingsPath: join(directory, CLAUDE_WORKER_SETTINGS_FILE) } : {}),
   });
 }
 

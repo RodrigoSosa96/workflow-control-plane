@@ -516,6 +516,44 @@ test("launch preview exposes selected harness argv with generated values marked 
   assert.doesNotMatch(JSON.stringify(preview.launchSpec), /touch \/tmp\/no|Do not paraphrase/);
 });
 
+test("launch preview for an interactive claude profile includes --settings at the placeholder run directory, and it survives into the persisted launchArgv audit record", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker" });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+
+  const placeholderSettingsPath = join(STATE_ROOT, "<generated-run-id>", "claude-worker-settings.json");
+  assert.ok(preview.launchSpec.argv.includes("--settings"));
+  assert.equal(preview.launchSpec.argv[preview.launchSpec.argv.indexOf("--settings") + 1], placeholderSettingsPath);
+
+  // The approved preview + digest must cover the exact argv executeLaunch runs (including
+  // --settings), and run.launchArgv is a security-relevant audit record (see the secret-leak
+  // assertions against it elsewhere in this file) — so it must carry --settings too.
+  const store = createStore(calls);
+  await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [{ id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" }],
+      notes: [],
+    }),
+  });
+
+  const storedLaunchArgv = store.snapshot().launchArgv;
+  assert.ok(storedLaunchArgv.includes("--settings"));
+  assert.equal(storedLaunchArgv[storedLaunchArgv.indexOf("--settings") + 1], placeholderSettingsPath);
+});
+
+test("launch preview for a stream-json (supervised) claude profile omits --settings", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker", profileOverrides: { profile: { mode: "stream-json" } } });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+
+  assert.equal(preview.launchSpec.argv.includes("--settings"), false);
+});
+
 test("launch preview carries an explicit selection reason into the approved assignment", async () => {
   const reason = "selected after ticket triage";
   const preview = await previewFor({ selectionReason: reason });
