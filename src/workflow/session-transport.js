@@ -43,8 +43,13 @@ export function createSessionTransport({ herdr, harness = "pi", exitKeys } = {})
   if (!adapter) {
     fail(harness, `unsupported harness "${harness}" for session transport`, { harness });
   }
-  if (!herdr || typeof herdr.listAgents !== "function" || typeof herdr.agentSendKeys !== "function") {
-    fail(harness, `${harness}-session transport requires a Herdr adapter with listAgents and agentSendKeys`);
+  // Only `listAgents` is required up front: `observeExact` (used by both resume and close) needs
+  // nothing else. `agentSendKeys` is needed solely by `requestGracefulClose` (close), so it is
+  // validated lazily there instead of here — a resume-only caller (e.g. commands.js's
+  // transportForRun, built for every resume regardless of whether a relaunch follows) should not
+  // have to hand this factory a Herdr adapter capable of sending keys it will never send.
+  if (!herdr || typeof herdr.listAgents !== "function") {
+    fail(harness, `${harness}-session transport requires a Herdr adapter with listAgents`);
   }
   const resolvedExitKeys = exitKeys ?? adapter.exitKeys;
 
@@ -70,6 +75,9 @@ export function createSessionTransport({ herdr, harness = "pi", exitKeys } = {})
     const identity = assertIdentity(harness, requested);
     const observation = await observeExact(identity);
     if (observation.state !== "idle") return { requested: false };
+    if (typeof herdr.agentSendKeys !== "function") {
+      fail(harness, `${harness}-session transport requires a Herdr adapter with agentSendKeys to close a session`);
+    }
     await herdr.agentSendKeys({ target: identity.paneId, keys: resolvedExitKeys });
     return { requested: true };
   }

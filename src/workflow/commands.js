@@ -8,9 +8,9 @@ import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./del
 import { createDelegationReservationStore } from "./delegation-reservations.js";
 import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
-import { PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
+import { buildClaudeWorkerSettings, CONTROL_PLANE_ROOT, PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
-import { createPiSessionTransport } from "./pi-session-transport.js";
+import { createSessionTransport as buildSessionTransport } from "./session-transport.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
@@ -1185,10 +1185,11 @@ function assertWorkerTransportDependency(deps, command) {
 }
 
 // resume/close operate on the top-level run's own transportIdentity, which is only ever
-// absent or `kind: "pi-session"` (see execute.js/launch.js — delegation identities live
-// under run.delegations[id], a separate field). A pi-session identity always needs the
-// session transport (built here from the live Herdr adapter); anything else falls back to
-// whatever worker transport the caller already injected (e.g. the CLI's delegation
+// absent or an exact-session identity — `kind: "pi-session"` or `kind: "claude-session"`
+// (see execute.js/launch.js — delegation identities live under run.delegations[id], a
+// separate field). Any `*-session` identity always needs the session transport (built here
+// from the live Herdr adapter, per-harness via `identity.harness`); anything else falls back
+// to whatever worker transport the caller already injected (e.g. the CLI's delegation
 // transport), preserving the prior behavior for runs with no exact session identity.
 function scopedRunStore(store, runId, run) {
   return {
@@ -1206,23 +1207,30 @@ function scopedRunStore(store, runId, run) {
 }
 
 function transportForRun(run, deps, command) {
-  if (run?.transportIdentity?.kind === "pi-session") {
+  const identity = run?.transportIdentity;
+  if (typeof identity?.kind === "string" && identity.kind.endsWith("-session")) {
     if (!deps.herdr) delegationError("PREFLIGHT", `${command} requires a worker transport`, 10);
-    const createSessionTransport = deps.createSessionTransport ?? createPiSessionTransport;
-    return createSessionTransport({ herdr: deps.herdr });
+    const createSessionTransport = deps.createSessionTransport ?? buildSessionTransport;
+    return createSessionTransport({ herdr: deps.herdr, harness: identity.harness ?? "pi" });
   }
   return assertWorkerTransportDependency(deps, command);
 }
 
-// Relaunch a dead pi-session so it comes back exactly as the interactive launch left it:
-// same native session (`--session-id <exact>`, never `--last`/`--continue`) AND the same
-// lifecycle/observability extensions and WORKFLOW_* env the interactive start wired up (see
-// execute.js's executeOrdinaryStart/executeGroupStart: createTab -> splitPane({ env }) ->
-// startAgent). A pane from herdr.createTab carries no env and no extensions on its own, so
-// skipping the split-with-env step here would resume the native history with the widget and
-// telemetry/lifecycle wiring silently dead. pi-session-transport.js deliberately does not
-// implement this itself (its start/deliverFollowUp are stubs) — relaunch is owned by resume.
-async function relaunchPiSession(identity, deps) {
+// Filename must match launch.js's CLAUDE_WORKER_SETTINGS_FILE — this is the same file the
+// interactive launch generates into the run directory, regenerated here so a relaunch reloads
+// working hooks/statusLine (the settings file itself is not carried across the dead session).
+const CLAUDE_WORKER_SETTINGS_FILE = "claude-worker-settings.json";
+
+// Relaunch a dead *-session so it comes back exactly as the interactive launch left it: same
+// native session (`--session-id <exact>`, never `--last`/`--continue`) AND the same
+// lifecycle/observability wiring the interactive start set up (see execute.js's
+// executeOrdinaryStart/executeGroupStart: createTab -> splitPane({ env }) -> startAgent). A
+// pane from herdr.createTab carries no env on its own, so skipping the split-with-env step
+// here would resume the native history with the widget/telemetry/lifecycle wiring silently
+// dead. session-transport.js deliberately does not implement this itself (its start/
+// deliverFollowUp are stubs) — relaunch is owned by resume, branching on `identity.harness`
+// for the parts that differ per harness (Pi's --extension flags vs Claude's --settings file).
+async function relaunchSession(identity, deps) {
   const herdr = deps.herdr;
   if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.splitPane !== "function" || typeof herdr.startAgent !== "function") {
     delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab, splitPane, and startAgent", 10);
@@ -1233,18 +1241,19 @@ async function relaunchPiSession(identity, deps) {
   if (!deps.store || typeof deps.store.read !== "function") {
     delegationError("PREFLIGHT", "resume relaunch requires a run store to rebuild the workflow environment", 10);
   }
-  const piCommand = await deps.lookupExecutable("pi");
-  if (!piCommand || !isAbsolute(piCommand)) {
-    delegationError("PREFLIGHT", "Pi executable must resolve to an absolute path to relaunch a session", 10);
+  const harness = identity.harness === "claude" ? "claude" : "pi";
+  const command = await deps.lookupExecutable(harness);
+  if (!command || !isAbsolute(command)) {
+    delegationError("PREFLIGHT", `${harness === "claude" ? "Claude" : "Pi"} executable must resolve to an absolute path to relaunch a session`, 10);
   }
 
   const run = await deps.store.read(identity.runId);
-  const env = runEnv(run, "pi");
+  const env = runEnv(run, harness);
   // Herdr agent names are limited to 1-32 chars ([a-z][a-z0-9_-]*). A full session UUID makes
   // `resume-<uuid>` 43 chars, which `herdr agent start` rejects — so the relaunch would create
-  // the tab + split pane but never start Pi, and the user sees an empty panel on reopen. Use the
-  // session id's first block (matching the tab label). The resume is driven by the exact
-  // `--session-id` below, not by this display name, so shortening it is safe.
+  // the tab + split pane but never start the agent, and the user sees an empty panel on reopen.
+  // Use the session id's first block (matching the tab label). The resume is driven by the
+  // exact `--session-id` below, not by this display name, so shortening it is safe.
   const shortSessionId = String(identity.sessionId ?? "").slice(0, 8) || "session";
   const sessionName = `resume-${shortSessionId}`;
 
@@ -1265,22 +1274,41 @@ async function relaunchPiSession(identity, deps) {
     focus: true,
   });
 
-  const argv = [piCommand, "--name", sessionName, "--session-id", identity.sessionId];
-  for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);
-  // No bootstrap prompt: a resume continues the existing session instead of starting a fresh
-  // assignment.
+  let argv;
+  if (harness === "claude") {
+    // Regenerate claude-worker-settings.json (the dead session left no live process to have
+    // kept it current) so the resumed pane reloads the same lifecycle/statusLine hooks the
+    // original interactive launch wired up, via the run store — not raw fs — mirroring how
+    // launch.js itself writes this file (store.writePrivateFile, not a direct fs write).
+    const settings = buildClaudeWorkerSettings({ controlPlaneRoot: CONTROL_PLANE_ROOT });
+    await deps.store.writePrivateFile(identity.runId, {
+      relativePath: CLAUDE_WORKER_SETTINGS_FILE,
+      text: `${JSON.stringify(settings, null, 2)}\n`,
+      updater: () => ({}),
+    });
+    const settingsPath = join(run.directory, CLAUDE_WORKER_SETTINGS_FILE);
+    // No bootstrap prompt: a resume continues the existing session instead of starting a
+    // fresh assignment. No --permission-mode/--model either — those live on the registry
+    // profile, which the transportIdentity does not carry (known follow-up).
+    argv = [command, "--session-id", identity.sessionId, "--add-dir", run.directory, "--settings", settingsPath];
+  } else {
+    argv = [command, "--name", sessionName, "--session-id", identity.sessionId];
+    for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);
+    // No bootstrap prompt: a resume continues the existing session instead of starting a fresh
+    // assignment.
+  }
 
   const started = await herdr.startAgent({
     name: sessionName,
     paneId: agentPane.paneId,
-    kind: "pi",
+    kind: harness,
     argv,
     timeout: 30000,
   });
   const newPaneId = started.paneId ?? agentPane.paneId;
   // Focus the resumed agent pane, not the fresh tab's empty root pane. createTab -> splitPane
-  // leaves an empty shell pane above Pi (same shape as launch), and createTab/splitPane focus
-  // lands on that shell; without this the relaunch surfaces the empty panel (observed).
+  // leaves an empty shell pane above the agent (same shape as launch), and createTab/splitPane
+  // focus lands on that shell; without this the relaunch surfaces the empty panel (observed).
   if (typeof herdr.focusAgent === "function") {
     await herdr.focusAgent({ target: newPaneId });
   }
@@ -1293,13 +1321,17 @@ async function relaunchPiSession(identity, deps) {
   };
 }
 
+// Back-compat alias: relaunchSession used to be Pi-only (relaunchPiSession). Nothing in this
+// module still calls it under the old name, but keep the alias in case an external caller does.
+const relaunchPiSession = relaunchSession;
+
 export async function resumeCommand(options = {}, deps = {}) {
   const runId = assertRunId(options.runId);
   const store = await storeForCommand(options, deps);
   const run = await store.read(runId);
   const transport = transportForRun(run, deps, "resume");
   const executeResume = deps.executeResume ?? defaultExecuteResume;
-  const relaunch = deps.relaunch ?? ((identity) => relaunchPiSession(identity, { ...deps, store }));
+  const relaunch = deps.relaunch ?? ((identity) => relaunchSession(identity, { ...deps, store }));
   const result = await executeResume({
     store: scopedRunStore(store, runId, run),
     transport,
