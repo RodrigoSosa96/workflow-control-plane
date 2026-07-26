@@ -56,8 +56,19 @@ export function renderClaudeStatusLine({ env, stdinJson, snapshot } = {}) {
     const runId = typeof safeEnv.WORKFLOW_RUN_ID === "string" ? safeEnv.WORKFLOW_RUN_ID : undefined;
     const id = shortId(runId);
 
+    // The model comes from the statusLine stdin payload, not the telemetry snapshot, so it is
+    // resolved before the thin-snapshot early return — a valid model must surface even when the
+    // snapshot has not been written yet (worst case: "Workflow <id> | starting | <model>").
+    const safeStdin = stdinJson && typeof stdinJson === "object" ? stdinJson : {};
+    const model = safeStdin.model && typeof safeStdin.model === "object"
+      ? safeStdin.model.display_name ?? safeStdin.model.id
+      : undefined;
+    const modelSegment = typeof model === "string" && model ? model : undefined;
+
     if (!snapshot || typeof snapshot !== "object") {
-      return `Workflow ${id} | starting`;
+      const segments = [`Workflow ${id}`, "starting"];
+      if (modelSegment) segments.push(modelSegment);
+      return segments.join(" | ");
     }
 
     const phase = typeof snapshot.phase === "string" && snapshot.phase ? snapshot.phase : "starting";
@@ -66,12 +77,7 @@ export function renderClaudeStatusLine({ env, stdinJson, snapshot } = {}) {
       : "claude";
 
     const segments = [`Workflow ${id}`, phase, harness];
-
-    const safeStdin = stdinJson && typeof stdinJson === "object" ? stdinJson : {};
-    const model = safeStdin.model && typeof safeStdin.model === "object"
-      ? safeStdin.model.display_name ?? safeStdin.model.id
-      : undefined;
-    if (typeof model === "string" && model) segments.push(model);
+    if (modelSegment) segments.push(modelSegment);
 
     const observability = buildObservabilitySegment(snapshot);
     if (observability) segments.push(observability);

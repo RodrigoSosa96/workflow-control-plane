@@ -13,7 +13,12 @@ export const PI_WORKER_EXTENSIONS = [
 // Claude worker is derived by the control plane's own hook scripts rather than parsed from
 // stdout (Claude has no non-interactive JSON event stream comparable to Pi's --mode json), so
 // these are wired in via `--settings` instead of `--extension`.
-export const CLAUDE_WORKER_HOOKS = Object.freeze(["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]);
+//
+// SessionStart is intentionally NOT wired: it fires before any real prompt and would consume
+// the LAUNCHING→RUNNING transition, so the first real UserPromptSubmit would be misread as a
+// follow-up and increment the generation to 2. UserPromptSubmit is the single work-start
+// driver (matching Pi's agent_start), so generation 1 lines up with the first prompt.
+export const CLAUDE_WORKER_HOOKS = Object.freeze(["UserPromptSubmit", "Stop", "SessionEnd"]);
 
 export const WORKFLOW_ENV_KEYS = Object.freeze([
   "WORKFLOW_RUN_ID",
@@ -76,13 +81,16 @@ export function buildClaudeWorkerSettings({ controlPlaneRoot } = {}) {
   assertString(controlPlaneRoot, "controlPlaneRoot");
   const lifecycleScript = join(controlPlaneRoot, "hooks", "claude-lifecycle.mjs");
   const statuslineScript = join(controlPlaneRoot, "hooks", "claude-statusline.mjs");
+  // The script paths are absolute and per-machine/worktree, so they can contain spaces.
+  // Double-quote them so the shell keeps each path a single argument instead of splitting
+  // it (which would silently break the hook).
   const hooks = Object.fromEntries(CLAUDE_WORKER_HOOKS.map((event) => [
     event,
-    [{ hooks: [{ type: "command", command: `node ${lifecycleScript} ${event}` }] }],
+    [{ hooks: [{ type: "command", command: `node "${lifecycleScript}" ${event}` }] }],
   ]));
   return {
     hooks,
-    statusLine: { type: "command", command: `node ${statuslineScript}` },
+    statusLine: { type: "command", command: `node "${statuslineScript}"` },
   };
 }
 

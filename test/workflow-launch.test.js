@@ -1436,7 +1436,9 @@ test("a claude interactive launch writes worker hook/statusLine settings and poi
   const settingsWrite = calls.find((call) => call.kind === "store.writePrivateFile" && call.relativePath === "claude-worker-settings.json");
   assert.ok(settingsWrite, "expected the worker settings file to be written into the run directory");
   const settings = JSON.parse(settingsWrite.text);
-  for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
+  // SessionStart is intentionally NOT wired (it would push the generation off-by-one).
+  assert.equal(settings.hooks.SessionStart, undefined);
+  for (const event of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
     assert.match(settings.hooks[event][0].hooks[0].command, /claude-lifecycle\.mjs/);
     assert.match(settings.hooks[event][0].hooks[0].command, new RegExp(`${event}$`));
   }

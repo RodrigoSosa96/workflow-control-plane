@@ -235,12 +235,20 @@ test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
 
 test("claude worker settings wire lifecycle hooks and a statusLine to control-plane scripts", () => {
   const s = buildClaudeWorkerSettings({ controlPlaneRoot: "/cp" });
-  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
+  // SessionStart is intentionally NOT wired: it would consume the LAUNCHING→RUNNING
+  // transition and push every generation off-by-one. UserPromptSubmit is the sole work-start.
+  assert.deepEqual(Object.keys(s.hooks).sort(), ["SessionEnd", "Stop", "UserPromptSubmit"]);
+  assert.equal(s.hooks.SessionStart, undefined);
+  for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
     const cmd = s.hooks[ev][0].hooks[0].command;
     assert.match(cmd, /\/cp\/hooks\/claude-lifecycle\.mjs/);
+    // The script path must be double-quoted so a control-plane path containing a space is
+    // passed as a single argument instead of being split by the shell.
+    assert.ok(cmd.includes(`node "/cp/hooks/claude-lifecycle.mjs" ${ev}`), `command must quote the script path: ${cmd}`);
     assert.equal(s.hooks[ev][0].hooks[0].type, "command");
   }
   assert.match(s.statusLine.command, /\/cp\/hooks\/claude-statusline\.mjs/);
+  assert.ok(s.statusLine.command.includes(`node "/cp/hooks/claude-statusline.mjs"`), "statusLine command must quote the script path");
   assert.equal(s.statusLine.type, "command");
 });
 
