@@ -1356,3 +1356,86 @@ test("ordinary interactive launch never routes through the supervisor", async ()
   assert.equal(capturedArgv[0], "codex");
   assert.equal(calls.some((c) => c.kind === "store.writePrivateFile"), false);
 });
+
+test("a claude interactive launch writes worker hook/statusLine settings and points --settings at that file", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker" });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+  let launchSpec;
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async (plan, adapters, options) => {
+      calls.push({ kind: "executeStart" });
+      launchSpec = options.buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { harness: plan.agent.harness, command: plan.agent.command, roles: plan.agent.roles, ...plan.agent.profile },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      return {
+        status: "completed",
+        operations: [
+          { id: "worktree", kind: "herdr.worktree.ensure", status: "created" },
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+        ],
+        guidance: [],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  const settingsPath = join(STATE_ROOT, RUN_ID, "claude-worker-settings.json");
+  assert.ok(launchSpec.argv.includes("--settings"));
+  assert.equal(launchSpec.argv[launchSpec.argv.indexOf("--settings") + 1], settingsPath);
+
+  const settingsWrite = calls.find((call) => call.kind === "store.writePrivateFile" && call.relativePath === "claude-worker-settings.json");
+  assert.ok(settingsWrite, "expected the worker settings file to be written into the run directory");
+  const settings = JSON.parse(settingsWrite.text);
+  for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
+    assert.match(settings.hooks[event][0].hooks[0].command, /claude-lifecycle\.mjs/);
+    assert.match(settings.hooks[event][0].hooks[0].command, new RegExp(`${event}$`));
+  }
+  assert.match(settings.statusLine.command, /claude-statusline\.mjs/);
+});
+
+test("a claude stream-json (supervised) launch does not write worker settings or pass --settings", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker", profileOverrides: { profile: { mode: "stream-json" } } });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+  let launchSpec;
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async (plan, adapters, options) => {
+      launchSpec = options.buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { harness: plan.agent.harness, command: plan.agent.command, roles: plan.agent.roles, ...plan.agent.profile },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      return {
+        status: "completed",
+        operations: [
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+        ],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  assert.equal(launchSpec.argv.includes("--settings"), false);
+  assert.equal(calls.some((c) => c.kind === "store.writePrivateFile"), false);
+});

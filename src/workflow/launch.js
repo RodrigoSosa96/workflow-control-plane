@@ -4,8 +4,10 @@ import { HARNESS_TELEMETRY_VERSIONS } from "./telemetry-adapters.js";
 import { buildAssignmentTemplate } from "./assignment.js";
 import { WorkflowError } from "./errors.js";
 import { executeStart as defaultExecuteStart } from "./execute.js";
-import { buildHarnessLaunch } from "./harnesses.js";
+import { buildClaudeWorkerSettings, buildHarnessLaunch, CONTROL_PLANE_ROOT } from "./harnesses.js";
 import { RUN_STATES } from "./run-state.js";
+
+const CLAUDE_WORKER_SETTINGS_FILE = "claude-worker-settings.json";
 
 function fail(category, message, details, exitCode = 10) {
   throw new WorkflowError(category, message, { details, exitCode });
@@ -429,6 +431,17 @@ function assignmentWithExecutionHeader(run, assignment) {
   ].join("\n");
 }
 
+// Mirrors the Pi interactive gate in harnesses.js's piArgv (--extension only for interactive
+// runs): the Claude worker's hooks/statusLine settings file is only useful — and only safe to
+// generate — for an interactive Claude agent. A supervised (stream-json) Claude run is headless
+// and short-lived, so it must not receive --settings.
+function isClaudeInteractiveAgent(plan = {}) {
+  const agent = plan.agent ?? {};
+  const harness = agent.harness ?? agent.profile?.harness;
+  const mode = agent.profile?.mode ?? "interactive";
+  return harness === "claude" && mode === "interactive";
+}
+
 function runForHarness(run, { stateRoot, controlPlaneBin }) {
   return {
     ...run,
@@ -560,6 +573,22 @@ export async function executeLaunch(preview, deps = {}) {
   }));
   const run = runForHarness(created, { stateRoot, controlPlaneBin });
   await store.writeAssignment(run.id, assignmentWithExecutionHeader(run, fresh.assignment));
+
+  // The Claude analog of Pi's --extension: an interactive Claude worker needs its
+  // hooks/statusLine wired via --settings, so generate that settings file into the run
+  // directory now (mirroring the assignment write above) and thread its path through to
+  // the launch builder below.
+  let claudeSettingsPath = null;
+  if (isClaudeInteractiveAgent(fresh.reconciliation)) {
+    const settings = buildClaudeWorkerSettings({ controlPlaneRoot: CONTROL_PLANE_ROOT });
+    await store.writePrivateFile(run.id, {
+      relativePath: CLAUDE_WORKER_SETTINGS_FILE,
+      text: `${JSON.stringify(settings, null, 2)}\n`,
+      updater: () => ({}),
+    });
+    claudeSettingsPath = join(run.directory, CLAUDE_WORKER_SETTINGS_FILE);
+  }
+
   await updateRun(store, run.id, {
     state: RUN_STATES.LAUNCHING,
     launchStartedAt: new Date().toISOString(),
@@ -626,7 +655,7 @@ export async function executeLaunch(preview, deps = {}) {
           launchExpected = supervisorSpec.expected;
           return supervisorSpec;
         }
-        const spec = launchBuilder(input);
+        const spec = launchBuilder(claudeSettingsPath ? { ...input, settingsPath: claudeSettingsPath } : input);
         launchExpected = spec.expected;
         return spec;
       },

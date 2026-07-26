@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildHarnessLaunch } from "../src/workflow/harnesses.js";
+import { buildClaudeWorkerSettings, buildHarnessLaunch } from "../src/workflow/harnesses.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -231,4 +231,29 @@ test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
     cwd: CWD,
     nativeSessionId: null,
   });
+});
+
+test("claude worker settings wire lifecycle hooks and a statusLine to control-plane scripts", () => {
+  const s = buildClaudeWorkerSettings({ controlPlaneRoot: "/cp" });
+  for (const ev of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) {
+    const cmd = s.hooks[ev][0].hooks[0].command;
+    assert.match(cmd, /\/cp\/hooks\/claude-lifecycle\.mjs/);
+    assert.equal(s.hooks[ev][0].hooks[0].type, "command");
+  }
+  assert.match(s.statusLine.command, /\/cp\/hooks\/claude-statusline\.mjs/);
+  assert.equal(s.statusLine.type, "command");
+});
+
+test("interactive claudeArgv appends --settings; stream-json does not", () => {
+  const run = { id: "r", directory: "/state/r", generation: 1, stateRoot: "/state", controlPlaneBin: "/cp/bin/workflow.js" };
+  const interactive = buildHarnessLaunch({ profileName: "claude-worker",
+    profile: { harness: "claude", command: "claude", mode: "interactive", model: null, arguments: [], permission_mode: "manual" },
+    sessionName: "s", cwd: "/wt", run, settingsPath: "/state/r/claude-worker-settings.json" });
+  assert.ok(interactive.argv.includes("--settings"));
+  assert.equal(interactive.argv[interactive.argv.indexOf("--settings") + 1], "/state/r/claude-worker-settings.json");
+
+  const streamed = buildHarnessLaunch({ profileName: "claude-worker",
+    profile: { harness: "claude", command: "claude", mode: "stream-json", model: null, arguments: [], permission_mode: "manual" },
+    sessionName: "s", cwd: "/wt", run });
+  assert.ok(!streamed.argv.includes("--settings"));
 });
