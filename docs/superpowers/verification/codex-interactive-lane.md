@@ -612,7 +612,7 @@ found + fixed 3 defects and surfaced one Codex/Herdr limitation.
 - [x] **6. resume --yes → relaunched:** `codex resume <id>` **reuses the same session id
   and resumes the full native history** (verified via `herdr pane read` — the prior
   conversation, incl. the submitted handoff, was intact).
-- [~] **7. resume again → LIMITATION** (see below).
+- [x] **7. resume again → focused** (after the fix below).
 
 **Bugs found + fixed by this e2e:**
 
@@ -628,14 +628,14 @@ found + fixed 3 defects and surfaced one Codex/Herdr limitation.
    worker would prompt and stall. FIX (`3ce68f0`): allow `approval_policy: never`
    (autonomous; the sandbox still applies; sneaking approval flags via `arguments` stays forbidden).
 
-**Known limitation (documented follow-up, not a code defect):** after a `codex resume`
-relaunch, Herdr does **not** report the resumed agent's `agent_session` while it is idle
-(it stays empty until Codex takes a turn). So re-observing/closing the **relaunched**
-session via the workflow returns `mismatch` until it acts — step 7's re-resume and closing
-the relaunched agent aren't reliable until then. The relaunch itself works and resumes the
-history (the core recovery goal). This is a Herdr↔Codex integration limit, not the lane's
-code; a future workaround could relax `observeExact` to trust the pane it just relaunched
-into when the session value is not yet reported.
+**Herdr-resume quirk (FIXED, `b528599`):** after a `codex resume` relaunch, Herdr reports
+the resumed agent at its pane but leaves `agent_session` **empty** until Codex takes a turn.
+That made `observeExact` return a permanent `mismatch` on a session we just relaunched.
+Fixed: the codex adapter opts into trusting an unreported (empty) session at the pane it
+relaunched into (`trustPaneWhenSessionUnreported`; the cwd check still guards, and a
+present-but-different session is still a mismatch). Pi/Claude report their session reliably
+and stay strict (no opt-in). Re-verify step 7 (re-observe/close of the relaunched session)
+in the next e2e.
 
 **Note:** after `rm -rf` of the fixture, Herdr may show the leftover
 workspace/panes as `(deleted)` (their cwd is gone) — cosmetic, the lane
