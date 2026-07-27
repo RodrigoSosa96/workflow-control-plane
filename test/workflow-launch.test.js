@@ -499,7 +499,7 @@ test("dry launch preview is data-only, mutates nothing, and keeps the raw reques
 test("launch preview exposes selected harness argv with generated values marked and no request text", async () => {
   const preview = await previewFor();
 
-  assert.deepEqual(preview.launchSpec.argv.slice(0, 10), [
+  assert.deepEqual(preview.launchSpec.argv.slice(0, 11), [
     "codex",
     "-C",
     "/worktrees/ocr/ASANA-123-app",
@@ -509,6 +509,7 @@ test("launch preview exposes selected harness argv with generated values marked 
     "workspace-write",
     "--ask-for-approval",
     "on-request",
+    "--dangerously-bypass-hook-trust",
     "--model",
   ]);
   assert.equal(preview.launchSpec.expected.nativeSessionId, null);

@@ -172,6 +172,12 @@ function codexArgv({ profile, cwd, run }) {
   if (run) argv.push("--add-dir", assertString(run.directory, "run.directory"));
   argv.push("--sandbox", assertString(profile.sandbox, "profile.sandbox"));
   argv.push("--ask-for-approval", assertString(profile.approval_policy, "profile.approval_policy"));
+  // The interactive worker's lifecycle hook (wired via Codex's notify/config) would otherwise
+  // trigger a per-invocation trust prompt; a supervised stream-json/exec run is headless and
+  // has no one to answer that prompt, so only interactive runs get the bypass.
+  if (run && profile.mode === "interactive") {
+    argv.push("--dangerously-bypass-hook-trust");
+  }
   appendModel(argv, profile.model);
   argv.push(...profile.arguments);
   const bootstrap = runBootstrapPrompt(run);
