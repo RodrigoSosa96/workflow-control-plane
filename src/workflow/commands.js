@@ -1241,10 +1241,11 @@ async function relaunchSession(identity, deps) {
   if (!deps.store || typeof deps.store.read !== "function") {
     delegationError("PREFLIGHT", "resume relaunch requires a run store to rebuild the workflow environment", 10);
   }
-  const harness = identity.harness === "claude" ? "claude" : "pi";
+  const harness = identity.harness === "claude" ? "claude" : identity.harness === "codex" ? "codex" : "pi";
   const command = await deps.lookupExecutable(harness);
   if (!command || !isAbsolute(command)) {
-    delegationError("PREFLIGHT", `${harness === "claude" ? "Claude" : "Pi"} executable must resolve to an absolute path to relaunch a session`, 10);
+    const harnessLabel = harness === "claude" ? "Claude" : harness === "codex" ? "Codex" : "Pi";
+    delegationError("PREFLIGHT", `${harnessLabel} executable must resolve to an absolute path to relaunch a session`, 10);
   }
 
   const run = await deps.store.read(identity.runId);
@@ -1294,6 +1295,18 @@ async function relaunchSession(identity, deps) {
     // the assignment). No --permission-mode/--model either — those live on the registry profile,
     // which the transportIdentity does not carry (known follow-up).
     argv = [command, "--resume", identity.sessionId, "--add-dir", run.directory, "--settings", settingsPath];
+  } else if (harness === "codex") {
+    // Codex resumes via the `codex resume <id>` SUBCOMMAND, not a flag — the subcommand and
+    // exact session id must be argv[0]/argv[1]/argv[2] (after the executable), unlike Pi/Claude
+    // which resume through flags on the base command. Run in the session's original cwd
+    // (`-C`), never prompt on approval (`-a never`), and bypass the interactive worker's
+    // lifecycle-hook trust prompt exactly like the initial interactive launch does (Codex hooks
+    // are global, so no settings/hook regeneration is needed here). Sandbox/approval-policy
+    // aren't carried on the transportIdentity, so they're omitted for now (documented
+    // follow-up, mirroring how the claude relaunch omits --permission-mode/--model). No
+    // bootstrap prompt: a resume continues the existing session instead of starting a fresh
+    // assignment.
+    argv = [command, "resume", identity.sessionId, "-C", identity.cwd, "-a", "never", "--dangerously-bypass-hook-trust"];
   } else {
     argv = [command, "--name", sessionName, "--session-id", identity.sessionId];
     for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);

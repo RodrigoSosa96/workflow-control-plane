@@ -150,6 +150,28 @@ test("claude relaunch builds claude --resume <exact> --settings, no bootstrap, v
   assert.equal(startCalls[0].argv.some((v) => /assignment\.md|handoff-input\.json/.test(v)), false);
 });
 
+test("codex relaunch builds `codex resume <exact>` subcommand, no bootstrap, valid name", async () => {
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "codex-session", harness: "codex", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const startCalls = [];
+  const herdr = { async listAgents() { return { agents: [] }; },
+    async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane() { return { paneId: "w3:p1" }; },
+    async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent() {} };
+  const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "codex-worker", harness: "codex" };
+  const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/codex" });
+  assert.equal(res.action, "relaunched");
+  assert.equal(startCalls[0].kind, "codex");
+  assert.ok(startCalls[0].name.length <= 32);
+  assert.match(startCalls[0].name, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.equal(startCalls[0].argv[0], "/usr/bin/codex");
+  assert.equal(startCalls[0].argv[1], "resume");
+  assert.equal(startCalls[0].argv[2], sessionId);
+  assert.ok(startCalls[0].argv.includes("-C"));
+  assert.equal(startCalls[0].argv.some((v) => /assignment\.md|handoff-input\.json/.test(v)), false);
+});
+
 test("resumeCommand reports needs-confirmation for a dead pi-session and relaunches only when confirmed", async () => {
   const identity = { kind: "pi-session", runId: RUN_ID, sessionId: "s1", paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
   const deadHerdr = {
