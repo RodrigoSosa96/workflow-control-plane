@@ -636,6 +636,24 @@ test("exclusive private artifact writes reject a duplicate worker launch record"
   assert.equal(await readFile(join(run.directory, relativePath), "utf8"), "{\"version\":2}\n");
 });
 
+test("update skips the write when the updater returns an empty patch (a no-op must not bump updatedAt)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  // Distinct create vs. later-write timestamps: any real write on the no-op path would move
+  // updatedAt off the create timestamp, so a bumped updatedAt is exactly what this test catches.
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-06-06T00:00:00.000Z"),
+  });
+  await store.create(plannedInput());
+  const before = (await store.read(RUN_ID_1)).updatedAt;
+
+  const result = await store.update(RUN_ID_1, () => ({}));
+
+  assert.equal(result.updatedAt, before, "an empty-patch update must return the unchanged updatedAt");
+  assert.equal((await store.read(RUN_ID_1)).updatedAt, before, "an empty-patch update must not rewrite the run file");
+});
+
 test("rejects unsafe private artifact paths without writing outside the run", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });

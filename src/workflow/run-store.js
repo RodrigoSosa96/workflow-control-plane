@@ -100,6 +100,10 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function isEmptyPatch(patch) {
+  return patch !== null && typeof patch === "object" && !Array.isArray(patch) && Object.keys(patch).length === 0;
+}
+
 function attachDirectory(run, directory) {
   return { ...run, directory };
 }
@@ -648,6 +652,12 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     return withLock(directory, async () => {
       const current = await readRunInternal(id, directory);
       const patch = await updater(cloneJson(attachDirectory(current, directory)));
+      // An updater that returns an empty object is signalling "no change". Skip the write so a
+      // no-op does not rewrite the run file with a fresh `updatedAt` (which would make updatedAt
+      // misleading). Lifecycle's guarded no-op branches — a stale-generation stop, an illegal
+      // state transition — return `{}` precisely to land here. A non-empty patch still flows
+      // through updatedRun, whose assertObject rejects any non-object patch as before.
+      if (isEmptyPatch(patch)) return attachDirectory(current, directory);
       const next = updatedRun(current, patch);
       return writeRun(directory, next);
     });

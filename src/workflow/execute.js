@@ -630,6 +630,32 @@ async function discoverCodexSessionId({
   return null;
 }
 
+// The ordinary and group/coordinator start paths build the exact-session identity identically.
+// Keeping it in one place stops the two copies from drifting — a group-path regression to a null
+// sessionId would silently make a coordinator run non-resumable with no obvious symptom. Returns
+// null for supervised runs, which have no interactive session to resume.
+//
+// NOTE: this identity is only PERSISTED by `launch` (as the run's transportIdentity). A bare
+// `workflow start` emits it in the execute report but never writes it to a run record, so
+// start-created runs are intentionally not resumable — resume/close are scoped to launch runs.
+async function resolveSessionIdentity({ launch, harness, startedAgent, workspaceId, worktreePath, runId, herdr, codexSessionDiscovery }) {
+  if (launch.supervisor === true) return null;
+  const nativeSessionId = launch.expected?.nativeSessionId ?? null;
+  const sessionId = harness === "codex" && !nativeSessionId
+    ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
+    : nativeSessionId;
+  return {
+    kind: `${harness}-session`,
+    harness,
+    runId,
+    sessionId,
+    paneId: startedAgent.paneId,
+    tabId: startedAgent.tabId,
+    workspaceId,
+    cwd: worktreePath,
+  };
+}
+
 async function recoverStartedAgent({ herdr, error, paneId, tabId }) {
   if (!isAgentStartupTimeout(error) || typeof herdr.listAgents !== "function") return null;
   let agents;
@@ -826,23 +852,10 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessio
 
     const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
     const harness = plan.agent?.harness ?? "pi";
-    let sessionIdentity = null;
-    if (launch.supervisor !== true) {
-      const nativeSessionId = launch.expected?.nativeSessionId ?? null;
-      const sessionId = harness === "codex" && !nativeSessionId
-        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
-        : nativeSessionId;
-      sessionIdentity = {
-        kind: `${harness}-session`,
-        harness,
-        runId: plan.run?.id,
-        sessionId,
-        paneId: startedAgent.paneId,
-        tabId: startedAgent.tabId,
-        workspaceId,
-        cwd: plan.agent.worktreePath,
-      };
-    }
+    const sessionIdentity = await resolveSessionIdentity({
+      launch, harness, startedAgent, workspaceId,
+      worktreePath: plan.agent.worktreePath, runId: plan.run?.id, herdr, codexSessionDiscovery,
+    });
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
@@ -1071,23 +1084,10 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
     });
 
     const harness = plan.agent?.harness ?? "pi";
-    let sessionIdentity = null;
-    if (launch.supervisor !== true) {
-      const nativeSessionId = launch.expected?.nativeSessionId ?? null;
-      const sessionId = harness === "codex" && !nativeSessionId
-        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
-        : nativeSessionId;
-      sessionIdentity = {
-        kind: `${harness}-session`,
-        harness,
-        runId: plan.run?.id,
-        sessionId,
-        paneId: startedAgent.paneId,
-        tabId: startedAgent.tabId,
-        workspaceId,
-        cwd: plan.agent.worktreePath,
-      };
-    }
+    const sessionIdentity = await resolveSessionIdentity({
+      launch, harness, startedAgent, workspaceId,
+      worktreePath: plan.agent.worktreePath, runId: plan.run?.id, herdr, codexSessionDiscovery,
+    });
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
