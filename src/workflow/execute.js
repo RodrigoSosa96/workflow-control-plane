@@ -591,6 +591,41 @@ function isAgentStartupTimeout(error) {
   return /timed out waiting for agent startup/iu.test(String(error?.message ?? ""));
 }
 
+const CODEX_SESSION_DISCOVERY_ATTEMPTS = 3;
+const CODEX_SESSION_DISCOVERY_DELAY_MS = 20;
+
+// Codex generates its own session id after launch (no `--session-id` flag to force it), so it
+// isn't known from `launch.expected` the way Pi/Claude's is. Discover it from Herdr's agent list
+// by matching the pane we just started it in. The id can take a beat to appear, so retry a few
+// times before giving up; if it's still missing, leave sessionId null — resume fails safe later
+// by offering a relaunch instead of resuming a session id we never captured.
+async function discoverCodexSessionId({
+  herdr,
+  paneId,
+  attempts = CODEX_SESSION_DISCOVERY_ATTEMPTS,
+  delayMs = CODEX_SESSION_DISCOVERY_DELAY_MS,
+}) {
+  if (typeof herdr?.listAgents !== "function") return null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    let agents;
+    try {
+      agents = listValue(await herdr.listAgents(), "agents");
+    } catch {
+      agents = [];
+    }
+    const match = agents.find((agent) => getPaneId(agent) === paneId);
+    const sessionId = match?.agent_session?.value ?? null;
+    if (sessionId) return sessionId;
+
+    if (attempt < attempts - 1) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs));
+    }
+  }
+
+  return null;
+}
+
 async function recoverStartedAgent({ herdr, error, paneId, tabId }) {
   if (!isAgentStartupTimeout(error) || typeof herdr.listAgents !== "function") return null;
   let agents;
@@ -787,16 +822,23 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
 
     const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
     const harness = plan.agent?.harness ?? "pi";
-    const sessionIdentity = launch.supervisor === true ? null : {
-      kind: `${harness}-session`,
-      harness,
-      runId: plan.run?.id,
-      sessionId: launch.expected?.nativeSessionId ?? null,
-      paneId: startedAgent.paneId,
-      tabId: startedAgent.tabId,
-      workspaceId,
-      cwd: plan.agent.worktreePath,
-    };
+    let sessionIdentity = null;
+    if (launch.supervisor !== true) {
+      const nativeSessionId = launch.expected?.nativeSessionId ?? null;
+      const sessionId = harness === "codex" && !nativeSessionId
+        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId })
+        : nativeSessionId;
+      sessionIdentity = {
+        kind: `${harness}-session`,
+        harness,
+        runId: plan.run?.id,
+        sessionId,
+        paneId: startedAgent.paneId,
+        tabId: startedAgent.tabId,
+        workspaceId,
+        cwd: plan.agent.worktreePath,
+      };
+    }
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
@@ -1017,16 +1059,23 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
     });
 
     const harness = plan.agent?.harness ?? "pi";
-    const sessionIdentity = launch.supervisor === true ? null : {
-      kind: `${harness}-session`,
-      harness,
-      runId: plan.run?.id,
-      sessionId: launch.expected?.nativeSessionId ?? null,
-      paneId: startedAgent.paneId,
-      tabId: startedAgent.tabId,
-      workspaceId,
-      cwd: plan.agent.worktreePath,
-    };
+    let sessionIdentity = null;
+    if (launch.supervisor !== true) {
+      const nativeSessionId = launch.expected?.nativeSessionId ?? null;
+      const sessionId = harness === "codex" && !nativeSessionId
+        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId })
+        : nativeSessionId;
+      sessionIdentity = {
+        kind: `${harness}-session`,
+        harness,
+        runId: plan.run?.id,
+        sessionId,
+        paneId: startedAgent.paneId,
+        tabId: startedAgent.tabId,
+        workspaceId,
+        cwd: plan.agent.worktreePath,
+      };
+    }
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,

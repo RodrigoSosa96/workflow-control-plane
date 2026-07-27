@@ -639,6 +639,22 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   assert.equal(agentOp.sessionIdentity.sessionId, launchSpec.expected.nativeSessionId);
 });
 
+test("an interactive codex start discovers the session id from herdr agent list", async () => {
+  const calls = [];
+  const plan = buildPlan({ agentHarness: "codex", agentProfileName: "codex-worker",
+    agentProfile: { mode: "interactive", model: null, arguments: [], sandbox: "workspace-write", approval_policy: "never" } });
+  plan.operations = plan.operations.map((o) => o.id === "agent" ? { ...o, kind: "agent.session.start", command: "codex" } : o);
+  const launchSpec = { argv: ["codex", "-C", plan.agent.worktreePath], env: {},
+    expected: { harness: "codex", nativeSessionId: null, cwd: plan.agent.worktreePath } };
+  // herdr reports the started codex agent (pane w1:p2) with its generated session id
+  const herdr = createHerdr(calls, { agentsAfterStart: [{ agent: "codex", pane_id: "w1:p2", agent_session: { kind: "id", value: "codex-sess-9" } }] });
+  const report = await executeStart(plan, { git: {}, herdr }, { buildAgentLaunch: () => launchSpec });
+  const agentOp = report.operations.find((o) => o.id === "agent");
+  assert.equal(agentOp.sessionIdentity.kind, "codex-session");
+  assert.equal(agentOp.sessionIdentity.harness, "codex");
+  assert.equal(agentOp.sessionIdentity.sessionId, "codex-sess-9");
+});
+
 test("accepts an exact OpenCode agent identity before Herdr mutation", async () => {
   const calls = [];
   const plan = buildPlan({
