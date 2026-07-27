@@ -215,9 +215,11 @@ test("rejects permission and sandbox bypass shortcuts", () => {
   configApprovalOverride.launcher.agent_profiles["codex-worker"].arguments = ["-c", 'approval_policy = "never"'];
   assert.throws(() => validateRegistry(configApprovalOverride), /config|approval|never/i);
 
+  // approval_policy: "never" is allowed on the profile (autonomous worker; sandbox still applies).
+  // Sneaking approval overrides via `arguments` (above) stays forbidden.
   const never = registryValue();
   never.launcher.agent_profiles["codex-worker"].approval_policy = "never";
-  assert.throws(() => validateRegistry(never), /approval_policy.*never|never.*approval/i);
+  assert.doesNotThrow(() => validateRegistry(never));
 
   const bypassBoth = registryValue();
   bypassBoth.launcher.agent_profiles["codex-worker"].arguments = ["--dangerously-bypass-approvals-and-sandbox"];

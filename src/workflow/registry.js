@@ -18,7 +18,10 @@ const MODES_BY_HARNESS = {
 };
 const CLAUDE_PERMISSION_MODES = new Set(["manual", "acceptEdits", "plan", "auto", "dontAsk"]);
 const CODEX_SANDBOXES = new Set(["read-only", "workspace-write"]);
-const CODEX_APPROVALS = new Set(["untrusted", "on-request"]);
+// "never" lets an autonomous worker execute without approval prompts; the sandbox
+// (CODEX_SANDBOXES, still validated separately) remains the safety boundary, and the
+// FORBIDDEN_ARGUMENTS guard still blocks sneaking approval flags in via `arguments`.
+const CODEX_APPROVALS = new Set(["untrusted", "on-request", "never"]);
 const COMMON_PROFILE_FIELDS = new Set(["harness", "command", "mode", "roles", "model", "arguments"]);
 const PROFILE_FIELDS_BY_HARNESS = {
   pi: COMMON_PROFILE_FIELDS,
