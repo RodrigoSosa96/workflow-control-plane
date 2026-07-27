@@ -597,16 +597,45 @@ Fill in after running live:
 
 - [ ] 0. Launch reported ____ (running/partial); no schema error.
 - [ ] 1. Identity survives: `transportIdentity.kind == "codex-session"`, `sessionId` discovered: ____
-- [ ] 2. Telemetry: `phase` = ____, `harness` = ____
-- [ ] 3. resume LIVE → focused Codex's own pane: ____
-- [ ] 4. close IDLE → `closed:true` and the process actually exited: ____
-- [ ] 5. resume DEAD (no `--yes`) → `needs-confirmation`: ____
-- [ ] 6. resume `--yes` → relaunched via `codex resume`, native history intact, telemetry resumes: ____
-- [ ] 7. resume again → focused the new pane: ____
+### Findings (e2e run, 2026-07-27, Herdr 0.7.5 / codex-cli 0.145.0)
 
-**Bugs found + fixed by this e2e:** (none yet — fill in as discovered, one
-bullet per fix, with the commit hash, mirroring `claude-interactive-lane.md`
-§4's list)
+Verified live against a real interactive Codex session. Core recovery works; the e2e
+found + fixed 3 defects and surfaced one Codex/Herdr limitation.
+
+- [x] **0–1. Identity discovered:** `transportIdentity.kind == "codex-session"`, id OK.
+  Codex `agent_session` is a bare uuid (`{kind:"id", value:"<uuid>"}`) → `value===id`.
+- [x] **2. Telemetry:** `worker status` shows `phase` (`settled`), `harness: codex`,
+  and the workflow hook installed into `~/.codex/hooks.json` (best-effort, beside Herdr's).
+- [x] **3. resume LIVE → focused** Codex's own pane (`agent focus`).
+- [x] **4. close IDLE → exits** via `/quit` (after the settle fix, see below).
+- [x] **5. resume DEAD → needs-confirmation.**
+- [x] **6. resume --yes → relaunched:** `codex resume <id>` **reuses the same session id
+  and resumes the full native history** (verified via `herdr pane read` — the prior
+  conversation, incl. the submitted handoff, was intact).
+- [~] **7. resume again → LIMITATION** (see below).
+
+**Bugs found + fixed by this e2e:**
+
+1. **Post-launch identity discovery was too impatient** (3×20ms ≈ 60ms). Codex's session
+   id appears in `herdr agent list` only ~seconds after `SessionStart` fires. FIX
+   (`e4dd0ee`): widen the discovery window to ~10s (returns as soon as found; timing
+   injectable so the no-match test stays fast).
+2. **`close` typed `/quit` but the immediate `enter` was swallowed as a newline** in
+   Codex's multi-line composer (race — enter arrived before Codex rendered the text),
+   leaving the agent alive. FIX (`fb7eddb`): the codex adapter declares `exitSettleMs=1000`;
+   `requestGracefulClose` waits it between the text and the enter (Pi/Claude unchanged).
+3. **Approval-autonomy** — the registry's `CODEX_APPROVALS` didn't allow `never`, so the
+   worker would prompt and stall. FIX (`3ce68f0`): allow `approval_policy: never`
+   (autonomous; the sandbox still applies; sneaking approval flags via `arguments` stays forbidden).
+
+**Known limitation (documented follow-up, not a code defect):** after a `codex resume`
+relaunch, Herdr does **not** report the resumed agent's `agent_session` while it is idle
+(it stays empty until Codex takes a turn). So re-observing/closing the **relaunched**
+session via the workflow returns `mismatch` until it acts — step 7's re-resume and closing
+the relaunched agent aren't reliable until then. The relaunch itself works and resumes the
+history (the core recovery goal). This is a Herdr↔Codex integration limit, not the lane's
+code; a future workaround could relax `observeExact` to trust the pane it just relaunched
+into when the session value is not yet reported.
 
 **Note:** after `rm -rf` of the fixture, Herdr may show the leftover
 workspace/panes as `(deleted)` (their cwd is gone) — cosmetic, the lane
