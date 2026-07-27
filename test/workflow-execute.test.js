@@ -211,6 +211,7 @@ function createHerdr(calls, {
   failListTabs = null,
   failListPanes = null,
   failSplit = null,
+  failClosePane = null,
   agentsAfterStart = null,
   workspaces,
   tabs,
@@ -274,6 +275,7 @@ function createHerdr(calls, {
     },
     async closePane({ paneId }) {
       calls.push({ kind: "herdr.pane.close", paneId });
+      if (failClosePane) throw failClosePane;
       return { pane_id: paneId, closed: true };
     },
   };
@@ -837,6 +839,34 @@ test("closes the bootstrap shell when the started pane matches the selected non-
 
   assert.equal(report.status, "completed");
   assert.equal(calls.some((call) => call.kind === "herdr.pane.close" && call.paneId === "w1:p1"), true);
+});
+
+test("a failed bootstrap-pane close does NOT degrade a successful start to partial", async () => {
+  // The agent is already started; closing the leftover bootstrap shell pane is cosmetic cleanup.
+  // If closePane throws it must become a note, never flip the launch to partial/failed (which the
+  // CLI then reports as a failed launch even though the run is running).
+  const calls = [];
+  const report = await executeStart(buildPlan({
+    agentHarness: "claude",
+    agentProfileName: "claude-worker",
+    agentProfile: { mode: "interactive", model: null, arguments: [], permission_mode: "manual" },
+  }), fakeAdapters(calls, {
+    failClosePane: new Error("pane close failed"),
+    panes: {
+      w1: [
+        { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: workspacePath, foreground_cwd: workspacePath },
+        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", cwd: workspacePath, foreground_cwd: workspacePath,
+          agent: "claude", agent_status: "working",
+          agent_session: { agent: "claude", kind: "path", source: "herdr:claude", value: "/tmp/claude-session.jsonl" } },
+      ],
+    },
+  }));
+
+  // closePane WAS attempted (canClose passed), it threw, but the start still succeeded.
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close" && call.paneId === "w1:p1"), true);
+  assert.equal(report.status, "completed");
+  assert.equal(report.operations.find((operation) => operation.id === "agent").status, "created");
+  assert.match(report.notes.join("\n"), /retained|bootstrap shell|pane close failed/i);
 });
 
 test("reuses an already-open compatible workspace without mutating anything", async () => {

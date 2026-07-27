@@ -78,11 +78,14 @@ The first real e2e found and fixed a launch bug, and verified most of the lane:
   added recovery: on that timeout, consult `agent list` and, if the agent is in the
   pane we started it in, treat it as started so the identity is captured.
 
-## Related, still-open (not blocking recovery)
+## Related
 
-- **Interactive launch can still report `partial`/`failed` though the run succeeds.**
-  The post-start bootstrap-pane cleanup (`herdr.closePane`, not wrapped in try) can
-  throw and downgrade a successful start, and the run-state write can still lose the
-  race. Cosmetic now — the identity is persisted regardless (state-less write) and the
-  worker drives the run — but `launchStatus`/the report remain misleading. A full fix
-  decouples launch metadata/state the same way the identity write was decoupled.
+- **Interactive launch reporting `partial`/`failed` though the run succeeds — FIXED**
+  (branch `fix/interactive-launch-partial-report`). The concrete trigger — the post-start
+  bootstrap-pane cleanup (`herdr.closePane`) not being wrapped in try, so a cleanup failure
+  degraded a successful start to `partial` — is fixed: `closePane` failures are now a note,
+  never a partial (matching `verifyCloseSafety`'s handling). The earlier `partial`/`Tab:
+  unknown` reports were the readiness-timeout / identity-race path, already resolved by the
+  recovery lane's `recoverStartedAgent` + state-less identity write; recent Claude/Codex
+  launches report `running` cleanly with real tab/pane. Genuine agent-start failures still
+  correctly report `partial`.

@@ -876,7 +876,15 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessio
       }
 
       if (canClose) {
-        await herdr.closePane({ paneId: bootstrapPaneId });
+        // Closing the leftover bootstrap shell pane is cosmetic cleanup — the agent is already
+        // started. A failure here must never propagate to the outer catch (which would flip the
+        // whole start to "partial" and make the launch report a failed run for a running worker);
+        // record it as a note instead, mirroring the verifyCloseSafety failure handling above.
+        try {
+          await herdr.closePane({ paneId: bootstrapPaneId });
+        } catch (error) {
+          report.notes.push(`Retained the bootstrap shell pane because closing it failed: ${error.message}`);
+        }
       } else if (report.notes.length === 0) {
         report.notes.push("Retained the bootstrap shell pane because the close safety checks did not pass.");
       }
