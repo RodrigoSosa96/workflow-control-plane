@@ -20,6 +20,25 @@ export const PI_WORKER_EXTENSIONS = [
 // driver (matching Pi's agent_start), so generation 1 lines up with the first prompt.
 export const CLAUDE_WORKER_HOOKS = Object.freeze(["UserPromptSubmit", "Stop", "SessionEnd"]);
 
+// The worker runs with `--permission-mode dontAsk`, which auto-DENIES a tool unless an
+// allowlist grants it. A denial makes Claude retry, wasting tokens (observed in the human/TTY
+// e2e), so the worker's full toolset is allowlisted with ZERO denials. In Claude settings a
+// bare tool name (e.g. "Bash") allows every use of that tool; a parenthesized form
+// ("Bash(cmd:*)") would scope it, which is not what a trusted worktree worker needs.
+export const CLAUDE_WORKER_ALLOWED_TOOLS = Object.freeze([
+  "Bash",
+  "Read",
+  "Edit",
+  "Write",
+  "Glob",
+  "Grep",
+  "MultiEdit",
+  "NotebookEdit",
+  "TodoWrite",
+  "WebFetch",
+  "WebSearch",
+]);
+
 export const WORKFLOW_ENV_KEYS = Object.freeze([
   "WORKFLOW_RUN_ID",
   "WORKFLOW_RUN_DIR",
@@ -91,6 +110,7 @@ export function buildClaudeWorkerSettings({ controlPlaneRoot } = {}) {
   return {
     hooks,
     statusLine: { type: "command", command: `node "${statuslineScript}"` },
+    permissions: { allow: [...CLAUDE_WORKER_ALLOWED_TOOLS] },
   };
 }
 

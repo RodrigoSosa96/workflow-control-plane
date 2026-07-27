@@ -252,6 +252,20 @@ test("claude worker settings wire lifecycle hooks and a statusLine to control-pl
   assert.equal(s.statusLine.type, "command");
 });
 
+test("claude worker settings allow the worker's tools so --permission-mode dontAsk never denies", () => {
+  const s = buildClaudeWorkerSettings({ controlPlaneRoot: "/cp" });
+  assert.ok(Array.isArray(s.permissions?.allow), "permissions.allow must be an array");
+  // A bare tool name allows all uses of that tool. The worker must read/edit/write in its
+  // worktree and run bash (tests + the handoff command) without a denial that triggers a
+  // retry loop and wastes tokens.
+  for (const tool of ["Bash", "Read", "Write", "Edit"]) {
+    assert.ok(s.permissions.allow.includes(tool), `permissions.allow must include ${tool}`);
+  }
+  // hooks and statusLine must be unchanged by adding permissions.
+  assert.deepEqual(Object.keys(s.hooks).sort(), ["SessionEnd", "Stop", "UserPromptSubmit"]);
+  assert.equal(s.statusLine.type, "command");
+});
+
 test("interactive claudeArgv appends --settings; stream-json does not", () => {
   const run = { id: "r", directory: "/state/r", generation: 1, stateRoot: "/state", controlPlaneBin: "/cp/bin/workflow.js" };
   const interactive = buildHarnessLaunch({ profileName: "claude-worker",
