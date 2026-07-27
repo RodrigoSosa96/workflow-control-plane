@@ -1299,14 +1299,16 @@ async function relaunchSession(identity, deps) {
     // Codex resumes via the `codex resume <id>` SUBCOMMAND, not a flag — the subcommand and
     // exact session id must be argv[0]/argv[1]/argv[2] (after the executable), unlike Pi/Claude
     // which resume through flags on the base command. Run in the session's original cwd
-    // (`-C`), never prompt on approval (`-a never`), and bypass the interactive worker's
+    // (`-C`), grant write access to the run directory (`--add-dir`, same as codexArgv's initial
+    // launch and the claude relaunch above — needed so the resumed worker can write the
+    // handoff), never prompt on approval (`-a never`), and bypass the interactive worker's
     // lifecycle-hook trust prompt exactly like the initial interactive launch does (Codex hooks
     // are global, so no settings/hook regeneration is needed here). Sandbox/approval-policy
     // aren't carried on the transportIdentity, so they're omitted for now (documented
     // follow-up, mirroring how the claude relaunch omits --permission-mode/--model). No
     // bootstrap prompt: a resume continues the existing session instead of starting a fresh
     // assignment.
-    argv = [command, "resume", identity.sessionId, "-C", identity.cwd, "-a", "never", "--dangerously-bypass-hook-trust"];
+    argv = [command, "resume", identity.sessionId, "-C", identity.cwd, "--add-dir", run.directory, "-a", "never", "--dangerously-bypass-hook-trust"];
   } else {
     argv = [command, "--name", sessionName, "--session-id", identity.sessionId];
     for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);

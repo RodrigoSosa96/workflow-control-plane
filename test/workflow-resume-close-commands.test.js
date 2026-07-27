@@ -169,6 +169,11 @@ test("codex relaunch builds `codex resume <exact>` subcommand, no bootstrap, val
   assert.equal(startCalls[0].argv[1], "resume");
   assert.equal(startCalls[0].argv[2], sessionId);
   assert.ok(startCalls[0].argv.includes("-C"));
+  // --add-dir grants the worker write access to the run directory (under stateRoot, outside
+  // the worktree cwd) so it can write the handoff — same as the initial codex launch's
+  // codexArgv and the claude relaunch just above; dropping it silently breaks handoff writes.
+  assert.ok(startCalls[0].argv.includes("--add-dir"), "codex relaunch must include --add-dir");
+  assert.equal(startCalls[0].argv[startCalls[0].argv.indexOf("--add-dir") + 1], RUN_DIRECTORY);
   assert.equal(startCalls[0].argv.some((v) => /assignment\.md|handoff-input\.json/.test(v)), false);
 });
 

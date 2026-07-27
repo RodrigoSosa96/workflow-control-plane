@@ -3,8 +3,12 @@
 // Claude (UserPromptSubmit, Stop, SessionEnd), so this hook is full parity: it drives the same
 // neutral run-state machine (src/workflow/lifecycle.js) via the shared, harness-agnostic core
 // at hooks/lib/lifecycle-hook-core.mjs, invoked once per event as
-// `node hooks/codex-lifecycle.mjs <event>` with the hook payload on stdin (wired via Codex's
-// notify/config — see codexArgv in src/workflow/harnesses.js).
+// `node hooks/codex-lifecycle.mjs <event>` with the hook payload on stdin. Unlike Claude's
+// per-run --settings file, Codex has no per-invocation hook flag: this script is wired into
+// the GLOBAL ~/.codex/hooks.json by ensureCodexWorkerHooks/mergeCodexWorkerHooks (see
+// src/workflow/codex-hooks.js), which additively merges one command entry per event. codexArgv
+// in src/workflow/harnesses.js only adds --dangerously-bypass-hook-trust so the interactive
+// worker skips the resulting per-invocation trust prompt.
 //
 // See hooks/claude-lifecycle.mjs and hooks/lib/lifecycle-hook-core.mjs for the full design
 // rationale (stateless-subprocess markers, telemetry phase recording, error swallowing). This
