@@ -7,16 +7,19 @@
 // once per event as `node hooks/claude-lifecycle.mjs <event>` with the hook payload on
 // stdin.
 //
-// Unlike the Pi extension, Claude does not fire UserPromptSubmit for a Stop-hook block
-// continuation (confirmed in the Task 7 probe), so there is no "continuation" source and
-// no local pendingContinuation flag to track it: the launching-vs-running state check in
-// lifecycle.js's onPrompt (via current.state here) is the only follow-up discriminator
-// needed.
-//
 // UserPromptSubmit is the single work-start driver (the analog of Pi's agent_start).
 // SessionStart is deliberately NOT wired (see CLAUDE_WORKER_HOOKS): it fires before the
-// first real prompt and would otherwise consume the LAUNCHING→RUNNING transition, making
-// the first UserPromptSubmit look like a follow-up and pushing every generation off-by-one.
+// first real prompt.
+//
+// This hook is a stateless subprocess, so unlike Pi's in-process extension it cannot hold
+// `startedOnce` / `pendingContinuation` flags in memory. It persists the equivalent markers
+// on the RUN RECORD (`claudeStartedOnce` / `claudePendingContinuation`) and reads them back
+// each invocation. Those markers — NOT the run state — are the first-prompt / continuation
+// discriminators: the parent launch moves the run to RUNNING before the first UserPromptSubmit
+// fires, so a state === "launching" check would misclassify the first prompt as a follow-up
+// and inflate every generation by one. A Stop-hook block continuation, if it triggers its own
+// UserPromptSubmit, is recognized via claudePendingContinuation so it reuses the generation
+// instead of bumping it.
 //
 // The hook also records the run's telemetry phase (running on a prompt; settled / running /
 // manual-recovery on stop, per the onStop action) so the statusLine widget reflects real
@@ -52,6 +55,17 @@ async function recordPhase(telemetry, runId, phase) {
   }
 }
 
+// Persists a stateless field-merge marker on the run record (the subprocess analog of Pi's
+// in-memory startedOnce/pendingContinuation flags). Wrapped so a throw is swallowed — a marker
+// write must never break the Claude worker (same contract as the rest of this hook).
+async function persistMarker(store, runId, patch) {
+  try {
+    await store.update(runId, () => ({ ...patch }));
+  } catch {
+    // Swallow: a marker write must never break the Claude worker.
+  }
+}
+
 export function continuationPrompt(runId, generation) {
   return `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}.`;
 }
@@ -84,11 +98,24 @@ export async function runClaudeLifecycleHook({
     // transition and push every generation off-by-one. UserPromptSubmit is the sole work-start.
     if (event === "UserPromptSubmit") {
       const current = await store.read(runId);
-      // The first UserPromptSubmit of a run confirms the launch generation; a later one
-      // (state already past "launching") is a follow-up that increments it.
-      const isFirst = current.state === RUN_STATES.LAUNCHING;
-      const generation = isFirst ? current.generation : current.generation + 1;
-      await lifecycle.onPrompt({ runId, generation, source: "user" });
+      // Discriminate from persisted markers, not run state (the parent moves the run to RUNNING
+      // before this first fires): the first prompt confirms the launch generation, a continuation
+      // reuses it, and any other user prompt is a follow-up that increments it.
+      let source;
+      let generation;
+      if (!current.claudeStartedOnce) {
+        source = "user";
+        generation = current.generation;
+        await persistMarker(store, runId, { claudeStartedOnce: true });
+      } else if (current.claudePendingContinuation) {
+        source = "continuation";
+        generation = current.generation;
+        await persistMarker(store, runId, { claudePendingContinuation: false });
+      } else {
+        source = "user";
+        generation = current.generation + 1;
+      }
+      await lifecycle.onPrompt({ runId, generation, source });
       await recordPhase(telemetry, runId, "running");
       return undefined;
     }
@@ -102,6 +129,10 @@ export async function runClaudeLifecycleHook({
       });
       await recordPhase(telemetry, runId, stopPhaseForAction(action));
       if (action === "continue") {
+        // Mark the continuation BEFORE returning the block decision, so the UserPromptSubmit it
+        // may trigger is recognized as a continuation (reuses the generation) rather than a
+        // user follow-up (which would bump it).
+        await persistMarker(store, runId, { claudePendingContinuation: true });
         return JSON.stringify({ decision: "block", reason: continuationPrompt(runId, current.generation) });
       }
       return undefined;

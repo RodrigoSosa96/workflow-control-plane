@@ -47,11 +47,25 @@ test("first UserPromptSubmit calls onPrompt with the current generation, source 
   assert.deepEqual(rec[0], ["onPrompt", { runId: "r1", generation: 1, source: "user" }]);
 });
 
-test("a subsequent UserPromptSubmit (running) increments the generation", async () => {
+test("a subsequent user UserPromptSubmit (started once) increments the generation", async () => {
   const rec = [];
   await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "claude" },
-    store: fakeStore({ id: "r1", state: "running", generation: 2 }), lifecycle: fakeLifecycle(rec) });
+    store: fakeStore({ id: "r1", state: "running", generation: 2, claudeStartedOnce: true }), lifecycle: fakeLifecycle(rec) });
   assert.deepEqual(rec[0], ["onPrompt", { runId: "r1", generation: 3, source: "user" }]);
+});
+
+test("a first UserPromptSubmit from RUNNING (no markers) does not bump; source user", async () => {
+  const rec = [];
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "claude" },
+    store: fakeStore({ id: "r1", state: "running", generation: 1 }), lifecycle: fakeLifecycle(rec) });
+  assert.deepEqual(rec[0], ["onPrompt", { runId: "r1", generation: 1, source: "user" }]);
+});
+
+test("a UserPromptSubmit while pendingContinuation is set reuses the generation; source continuation", async () => {
+  const rec = [];
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "claude" },
+    store: fakeStore({ id: "r1", state: "idle-awaiting-handoff", generation: 2, claudeStartedOnce: true, claudePendingContinuation: true }), lifecycle: fakeLifecycle(rec) });
+  assert.deepEqual(rec[0], ["onPrompt", { runId: "r1", generation: 2, source: "continuation" }]);
 });
 
 test("Stop with action continue emits a block decision on stdout", async () => {
@@ -93,6 +107,57 @@ test("the real lifecycle sequence keeps generation aligned to the prompt (no off
   const afterSecond = await store.read(RUN_ID);
   assert.equal(afterSecond.state, RUN_STATES.RUNNING);
   assert.equal(afterSecond.generation, 2);
+});
+
+// FIX #3: the parent launch now moves the run to RUNNING *before* the first UserPromptSubmit
+// hook fires, which defeats the old state === "launching" first-prompt check. The hook must
+// key off persisted markers on the run (claudeStartedOnce / claudePendingContinuation), not the
+// run state, so the first prompt keeps generation 1 instead of inflating to 2.
+async function runningFixture(t) {
+  const root = await fs.mkdtemp(join(tmpdir(), "workflow-claude-lifecycle-running-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const store = createRunStore({ stateRoot: join(root, "state"), randomUUID: () => RUN_ID });
+  await store.create({ harness: "claude", profileName: "claude-worker", generation: 1 });
+  // The parent launch drives LAUNCHING then RUNNING before the first prompt hook fires.
+  await store.update(RUN_ID, () => ({ state: RUN_STATES.LAUNCHING }));
+  await store.update(RUN_ID, () => ({ state: RUN_STATES.RUNNING }));
+  const lifecycle = createLifecycle({ store });
+  const telemetry = createTelemetryStore({ store });
+  const env = { WORKFLOW_RUN_ID: RUN_ID, WORKFLOW_HARNESS: "claude" };
+  return { root, store, lifecycle, telemetry, env };
+}
+
+test("first prompt from RUNNING with no markers keeps generation 1 (no inflation) and sets the marker", async (t) => {
+  const { store, lifecycle, telemetry, env } = await runningFixture(t);
+  const launched = await store.read(RUN_ID);
+  assert.equal(launched.state, RUN_STATES.RUNNING);
+  assert.equal(launched.generation, 1);
+  assert.equal(launched.claudeStartedOnce, undefined);
+
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle, telemetry });
+  const afterFirst = await store.read(RUN_ID);
+  assert.equal(afterFirst.generation, 1);
+  assert.equal(afterFirst.claudeStartedOnce, true);
+
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle, telemetry });
+  const afterSecond = await store.read(RUN_ID);
+  assert.equal(afterSecond.generation, 2);
+});
+
+test("Stop with a continue action sets claudePendingContinuation; the continuation prompt reuses the generation and clears it", async (t) => {
+  const { store, lifecycle, telemetry, env } = await runningFixture(t);
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle, telemetry });
+
+  const out = await runClaudeLifecycleHook({ event: "Stop", stdinJson: {}, env, store, lifecycle, telemetry, hasValidHandoff: async () => false });
+  assert.match(out ?? "", /"decision":"block"/);
+  const afterStop = await store.read(RUN_ID);
+  assert.equal(afterStop.claudePendingContinuation, true);
+  const genBeforeContinuation = afterStop.generation;
+
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle, telemetry });
+  const afterContinuation = await store.read(RUN_ID);
+  assert.equal(afterContinuation.generation, genBeforeContinuation);
+  assert.equal(afterContinuation.claudePendingContinuation, false);
 });
 
 test("SessionStart is a no-op (unwired) and never advances state or generation", async (t) => {
