@@ -100,3 +100,19 @@ test("SESSION_ADAPTERS.codex exposes a bare-id match rule", () => {
   assert.equal(SESSION_ADAPTERS.codex.sessionMatches("abc", "abc"), true);
   assert.equal(SESSION_ADAPTERS.codex.sessionMatches("/x/abc.jsonl", "abc"), false);
 });
+
+test("codex observeExact trusts its pane when the resumed session is not yet reported (empty)", async () => {
+  const identity = { kind: "codex-session", harness: "codex", runId: "r1", sessionId: "sess-1", paneId: "w3:p1", tabId: "w3:t1", workspaceId: "w3", cwd: "/wt" };
+  const herdrWith = (session, cwd = "/wt") => ({ async listAgents() { return { agents: [{ agent: "codex", pane_id: "w3:p1", cwd, agent_status: "idle", agent_session: session }] }; } });
+  // Herdr reports the relaunched agent at our pane but agent_session is still empty → trust it (idle, not mismatch).
+  assert.equal((await createSessionTransport({ harness: "codex", herdr: herdrWith({ kind: "id", value: "" }) }).observeExact(identity)).state, "idle");
+  assert.equal((await createSessionTransport({ harness: "codex", herdr: herdrWith(undefined) }).observeExact(identity)).state, "idle");
+  // A DIFFERENT non-empty session at the pane is still a mismatch.
+  assert.equal((await createSessionTransport({ harness: "codex", herdr: herdrWith({ kind: "id", value: "other" }) }).observeExact(identity)).state, "mismatch");
+});
+
+test("pi/claude do NOT trust an empty session (no opt-in) — still mismatch", async () => {
+  const mk = (harness) => ({ kind: `${harness}-session`, harness, runId: "r1", sessionId: "sess-1", paneId: "w3:p1", tabId: "w3:t1", workspaceId: "w3", cwd: "/wt" });
+  const herdrEmpty = { async listAgents() { return { agents: [{ agent: "claude", pane_id: "w3:p1", cwd: "/wt", agent_status: "idle", agent_session: { kind: "id", value: "" } }] }; } };
+  assert.equal((await createSessionTransport({ harness: "claude", herdr: herdrEmpty }).observeExact(mk("claude"))).state, "mismatch");
+});

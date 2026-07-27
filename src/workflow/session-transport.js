@@ -45,6 +45,11 @@ export const SESSION_ADAPTERS = Object.freeze({
     sessionMatches(value, id) {
       return value === id;
     },
+    // After `codex resume`, Herdr reports the agent at its (new) pane but leaves agent_session
+    // EMPTY until Codex takes a turn (empirically observed) — so observeExact would otherwise see
+    // a permanent mismatch on a session we just relaunched. Since the pane is one we relaunched
+    // into (and cwd still guards), trust an as-yet-unreported session there.
+    trustPaneWhenSessionUnreported: true,
     // Codex exits on the `/quit` slash command. But its multi-line composer treats a bare `enter`
     // sent immediately after the text as a NEWLINE (race: the enter arrives before Codex renders
     // the typed text), leaving `/quit` unsubmitted (empirically observed in the human/TTY e2e).
@@ -81,7 +86,12 @@ export function createSessionTransport({ herdr, harness = "pi", exitKeys, sleep 
     if (!onPane) return { state: "missing", identity };
     const sessionValue = onPane.agent_session?.value ?? onPane.agentSession?.value;
     const cwd = onPane.cwd ?? onPane.foreground_cwd;
-    if (!adapter.sessionMatches(sessionValue, identity.sessionId) || (identity.cwd && cwd && cwd !== identity.cwd)) {
+    // An unreported (empty) session is trusted only for adapters that opt in (codex, post-resume);
+    // a session that is present but different is always a mismatch.
+    const sessionUnreported = sessionValue === undefined || sessionValue === null || sessionValue === "";
+    const sessionOk = adapter.sessionMatches(sessionValue, identity.sessionId)
+      || (adapter.trustPaneWhenSessionUnreported && sessionUnreported);
+    if (!sessionOk || (identity.cwd && cwd && cwd !== identity.cwd)) {
       return { state: "mismatch", identity, details: { observedActive: String(onPane.agent_status === "working") } };
     }
     return { state: onPane.agent_status === "working" ? "active" : "idle", identity };
