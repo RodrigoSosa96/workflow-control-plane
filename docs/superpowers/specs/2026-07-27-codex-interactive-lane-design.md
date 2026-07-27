@@ -61,14 +61,26 @@ After an interactive `workflow launch` with the `codex-worker` profile
   timeout }] }] } }`; hook receives its event JSON on stdin (matches how
   `herdr-agent-state.sh` reads it). Herdr's `SessionStart` hook is already installed and
   says "add custom hooks beside this file."
+- **Hook events (confirmed from the codex binary): the SAME set as Claude Code** —
+  `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Notification`. So the Codex lifecycle hook can drive **full** lifecycle
+  parity (generation via `UserPromptSubmit`, terminal via `Stop`, `onSessionEnd` via
+  `SessionEnd`) and is essentially a copy of `hooks/claude-lifecycle.mjs`. Lifecycle is
+  **not** degraded — the only open lifecycle question is whether Codex's `Stop` hook
+  honors a `{decision:"block"}` continuation (probe), and if not the run still reaches a
+  terminal state via the handoff (the bounded stop-continuation is an optimization).
+- Sessions are stored at `~/.codex/sessions/<YYYY>/<MM>/<...>_<uuid>.jsonl` (the id is in
+  the filename), so post-launch identity discovery can read the newest one for the cwd.
 - `-c key=value` overrides config; `-p <profile>` layers `$CODEX_HOME/<name>.config.toml`.
 
 ### Runtime unknowns to settle in the probe (human/TTY) — gate the adapters
 
-1. **Which hook events Codex fires** beyond `SessionStart` (does it fire a
-   prompt-submit and a turn-stop event?). This sets lifecycle fidelity: full
-   (generation + stop-continuation) vs degraded (`launching → running` only, terminal
-   state from handoff/reconcile).
+1. **Stop-hook continuation:** the event SET is confirmed (same as Claude), so this is
+   narrowed to: does Codex's `Stop` hook honor a `{decision:"block", reason}` output to
+   force a continuation (like Claude), or must the worker reach a terminal state on its
+   own? Either way lifecycle is full — this only decides whether the bounded
+   stop-continuation optimization is available. Also confirm the hook stdin JSON field
+   names (event name key, session id) match or differ from Claude's.
 2. **`herdr agent list` shape for a Codex agent** — is `agent_session.value` a bare
    UUID (`kind:"id"`, like Claude) or a path? Sets `codex.sessionMatches` and confirms
    the id is readable post-launch.
@@ -127,15 +139,17 @@ workflow resume <run-id> [--yes]        workflow close <run-id>
    per-invocation hook-trust prompt (the worker is isolated). No `--settings` (Codex
    hooks are global, installed separately in unit 5).
 
-4. **Codex lifecycle hook (`hooks/codex-lifecycle.mjs`, new).** The same pattern as
-   `claude-lifecycle.mjs`: reads the hook JSON on stdin + `WORKFLOW_*` env, no-ops unless
-   this is a codex worker, maps Codex's hook events to `lifecycle.onPrompt/onStop/
-   onSessionEnd`, and records telemetry `phase`. Maps only the events Codex actually
-   fires (per probe). Degrades gracefully: if Codex fires only `SessionStart`, it drives
-   `launching → running` and records `running`; if it also fires prompt/stop events, it
-   drives generation + stop-continuation like the Claude hook (persisted
-   `startedOnce`/`pendingContinuation` markers, since the hook is a stateless subprocess).
-   Every handler error-swallowed.
+4. **Codex lifecycle hook (`hooks/codex-lifecycle.mjs`, new).** Essentially a copy of
+   `hooks/claude-lifecycle.mjs` (Codex fires the same event set): reads the hook JSON on
+   stdin + `WORKFLOW_*` env, no-ops unless this is a codex worker, maps `UserPromptSubmit
+   → onPrompt`, `Stop → onStop`, `SessionEnd → onSessionEnd`, records telemetry `phase`,
+   and uses the persisted `startedOnce`/`pendingContinuation` markers (the parent launch
+   pre-sets `running`, and the hook is a stateless subprocess — the same two fixes the
+   Claude lane needed). The `Stop → {decision:"block"}` continuation is emitted only if
+   the probe confirms Codex honors it; otherwise `Stop` just records phase and the run
+   completes via the handoff. Field-name differences from Claude's hook JSON (per probe)
+   are handled here. Every handler error-swallowed. Consider extracting the shared
+   lifecycle-hook core so `claude-lifecycle.mjs` and `codex-lifecycle.mjs` don't diverge.
 
 5. **Codex hook installation (`hooks/codex-hook-install.mjs` or a launch step).** The
    workflow's lifecycle hook must be present in `~/.codex/hooks.json` for the events
@@ -208,10 +222,12 @@ TDD per unit with fakes (no real Codex, no model):
 
 ## Risks and open items
 
-- **Lifecycle fidelity (highest).** Bounded by Codex's hook events. If Codex fires only
-  `SessionStart`, generation/stop-continuation are not available and the run reaches its
-  terminal state via the handoff/reconcile path (as the supervised lane already does).
-  The probe decides; the design degrades gracefully rather than failing.
+- **Lifecycle.** De-risked: Codex fires the same hook event set as Claude, so the
+  lifecycle hook mirrors `claude-lifecycle.mjs` and drives full generation/terminal
+  state. The only residual is whether the `Stop` hook honors a `{decision:"block"}`
+  continuation; if not, the worker reaches a terminal state via the handoff (the
+  stop-continuation is an optimization, not load-bearing). Hook stdin field names are
+  confirmed against Claude's in the probe.
 - **Global hook side effect.** The workflow hook lives in the user's `~/.codex/hooks.json`.
   Mitigated by the no-op guard (matches Herdr's own pattern) and idempotent, non-clobbering
   install. Documented; a per-run `CODEX_HOME` isolation is a heavier fallback if needed.
