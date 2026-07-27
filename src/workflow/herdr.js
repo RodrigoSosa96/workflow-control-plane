@@ -568,6 +568,19 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
       return await invoke("agent", "send-keys", [target, ...keys]);
     },
 
+    // `pane send-text` types literal text into the pane (no key translation), so it is the
+    // way to enter a slash command like `/exit` verbatim. Unlike `agent send-keys`, it does
+    // not submit — the caller sends `enter` separately. Only shape is validated here.
+    async sendText({ paneId, text } = {}) {
+      if (typeof paneId !== "string" || !paneId) {
+        fail("PREFLIGHT", "sendText requires a pane ID", { paneId }, 10);
+      }
+      if (typeof text !== "string") {
+        fail("PREFLIGHT", "sendText requires text as a string", { paneId, text }, 10);
+      }
+      return await invoke("pane", "send-text", [paneId, text]);
+    },
+
     // Focus a specific agent by its target (the pane id, same target `agent send-keys` takes).
     // `agent focus` brings the agent's OWN pane forward — unlike `tab focus`, which only raises
     // the tab and leaves the retained bootstrap shell pane (above Pi) as the active pane.
