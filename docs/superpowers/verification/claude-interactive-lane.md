@@ -425,14 +425,45 @@ WORKFLOW_PROJECTS_FILE=$F/projects.yaml node bin/workflow.js close $R || true
 rm -rf $F
 ```
 
-### Findings (fill in after running)
+### Findings (e2e run, 2026-07-27, Herdr 0.7.5 / Claude Code 2.1.220)
 
-- [ ] 0–1. Identity survived to: state ____ , `transportIdentity.kind` ____
-- [ ] 2. Observability line observed: ____
-- [ ] 3. resume LIVE → focused Claude's own pane? ____
-- [ ] 4. close IDLE → closed:true? ____ (exit key that worked, cross-ref §3(a)): ____
-- [ ] 5. resume DEAD (no --yes) → needs-confirmation? ____
-- [ ] 6. resume --yes → relaunched, native history intact, statusLine + hooks reloaded? ____
-- [ ] 7. resume again → focused the new pane? ____
-- Bugs found (if any), with commit hash of the fix: ____
-- Herdr version: ____ / Claude version: ____ / date: ____
+Full cycle verified live against a real interactive Claude session. The e2e found
+**6 real defects** (none catchable by the unit tests) — all fixed and re-verified:
+
+- [x] **0–1. Identity survives:** state `completed` (Claude completed the handoff once
+  the allowlist let it), `transportIdentity.kind == "claude-session"`, id OK.
+- [x] **2. Observability:** telemetry produced (`phase`, `observability: reported`); the
+  statusLine renders a real phase + the model — not stuck on "starting".
+- [x] **3. resume LIVE → focused** Claude's own pane (`agent focus`).
+- [x] **4. close IDLE → closed:true** and the worker actually exits.
+- [x] **5. resume DEAD (no --yes) → needs-confirmation.**
+- [x] **6. resume --yes → relaunched**, native history intact (resumed via `--resume`),
+  statusLine + hooks reloaded, identity re-pointed at the new pane.
+- [x] **7. resume again → focused the new pane.**
+
+**Bugs found + fixed by this e2e:**
+
+1. **Trust dialog stalls the worker** on a fresh worktree (Claude asks to trust the
+   folder). Trust is keyed per-repo in `~/.claude.json`. Left as a **one-time manual
+   accept per project** (semi-autonomous); pre-trust/skip is a documented opt-in.
+2. **`dontAsk` auto-denied Write/Bash** → the worker couldn't submit the handoff and
+   burned tokens on Stop-hook retry loops. FIX (`f197ad6`): `buildClaudeWorkerSettings`
+   now emits a `permissions.allow` allowlist (`CLAUDE_WORKER_ALLOWED_TOOLS`) covering
+   the worker's tools → zero denials → no wasted tokens.
+3. **Generation inflated to 2** on the first prompt: the launch pre-sets state→running
+   before the first `UserPromptSubmit` hook fires, defeating the `state==="launching"`
+   discriminator. FIX (`63808a2`): persist `claudeStartedOnce` + `claudePendingContinuation`
+   markers on the run (the stateless-hook equivalent of Pi's two in-process flags).
+4. **`close` reported closed but Claude never exited** (`ctrl+d` is not Claude's exit).
+   PROBED: `pane send-text "/exit"` + `enter` exits. FIX (`4457374`): `herdr.sendText`
+   added; the claude adapter closes via `/exit` text, not `ctrl+d` keys (Pi unchanged).
+5. **Model was Claude's default** (`claude-worker.model: null`). Not a bug — set `model`
+   on the profile (a pattern like `sonnet` or an exact id); the launch passes `--model`.
+6. **relaunch failed: "Session ID already in use."** Claude's `--session-id` *creates*
+   (errors if the id exists); resuming needs `--resume <id>` (opposite of Pi). FIX
+   (`80ded5e`): the claude relaunch uses `--resume`; Pi keeps `--session-id`.
+
+**Note:** after `rm -rf` of the fixture, Herdr shows the leftover workspace/panes as
+`(deleted)` (their cwd is gone). Cosmetic — the lane closes the *agent*, not the Herdr
+workspace (out of scope; the canary forbids closing the workspace). Clear with
+`herdr workspace close <id>`.
