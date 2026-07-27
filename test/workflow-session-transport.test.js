@@ -85,12 +85,15 @@ test("codex adapter matches a bare-uuid session and closes via /quit text", asyn
     async agentSendKeys(a) { calls.push(["agentSendKeys", a]); return { type: "ok" }; },
     async focusAgent() {},
   };
-  const t = createSessionTransport({ harness: "codex", herdr });
+  // Inject a no-op sleep so the test doesn't wait the real settle, and record it to assert the
+  // settle happens BETWEEN typing /quit and the enter (the fix for Codex's newline-swallow race).
+  const t = createSessionTransport({ harness: "codex", herdr, sleep: async (ms) => { calls.push(["sleep", ms]); } });
   assert.equal((await t.observeExact(identity)).state, "idle");
   const r = await t.requestGracefulClose(identity);
   assert.equal(r.requested, true);
   assert.deepEqual(calls[0], ["sendText", { paneId: "w1:p2", text: "/quit" }]);
-  assert.deepEqual(calls[1], ["agentSendKeys", { target: "w1:p2", keys: ["enter"] }]);
+  assert.deepEqual(calls[1], ["sleep", 1000]);
+  assert.deepEqual(calls[2], ["agentSendKeys", { target: "w1:p2", keys: ["enter"] }]);
 });
 
 test("SESSION_ADAPTERS.codex exposes a bare-id match rule", () => {

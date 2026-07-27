@@ -45,11 +45,16 @@ export const SESSION_ADAPTERS = Object.freeze({
     sessionMatches(value, id) {
       return value === id;
     },
+    // Codex exits on the `/quit` slash command. But its multi-line composer treats a bare `enter`
+    // sent immediately after the text as a NEWLINE (race: the enter arrives before Codex renders
+    // the typed text), leaving `/quit` unsubmitted (empirically observed in the human/TTY e2e).
+    // Waiting `exitSettleMs` after typing lets Codex render the text so the enter submits it.
     exitText: "/quit",
+    exitSettleMs: 1000,
   }),
 });
 
-export function createSessionTransport({ herdr, harness = "pi", exitKeys } = {}) {
+export function createSessionTransport({ herdr, harness = "pi", exitKeys, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
   const adapter = SESSION_ADAPTERS[harness];
   if (!adapter) {
     fail(harness, `unsupported harness "${harness}" for session transport`, { harness });
@@ -97,6 +102,9 @@ export function createSessionTransport({ herdr, harness = "pi", exitKeys } = {})
         fail(harness, `${harness}-session transport requires a Herdr adapter with sendText to close a session`);
       }
       await herdr.sendText({ paneId: identity.paneId, text: adapter.exitText });
+      // Some composers (Codex) need a beat to render the typed text before the submit, or the
+      // `enter` is swallowed as a newline. Adapters that need it declare `exitSettleMs`.
+      if (adapter.exitSettleMs) await sleep(adapter.exitSettleMs);
       await herdr.agentSendKeys({ target: identity.paneId, keys: ["enter"] });
       return { requested: true };
     }
