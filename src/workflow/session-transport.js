@@ -41,6 +41,12 @@ export const SESSION_ADAPTERS = Object.freeze({
     exitText: "/exit",
     exitKeys: Object.freeze(["ctrl+d"]),
   }),
+  codex: Object.freeze({
+    sessionMatches(value, id) {
+      return value === id;
+    },
+    exitText: "/quit",
+  }),
 });
 
 export function createSessionTransport({ herdr, harness = "pi", exitKeys } = {}) {
