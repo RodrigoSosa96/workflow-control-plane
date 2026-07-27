@@ -126,7 +126,7 @@ test("transportForRun selects the session transport for a claude-session identit
   assert.deepEqual(herdr._f, { target: "w1:p2" });
 });
 
-test("claude relaunch builds claude --session-id <exact> --settings, no bootstrap, valid agent name", async () => {
+test("claude relaunch builds claude --resume <exact> --settings, no bootstrap, valid agent name", async () => {
   const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
   const identity = { kind: "claude-session", harness: "claude", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
   const startCalls = [];
@@ -142,7 +142,10 @@ test("claude relaunch builds claude --session-id <exact> --settings, no bootstra
   assert.equal(startCalls[0].kind, "claude");
   assert.ok(startCalls[0].name.length <= 32);
   assert.match(startCalls[0].name, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.ok(startCalls[0].argv.includes(sessionId));
+  // Claude RESUMES with --resume <id>; --session-id would try to CREATE and fail ("already in use").
+  assert.ok(startCalls[0].argv.includes("--resume"), "claude relaunch must use --resume");
+  assert.equal(startCalls[0].argv[startCalls[0].argv.indexOf("--resume") + 1], sessionId);
+  assert.equal(startCalls[0].argv.includes("--session-id"), false, "claude relaunch must NOT use --session-id");
   assert.ok(startCalls[0].argv.includes("--settings"));
   assert.equal(startCalls[0].argv.some((v) => /assignment\.md|handoff-input\.json/.test(v)), false);
 });

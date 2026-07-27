@@ -1287,10 +1287,13 @@ async function relaunchSession(identity, deps) {
       updater: () => ({}),
     });
     const settingsPath = join(run.directory, CLAUDE_WORKER_SETTINGS_FILE);
-    // No bootstrap prompt: a resume continues the existing session instead of starting a
-    // fresh assignment. No --permission-mode/--model either — those live on the registry
-    // profile, which the transportIdentity does not carry (known follow-up).
-    argv = [command, "--session-id", identity.sessionId, "--add-dir", run.directory, "--settings", settingsPath];
+    // Claude resumes an EXISTING session with `--resume <id>`; `--session-id <id>` CREATES a
+    // session and errors ("Session ID already in use") if it exists — the opposite of Pi, whose
+    // `--session-id` resumes-or-creates. So the relaunch must use `--resume` to reattach to the
+    // dead session's native history. No bootstrap prompt (a resume continues, it does not restart
+    // the assignment). No --permission-mode/--model either — those live on the registry profile,
+    // which the transportIdentity does not carry (known follow-up).
+    argv = [command, "--resume", identity.sessionId, "--add-dir", run.directory, "--settings", settingsPath];
   } else {
     argv = [command, "--name", sessionName, "--session-id", identity.sessionId];
     for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);
