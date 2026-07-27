@@ -601,6 +601,11 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   plan.run = { id: "run-123", directory: "/state/run-123", generation: 1 };
 
   const report = await executeStart(plan, fakeAdapters(calls), {
+    // This plan's fake Herdr never reports a matching agent_session (no agentsAfterStart given),
+    // so discovery exhausts its window and returns null. Keep that window tiny here — the default
+    // production window is patient (~10s) to cover Codex's real SessionStart hook delay, but this
+    // test only cares about the no-match outcome, not the timing.
+    codexSessionDiscovery: { attempts: 2, delayMs: 1 },
     buildAgentLaunch(input) {
       calls.push({ kind: "launch.builder", input });
       return launchSpec;

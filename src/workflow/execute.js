@@ -591,8 +591,12 @@ function isAgentStartupTimeout(error) {
   return /timed out waiting for agent startup/iu.test(String(error?.message ?? ""));
 }
 
-const CODEX_SESSION_DISCOVERY_ATTEMPTS = 3;
-const CODEX_SESSION_DISCOVERY_DELAY_MS = 20;
+// Codex's SessionStart hook fires (and Herdr's integration reports agent_session) a few seconds
+// after launch, not milliseconds — so the discovery window has to be patient enough to cover real
+// startup latency. discoverCodexSessionId returns as soon as it sees a non-empty agent_session.value,
+// so the common case still resolves in ~1-2s; this window only fully elapses in a genuine no-id case.
+const CODEX_SESSION_DISCOVERY_ATTEMPTS = 40;
+const CODEX_SESSION_DISCOVERY_DELAY_MS = 250;
 
 // Codex generates its own session id after launch (no `--session-id` flag to force it), so it
 // isn't known from `launch.expected` the way Pi/Claude's is. Discover it from Herdr's agent list
@@ -743,7 +747,7 @@ function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorT
   }
 }
 
-async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
+async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessionDiscovery }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -826,7 +830,7 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
     if (launch.supervisor !== true) {
       const nativeSessionId = launch.expected?.nativeSessionId ?? null;
       const sessionId = harness === "codex" && !nativeSessionId
-        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId })
+        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
         : nativeSessionId;
       sessionIdentity = {
         kind: `${harness}-session`,
@@ -905,7 +909,7 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
   }
 }
 
-async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
+async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSessionDiscovery }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -1063,7 +1067,7 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
     if (launch.supervisor !== true) {
       const nativeSessionId = launch.expected?.nativeSessionId ?? null;
       const sessionId = harness === "codex" && !nativeSessionId
-        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId })
+        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
         : nativeSessionId;
       sessionIdentity = {
         kind: `${harness}-session`,
@@ -1265,13 +1269,13 @@ async function executeRuntimePhase(plan, { herdr, observeMs = DEFAULT_RUNTIME_OB
   }
 }
 
-export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch } = {}) {
+export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch, codexSessionDiscovery } = {}) {
   ensureStartablePlan(reconciledPlan);
   validateAgentStartIdentity(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
   return reconciledPlan.mode === "group"
-    ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch })
-    : await executeOrdinaryStart(reconciledPlan, { herdr, buildAgentLaunch });
+    ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch, codexSessionDiscovery })
+    : await executeOrdinaryStart(reconciledPlan, { herdr, buildAgentLaunch, codexSessionDiscovery });
 }
 
 export async function executeRuntime(reconciledPlan, { herdr, observeMs } = {}) {
