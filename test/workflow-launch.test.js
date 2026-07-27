@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildHarnessLaunch, WORKFLOW_ENV_KEYS } from "../src/workflow/harnesses.js";
+import { buildHarnessLaunch, CONTROL_PLANE_ROOT, WORKFLOW_ENV_KEYS } from "../src/workflow/harnesses.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 import { buildAssignmentTemplate } from "../src/workflow/assignment.js";
 import { createLaunchPreview, executeLaunch, launchCommand } from "../src/workflow/launch.js";
@@ -1479,4 +1479,127 @@ test("a claude stream-json (supervised) launch does not write worker settings or
   assert.equal(report.status, "running");
   assert.equal(launchSpec.argv.includes("--settings"), false);
   assert.equal(calls.some((c) => c.kind === "store.writePrivateFile"), false);
+});
+
+test("an interactive codex launch invokes the injected codex hook installer with the CODEX_HOME-derived path", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = "/custom/codex-home";
+  let installCall = null;
+  let report;
+  try {
+    report = await executeLaunch(preview, {
+      planCommand,
+      store,
+      stateRoot: STATE_ROOT,
+      controlPlaneBin: CONTROL_PLANE_BIN,
+      ensureCodexWorkerHooks: async (args) => {
+        installCall = args;
+        calls.push({ kind: "ensureCodexWorkerHooks", args });
+        return { hooks: {} };
+      },
+      executeStart: async () => {
+        calls.push({ kind: "executeStart" });
+        return {
+          status: "completed",
+          operations: [
+            { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+          ],
+          notes: [],
+        };
+      },
+    });
+  } finally {
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+
+  assert.equal(report.status, "running");
+  assert.ok(installCall, "expected the codex hook installer to be invoked for an interactive codex launch");
+  assert.equal(installCall.hooksPath, "/custom/codex-home/hooks.json");
+  assert.equal(installCall.controlPlaneRoot, CONTROL_PLANE_ROOT);
+  // The installer must run before the agent is started, mirroring the claude settings write.
+  assert.ok(calls.findIndex((c) => c.kind === "ensureCodexWorkerHooks") < calls.findIndex((c) => c.kind === "executeStart"));
+});
+
+test("a failed codex hook install is best-effort: it adds a launch note but never aborts the launch", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    ensureCodexWorkerHooks: async () => {
+      throw new Error("disk full");
+    },
+    executeStart: async () => ({
+      status: "completed",
+      operations: [
+        { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+      ],
+      notes: [],
+    }),
+  });
+
+  assert.equal(report.status, "running");
+  assert.ok(report.notes.some((note) => /codex/i.test(note) && note.includes("disk full")));
+});
+
+test("a claude interactive launch never invokes the codex hook installer", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker" });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+  let installerCalled = false;
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    ensureCodexWorkerHooks: async () => {
+      installerCalled = true;
+      return {};
+    },
+    executeStart: async () => ({
+      status: "completed",
+      operations: [
+        { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+      ],
+      notes: [],
+    }),
+  });
+
+  assert.equal(report.status, "running");
+  assert.equal(installerCalled, false);
+});
+
+test("without an injected ensureCodexWorkerHooks dependency, an interactive codex launch never touches the filesystem for hooks and still succeeds", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [
+        { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+      ],
+      notes: [],
+    }),
+  });
+
+  assert.equal(report.status, "running");
 });

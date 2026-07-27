@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { HARNESS_TELEMETRY_VERSIONS } from "./telemetry-adapters.js";
 import { buildAssignmentTemplate } from "./assignment.js";
@@ -450,6 +451,28 @@ function isClaudeInteractiveAgent(plan = {}) {
   return harness === "claude" && mode === "interactive";
 }
 
+// The Codex analog of isClaudeInteractiveAgent: Codex has no per-launch --settings
+// equivalent, so its lifecycle hook lives in the GLOBAL ~/.codex/hooks.json instead of a
+// fresh per-run file. Only an interactive Codex worker needs that hook ensured before it
+// starts; a supervised (stream-json) run is headless and derives state from stdout instead.
+function isCodexInteractiveAgent(plan = {}) {
+  const agent = plan.agent ?? {};
+  const harness = agent.harness ?? agent.profile?.harness;
+  const mode = agent.profile?.mode ?? "interactive";
+  return harness === "codex" && mode === "interactive";
+}
+
+function codexHooksPath(deps = {}) {
+  const env = deps.env ?? process.env;
+  const codexHome = env.CODEX_HOME ?? join(homedir(), ".codex");
+  return join(codexHome, "hooks.json");
+}
+
+function withExtraNotes(execution, notes) {
+  if (!notes || notes.length === 0) return execution;
+  return { ...execution, notes: [...list(execution?.notes), ...notes] };
+}
+
 function runForHarness(run, { stateRoot, controlPlaneBin }) {
   return {
     ...run,
@@ -597,6 +620,28 @@ export async function executeLaunch(preview, deps = {}) {
     claudeSettingsPath = join(run.directory, CLAUDE_WORKER_SETTINGS_FILE);
   }
 
+  // The Codex analog of the Claude settings write above: an interactive Codex worker's
+  // lifecycle hook is wired via Codex's GLOBAL ~/.codex/hooks.json instead of a per-run
+  // settings file (Codex has no --settings equivalent). Unlike the Claude write, this
+  // mutates a machine-wide file the workflow does not own outright (Herdr already keeps
+  // its own SessionStart hook there), so it (a) is strictly best-effort — caught here so a
+  // failure never aborts the launch, only leaves a note — and (b) only runs when a caller
+  // actually wires deps.ensureCodexWorkerHooks (bin/workflow.js's live dependencies do this
+  // for a real launch). There is deliberately no baked-in real-fs default here: every
+  // codex-interactive launch test in this suite exercises the default codex-worker profile
+  // and must never be able to touch a developer's real ~/.codex/hooks.json.
+  const codexHookNotes = [];
+  if (isCodexInteractiveAgent(fresh.reconciliation) && typeof deps.ensureCodexWorkerHooks === "function") {
+    try {
+      await deps.ensureCodexWorkerHooks({
+        hooksPath: codexHooksPath(deps),
+        controlPlaneRoot: CONTROL_PLANE_ROOT,
+      });
+    } catch (error) {
+      codexHookNotes.push(`Could not install the Codex workflow lifecycle hooks into ~/.codex/hooks.json: ${error.message}`);
+    }
+  }
+
   await updateRun(store, run.id, {
     state: RUN_STATES.LAUNCHING,
     launchStartedAt: new Date().toISOString(),
@@ -668,7 +713,7 @@ export async function executeLaunch(preview, deps = {}) {
         return spec;
       },
     });
-    const execution = partializeMissingCreatedAgent(rawExecution);
+    const execution = withExtraNotes(partializeMissingCreatedAgent(rawExecution), codexHookNotes);
     const isRunning = completedLaunchWithCreatedAgent(execution);
     const hasCreatedAgent = createdSelectedAgent(execution);
     const session = hasCreatedAgent ? sessionPatch(execution, launchExpected ?? {}) : {};
@@ -705,12 +750,12 @@ export async function executeLaunch(preview, deps = {}) {
 
     return buildLaunchReport("running", run, execution);
   } catch (error) {
-    const execution = {
+    const execution = withExtraNotes({
       status: "partial",
       operations: [],
       notes: [],
       error: { name: error.name, message: error.message },
-    };
+    }, codexHookNotes);
     try {
       await updateRun(store, run.id, {
         state: RUN_STATES.FAILED,
