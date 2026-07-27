@@ -47,16 +47,26 @@ brainstorm → spec → plan cycle.
 
 ## Smaller hardening / polish
 
-5. **`lifecycle.js` no-op writes.** `onStop`/`onSessionEnd` call `store.update`
-   even on no-op paths, causing a real write + fresh `updatedAt`. Skip the write
-   when nothing changes. (No corruption; just wasteful and makes `updatedAt`
-   slightly misleading.)
-6. **`resume.js` integration test.** No test exercises `planResume` against a real
-   throwing store (unit tests use fakes); add one when the recovery lane is wired.
-7. **Extension polish.** Redundant `store.read` in the `agent_settled` default
-   `hasValidHandoff` path; `readEnv`-allowlist style divergence from the
+> Hardening sweep 2026-07-27 (branch `fix/recovery-lane-hardening`) closed items 5 and 6.
+
+5. **`lifecycle.js` no-op writes — DONE.** The fix landed at the store layer: the
+   no-op decision must stay inside the lock-protected updater (deciding it from an
+   outer read is the race the Task 2 fix eliminated), so `run-store.update` now
+   short-circuits when the updater returns an empty patch `{}` — no write, no fresh
+   `updatedAt`. `onStop`/`onSessionEnd`'s guarded no-op branches return `{}` to land
+   there. A non-empty patch still flows through `updatedRun` unchanged. Pinned by a
+   run-store test.
+6. **`resume.js` integration test — DONE.** Added two tests in
+   `test/workflow-resume.test.js` that exercise `planResume` against the REAL
+   `run-store` (not a fake): one where a freshly-created run has no
+   `transportIdentity` (refused with a resume-category error), one where the run is
+   missing (the store's real not-found error propagates).
+7. **Extension polish — DEFERRED.** Redundant `store.read` in the `agent_settled`
+   default `hasValidHandoff` path; `readEnv`-allowlist style divergence from the
    observability sibling; `any`-heavy typing (no `Lifecycle`/`Store` interfaces).
-   Cosmetic; the un-awaited `sendUserMessage` was already fixed on this branch.
+   Cosmetic; the un-awaited `sendUserMessage` was already fixed on this branch. Left
+   deferred: it touches the `.ts` Pi extensions, whose typing changes can't be
+   verified without running Pi, for negligible runtime value.
 
 ## Runtime assumptions to confirm in Task 8 (interactive e2e)
 

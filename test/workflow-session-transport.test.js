@@ -116,3 +116,29 @@ test("pi/claude do NOT trust an empty session (no opt-in) — still mismatch", a
   const herdrEmpty = { async listAgents() { return { agents: [{ agent: "claude", pane_id: "w3:p1", cwd: "/wt", agent_status: "idle", agent_session: { kind: "id", value: "" } }] }; } };
   assert.equal((await createSessionTransport({ harness: "claude", herdr: herdrEmpty }).observeExact(mk("claude"))).state, "mismatch");
 });
+
+// Herdr's `agent list` response shape is not fully pinned by a schema — it may return a bare array
+// (not `{ agents: [] }`) and it may use snake_case or camelCase field names. observeExact tolerates
+// both via defensive fallbacks; these two tests pin that behaviour so the fallbacks are covered
+// (not dead code) and a refactor cannot silently drop one.
+test("observeExact accepts a bare-array agent list, not only { agents: [] }", async () => {
+  const herdr = {
+    async listAgents() {
+      return [{ agent: "claude", pane_id: "w1:p2", cwd: "/wt", agent_status: "idle",
+        agent_session: { kind: "id", value: identity.sessionId } }];
+    },
+  };
+  const obs = await createSessionTransport({ harness: "claude", herdr }).observeExact(identity);
+  assert.equal(obs.state, "idle");
+});
+
+test("observeExact resolves via camelCase Herdr fields (paneId, agentSession.value, foreground_cwd)", async () => {
+  const herdr = {
+    async listAgents() {
+      return { agents: [{ agent: "claude", paneId: "w1:p2", foreground_cwd: "/wt", agent_status: "working",
+        agentSession: { value: identity.sessionId } }] };
+    },
+  };
+  const obs = await createSessionTransport({ harness: "claude", herdr }).observeExact(identity);
+  assert.equal(obs.state, "active");
+});

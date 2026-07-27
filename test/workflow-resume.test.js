@@ -1,7 +1,27 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { planResume, executeResume } from "../src/workflow/resume.js";
 import { WorkflowError } from "../src/workflow/errors.js";
+import { createRunStore } from "../src/workflow/run-store.js";
+import { RUN_STATES } from "../src/workflow/run-state.js";
+
+const REAL_RUN_ID = "11111111-1111-4111-8111-111111111111";
+const MISSING_RUN_ID = "22222222-2222-4222-8222-222222222222";
+// A structurally-valid worker transport; these integration tests exercise the real store's read
+// path, so observeExact only runs when a real identity is present.
+const inertTransport = {
+  start() {}, deliverFollowUp() {}, requestGracefulClose() {},
+  async observeExact(identity) { return { state: "idle", identity }; },
+};
+
+async function realStore(t) {
+  const stateRoot = await mkdtemp(join(tmpdir(), "workflow-resume-store-"));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  return createRunStore({ stateRoot, randomUUID: () => REAL_RUN_ID });
+}
 
 function deps({ observation, run }) {
   return {
@@ -85,4 +105,24 @@ test("executeResume persists the new identity after a confirmed relaunch, but ne
   assert.deepEqual(updateCalls[0].patch, { transportIdentity: newIdentity });
   assert.equal(updateCalls[0].patch.transportIdentity.sessionId, oldIdentity.sessionId);
   assert.notEqual(updateCalls[0].patch.transportIdentity.paneId, oldIdentity.paneId);
+});
+
+// Integration: the tests above use a fake store; these ride the REAL run-store read path so its
+// actual record shape (no transportIdentity on a fresh run) and its real not-found error reach
+// planResume, not a hand-shaped fake.
+test("planResume refuses a real run that has no transport identity", async (t) => {
+  const store = await realStore(t);
+  await store.create({ projectAlias: "ocr", primaryTicket: "A-1", relatedTickets: [], state: RUN_STATES.PLANNED });
+  await assert.rejects(
+    () => planResume({ store, transport: inertTransport, runId: REAL_RUN_ID }),
+    (error) => error instanceof WorkflowError && error.category === "resume" && /session identity/i.test(error.message),
+  );
+});
+
+test("planResume propagates the real store's not-found error for a missing run", async (t) => {
+  const store = await realStore(t);
+  await assert.rejects(
+    () => planResume({ store, transport: inertTransport, runId: MISSING_RUN_ID }),
+    (error) => error instanceof WorkflowError && /not found/i.test(error.message),
+  );
 });

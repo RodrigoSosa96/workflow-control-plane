@@ -365,6 +365,35 @@ test("creates selected child worktrees inside one Acme task workspace", async (t
   assert.equal(agentOp.sessionIdentity.cwd, metaWorktree);
 });
 
+test("the coordinator group start wires the native session id into the pi-session identity", async (t) => {
+  // Guards the group/coordinator start path specifically: if its nativeSessionId ever stopped
+  // flowing into sessionIdentity.sessionId, a coordinator run would silently become non-resumable.
+  // Injecting the launch builder lets us assert an exact session id (the real builder generates a
+  // random UUID). Both start paths share resolveSessionIdentity, so this pins the group path too.
+  const { registry, git, herdr } = await createFixture(t);
+  const { plan, reconciled } = await reconcileAcmePlan({
+    registry,
+    git,
+    herdr,
+    repositories: ["panel", "backend"],
+  });
+  const launchSpec = {
+    argv: ["pi", "--name", "coordinator", "--session-id", "grp-sess-1"],
+    env: {},
+    expected: { harness: "pi", nativeSessionId: "grp-sess-1", cwd: plan.workspace.path },
+  };
+
+  const report = await executeStart(reconciled, { git, herdr }, { buildAgentLaunch: () => launchSpec });
+
+  const agentOp = report.operations.find((operation) => operation.id === "agent");
+  assert.equal(agentOp.sessionIdentity.kind, "pi-session");
+  assert.equal(
+    agentOp.sessionIdentity.sessionId,
+    "grp-sess-1",
+    "the coordinator identity must carry the native session id or the run is not resumable",
+  );
+});
+
 test("creates three selected Acme child worktrees in deterministic order", async (t) => {
   const { registry, git, herdr } = await createFixture(t);
   const { plan, reconciled } = await reconcileAcmePlan({
