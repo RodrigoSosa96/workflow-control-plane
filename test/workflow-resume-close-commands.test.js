@@ -27,9 +27,11 @@ function transportIdentity() {
 function storeFor(run) {
   const calls = [];
   const updates = [];
+  const privateFileWrites = [];
   return {
     calls,
     updates,
+    privateFileWrites,
     async read(runId) {
       calls.push(runId);
       return structuredClone(run);
@@ -38,6 +40,14 @@ function storeFor(run) {
       const patch = await updater(structuredClone(run));
       updates.push({ runId, patch });
       return { ...structuredClone(run), ...patch };
+    },
+    // Mirrors run-store.js's writePrivateFile contract (run-store.js:741) without touching
+    // disk, so the claude relaunch path can regenerate claude-worker-settings.json against an
+    // in-memory run the same way it would against the real store.
+    async writePrivateFile(runId, { relativePath, text, updater } = {}) {
+      const patch = typeof updater === "function" ? await updater(structuredClone(run)) : {};
+      privateFileWrites.push({ runId, relativePath, text });
+      return { run: { ...structuredClone(run), ...patch }, path: join(run.directory, relativePath), writtenAt: new Date().toISOString() };
     },
   };
 }
@@ -103,6 +113,41 @@ test("resumeCommand builds the pi-session transport from the live Herdr adapter 
   assert.deepEqual(focusCalls, [{ target: identity.paneId }]);
   assert.deepEqual(store.calls, [RUN_ID]);
   assert.deepEqual(store.updates, []);
+});
+
+test("transportForRun selects the session transport for a claude-session identity", async () => {
+  const run = { id: RUN_ID, transportIdentity: { kind: "claude-session", harness: "claude", sessionId: "s", paneId: "w1:p2", tabId: "w1:t1", workspaceId: "w1", cwd: "/wt" } };
+  // resume against a live idle claude agent → focused
+  const identity = run.transportIdentity;
+  const herdr = { async listAgents() { return { agents: [{ agent: "claude", pane_id: "w1:p2", cwd: "/wt", agent_status: "idle", agent_session: { kind: "id", value: "s" } }] }; },
+    async focusAgent(a) { herdr._f = a; }, async agentSendKeys() { assert.fail("no keys on resume"); } };
+  const result = await resumeCommand({ runId: RUN_ID, confirmed: false }, { store: storeFor(run), herdr });
+  assert.equal(result.action, "focused");
+  assert.deepEqual(herdr._f, { target: "w1:p2" });
+});
+
+test("claude relaunch builds claude --resume <exact> --settings, no bootstrap, valid agent name", async () => {
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "claude-session", harness: "claude", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const startCalls = [];
+  const herdr = { async listAgents() { return { agents: [] }; },
+    async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane() { return { paneId: "w3:p1" }; },
+    async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent() {} };
+  const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+    profileName: "claude-worker", harness: "claude" };
+  const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/claude" });
+  assert.equal(res.action, "relaunched");
+  assert.equal(startCalls[0].kind, "claude");
+  assert.ok(startCalls[0].name.length <= 32);
+  assert.match(startCalls[0].name, /^[a-z][a-z0-9_-]{0,31}$/);
+  // Claude RESUMES with --resume <id>; --session-id would try to CREATE and fail ("already in use").
+  assert.ok(startCalls[0].argv.includes("--resume"), "claude relaunch must use --resume");
+  assert.equal(startCalls[0].argv[startCalls[0].argv.indexOf("--resume") + 1], sessionId);
+  assert.equal(startCalls[0].argv.includes("--session-id"), false, "claude relaunch must NOT use --session-id");
+  assert.ok(startCalls[0].argv.includes("--settings"));
+  assert.equal(startCalls[0].argv.some((v) => /assignment\.md|handoff-input\.json/.test(v)), false);
 });
 
 test("resumeCommand reports needs-confirmation for a dead pi-session and relaunches only when confirmed", async () => {

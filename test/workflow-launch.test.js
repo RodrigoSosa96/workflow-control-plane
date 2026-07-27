@@ -516,6 +516,44 @@ test("launch preview exposes selected harness argv with generated values marked 
   assert.doesNotMatch(JSON.stringify(preview.launchSpec), /touch \/tmp\/no|Do not paraphrase/);
 });
 
+test("launch preview for an interactive claude profile includes --settings at the placeholder run directory, and it survives into the persisted launchArgv audit record", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker" });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+
+  const placeholderSettingsPath = join(STATE_ROOT, "<generated-run-id>", "claude-worker-settings.json");
+  assert.ok(preview.launchSpec.argv.includes("--settings"));
+  assert.equal(preview.launchSpec.argv[preview.launchSpec.argv.indexOf("--settings") + 1], placeholderSettingsPath);
+
+  // The approved preview + digest must cover the exact argv executeLaunch runs (including
+  // --settings), and run.launchArgv is a security-relevant audit record (see the secret-leak
+  // assertions against it elsewhere in this file) — so it must carry --settings too.
+  const store = createStore(calls);
+  await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [{ id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" }],
+      notes: [],
+    }),
+  });
+
+  const storedLaunchArgv = store.snapshot().launchArgv;
+  assert.ok(storedLaunchArgv.includes("--settings"));
+  assert.equal(storedLaunchArgv[storedLaunchArgv.indexOf("--settings") + 1], placeholderSettingsPath);
+});
+
+test("launch preview for a stream-json (supervised) claude profile omits --settings", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker", profileOverrides: { profile: { mode: "stream-json" } } });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+
+  assert.equal(preview.launchSpec.argv.includes("--settings"), false);
+});
+
 test("launch preview carries an explicit selection reason into the approved assignment", async () => {
   const reason = "selected after ticket triage";
   const preview = await previewFor({ selectionReason: reason });
@@ -1354,5 +1392,90 @@ test("ordinary interactive launch never routes through the supervisor", async ()
 
   assert.equal(report.status, "running");
   assert.equal(capturedArgv[0], "codex");
+  assert.equal(calls.some((c) => c.kind === "store.writePrivateFile"), false);
+});
+
+test("a claude interactive launch writes worker hook/statusLine settings and points --settings at that file", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker" });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+  let launchSpec;
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async (plan, adapters, options) => {
+      calls.push({ kind: "executeStart" });
+      launchSpec = options.buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { harness: plan.agent.harness, command: plan.agent.command, roles: plan.agent.roles, ...plan.agent.profile },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      return {
+        status: "completed",
+        operations: [
+          { id: "worktree", kind: "herdr.worktree.ensure", status: "created" },
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+        ],
+        guidance: [],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  const settingsPath = join(STATE_ROOT, RUN_ID, "claude-worker-settings.json");
+  assert.ok(launchSpec.argv.includes("--settings"));
+  assert.equal(launchSpec.argv[launchSpec.argv.indexOf("--settings") + 1], settingsPath);
+
+  const settingsWrite = calls.find((call) => call.kind === "store.writePrivateFile" && call.relativePath === "claude-worker-settings.json");
+  assert.ok(settingsWrite, "expected the worker settings file to be written into the run directory");
+  const settings = JSON.parse(settingsWrite.text);
+  // SessionStart is intentionally NOT wired (it would push the generation off-by-one).
+  assert.equal(settings.hooks.SessionStart, undefined);
+  for (const event of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    assert.match(settings.hooks[event][0].hooks[0].command, /claude-lifecycle\.mjs/);
+    assert.match(settings.hooks[event][0].hooks[0].command, new RegExp(`${event}$`));
+  }
+  assert.match(settings.statusLine.command, /claude-statusline\.mjs/);
+});
+
+test("a claude stream-json (supervised) launch does not write worker settings or pass --settings", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker", profileOverrides: { profile: { mode: "stream-json" } } });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+  let launchSpec;
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async (plan, adapters, options) => {
+      launchSpec = options.buildAgentLaunch({
+        profileName: plan.agent.profileName,
+        profile: { harness: plan.agent.harness, command: plan.agent.command, roles: plan.agent.roles, ...plan.agent.profile },
+        sessionName: plan.agent.sessionName,
+        cwd: plan.agent.worktreePath,
+        run: plan.run,
+      });
+      return {
+        status: "completed",
+        operations: [
+          { id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1", tabId: "tab-1", paneId: "pane-1" },
+        ],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  assert.equal(launchSpec.argv.includes("--settings"), false);
   assert.equal(calls.some((c) => c.kind === "store.writePrivateFile"), false);
 });

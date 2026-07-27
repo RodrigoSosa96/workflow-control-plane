@@ -500,12 +500,28 @@ test("an interactive start reports a pi-session identity with session, pane, and
 
   const agentOp = report.operations.find((operation) => operation.id === "agent");
   assert.equal(agentOp.sessionIdentity.kind, "pi-session");
+  assert.equal(agentOp.sessionIdentity.harness, "pi");
   assert.equal(agentOp.sessionIdentity.sessionId, "sess-1");
   assert.equal(agentOp.sessionIdentity.paneId, "w1:p2");
   assert.equal(agentOp.sessionIdentity.tabId, "w1:t1");
   assert.equal(agentOp.sessionIdentity.workspaceId, "w1");
   assert.equal(agentOp.sessionIdentity.cwd, plan.agent.worktreePath);
   assert.equal(agentOp.sessionIdentity.runId, undefined);
+});
+
+test("an interactive claude start reports a claude-session identity carrying harness", async () => {
+  const calls = [];
+  const plan = buildPlan({ agentHarness: "claude", agentProfileName: "claude-worker",
+    agentProfile: { mode: "interactive", model: null, arguments: [], permission_mode: "manual" } });
+  plan.operations = plan.operations.map((o) => o.id === "agent" ? { ...o, kind: "agent.session.start", command: "claude" } : o);
+  const launchSpec = { argv: ["claude", "--session-id", "sess-1"], env: {},
+    expected: { harness: "claude", nativeSessionId: "sess-1", cwd: plan.agent.worktreePath } };
+
+  const report = await executeStart(plan, fakeAdapters(calls), { buildAgentLaunch: () => launchSpec });
+  const agentOp = report.operations.find((o) => o.id === "agent");
+  assert.equal(agentOp.sessionIdentity.kind, "claude-session");
+  assert.equal(agentOp.sessionIdentity.harness, "claude");
+  assert.equal(agentOp.sessionIdentity.sessionId, "sess-1");
 });
 
 test("an interactive start recovers the identity when Herdr's readiness wait times out but Pi actually started", async () => {
@@ -617,7 +633,8 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   assert.equal(launch.paneId, "w1:p2");
 
   const agentOp = report.operations.find((operation) => operation.id === "agent");
-  assert.equal(agentOp.sessionIdentity.kind, "pi-session");
+  assert.equal(agentOp.sessionIdentity.kind, "codex-session");
+  assert.equal(agentOp.sessionIdentity.harness, "codex");
   assert.equal(agentOp.sessionIdentity.runId, "run-123");
   assert.equal(agentOp.sessionIdentity.sessionId, launchSpec.expected.nativeSessionId);
 });

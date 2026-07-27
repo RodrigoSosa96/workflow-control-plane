@@ -1376,6 +1376,27 @@ test("agentSendKeys rejects a missing target or empty keys", async () => {
   await assert.rejects(herdr.agentSendKeys({}), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
 });
 
+test("sendText types literal text into the target pane via the public cli", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["pane", "send-text", "w2:p9", "/exit"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ sent: true }, "cli:pane:send-text"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+  assert.deepEqual(await herdr.sendText({ paneId: "w2:p9", text: "/exit" }), { sent: true });
+});
+
+test("sendText rejects a missing paneId or non-string text", async () => {
+  const herdr = createHerdrAdapter({ runner: fixtureRunner([]).runner });
+  await assert.rejects(herdr.sendText({ paneId: "", text: "/exit" }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.sendText({ paneId: "w2:p9", text: 42 }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+  await assert.rejects(herdr.sendText({ text: "/exit" }), (e) => e instanceof WorkflowError && e.category === "PREFLIGHT");
+});
+
 test("focusTab focuses the target tab via the public cli", async () => {
   const fixture = fixtureRunner([
     {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildHarnessLaunch } from "../src/workflow/harnesses.js";
+import { buildClaudeWorkerSettings, buildHarnessLaunch } from "../src/workflow/harnesses.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -231,4 +231,51 @@ test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
     cwd: CWD,
     nativeSessionId: null,
   });
+});
+
+test("claude worker settings wire lifecycle hooks and a statusLine to control-plane scripts", () => {
+  const s = buildClaudeWorkerSettings({ controlPlaneRoot: "/cp" });
+  // SessionStart is intentionally NOT wired: it would consume the LAUNCHING→RUNNING
+  // transition and push every generation off-by-one. UserPromptSubmit is the sole work-start.
+  assert.deepEqual(Object.keys(s.hooks).sort(), ["SessionEnd", "Stop", "UserPromptSubmit"]);
+  assert.equal(s.hooks.SessionStart, undefined);
+  for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    const cmd = s.hooks[ev][0].hooks[0].command;
+    assert.match(cmd, /\/cp\/hooks\/claude-lifecycle\.mjs/);
+    // The script path must be double-quoted so a control-plane path containing a space is
+    // passed as a single argument instead of being split by the shell.
+    assert.ok(cmd.includes(`node "/cp/hooks/claude-lifecycle.mjs" ${ev}`), `command must quote the script path: ${cmd}`);
+    assert.equal(s.hooks[ev][0].hooks[0].type, "command");
+  }
+  assert.match(s.statusLine.command, /\/cp\/hooks\/claude-statusline\.mjs/);
+  assert.ok(s.statusLine.command.includes(`node "/cp/hooks/claude-statusline.mjs"`), "statusLine command must quote the script path");
+  assert.equal(s.statusLine.type, "command");
+});
+
+test("claude worker settings allow the worker's tools so --permission-mode dontAsk never denies", () => {
+  const s = buildClaudeWorkerSettings({ controlPlaneRoot: "/cp" });
+  assert.ok(Array.isArray(s.permissions?.allow), "permissions.allow must be an array");
+  // A bare tool name allows all uses of that tool. The worker must read/edit/write in its
+  // worktree and run bash (tests + the handoff command) without a denial that triggers a
+  // retry loop and wastes tokens.
+  for (const tool of ["Bash", "Read", "Write", "Edit"]) {
+    assert.ok(s.permissions.allow.includes(tool), `permissions.allow must include ${tool}`);
+  }
+  // hooks and statusLine must be unchanged by adding permissions.
+  assert.deepEqual(Object.keys(s.hooks).sort(), ["SessionEnd", "Stop", "UserPromptSubmit"]);
+  assert.equal(s.statusLine.type, "command");
+});
+
+test("interactive claudeArgv appends --settings; stream-json does not", () => {
+  const run = { id: "r", directory: "/state/r", generation: 1, stateRoot: "/state", controlPlaneBin: "/cp/bin/workflow.js" };
+  const interactive = buildHarnessLaunch({ profileName: "claude-worker",
+    profile: { harness: "claude", command: "claude", mode: "interactive", model: null, arguments: [], permission_mode: "manual" },
+    sessionName: "s", cwd: "/wt", run, settingsPath: "/state/r/claude-worker-settings.json" });
+  assert.ok(interactive.argv.includes("--settings"));
+  assert.equal(interactive.argv[interactive.argv.indexOf("--settings") + 1], "/state/r/claude-worker-settings.json");
+
+  const streamed = buildHarnessLaunch({ profileName: "claude-worker",
+    profile: { harness: "claude", command: "claude", mode: "stream-json", model: null, arguments: [], permission_mode: "manual" },
+    sessionName: "s", cwd: "/wt", run });
+  assert.ok(!streamed.argv.includes("--settings"));
 });

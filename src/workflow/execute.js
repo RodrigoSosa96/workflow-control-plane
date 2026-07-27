@@ -786,8 +786,10 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
     });
 
     const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
+    const harness = plan.agent?.harness ?? "pi";
     const sessionIdentity = launch.supervisor === true ? null : {
-      kind: "pi-session",
+      kind: `${harness}-session`,
+      harness,
       runId: plan.run?.id,
       sessionId: launch.expected?.nativeSessionId ?? null,
       paneId: startedAgent.paneId,
@@ -1014,8 +1016,10 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
       tabId: coordinatorTabId,
     });
 
+    const harness = plan.agent?.harness ?? "pi";
     const sessionIdentity = launch.supervisor === true ? null : {
-      kind: "pi-session",
+      kind: `${harness}-session`,
+      harness,
       runId: plan.run?.id,
       sessionId: launch.expected?.nativeSessionId ?? null,
       paneId: startedAgent.paneId,
