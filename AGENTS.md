@@ -33,6 +33,25 @@ This repository coordinates Rodrigo's AI-assisted development workflows across p
 6. **Verification:** run repository checks and review the diff.
 7. **Handoff:** summarize status, decisions, blockers, and next action.
 
+## Workflow launcher (external worker sessions)
+
+The globally installed `workflow` CLI dispatches implementation to isolated external worker
+sessions. Each `workflow launch` creates a dedicated git worktree, opens a Herdr workspace with
+an agent tab, and starts a Pi, Claude, or Codex session whose first prompt is already submitted
+from the generated `assignment.md`. When Rodrigo asks to run tickets in separate sessions,
+spaces, or worktrees, to delegate implementation to Claude or Codex, or to start several
+tickets in parallel, use this CLI — you can open those sessions yourself by running it. Do not
+claim that new Claude/Codex spaces or sessions must be created manually.
+
+- Read-only, run freely: `workflow doctor|plan|status|result|reconcile|worker status|worker watch`.
+- Mutating, confirmation required: `workflow start|launch|runtime|resume|close`; `launch` also
+  requires the `--approval-digest` shown by its own `--dry-run` preview.
+- Select the harness per launch with `--agent pi-worker|claude-worker|codex-worker`
+  (profiles in `projects.yaml`). If Rodrigo does not choose, recommend one and state the reason.
+- One launch per ticket preserves context isolation; Acme launches must name `--repos` explicitly.
+- Follow `.agents/skills/workflow-launch/SKILL.md` for the full procedure; CLI safety boundaries
+  are documented in `README.md` ("Workflow launcher CLI").
+
 ## Current scope
 
 The initial supported projects are ExampleProject, Acme, PersonalProjectD, PersonalProjectB, PersonalProjectC, and PersonalProjectA. Acme is a group of three independent git repositories rather than one monorepo.
