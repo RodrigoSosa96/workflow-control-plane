@@ -49,6 +49,8 @@ claim that new Claude/Codex spaces or sessions must be created manually.
 - Select the harness per launch with `--agent pi-worker|claude-worker|codex-worker`
   (profiles in `projects.yaml`). If Rodrigo does not choose, recommend one and state the reason.
 - One launch per ticket preserves context isolation; Acme launches must name `--repos` explicitly.
+- Always pass `--feature "<short feature name>"` so the worktree, branch, and session get
+  readable names; without it they degrade to the ticket id repeated.
 - Follow `.agents/skills/workflow-launch/SKILL.md` for the full procedure; CLI safety boundaries
   are documented in `README.md` ("Workflow launcher CLI").
 

@@ -31,8 +31,10 @@ spaces or sessions must be created manually.
    the worker should do in its own session — typically brainstorm → spec → implementation plan
    → implement → verify. If an approved plan already exists, reference it instead.
 2. Preflight: `workflow doctor <project> --agent <profile>`.
-3. Preview: `workflow launch <project> <ticket> --prompt-file <path> --agent <profile> --dry-run`.
-   Acme always needs `--repos` naming only the affected repositories (e.g. `--repos backend,webapp`).
+3. Preview: `workflow launch <project> <ticket> --prompt-file <path> --agent <profile> --feature "<short feature name>" --dry-run`.
+   `--feature` (slugified) names the worktree directory, branch, Herdr workspace, and session;
+   without it they all degrade to the bare ticket id repeated (`<id>-<id>`). Acme always
+   needs `--repos` naming only the affected repositories (e.g. `--repos backend,webapp`).
 4. Show Rodrigo the preview and its approval digest. Wait for explicit confirmation.
 5. Execute: rerun the same command with `--approval-digest <digest> --yes`.
 6. Repeat per ticket, then monitor.
@@ -64,3 +66,5 @@ workflow close <run-id>           # end a live session (confirm first)
 | Bundling tickets with `--tickets` "for efficiency" | That is the opposite of isolation — one launch per ticket unless told otherwise. |
 | Auto-approving with `--yes` | Dry-run preview + digest + Rodrigo's confirmation first, every time. |
 | Acme launch without `--repos` | Acme must name the affected repositories explicitly. |
+| Launch without `--feature` | Worktree, branch, and session end up named `<ticket-id>-<ticket-id>`; always pass a short descriptive feature name. |
+| Reporting the retained top shell pane in a Acme launch as an error | It is deliberate: the group lane keeps a coordinator shell above the agent pane for manual cross-repository work. |
