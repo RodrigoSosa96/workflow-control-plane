@@ -279,3 +279,12 @@ test("interactive claudeArgv appends --settings; stream-json does not", () => {
     sessionName: "s", cwd: "/wt", run });
   assert.ok(!streamed.argv.includes("--settings"));
 });
+
+test("interactive codexArgv adds --dangerously-bypass-hook-trust; stream-json does not", () => {
+  const run = { id: "r", directory: "/state/r", generation: 1, stateRoot: "/state", controlPlaneBin: "/cp/bin/workflow.js" };
+  const base = { harness: "codex", command: "codex", model: null, arguments: [], sandbox: "workspace-write", approval_policy: "never" };
+  const interactive = buildHarnessLaunch({ profileName: "codex-worker", profile: { ...base, mode: "interactive" }, sessionName: "s", cwd: "/wt", run });
+  assert.ok(interactive.argv.includes("--dangerously-bypass-hook-trust"));
+  const streamed = buildHarnessLaunch({ profileName: "codex-worker", profile: { ...base, mode: "stream-json" }, sessionName: "s", cwd: "/wt", run });
+  assert.ok(!streamed.argv.includes("--dangerously-bypass-hook-trust"));
+});

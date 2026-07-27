@@ -591,6 +591,45 @@ function isAgentStartupTimeout(error) {
   return /timed out waiting for agent startup/iu.test(String(error?.message ?? ""));
 }
 
+// Codex's SessionStart hook fires (and Herdr's integration reports agent_session) a few seconds
+// after launch, not milliseconds — so the discovery window has to be patient enough to cover real
+// startup latency. discoverCodexSessionId returns as soon as it sees a non-empty agent_session.value,
+// so the common case still resolves in ~1-2s; this window only fully elapses in a genuine no-id case.
+const CODEX_SESSION_DISCOVERY_ATTEMPTS = 40;
+const CODEX_SESSION_DISCOVERY_DELAY_MS = 250;
+
+// Codex generates its own session id after launch (no `--session-id` flag to force it), so it
+// isn't known from `launch.expected` the way Pi/Claude's is. Discover it from Herdr's agent list
+// by matching the pane we just started it in. The id can take a beat to appear, so retry a few
+// times before giving up; if it's still missing, leave sessionId null — resume fails safe later
+// by offering a relaunch instead of resuming a session id we never captured.
+async function discoverCodexSessionId({
+  herdr,
+  paneId,
+  attempts = CODEX_SESSION_DISCOVERY_ATTEMPTS,
+  delayMs = CODEX_SESSION_DISCOVERY_DELAY_MS,
+}) {
+  if (typeof herdr?.listAgents !== "function") return null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    let agents;
+    try {
+      agents = listValue(await herdr.listAgents(), "agents");
+    } catch {
+      agents = [];
+    }
+    const match = agents.find((agent) => getPaneId(agent) === paneId);
+    const sessionId = match?.agent_session?.value ?? null;
+    if (sessionId) return sessionId;
+
+    if (attempt < attempts - 1) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs));
+    }
+  }
+
+  return null;
+}
+
 async function recoverStartedAgent({ herdr, error, paneId, tabId }) {
   if (!isAgentStartupTimeout(error) || typeof herdr.listAgents !== "function") return null;
   let agents;
@@ -708,7 +747,7 @@ function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorT
   }
 }
 
-async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
+async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessionDiscovery }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -787,16 +826,23 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
 
     const workspaceId = bootstrapContext?.workspaceId ?? ensured.result?.workspaceId ?? null;
     const harness = plan.agent?.harness ?? "pi";
-    const sessionIdentity = launch.supervisor === true ? null : {
-      kind: `${harness}-session`,
-      harness,
-      runId: plan.run?.id,
-      sessionId: launch.expected?.nativeSessionId ?? null,
-      paneId: startedAgent.paneId,
-      tabId: startedAgent.tabId,
-      workspaceId,
-      cwd: plan.agent.worktreePath,
-    };
+    let sessionIdentity = null;
+    if (launch.supervisor !== true) {
+      const nativeSessionId = launch.expected?.nativeSessionId ?? null;
+      const sessionId = harness === "codex" && !nativeSessionId
+        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
+        : nativeSessionId;
+      sessionIdentity = {
+        kind: `${harness}-session`,
+        harness,
+        runId: plan.run?.id,
+        sessionId,
+        paneId: startedAgent.paneId,
+        tabId: startedAgent.tabId,
+        workspaceId,
+        cwd: plan.agent.worktreePath,
+      };
+    }
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
@@ -863,7 +909,7 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch }) {
   }
 }
 
-async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
+async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSessionDiscovery }) {
   const report = buildInitialReport(plan);
   const startOperations = plan.operations.filter((operation) => operation.phase === "start");
   const completedIds = new Set();
@@ -1017,16 +1063,23 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch }) {
     });
 
     const harness = plan.agent?.harness ?? "pi";
-    const sessionIdentity = launch.supervisor === true ? null : {
-      kind: `${harness}-session`,
-      harness,
-      runId: plan.run?.id,
-      sessionId: launch.expected?.nativeSessionId ?? null,
-      paneId: startedAgent.paneId,
-      tabId: startedAgent.tabId,
-      workspaceId,
-      cwd: plan.agent.worktreePath,
-    };
+    let sessionIdentity = null;
+    if (launch.supervisor !== true) {
+      const nativeSessionId = launch.expected?.nativeSessionId ?? null;
+      const sessionId = harness === "codex" && !nativeSessionId
+        ? await discoverCodexSessionId({ herdr, paneId: startedAgent.paneId, ...codexSessionDiscovery })
+        : nativeSessionId;
+      sessionIdentity = {
+        kind: `${harness}-session`,
+        harness,
+        runId: plan.run?.id,
+        sessionId,
+        paneId: startedAgent.paneId,
+        tabId: startedAgent.tabId,
+        workspaceId,
+        cwd: plan.agent.worktreePath,
+      };
+    }
 
     report.operations.push(buildOperationReport(agentOperation, "created", {
       agentId: startedAgent.agentId,
@@ -1216,13 +1269,13 @@ async function executeRuntimePhase(plan, { herdr, observeMs = DEFAULT_RUNTIME_OB
   }
 }
 
-export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch } = {}) {
+export async function executeStart(reconciledPlan, { git, herdr } = {}, { buildAgentLaunch = buildHarnessLaunch, codexSessionDiscovery } = {}) {
   ensureStartablePlan(reconciledPlan);
   validateAgentStartIdentity(reconciledPlan);
   ensureNoConflicts(reconciledPlan);
   return reconciledPlan.mode === "group"
-    ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch })
-    : await executeOrdinaryStart(reconciledPlan, { herdr, buildAgentLaunch });
+    ? await executeGroupStart(reconciledPlan, { git, herdr, buildAgentLaunch, codexSessionDiscovery })
+    : await executeOrdinaryStart(reconciledPlan, { herdr, buildAgentLaunch, codexSessionDiscovery });
 }
 
 export async function executeRuntime(reconciledPlan, { herdr, observeMs } = {}) {

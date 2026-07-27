@@ -28,6 +28,7 @@ import {
   workerWatchCommand as defaultWorkerWatchCommand,
 } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
+import { ensureCodexWorkerHooks as defaultEnsureCodexWorkerHooks } from "../src/workflow/codex-hooks.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
 import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
@@ -390,6 +391,12 @@ function createLiveDependencies(dependencies) {
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
     store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot }) : undefined),
+    // Real wiring for launch.js's best-effort Codex hook install (see isCodexInteractiveAgent
+    // there): only assembled here, at the live-dependency boundary, so that unit tests of
+    // launch.js — which exercise the default codex-worker interactive profile pervasively —
+    // never get a real, filesystem-touching default and can never write to a developer's
+    // actual ~/.codex/hooks.json.
+    ensureCodexWorkerHooks: dependencies.ensureCodexWorkerHooks ?? defaultEnsureCodexWorkerHooks,
     transport: dependencies.transport,
     delegations: dependencies.delegations,
     reservations: dependencies.reservations,
