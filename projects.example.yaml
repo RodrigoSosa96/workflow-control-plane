@@ -1,0 +1,118 @@
+# Example projects.yaml for a fresh machine.
+# Copy this file, replace all placeholders, and point WORKFLOW_PROJECTS_FILE at it.
+# Paths must be absolute after ~ expansion; relative paths are rejected.
+version: 3
+launcher:
+  # Where the launcher creates native git worktrees.
+  worktree_root: /home/YOU/.herdr/worktrees
+  # Where the launcher stores private run state (assignments, results, telemetry).
+  state_root: /home/YOU/.local/state/workflow-launcher
+  delegation:
+    version: 1
+    totalInternal: 4
+    foreground: 3
+    readOnlyBackground: 3
+    writersTotal: 1
+    writersPerCheckout: 1
+    maxDepth: 1
+    remediationTurns: 2
+    allowBackgroundWriters: false
+  session_template: "{project}-{task}-{slug}"
+  default_agent_profile: pi-worker
+  max_bundle_tickets: 10
+  agent_profiles:
+    pi-worker:
+      harness: pi
+      command: pi
+      mode: interactive
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      arguments: []
+    claude-worker:
+      harness: claude
+      command: claude
+      mode: interactive
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      permission_mode: manual
+      arguments: []
+    codex-worker:
+      harness: codex
+      command: codex
+      mode: interactive
+      roles:
+        - coordinator
+        - implementer
+        - reviewer
+      model: null
+      sandbox: workspace-write
+      approval_policy: on-request
+      arguments: []
+projects:
+  # Example monorepo project.
+  ocr:
+    label: ExampleProject
+    kind: work
+    path: /home/YOU/projects/work/example_project
+    repository: monorepo
+    base_branch: dev
+    task_source: asana
+    package_manager: pnpm
+    default_agent_profile: pi-worker
+    worktree:
+      branch_template: "feature/{task}/{slug}"
+      path_template: "{worktree_root}/{project}/{task}-{slug}"
+    runtime:
+      default_profile: standard
+      profiles:
+        standard:
+          processes:
+            - id: infrastructure
+              cwd: .
+              command: pnpm docker:dev
+            - id: backend
+              cwd: .
+              command: pnpm dev:api
+            - id: frontend
+              cwd: .
+              command: pnpm dev:front
+              split: right
+              ratio: 0.5
+    verify:
+      - pnpm typecheck
+      - pnpm biome:check
+
+  # Example group project with multiple independent repositories.
+  acme:
+    label: Acme
+    kind: work
+    # The group path is used for naming and coordination; source code lives in the child repos.
+    path: /home/YOU/projects/work/acme
+    repository: group
+    task_source: asana
+    default_agent_profile: pi-worker
+    worktree:
+      branch_template: "ticket/{task}/{slug}"
+      path_template: "{worktree_root}/acme/{task}-{slug}"
+    coordination:
+      meta_repository: /home/YOU/projects/work/acme
+      repos_directory: repos
+    repositories:
+      backend:
+        path: /home/YOU/projects/work/acme/acme_backend
+        base_branch: dev
+        branch_template: "feature/{task}/{slug}"
+      panel:
+        path: /home/YOU/projects/work/acme/acme_panel
+        base_branch: dev
+        branch_template: "feature/{task}/{slug}"
+      webapp:
+        path: /home/YOU/projects/work/acme/acme_webapp
+        base_branch: dev
+        branch_template: "feature/{task}/{slug}"

@@ -16,7 +16,9 @@
     ".pi/extensions",
     ".pi/prompts",
     "projects.yaml",
-    "README.md"
+    "projects.example.yaml",
+    "README.md",
+    "INSTALL.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",

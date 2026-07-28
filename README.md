@@ -14,6 +14,19 @@ This directory stores project metadata and reusable workflow prompts. Applicatio
 
 After changing Pi resources, run `/reload` in an existing Pi session or restart Pi.
 
+## Fresh machine setup
+
+For a new machine, follow the full setup in [`INSTALL.md`](INSTALL.md). It covers:
+
+1. Installing the `workflow` and `asana-workflow` CLIs globally.
+2. Configuring Asana securely without exposing tokens in agent transcripts.
+3. Using a machine-local `projects.yaml` (copy `projects.example.yaml` and set `WORKFLOW_PROJECTS_FILE`) instead of editing the committed registry.
+4. Installing the harness lifecycle hooks:
+   - **Pi** uses `.pi/extensions/` rather than `hooks/` scripts.
+   - **Claude** hooks are generated per-run via `--settings`.
+   - **Codex** hooks are additively merged into `~/.codex/hooks.json`.
+5. Starting Herdr and verifying with `workflow doctor <project>`.
+
 ## Initial commands
 
 From this directory, start Pi and use:
@@ -26,6 +39,10 @@ From this directory, start Pi and use:
 ```
 
 These prompts intentionally stop before implementation. The expected flow is triage → design/spec → approval → implementation plan → `workflow plan` → confirmation → `workflow start` → implementation → verification.
+
+## Hook layout
+
+Pi is wired through `.pi/extensions/` because it supports in-process TypeScript extensions; Claude and Codex are wired through stateless scripts under `hooks/` because they expose lifecycle hooks via external subprocess calls. All three harnesses end up driving the same neutral run-state machine in `src/workflow/lifecycle.js`.
 
 ## Project layout policy
 
