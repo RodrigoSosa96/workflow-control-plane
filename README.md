@@ -1,8 +1,55 @@
-# AI Development Workflows
+# Workflow Control Plane
 
-Control plane for Rodrigo's Pi + Herdr development workflow.
+AI-assisted development workflow control plane for [Pi](https://github.com/earendil-works/pi), Claude, Codex, and [Herdr](https://herdr.dev).
 
-This directory stores project metadata and reusable workflow prompts. Application code remains in its original repository under `~/projects/work` or `~/projects/personal`.
+This repository is a **control plane**, not an application. It stores project metadata, reusable agent prompts, shared workflow skills, and a deterministic `workflow` CLI that dispatches Pi, Claude, Codex, or OpenCode workers into isolated git worktrees. Application source code stays in its original repositories.
+
+## Features
+
+- Multi-harness agent launcher: Pi, Claude, Codex, and fixture-only OpenCode.
+- Deterministic, read-only planning checkpoints before any mutation.
+- One dedicated git worktree per ticket or feature.
+- Herdr workspace, tab, pane, and runtime process orchestration.
+- Structured worker handoffs and canonical results.
+- Two-lane operator model: external workers produce canonical results; internal Pi delegations produce advisory evidence.
+- Read-only Asana triage CLI with secure token handling.
+
+## Install
+
+```bash
+npm install --global /home/you/projects/personal/workflows
+```
+
+Or with pnpm:
+
+```bash
+pnpm add --global /home/you/projects/personal/workflows
+```
+
+This installs both `workflow` and `asana-workflow`. For a full fresh-machine setup, see [`INSTALL.md`](INSTALL.md).
+
+## Quick start
+
+After the design and implementation plan are approved:
+
+```bash
+workflow doctor ocr
+workflow plan ocr ASANA-123 --feature "Discovered Docs"
+workflow start ocr ASANA-123 --feature "Discovered Docs" --yes
+workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --dry-run
+workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --approval-digest sha256:<digest> --yes
+workflow result <run-id>
+workflow status ocr ASANA-123 --feature "Discovered Docs"
+```
+
+## Safety boundaries
+
+- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, and `workflow reconcile` are read-only.
+- `workflow start`, `workflow launch`, and `workflow runtime` require explicit confirmation or `--yes`; `workflow launch --yes` also requires the current `--approval-digest` from a dry-run preview.
+- In other words, every mutating launcher command requires explicit confirmation or --yes.
+- `workflow launch` reads the untrusted request only from `--prompt-file`; there is no `--prompt` option.
+- The launcher follows a no-cleanup policy: failed or partial launches preserve worktrees, Herdr tabs/panes, run directories, and the fallback workspace for manual recovery.
+- No external or internal lane performs automatic cleanup, reservation release, or process kill.
 
 ## Installed foundations
 
@@ -198,6 +245,9 @@ For bash, the hidden-input line is instead:
 
 ```bash
 read -r -s -p 'Asana token: ' ASANA_TOKEN; echo
+printf '%s' "$ASANA_TOKEN" > ~/.config/workflows/asana-token
+unset ASANA_TOKEN
+chmod 600 ~/.config/workflows/asana-token
 ```
 
 Verify without displaying the token:
@@ -267,3 +317,7 @@ If the command is not found after installation, confirm that the npm or pnpm glo
 - Add scripts for deterministic Herdr workspace/tab/worktree creation.
 - Add a Pi command extension over those scripts.
 - Normalize missing or misplaced project instructions, especially PersonalProjectD and Acme.
+
+## License
+
+AGPL-3.0. See [LICENSE](LICENSE).
