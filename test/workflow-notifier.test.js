@@ -1,8 +1,9 @@
 import assert from "node:assert";
-import { access, constants, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, constants, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { readEvents } from "../src/workflow/events-bus.js";
 import {
   notifyHandoff,
   notifyRun,
@@ -80,6 +81,46 @@ test("notifyHandoff rejects relative paths", async () => {
   });
   assert.equal(result.notified, false);
   assert.equal(result.reason, "notifier path must be absolute");
+});
+
+test("notifyHandoff uses the injected spawner for an executable notifier", async () => {
+  const dir = await tempDir();
+  const notifier = join(dir, "notifier");
+  await writeFile(notifier, "#!/bin/sh\nexit 0\n");
+  await chmod(notifier, 0o700);
+  const calls = [];
+  const result = await notifyHandoff({
+    run: makeRun(),
+    result: makeResult(),
+    env: { WORKFLOW_HANDOFF_NOTIFIER: notifier },
+    spawnFn(path, args, options) {
+      calls.push({ path, args, options });
+      return { unref() {} };
+    },
+  });
+  assert.equal(result.notified, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, notifier);
+  assert.equal(calls[0].options.env.WORKFLOW_RUN_ID, "run-123");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("notifyStop reads the persisted run before publishing its event", async () => {
+  const dir = await tempDir();
+  const stale = makeRun({ state: "running", resultStatus: "", resultPath: "", stateRoot: dir });
+  const settled = makeRun({ state: "needs_input", resultStatus: "needs-input", resultPath: "/tmp/run-123/result.json", stateRoot: dir });
+  const result = await notifyStop({
+    run: stale,
+    store: { read: async (id) => (id === stale.id ? settled : null) },
+    runId: stale.id,
+    action: "manual",
+    env: { HOME: join(dir, "missing-home") },
+  });
+  assert.equal(result.event.runState, "needs_input");
+  assert.equal(result.event.runStatus, "needs-input");
+  const { events } = await readEvents({ stateRoot: dir });
+  assert.equal(events[0].runState, "needs_input");
+  await rm(dir, { recursive: true, force: true });
 });
 
 test("notifyStop includes action in env", async () => {

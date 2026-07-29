@@ -514,7 +514,7 @@ export async function submitHandoff({ store, git, runId, generation, input, stat
   const resultText = canonicalResultText(result);
   const resultArtifactDigest = sha256Digest(resultText);
 
-  await store.update(runId, async (current) => {
+  const settledRun = await store.update(runId, async (current) => {
     const currentExpected = expectedFromRun(current);
     assertSameExpectations(expected, currentExpected);
     assertRunAcceptsHandoff(current);
@@ -536,7 +536,7 @@ export async function submitHandoff({ store, git, runId, generation, input, stat
 
   // Best-effort notification; never let a notifier script failure break the handoff.
   try {
-    await notifyHandoff({ run, result, env: stateRoot ? { WORKFLOW_STATE_ROOT: stateRoot } : undefined });
+    await notifyHandoff({ run: settledRun, result, env: stateRoot ? { WORKFLOW_STATE_ROOT: stateRoot } : undefined });
   } catch {
     // swallow
   }

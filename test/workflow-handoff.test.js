@@ -10,6 +10,7 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 import { createRunStore } from "../src/workflow/run-store.js";
+import { readEvents } from "../src/workflow/events-bus.js";
 import {
   HANDOFF_LIMITS,
   readCurrentResult,
@@ -63,7 +64,7 @@ async function createRunningRun(t, { repositories, tickets = ["A-1"], generation
   await store.update(created.id, () => ({ state: RUN_STATES.LAUNCHING }));
   await store.update(created.id, () => ({ state: RUN_STATES.RUNNING }));
 
-  return { store, run: await store.read(created.id) };
+  return { store, stateRoot, run: await store.read(created.id) };
 }
 
 function ticket(id, status = "completed") {
@@ -255,6 +256,28 @@ test("submitHandoff writes an authoritative private result and readCurrentResult
   const current = await readCurrentResult({ store, git, runId: run.id });
   assert.equal(current.status, "completed");
   assert.deepEqual(current.result, result);
+});
+
+test("submitHandoff publishes the persisted terminal run state", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const { store, run, stateRoot } = await createRunningRun(t, {
+    repositories: [{ id: "app", path: repoPath }],
+  });
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const input = validInput({
+    repositories: [{ id: "app", changedFiles: ["src/example.js"] }],
+  });
+  delete input.changedFiles;
+
+  const result = await submitHandoff({ store, git, runId: run.id, generation: 1, input, stateRoot });
+  const { events } = await readEvents({ stateRoot });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, "handoff");
+  assert.equal(events[0].runId, run.id);
+  assert.equal(events[0].runState, RUN_STATES.COMPLETED);
+  assert.equal(events[0].runStatus, result.status);
+  assert.equal(events[0].resultPath, join(run.directory, "result.json"));
 });
 
 test("submitHandoff rejects stale generations before creating result artifacts", async (t) => {

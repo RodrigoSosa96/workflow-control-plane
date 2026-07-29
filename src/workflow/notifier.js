@@ -70,7 +70,7 @@ async function appendBusEvent(stateRoot, event) {
   }
 }
 
-async function runScript({ env, context, run, result, notificationType, action }) {
+async function runScript({ env, context, run, result, notificationType, action, spawnFn = spawn }) {
   const path = resolveNotifierPath(env);
   if (!path) return { notified: false };
   if (!isAbsolute(path)) return { notified: false, reason: "notifier path must be absolute" };
@@ -95,7 +95,7 @@ async function runScript({ env, context, run, result, notificationType, action }
     ...(isNonEmptyString(action) ? { WORKFLOW_RUN_ACTION: action } : {}),
   };
 
-  const child = spawn(path, [], {
+  const child = spawnFn(path, [], {
     detached: true,
     stdio: "ignore",
     env: childEnv,
@@ -107,7 +107,7 @@ async function runScript({ env, context, run, result, notificationType, action }
 async function dispatch({ stateRoot, env, context, run, result, notificationType, action, spawnFn }) {
   const event = baseEvent(run, result, notificationType, action);
   await appendBusEvent(stateRoot, event);
-  const scriptResult = await runScript({ env, context, run, result, notificationType, action });
+  const scriptResult = await runScript({ env, context, run, result, notificationType, action, spawnFn });
   return { event, ...scriptResult };
 }
 
@@ -124,7 +124,11 @@ export async function notifyRun({ store, runId, env = process.env, spawnFn = spa
   return dispatch({ stateRoot, env, context: "lifecycle", run, result: null, notificationType: "run", spawnFn });
 }
 
-export async function notifyStop({ run, action, env = process.env, spawnFn = spawn } = {}) {
-  const stateRoot = stateRootFromRun(run, env);
-  return dispatch({ stateRoot, env, context: "stop", run, result: null, notificationType: "stop", action, spawnFn });
+export async function notifyStop({ run, store, runId, action, env = process.env, spawnFn = spawn } = {}) {
+  const current = store && typeof store.read === "function" && isNonEmptyString(runId)
+    ? await store.read(runId)
+    : run;
+  if (!current) return { notified: false, reason: "run not found" };
+  const stateRoot = stateRootFromRun(current, env);
+  return dispatch({ stateRoot, env, context: "stop", run: current, result: null, notificationType: "stop", action, spawnFn });
 }

@@ -53,7 +53,7 @@ export function createWorkflowWorkerLifecycleExtension({
         if (action !== "continue" && action !== "none") {
           try {
             const { notifyStop } = await import("../../src/workflow/notifier.js");
-            await notifyStop({ run: current, action });
+            await notifyStop({ run: current, store, runId, action });
           } catch {
             // swallow: a notifier must never break the lifecycle hook
           }

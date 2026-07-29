@@ -130,7 +130,7 @@ export async function runLifecycleHook({
       // Best-effort notification for non-continuation stop states (settled / manual).
       if (action !== "continue" && action !== "none") {
         try {
-          await notifyStop({ run: current, action });
+          await notifyStop({ run: current, store, runId, action });
         } catch {
           // swallow: a notifier must never break the lifecycle hook
         }
