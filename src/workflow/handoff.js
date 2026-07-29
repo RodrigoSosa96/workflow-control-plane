@@ -3,6 +3,7 @@ import * as defaultFs from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { WorkflowError } from "./errors.js";
 import { RUN_STATES } from "./run-state.js";
+import { notifyHandoff } from "./notifier.js";
 
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -494,7 +495,7 @@ function resultPaths(directory, generation) {
   };
 }
 
-export async function submitHandoff({ store, git, runId, generation, input } = {}) {
+export async function submitHandoff({ store, git, runId, generation, input, stateRoot } = {}) {
   if (!store || typeof store.read !== "function" || typeof store.update !== "function") {
     fail("Run store interface is required");
   }
@@ -532,6 +533,13 @@ export async function submitHandoff({ store, git, runId, generation, input } = {
       ])),
     };
   });
+
+  // Best-effort notification; never let a notifier script failure break the handoff.
+  try {
+    await notifyHandoff({ run, result, env: stateRoot ? { WORKFLOW_STATE_ROOT: stateRoot } : undefined });
+  } catch {
+    // swallow
+  }
 
   return result;
 }

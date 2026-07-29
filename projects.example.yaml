@@ -103,6 +103,12 @@ projects:
     coordination:
       meta_repository: /home/YOU/projects/work/acme
       repos_directory: repos
+      # Group layout preferences. By default the launcher closes the empty bootstrap shell
+      # pane so the agent tab shows only the agent. Set retain_coordinator_shell: true to keep
+      # a shell pane above the agent for manual cross-repo commands. Set agent_split: right
+      # to place the agent on the left and the shell on the right instead of stacked.
+      retain_coordinator_shell: false
+      agent_split: down
     repositories:
       backend:
         path: /home/YOU/projects/work/acme/acme_backend

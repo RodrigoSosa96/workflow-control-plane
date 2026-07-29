@@ -183,6 +183,78 @@ External exit `0` means a current terminal result was available; exit `20` means
 
 If the origin Pi session closes before an advisory delegation result is consumed, the result stays pending. A later coordinator session must explicitly adopt it; no cross-session result injection occurs automatically.
 
+### Handoff notifications
+
+The launcher can run a best-effort notifier when a worker reaches a terminal state (handoff, stop, or session end). It is **passive and opt-in**: it may alert the user, but it never injects a result, command, or message into another agent session.
+
+Enable it by creating an executable script at:
+
+```bash
+~/.config/workflows/handoff-notifier
+```
+
+or by pointing `WORKFLOW_HANDOFF_NOTIFIER` to any executable path:
+
+```bash
+export WORKFLOW_HANDOFF_NOTIFIER=/path/to/your/notifier
+```
+
+The script receives the run context as environment variables:
+
+```text
+WORKFLOW_NOTIFICATION_TYPE=handoff|stop|run
+WORKFLOW_RUN_CONTEXT=handoff|lifecycle|stop
+WORKFLOW_RUN_ID
+WORKFLOW_RUN_STATE
+WORKFLOW_RUN_STATUS
+WORKFLOW_RUN_DIR
+WORKFLOW_RESULT_PATH
+WORKFLOW_RESULT_STATUS
+WORKFLOW_RESULT_SUMMARY
+WORKFLOW_HARNESS
+WORKFLOW_RUN_ACTION         # only for stop notifications
+```
+
+An example is provided at `hooks/handoff-notifier.example.sh`. It uses `notify-send` on Linux and `osascript` on macOS.
+
+### Pi coordinator awareness
+
+When the launcher runs in a Pi coordinator session, the `workflow-coordinator` extension
+watches the workflow event bus (`$WORKFLOW_STATE_ROOT/events.jsonl`). As soon as an
+external worker hands off a terminal result (or stops/blocks without one), Pi receives
+a follow-up message with the run ID, state, and a pointer to the canonical result:
+
+```text
+Un worker terminó: <run-id>
+Estado: completed
+Podés ver el resultado con: workflow result <run-id>
+```
+
+This lets the coordinator session become aware of finished work automatically. It does
+not inject the full result into the conversation; it just tells you the worker is ready
+so you can ask Pi to pull it when you return.
+
+The event bus is the same mechanism that feeds the optional notifier script above, so
+the desktop notification and the Pi message share one source of truth.
+
+### Session-isolated launches from Pi
+
+An active Pi coordinator can launch an external worker through the
+`workflow_prepare_launch` and `workflow_execute_launch` tools. The extension takes the
+current Pi session ID itself, keeps the approved preview in that session only, and requires
+two UI approvals before mutation. A terminal event for that run returns only to the Pi
+session that prepared it.
+
+For a manual or non-Pi launcher, provide the same metadata explicitly:
+
+```bash
+workflow launch <project> <ticket> --prompt-file <path> --origin-session <id>
+```
+
+The origin is notification routing metadata, not result acceptance. Pi still receives only a
+readiness notice and must read the canonical `workflow result <run-id>` before reviewing the
+handoff.
+
 ## Real harness canaries (interactive only)
 
 Real canaries start an actual harness session and may consume API tokens. They are never run in CI or by `npm test`.

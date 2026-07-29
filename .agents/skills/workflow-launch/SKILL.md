@@ -39,6 +39,23 @@ spaces or sessions must be created manually.
 5. Execute: rerun the same command with `--approval-digest <digest> --yes`.
 6. Repeat per ticket, then monitor.
 
+### Launches from an active Pi coordinator
+
+When the launch originates in the current Pi coordinator session, use
+`workflow_prepare_launch` and then `workflow_execute_launch` rather than a shell command.
+The extension binds the real Pi origin session automatically, retains the approved preview
+only in that session, and requires both UI confirmations. A terminal worker notice is then
+routed only back to that origin session.
+
+For a manual/non-Pi launch, keep the explicit CLI path and provide the routing metadata:
+
+```bash
+workflow launch <project> <ticket> --prompt-file <path> --origin-session <id>
+```
+
+`originSessionId` only routes the passive readiness notice. It never injects or accepts the
+worker result; use `workflow result <run-id>` to read the canonical handoff.
+
 ## Choosing the harness
 
 `--agent` selects a profile from `projects.yaml`: `pi-worker` (default), `claude-worker`,
@@ -67,4 +84,19 @@ workflow close <run-id>           # end a live session (confirm first)
 | Auto-approving with `--yes` | Dry-run preview + digest + Rodrigo's confirmation first, every time. |
 | Acme launch without `--repos` | Acme must name the affected repositories explicitly. |
 | Launch without `--feature` | Worktree, branch, and session end up named `<ticket-id>-<ticket-id>`; always pass a short descriptive feature name. |
-| Reporting the retained top shell pane in a Acme launch as an error | It is deliberate: the group lane keeps a coordinator shell above the agent pane for manual cross-repository work. |
+
+## Notifications and coordinator awareness
+
+When a worker finishes or blocks, the launcher writes a structured event to the workflow
+event bus (`$WORKFLOW_STATE_ROOT/events.jsonl`). Two consumers can react to it:
+
+1. **Desktop/system notifier:** An optional executable `~/.config/workflows/handoff-notifier`
+   script (or `$WORKFLOW_HANDOFF_NOTIFIER`) receives the run context as environment variables.
+2. **Pi coordinator session:** The `workflow-coordinator` extension watches the event bus and
+   sends Pi a follow-up message when a worker launched from the current session reaches a
+   terminal state. It does not inject the result into the conversation; it just tells Rodrigo
+   the worker is ready, e.g. `Un worker terminó: <run-id>`. He can then ask Pi to pull the
+   result.
+
+Variables passed to the notifier script include `WORKFLOW_RUN_ID`, `WORKFLOW_RUN_STATUS`,
+`WORKFLOW_RESULT_SUMMARY`, and others.

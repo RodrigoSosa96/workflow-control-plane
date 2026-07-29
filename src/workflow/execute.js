@@ -1070,7 +1070,7 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
     });
     const agentPane = await herdr.splitPane({
       paneId: coordinatorTabPaneId,
-      direction: "down",
+      direction: plan.agentSplit ?? "down",
       cwd: plan.agent.worktreePath,
       env: launch.env,
       focus: false,
@@ -1097,7 +1097,38 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
     }));
     completedIds.add(agentOperation.id);
 
-    if (bootstrapCreatedFromReturnedRootPane || bootstrapContext?.paneId || ensured.result?.paneId) {
+    const retainCoordinatorShell = plan.retainCoordinatorShell === true;
+    if (!retainCoordinatorShell && typeof herdr.closePane === "function") {
+      const bootstrapPaneId = coordinatorTabPaneId;
+      const expectedTabId = coordinatorTabId;
+      let canClose = false;
+      if (isNonEmptyString(workspaceId)
+        && isNonEmptyString(bootstrapPaneId)
+        && isNonEmptyString(expectedTabId)
+        && isNonEmptyString(startedAgent?.paneId)) {
+        try {
+          canClose = await verifyCloseSafety({
+            herdr,
+            workspaceId,
+            expectedTabId,
+            bootstrapPaneId,
+            startedAgent,
+            expectedHarness: plan.agent.harness ?? "pi",
+          });
+        } catch (error) {
+          report.notes.push(`Retained the coordinator bootstrap shell pane because the post-start close safety inspection failed: ${error.message}`);
+        }
+      }
+      if (canClose) {
+        try {
+          await herdr.closePane({ paneId: bootstrapPaneId });
+        } catch (error) {
+          report.notes.push(`Retained the coordinator bootstrap shell pane because closing it failed: ${error.message}`);
+        }
+      } else if (report.notes.length === 0) {
+        report.notes.push("Retained the coordinator bootstrap shell pane because the close safety checks did not pass.");
+      }
+    } else if (retainCoordinatorShell && (bootstrapCreatedFromReturnedRootPane || coordinatorTabPaneId)) {
       report.notes.push("Retained the coordinator bootstrap shell pane for manual cross-repository coordination.");
     }
 

@@ -47,6 +47,17 @@ test("README documents the workflow launcher commands and safety boundaries", as
   assert.match(readme, /npm run smoke:fixture -- --real --agent pi --keep/);
   assert.match(readme, /Real canaries require a TTY|TTY-only/i);
   assert.match(readme, /Type the exact harness name/);
+  assert.match(readme, /workflow_prepare_launch/);
+  assert.match(readme, /workflow_execute_launch/);
+  assert.match(readme, /--origin-session <id>/);
+});
+
+test("workflow launch skill documents Pi-bound and manual origin sessions", async () => {
+  const skill = await read(".agents/skills/workflow-launch/SKILL.md");
+  assert.match(skill, /workflow_prepare_launch/);
+  assert.match(skill, /workflow_execute_launch/);
+  assert.match(skill, /--origin-session <id>/);
+  assert.match(skill, /originSessionId|origin session/i);
 });
 
 test("README documents the workflow-owned Pi delegation adapter boundaries", async () => {

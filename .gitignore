@@ -10,3 +10,6 @@ coverage/
 
 # SDD scratch (subagent-driven-development working files)
 .superpowers/
+
+# Reference material downloaded on demand
+projects/references/

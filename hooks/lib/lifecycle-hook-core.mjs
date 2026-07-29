@@ -25,6 +25,7 @@
 // marker fields never collide even though they share the run record — no per-harness rename is
 // needed beyond the `${harness}` prefix already baked into the field names below.
 import { RUN_STATES } from "../../src/workflow/run-state.js";
+import { notifyRun, notifyStop } from "../../src/workflow/notifier.js";
 
 // Maps a lifecycle.onStop action to a telemetry phase. The telemetry phase vocabulary is
 // fixed (see TELEMETRY_PHASES), so the neutral run states are projected onto the closest
@@ -126,6 +127,14 @@ export async function runLifecycleHook({
         hasValidHandoff: await validHandoff(current.generation),
       });
       await recordPhase(telemetry, harness, runId, stopPhaseForAction(action));
+      // Best-effort notification for non-continuation stop states (settled / manual).
+      if (action !== "continue" && action !== "none") {
+        try {
+          await notifyStop({ run: current, action });
+        } catch {
+          // swallow: a notifier must never break the lifecycle hook
+        }
+      }
       if (action === "continue") {
         // Mark the continuation BEFORE returning the block decision, so the UserPromptSubmit it
         // may trigger is recognized as a continuation (reuses the generation) rather than a
@@ -138,6 +147,12 @@ export async function runLifecycleHook({
 
     if (event === "SessionEnd") {
       await lifecycle.onSessionEnd({ runId });
+      // Best-effort notification when the session ends without a handoff.
+      try {
+        await notifyRun({ store, runId });
+      } catch {
+        // swallow: a notifier must never break the lifecycle hook
+      }
       return undefined;
     }
 

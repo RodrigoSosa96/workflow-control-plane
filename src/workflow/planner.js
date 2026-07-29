@@ -242,6 +242,8 @@ function buildGroupPlan({ registry, projectAlias, project, bundle, slug, feature
     slug,
   });
   const runtime = selectRuntime(projectAlias, project, runtimeProfile);
+  const retainCoordinatorShell = project.coordination?.retain_coordinator_shell === true;
+  const agentSplit = project.coordination?.agent_split === "right" ? "right" : "down";
   const selectedRepositories = selectRepositories(projectAlias, project, repositories);
   const childWorktrees = selectedRepositories.map((repository) => {
     const worktreePath = join(workspacePath, project.coordination.repos_directory, repository.alias);
@@ -323,6 +325,8 @@ function buildGroupPlan({ registry, projectAlias, project, bundle, slug, feature
       worktreePath: workspacePath,
       tabLabel: "runtime",
     },
+    retainCoordinatorShell,
+    agentSplit,
     operations: [
       {
         id: "meta-worktree",

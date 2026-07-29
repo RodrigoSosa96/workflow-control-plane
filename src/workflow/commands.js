@@ -1003,13 +1003,16 @@ export async function handoffCommand(options = {}, {
   const inputPath = canonicalHandoffInputPath(run);
   assertCanonicalHandoffInput(options.input, inputPath);
   const input = parseHandoffJson(await fs.readFile(inputPath, "utf8"));
-  return await submitHandoff({
+  const handoffEnv = options.env ?? env;
+  const result = await submitHandoff({
     store,
     git,
     runId,
     generation: run.generation ?? 1,
     input,
+    stateRoot: handoffEnv.WORKFLOW_STATE_ROOT,
   });
+  return result;
 }
 
 export async function delegationHandoffCommand(options = {}, deps = {}) {

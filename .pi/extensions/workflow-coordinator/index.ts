@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createProcessRunner } from "../../../src/workflow/process.js";
+import { createGitAdapter } from "../../../src/workflow/git.js";
+import { createHerdrAdapter } from "../../../src/workflow/herdr.js";
+import { ensureCodexWorkerHooks } from "../../../src/workflow/codex-hooks.js";
 import { fileURLToPath } from "node:url";
 import { isAbsolute, resolve } from "node:path";
 import { loadRegistry } from "../../../src/workflow/registry.js";
@@ -13,6 +17,9 @@ import { loadDelegationRole } from "../../../src/workflow/delegation-roles.js";
 import { inspectExactProcessByPid } from "../../../src/workflow/process-observation.js";
 import { validateSubagentRequestPolicy } from "../../../src/workflow/coordinator-policy.js";
 import { createDelegationWatcher } from "../../../src/workflow/delegation-watcher.js";
+import { createWorkerWatcher } from "../../../src/workflow/worker-watcher.js";
+import { readEvents } from "../../../src/workflow/events-bus.js";
+import { launchCommand } from "../../../src/workflow/commands.js";
 import { lookupExecutable, resolveWorkflowProjectsFile } from "../../../src/workflow/runtime-config.js";
 
 const PROJECTS_FILE = fileURLToPath(new URL("../../../projects.yaml", import.meta.url));
@@ -91,6 +98,21 @@ const prepareDelegationSchema = Type.Object({
 
 const executeDelegationSchema = Type.Object({
   approvalDigest: Type.String(),
+});
+
+const prepareLaunchSchema = Type.Object({
+  projectAlias: Type.String({ minLength: 1, maxLength: 128 }),
+  task: Type.String({ minLength: 1, maxLength: 128 }),
+  request: Type.String({ minLength: 1, maxLength: 64 * 1024 }),
+  feature: optional(Type.String({ minLength: 1, maxLength: 256 })),
+  repositories: optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 8 })),
+  tickets: optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32 })),
+  agentProfile: optional(Type.String({ minLength: 1, maxLength: 128 })),
+  selectionReason: optional(Type.String({ minLength: 1, maxLength: 4096 })),
+});
+
+const executeLaunchSchema = Type.Object({
+  approvalDigest: Type.String({ pattern: "^sha256:[0-9a-f]{64}$" }),
 });
 
 const delegationSelectorSchema = Type.Object({
@@ -191,6 +213,38 @@ function validatePrepareInput(input) {
   };
 }
 
+function validateStringList(value, name, { maximumItems, maximumLength }) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maximumItems) fail(`${name} must be a bounded non-empty list`);
+  const normalized = value.map((entry) => ensureString(entry, name, maximumLength));
+  if (new Set(normalized).size !== normalized.length) fail(`${name} must not contain duplicates`);
+  return normalized;
+}
+
+function validatePrepareLaunchInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) fail("launch input must be an object");
+  const keys = Object.keys(input);
+  if (keys.some((key) => !(key in prepareLaunchSchema.properties))) fail("launch input contains unsupported fields");
+  return {
+    projectAlias: ensureString(input.projectAlias, "projectAlias", 128),
+    task: ensureString(input.task, "task", 128),
+    request: ensureString(input.request, "request", 64 * 1024),
+    ...(input.feature === undefined ? {} : { feature: ensureString(input.feature, "feature", 256) }),
+    ...(input.repositories === undefined ? {} : { repositories: validateStringList(input.repositories, "repositories", { maximumItems: 8, maximumLength: 128 }) }),
+    ...(input.tickets === undefined ? {} : { tickets: validateStringList(input.tickets, "tickets", { maximumItems: 32, maximumLength: 128 }) }),
+    ...(input.agentProfile === undefined ? {} : { agentProfile: ensureString(input.agentProfile, "agentProfile", 128) }),
+    ...(input.selectionReason === undefined ? {} : { selectionReason: ensureString(input.selectionReason, "selectionReason", 4096) }),
+  };
+}
+
+function validateLaunchApproval(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some((key) => key !== "approvalDigest")) {
+    fail("launch approval must contain only approvalDigest");
+  }
+  const approvalDigest = ensureString(input.approvalDigest, "approvalDigest", 128);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(approvalDigest)) fail("approvalDigest must be a sha256 digest");
+  return { approvalDigest };
+}
+
 function validateSelector(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) fail("delegation selector must be an object");
   const keys = Object.keys(input);
@@ -281,6 +335,48 @@ function renderNotice(notice) {
     `State: ${notice.state}`,
     `Reason: ${notice.reason}`,
   ].join("\n"));
+}
+
+function renderLaunchPreview(preview) {
+  const identity = preview?.reconciliation?.identity ?? {};
+  const selection = preview?.selection ?? {};
+  return bound([
+    `Proyecto: ${identity.projectAlias ?? "unspecified"}`,
+    `Tarea: ${identity.task ?? "unspecified"}`,
+    `Agente: ${selection.profileName ?? "unspecified"}`,
+    `Harness: ${selection.harness ?? "unspecified"}`,
+    `Aprobación: ${preview?.approvalDigest ?? "missing"}`,
+    preview?.assignment ? `Asignación:\n${preview.assignment}` : "",
+  ].filter(Boolean).join("\n"));
+}
+
+function launchDetailsForReport(report) {
+  return {
+    status: typeof report?.status === "string" ? report.status : "unknown",
+    runId: typeof report?.runId === "string" ? report.runId : null,
+    recoveryCommand: typeof report?.recoveryCommand === "string" ? report.recoveryCommand : null,
+  };
+}
+
+function renderLaunchReport(report) {
+  return bound([
+    `Workflow launch: ${report.status}`,
+    report.runId ? `Run: ${report.runId}` : "",
+    report.recoveryCommand ? `Recuperación: ${report.recoveryCommand}` : "",
+  ].filter(Boolean).join("\n"));
+}
+
+function renderWorkerEvent(event) {
+  const origin = event.originSessionId ? "Un worker que lanzaste" : "Un worker";
+  const stateLine = event.resultStatus
+    ? `${event.runState} (${event.resultStatus})`
+    : event.runState;
+  return bound([
+    `${origin} terminó: ${event.runId}`,
+    `Estado: ${stateLine}`,
+    event.resultSummary ? `Resumen: ${event.resultSummary}` : "",
+    `Podés ver el resultado con: workflow result ${event.runId}`,
+  ].filter(Boolean).join("\n"));
 }
 
 function summarizeExecution(result) {
@@ -376,6 +472,11 @@ export async function createWorkflowCoordinatorRuntime({
   createTransportImpl = createPiDelegationTransport,
   loadDelegationRoleImpl = loadDelegationRole,
   lookupExecutableImpl = lookupExecutable,
+  createLaunchCommandImpl = launchCommand,
+  createProcessRunnerImpl = createProcessRunner,
+  createGitAdapterImpl = createGitAdapter,
+  createHerdrAdapterImpl = createHerdrAdapter,
+  ensureCodexWorkerHooksImpl = ensureCodexWorkerHooks,
   canonicalPath = resolveCanonicalPath,
   spawnChild = spawnChildProcess,
   inspectProcess = inspectChildProcess,
@@ -391,6 +492,9 @@ export async function createWorkflowCoordinatorRuntime({
   }
 
   const store = createRunStoreImpl({ stateRoot });
+  const runner = createProcessRunnerImpl();
+  const git = createGitAdapterImpl({ runner });
+  const herdr = createHerdrAdapterImpl({ runner });
   const delegations = createDelegationStoreImpl({ store });
   const reservations = createReservationStoreImpl({
     stateRoot,
@@ -415,6 +519,22 @@ export async function createWorkflowCoordinatorRuntime({
 
   return {
     delegations,
+    stateRoot,
+    async createLaunchCommand(options) {
+      return await createLaunchCommandImpl({
+        ...options,
+        registryPath: projectsFile,
+        stateRoot,
+        controlPlaneBin,
+      }, {
+        registry,
+        stateRoot,
+        controlPlaneBin,
+        git,
+        herdr,
+        ensureCodexWorkerHooks: ensureCodexWorkerHooksImpl,
+      });
+    },
     async resolveServicesForRun(runId) {
       const run = await store.read(runId);
       if (!servicesByProject.has(run.projectAlias)) {
@@ -438,12 +558,16 @@ export function createWorkflowCoordinatorExtension({
   delegations,
   getPreparedSubagentContext = async () => undefined,
   createWatcher = createDelegationWatcher,
+  createWorkerWatcherImpl = createWorkerWatcher,
+  createLaunchCommand,
   createRuntime = createWorkflowCoordinatorRuntime,
 } = {}) {
   return function workflowCoordinatorExtension(pi) {
     const approvedPreviews = new Map();
+    const approvedLaunches = new Map();
     const approvedMutations = new Map();
     let watcher = null;
+    let workerWatcher = null;
     let runtimePromise = null;
 
     async function runtime() {
@@ -456,6 +580,11 @@ export function createWorkflowCoordinatorExtension({
 
     async function servicesForRun(runId) {
       return await (await runtime()).resolveServicesForRun(runId);
+    }
+
+    async function launchCommandForSession(options) {
+      if (typeof createLaunchCommand === "function") return await createLaunchCommand(options);
+      return await (await runtime()).createLaunchCommand(options);
     }
 
     async function findDelegation(runId, delegationId, { originSessionId } = {}) {
@@ -481,8 +610,9 @@ export function createWorkflowCoordinatorExtension({
 
     pi.on("session_start", async (_event, ctx) => {
       const sessionId = sessionIdFromContext(ctx);
+      const rt = await runtime();
       watcher = createWatcher({
-        delegations: (await runtime()).delegations,
+        delegations: rt.delegations,
         originSessionId: sessionId,
         async onResult(result) {
           pi.sendMessage({
@@ -508,10 +638,35 @@ export function createWorkflowCoordinatorExtension({
         },
       });
       watcher.start();
+
+      if (rt.stateRoot) {
+        const { nextByte: initialByte } = await readEvents({ stateRoot: rt.stateRoot, fromByte: 0 });
+        workerWatcher = createWorkerWatcherImpl({
+          stateRoot: rt.stateRoot,
+          originSessionId: sessionId,
+          initialByte,
+          async onEvent(event) {
+            pi.sendMessage({
+              customType: "workflow-worker-result",
+              content: renderWorkerEvent(event),
+              details: event,
+              display: true,
+            }, {
+              deliverAs: "followUp",
+              triggerTurn: ctx.isIdle(),
+            });
+          },
+        });
+        workerWatcher.start();
+      }
     });
 
     pi.on("session_shutdown", async () => {
       watcher?.stop();
+      workerWatcher?.stop();
+      approvedPreviews.clear();
+      approvedLaunches.clear();
+      approvedMutations.clear();
     });
 
     pi.on("tool_call", async (event, ctx) => {
@@ -525,6 +680,67 @@ export function createWorkflowCoordinatorExtension({
       });
       if (accepted.allowed === true) return undefined;
       return { block: true, reason: accepted.reason };
+    });
+
+    pi.registerTool({
+      name: "workflow_prepare_launch",
+      label: "Workflow Prepare Launch",
+      description: "Render and approve a session-bound external workflow launch preview.",
+      parameters: prepareLaunchSchema,
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        requireUI(ctx, "workflow_prepare_launch");
+        const input = validatePrepareLaunchInput(params);
+        const originSession = { harness: "pi", sessionId: sessionIdFromContext(ctx) };
+        const command = await launchCommandForSession({ ...input, originSession });
+        const preview = command?.preview;
+        const approvalDigest = ensureString(preview?.approvalDigest, "launch approvalDigest", 128);
+        const approved = await ctx.ui.confirm("Approve Workflow launch preview?", renderLaunchPreview(preview));
+        if (!approved) {
+          return {
+            content: [{ type: "text", text: "Workflow launch preview was not approved." }],
+            details: { approved: false, approvalDigest },
+          };
+        }
+        approvedLaunches.set(approvalDigest, { command, preview, originSession });
+        return {
+          content: [{ type: "text", text: `Approved Workflow launch preview ${approvalDigest}.` }],
+          details: { approved: true, approvalDigest, preview },
+        };
+      },
+    });
+
+    pi.registerTool({
+      name: "workflow_execute_launch",
+      label: "Workflow Execute Launch",
+      description: "Execute only a previously approved session-bound workflow launch preview.",
+      parameters: executeLaunchSchema,
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        requireUI(ctx, "workflow_execute_launch");
+        const { approvalDigest } = validateLaunchApproval(params);
+        const prepared = approvedLaunches.get(approvalDigest);
+        if (!prepared) fail("Approved Workflow launch preview is missing or stale");
+        if (sessionIdFromContext(ctx) !== prepared.originSession.sessionId) {
+          fail("Approved Workflow launch preview belongs to a different Pi session");
+        }
+        const approved = await confirmMutation(ctx, "Execute Workflow launch?", renderLaunchPreview(prepared.preview), {
+          approvalDigest,
+          preview: prepared.preview,
+          originSession: prepared.originSession,
+        });
+        if (!approved) {
+          return {
+            content: [{ type: "text", text: "Workflow launch was cancelled." }],
+            details: { approved: false, approvalDigest },
+          };
+        }
+        approvedLaunches.delete(approvalDigest);
+        const report = await prepared.command.execute({ approvalDigest });
+        const details = launchDetailsForReport(report);
+        return {
+          content: [{ type: "text", text: renderLaunchReport(details) }],
+          details,
+        };
+      },
     });
 
     pi.registerTool({

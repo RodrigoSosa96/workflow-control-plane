@@ -49,6 +49,15 @@ export function createWorkflowWorkerLifecycleExtension({
           generation: current.generation,
           hasValidHandoff: await validHandoff(current.generation),
         });
+        // Best-effort notification for non-continuation stop states (settled / manual).
+        if (action !== "continue" && action !== "none") {
+          try {
+            const { notifyStop } = await import("../../src/workflow/notifier.js");
+            await notifyStop({ run: current, action });
+          } catch {
+            // swallow: a notifier must never break the lifecycle hook
+          }
+        }
         if (action === "continue") {
           // Set the flag BEFORE sending, so the agent_start this triggers is tagged.
           pendingContinuation = true;
@@ -65,6 +74,13 @@ export function createWorkflowWorkerLifecycleExtension({
     pi.on("session_shutdown", async () => {
       try {
         await life.onSessionEnd({ runId });
+        // Best-effort notification when the session ends without a handoff.
+        try {
+          const { notifyRun } = await import("../../src/workflow/notifier.js");
+          await notifyRun({ store, runId });
+        } catch {
+          // swallow: a notifier must never break the lifecycle hook
+        }
       } catch {
         // Swallow: a lifecycle bookkeeping error must never crash the worker.
       }

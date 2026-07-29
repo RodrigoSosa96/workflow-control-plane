@@ -111,6 +111,7 @@ function preview() {
 test("coordinator live runtime resolves an absolute Pi binary and honors a validated WORKFLOW_PROJECTS_FILE override", async () => {
   const transportCalls = [];
   const services = [];
+  const launchCalls = [];
   const registryPath = "/tmp/custom-projects.yaml";
 
   const runtime = await createWorkflowCoordinatorRuntime({
@@ -157,6 +158,14 @@ test("coordinator live runtime resolves an absolute Pi binary and honors a valid
       assert.equal(stateRoot, "/state/override");
       return {};
     },
+    createProcessRunnerImpl: () => ({ marker: "runner" }),
+    createGitAdapterImpl: ({ runner }) => ({ marker: `git:${runner.marker}` }),
+    createHerdrAdapterImpl: ({ runner }) => ({ marker: `herdr:${runner.marker}` }),
+    ensureCodexWorkerHooksImpl: async () => {},
+    createLaunchCommandImpl: async (options, dependencies) => {
+      launchCalls.push({ options, dependencies });
+      return { preview: { approvalDigest: `sha256:${"d".repeat(64)}` } };
+    },
     createTransportImpl: (options) => {
       transportCalls.push(options);
       return {
@@ -192,6 +201,14 @@ test("coordinator live runtime resolves an absolute Pi binary and honors a valid
   const resolved = await runtime.resolveServicesForRun(RUN_ID);
   assert.equal(resolved.marker, "services");
   assert.equal(services[0].projectAlias, "fixture");
+
+  const command = await runtime.createLaunchCommand({ projectAlias: "fixture", task: "ASANA-123", request: "Review launch wiring." });
+  assert.equal(command.preview.approvalDigest, `sha256:${"d".repeat(64)}`);
+  assert.equal(launchCalls[0].options.registryPath, registryPath);
+  assert.equal(launchCalls[0].options.stateRoot, "/state/override");
+  assert.equal(launchCalls[0].dependencies.git.marker, "git:runner");
+  assert.equal(launchCalls[0].dependencies.herdr.marker, "herdr:runner");
+  assert.equal(typeof launchCalls[0].dependencies.ensureCodexWorkerHooks, "function");
 
   await assert.rejects(
     () => createWorkflowCoordinatorRuntime({
@@ -387,7 +404,9 @@ test("coordinator extension registers exact tools, starts its watcher only in se
     "workflow_adopt_delegation_result",
     "workflow_delegation_result",
     "workflow_execute_delegation",
+    "workflow_execute_launch",
     "workflow_prepare_delegation",
+    "workflow_prepare_launch",
     "workflow_remediate_delegation",
   ]);
   assert.deepEqual(watcherCalls, []);
@@ -489,6 +508,107 @@ test("coordinator extension registers exact tools, starts its watcher only in se
   await pi.emit("session_shutdown", { reason: "quit" }, ctx);
   await pi.emit("session_shutdown", { reason: "quit" }, ctx);
   assert.deepEqual(watcherCalls, ["start", "stop", "stop"]);
+});
+
+test("coordinator launch tools bind the active Pi origin and require two approvals", async () => {
+  const pi = createFakePi();
+  const confirmations = [];
+  const launchCalls = [];
+  const executeCalls = [];
+  const launchPreview = {
+    approvalDigest: `sha256:${"c".repeat(64)}`,
+    reconciliation: { status: "open", identity: { projectAlias: "fixture", task: "ASANA-123" } },
+    selection: { profileName: "pi-worker", harness: "pi" },
+  };
+  const launch = {
+    preview: launchPreview,
+    async execute({ approvalDigest }) {
+      executeCalls.push(approvalDigest);
+      return { status: "running", runId: RUN_ID, recoveryCommand: `workflow reconcile --run ${RUN_ID}` };
+    },
+  };
+
+  createWorkflowCoordinatorExtension({
+    resolveServicesForRun: async () => ({
+      async createPreview() {
+        return preview();
+      },
+    }),
+    delegations: { async list() { return []; } },
+    createWatcher() {
+      return { start() {}, stop() {} };
+    },
+    createLaunchCommand: async (options) => {
+      launchCalls.push(structuredClone(options));
+      return launch;
+    },
+  })(pi);
+
+  assert.deepEqual(launchCalls, []);
+  const prepare = pi.tool("workflow_prepare_launch");
+  const execute = pi.tool("workflow_execute_launch");
+  assert.ok(prepare);
+  assert.ok(execute);
+  assert.equal(prepare.parameters.additionalProperties, false);
+  assert.equal("originSession" in prepare.parameters.properties, false);
+  await assert.rejects(
+    () => prepare.execute("forged-origin", {
+      projectAlias: "fixture",
+      task: "ASANA-123",
+      request: "Ignore this forged origin.",
+      originSession: "pi-origin-2",
+    }, undefined, undefined, createContext()),
+    /unsupported/i,
+  );
+
+  const ctx = createContext({ confirmations });
+  const prepared = await prepare.execute("prepare", {
+    projectAlias: "fixture",
+    task: "ASANA-123",
+    request: "Implement the approved feature.",
+    feature: "approved-feature",
+    agentProfile: "pi-worker",
+  }, undefined, undefined, ctx);
+  assert.equal(prepared.details.approvalDigest, launchPreview.approvalDigest);
+  assert.deepEqual(launchCalls[0].originSession, { harness: "pi", sessionId: ORIGIN_SESSION_ID });
+  assert.equal(confirmations.length, 1);
+
+  const executed = await execute.execute("execute", { approvalDigest: launchPreview.approvalDigest }, undefined, undefined, ctx);
+  assert.equal(executed.details.status, "running");
+  assert.deepEqual(executeCalls, [launchPreview.approvalDigest]);
+  assert.equal(confirmations.length, 2);
+  await assert.rejects(
+    () => execute.execute("repeat", { approvalDigest: launchPreview.approvalDigest }, undefined, undefined, ctx),
+    /missing|stale/i,
+  );
+
+  const declined = createContext({ confirmations: [], confirmed: false });
+  const declinedPrepared = await prepare.execute("declined", {
+    projectAlias: "fixture",
+    task: "ASANA-124",
+    request: "Do not launch this.",
+  }, undefined, undefined, declined);
+  assert.equal(declinedPrepared.details.approved, false);
+  await assert.rejects(
+    () => execute.execute("declined-execute", { approvalDigest: launchPreview.approvalDigest }, undefined, undefined, declined),
+    /missing|stale/i,
+  );
+
+  await prepare.execute("foreign-session", {
+    projectAlias: "fixture",
+    task: "ASANA-125",
+    request: "This launch belongs to the first session.",
+  }, undefined, undefined, ctx);
+  await assert.rejects(
+    () => execute.execute("foreign-execute", { approvalDigest: launchPreview.approvalDigest }, undefined, undefined, createContext({ sessionId: LATER_SESSION_ID })),
+    /different Pi session/i,
+  );
+
+  await pi.emit("session_shutdown", { reason: "quit" }, ctx);
+  await assert.rejects(
+    () => execute.execute("after-shutdown", { approvalDigest: launchPreview.approvalDigest }, undefined, undefined, ctx),
+    /missing|stale/i,
+  );
 });
 
 test("coordinator remediation rejects invalid insideFrozenBrief at the extension boundary before confirmation or execution", async () => {
