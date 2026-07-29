@@ -737,3 +737,46 @@ test("list skips unreadable run directories and reports them instead of failing 
   // Strict reads keep failing loudly for the poisoned run.
   await assert.rejects(() => store.read(RUN_ID_2), /not found/i);
 });
+
+test("update retries a fresh lock collision briefly and succeeds once it clears", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const sleeps = [];
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: uuidSequence(RUN_ID_1),
+    clock: clockSequence("2025-01-01T00:00:00.000Z"),
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      // The colliding writer (a worker lifecycle hook) releases its
+      // millisecond-scale lock while we back off.
+      await realFs.rm(join(stateRoot, RUN_ID_1, "run.lock", "active"), { recursive: true, force: true });
+    },
+  });
+  await store.create(plannedInput({ primaryTicket: "A-1" }));
+  await mkdir(join(stateRoot, RUN_ID_1, "run.lock", "active"), { recursive: true, mode: 0o700 });
+
+  const updated = await store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING }));
+  assert.equal(updated.state, RUN_STATES.LAUNCHING);
+  assert.equal(sleeps.length, 1);
+  assert.ok(sleeps[0] >= 25 && sleeps[0] < 100, `backoff must be jittered 25-100ms, got ${sleeps[0]}`);
+});
+
+test("update stays fail-fast when the lock collision persists past the bounded retries", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const sleeps = [];
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: uuidSequence(RUN_ID_1),
+    clock: clockSequence("2025-01-01T00:00:00.000Z"),
+    sleep: async (ms) => sleeps.push(ms),
+  });
+  await store.create(plannedInput({ primaryTicket: "A-1" }));
+  await mkdir(join(stateRoot, RUN_ID_1, "run.lock", "active"), { recursive: true, mode: 0o700 });
+
+  await assert.rejects(
+    () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
+    (error) => error.category === "run-lock" && error.details?.stale === false,
+  );
+  // Bounded: exactly two backoffs for three attempts, then the contention error.
+  assert.equal(sleeps.length, 2);
+});

@@ -413,7 +413,14 @@ test("beginRemediation races claim atomically so only one follow-up child launch
   const settled = await Promise.allSettled([first, second]);
   assert.equal(settled.filter((entry) => entry.status === "fulfilled").length, 1);
   assert.equal(settled.filter((entry) => entry.status === "rejected").length, 1);
-  assert.match(settled.find((entry) => entry.status === "rejected").reason.message, /claimed|launch|stale|remediation|locked|active lock/i);
+  // The loser may fail on lock contention (fast collision), on the claim guard,
+  // or — since lock acquisition retries briefly — on the record having already
+  // moved past a remediable state once the winner finished. All are fail-closed
+  // rejections before any side effect.
+  assert.match(
+    settled.find((entry) => entry.status === "rejected").reason.message,
+    /claimed|launch|stale|remediation|locked|active lock|allowed state/i,
+  );
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
 });
 

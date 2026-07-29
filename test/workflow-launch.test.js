@@ -1018,6 +1018,61 @@ test("an interactive launch persists the transport identity even when the post-s
   assert.deepEqual(store.snapshot().transportIdentity, sessionIdentity);
 });
 
+test("the launcher's final state write never regresses a run the worker already completed", async () => {
+  // COMPLETED→RUNNING is a legal transition (reserved for follow-ups), so a
+  // fixed `state: RUNNING` patch would silently regress a fast-completing
+  // worker with no later event to correct it. The final write must keep the
+  // worker's state and record only the launch report.
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+  const sessionIdentity = {
+    kind: "pi-session",
+    runId: RUN_ID,
+    sessionId: "sess-1",
+    paneId: "pane-1",
+    tabId: "tab-1",
+    workspaceId: "w1",
+    cwd: "/wt/ocr",
+  };
+
+  const report = await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => {
+      // The worker's lifecycle hooks win the race: a fast supervised worker
+      // registers a valid handoff and completes before the launcher's write lands.
+      await store.update(RUN_ID, () => ({ state: RUN_STATES.COMPLETED }));
+      return {
+        status: "completed",
+        operations: [
+          { id: "worktree", kind: "herdr.worktree.ensure", status: "created" },
+          {
+            id: "agent",
+            kind: "agent.session.start",
+            status: "created",
+            agentId: "agent-1",
+            tabId: "tab-1",
+            paneId: "pane-1",
+            sessionIdentity,
+          },
+        ],
+        guidance: [],
+        notes: [],
+      };
+    },
+  });
+
+  assert.equal(report.status, "running");
+  const stored = store.snapshot();
+  assert.equal(stored.state, RUN_STATES.COMPLETED);
+  assert.equal(stored.launchStatus, "completed");
+  assert.deepEqual(stored.transportIdentity, sessionIdentity);
+});
+
 test("partial environment or agent startup failures preserve the run and return exact reconcile recovery", async () => {
   const calls = [];
   const planCommand = planCommandFactory(calls);

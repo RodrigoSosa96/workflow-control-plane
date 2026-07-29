@@ -286,12 +286,14 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   // The relaunch focuses the resumed agent pane, not the fresh tab's empty root pane.
   assert.deepEqual(relaunchFocusCalls, [{ target: "w3:p1" }]);
 
-  // The confirmed relaunch must persist the new pane/tab identity — same sessionId, new
-  // paneId/tabId — so the next resume observes the live pane instead of the dead one.
-  assert.equal(relaunchStore.updates.length, 1);
+  // The confirmed relaunch first claims the relaunch under the run lock (so a
+  // concurrent resume refuses instead of double-spawning), then persists the new
+  // pane/tab identity — same sessionId, new paneId/tabId — and clears the claim.
+  assert.equal(relaunchStore.updates.length, 2);
   assert.equal(relaunchStore.updates[0].runId, RUN_ID);
-  assert.deepEqual(relaunchStore.updates[0].patch, { transportIdentity: newIdentity });
-  assert.equal(relaunchStore.updates[0].patch.transportIdentity.sessionId, identity.sessionId);
+  assert.equal(typeof relaunchStore.updates[0].patch.resumeClaim?.claimedAt, "string");
+  assert.deepEqual(relaunchStore.updates[1].patch, { transportIdentity: newIdentity, resumeClaim: null });
+  assert.equal(relaunchStore.updates[1].patch.transportIdentity.sessionId, identity.sessionId);
 });
 
 test("relaunch gives Herdr a valid agent name for a real UUID session id (<=32 chars)", async () => {

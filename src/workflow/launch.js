@@ -731,15 +731,25 @@ export async function executeLaunch(preview, deps = {}) {
       await updateRun(store, run.id, { transportIdentity: cloneData(agentOp.sessionIdentity) });
     }
 
-    await updateRun(store, run.id, {
-      state: isRunning ? RUN_STATES.RUNNING : RUN_STATES.FAILED,
-      harness: fresh.selection.harness,
-      profileName: fresh.selection.profileName,
-      launchStatus: isRunning ? (execution?.status ?? "completed") : "partial",
-      launchOperations: cloneData(execution?.operations ?? []),
-      launchNotes: cloneData(execution?.notes ?? []),
-      ...(hasCreatedAgent ? session : {}),
-      ...(!isRunning && execution?.error ? { launchError: cloneData(execution.error) } : {}),
+    await store.update(run.id, (current) => {
+      const launchPatch = {
+        harness: fresh.selection.harness,
+        profileName: fresh.selection.profileName,
+        launchStatus: isRunning ? (execution?.status ?? "completed") : "partial",
+        launchOperations: cloneData(execution?.operations ?? []),
+        launchNotes: cloneData(execution?.notes ?? []),
+        ...(hasCreatedAgent ? session : {}),
+        ...(!isRunning && execution?.error ? { launchError: cloneData(execution.error) } : {}),
+      };
+      // The worker's own lifecycle hooks advance the run concurrently with this
+      // launcher. If they already moved it past the launcher's states, keep
+      // their state — COMPLETED→RUNNING is a legal transition (follow-ups), so
+      // a fixed patch here would silently regress a fast-completing run — and
+      // record only the launch report.
+      if (current.state !== RUN_STATES.PLANNED && current.state !== RUN_STATES.LAUNCHING) {
+        return launchPatch;
+      }
+      return { state: isRunning ? RUN_STATES.RUNNING : RUN_STATES.FAILED, ...launchPatch };
     });
 
     if (!isRunning) {
@@ -757,12 +767,20 @@ export async function executeLaunch(preview, deps = {}) {
       error: { name: error.name, message: error.message },
     }, codexHookNotes);
     try {
-      await updateRun(store, run.id, {
-        state: RUN_STATES.FAILED,
-        harness: fresh.selection.harness,
-        profileName: fresh.selection.profileName,
-        launchStatus: "partial",
-        launchError: { name: error.name, message: error.message },
+      await store.update(run.id, (current) => {
+        const failurePatch = {
+          harness: fresh.selection.harness,
+          profileName: fresh.selection.profileName,
+          launchStatus: "partial",
+          launchError: { name: error.name, message: error.message },
+        };
+        // Only stamp FAILED while the run is still in the launcher's own
+        // states; a live worker that already advanced the run must keep its
+        // state and only gain the launch failure report.
+        if (current.state !== RUN_STATES.PLANNED && current.state !== RUN_STATES.LAUNCHING) {
+          return failurePatch;
+        }
+        return { state: RUN_STATES.FAILED, ...failurePatch };
       });
     } catch (_updateError) {
       // Preserve the original environment/start failure and the run directory for manual reconciliation.

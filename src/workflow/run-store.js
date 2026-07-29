@@ -139,11 +139,21 @@ function parseRunJson(text, path, expectedRunId) {
   return validateRunRecord(parsed, expectedRunId, path);
 }
 
-export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = defaultRandomUUID, onListProblem = () => {} } = {}) {
+export function createRunStore({
+  stateRoot,
+  fs = defaultFs,
+  clock,
+  randomUUID = defaultRandomUUID,
+  onListProblem = () => {},
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
   const root = resolveStateRoot(stateRoot);
   const now = createClock(clock);
   if (typeof onListProblem !== "function") {
     failStore("onListProblem must be a function");
+  }
+  if (typeof sleep !== "function") {
+    failStore("sleep must be a function");
   }
   let tempCounter = 0;
   let eventCounter = 0;
@@ -528,8 +538,26 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
     }
   }
 
+  // Millisecond-scale lock collisions (launcher final write vs a worker's
+  // fire-and-forget lifecycle hook) previously dropped the losing transition
+  // silently, because hook callers swallow errors by design. A short bounded
+  // retry makes those collisions survivable while staying fail-fast for stale
+  // locks (crash residue), which are never waited on.
+  async function acquireLockWithRetry(directory) {
+    const maxAttempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await acquireLock(directory);
+      } catch (error) {
+        const freshContention = error?.details?.stale === false;
+        if (!freshContention || attempt >= maxAttempts) throw error;
+        await sleep(25 + Math.floor(Math.random() * 75));
+      }
+    }
+  }
+
   async function withLock(directory, callback) {
-    const ownership = await acquireLock(directory);
+    const ownership = await acquireLockWithRetry(directory);
     let result;
     let callbackError;
     try {
