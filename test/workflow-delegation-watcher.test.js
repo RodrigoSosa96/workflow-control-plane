@@ -248,3 +248,63 @@ test("watcher survives reload races without losing results and reports stale/man
   assert.equal(notices.length, 1);
   assert.match(notices[0].reason, /stale|manual/i);
 });
+
+test("watcher retries a result whose delivery failed instead of consuming it", async () => {
+  const clock = createClock();
+  const delegations = createDelegations([delegationRecord()]);
+  const deliveries = [];
+  const errors = [];
+  let failuresRemaining = 1;
+  const watcher = createDelegationWatcher({
+    delegations,
+    originSessionId: ORIGIN_SESSION_ID,
+    clock,
+    async onResult(result) {
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        throw new Error("delivery failed");
+      }
+      deliveries.push(result);
+    },
+    onError: (error) => errors.push(error),
+  });
+
+  await watcher.poll();
+  // The failed delivery must not consume the record: it stays available for retry.
+  assert.equal(deliveries.length, 0);
+  assert.equal(delegations.calls.filter((call) => call.method === "consumeResult").length, 0);
+  assert.equal(errors.length, 1);
+
+  await watcher.poll();
+  assert.equal(deliveries.length, 1);
+  assert.equal(delegations.calls.filter((call) => call.method === "consumeResult").length, 1);
+});
+
+test("watcher reports scheduled poll failures and keeps polling", async () => {
+  const clock = createClock();
+  const errors = [];
+  const delegations = {
+    async list() {
+      throw new Error("store unavailable");
+    },
+    async consumeResult() {
+      throw new Error("unreachable");
+    },
+  };
+  const watcher = createDelegationWatcher({
+    delegations,
+    originSessionId: ORIGIN_SESSION_ID,
+    clock,
+    onResult: async () => {},
+    onError: (error) => errors.push(error),
+  });
+  watcher.start();
+  await clock.tick(5000);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(errors.length, 1);
+  assert.equal(watcher.isRunning(), true);
+  // The loop rescheduled itself despite the failure.
+  assert.equal(clock.pending().length, 1);
+  watcher.stop();
+});

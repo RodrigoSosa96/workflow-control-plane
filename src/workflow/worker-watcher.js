@@ -1,6 +1,7 @@
 import { readEvents } from "./events-bus.js";
 
-const TERMINAL_RUN_STATES = new Set(["completed", "failed", "blocked", "needs_input", "manual_handoff_required", "interrupted"]);
+// Run states use hyphenated names (see run-state.js RUN_STATES).
+const TERMINAL_RUN_STATES = new Set(["completed", "failed", "blocked", "needs-input", "manual-handoff-required", "interrupted"]);
 
 function fail(message) {
   throw new TypeError(message);
@@ -34,6 +35,7 @@ function eventPayload(event) {
     type: event.type,
     at: event.at,
     runId: event.runId,
+    generation: event.generation ?? null,
     originSessionId: event.originSessionId ?? null,
     harness: event.harness ?? null,
     runState: event.runState ?? null,
@@ -45,10 +47,19 @@ function eventPayload(event) {
   };
 }
 
+// One notification per run generation: a resumed run that reaches a second
+// terminal state in a later generation notifies again, while a handoff and a
+// lifecycle event for the same completion collapse into one notification.
+// Events written before generations were stamped share a single legacy key.
+function dedupeKey(event) {
+  return `${event.runId}:${event.generation ?? "legacy"}`;
+}
+
 export function createWorkerWatcher({
   stateRoot,
   originSessionId,
   onEvent,
+  onError = () => {},
   intervalMs = 5_000,
   clock,
   fs,
@@ -56,6 +67,7 @@ export function createWorkerWatcher({
 } = {}) {
   if (!stateRoot || typeof stateRoot !== "string") fail("stateRoot must be a non-empty string");
   const deliverEvent = ensureFunction(onEvent, "onEvent");
+  const reportError = ensureFunction(onError, "onError");
   const scheduler = ensureClock(clock);
   if (!Number.isInteger(intervalMs) || intervalMs < 1) fail("intervalMs must be a positive integer");
   if (!Number.isInteger(initialByte) || initialByte < 0) fail("initialByte must be a non-negative integer");
@@ -64,16 +76,28 @@ export function createWorkerWatcher({
   let timer = null;
   let inFlight = null;
   let nextByte = initialByte;
-  const seenRunIds = new Set();
+  const seenKeys = new Set();
   const sessionId = originSessionId ?? null;
+
+  function noteError(error) {
+    try {
+      reportError(error);
+    } catch {
+      // Error reporting is best-effort; it must never break the watcher.
+    }
+  }
 
   function schedule() {
     if (!running || timer) return;
     timer = scheduler.setTimeout(() => {
       timer = null;
-      Promise.resolve(poll()).finally(() => {
-        schedule();
-      });
+      // A poll failure must not become an unhandled rejection (it would tear
+      // down the extension host) and must not stop the polling loop.
+      Promise.resolve(poll())
+        .catch(noteError)
+        .finally(() => {
+          schedule();
+        });
     }, intervalMs);
     if (typeof timer?.unref === "function") timer.unref();
   }
@@ -102,10 +126,18 @@ export function createWorkerWatcher({
       if (sessionId && event.originSessionId && event.originSessionId !== sessionId) {
         continue;
       }
-      // Avoid duplicate notifications for the same run.
-      if (seenRunIds.has(event.runId)) continue;
-      seenRunIds.add(event.runId);
-      await deliverEvent(eventPayload(event));
+      const key = dedupeKey(event);
+      if (seenKeys.has(key)) continue;
+      try {
+        await deliverEvent(eventPayload(event));
+        // Mark seen only after a successful delivery so a later terminal event
+        // for the same generation still gets a chance if this delivery failed.
+        seenKeys.add(key);
+      } catch (error) {
+        // The cursor already advanced past this batch; a delivery failure is
+        // reported and the remaining events still get delivered.
+        noteError(error);
+      }
     }
   }
 

@@ -45,7 +45,13 @@ export async function readEvents({ stateRoot, fromByte = 0, fs = defaultFs } = {
     try {
       const buffer = Buffer.alloc(total - fromByte);
       const { bytesRead } = await fd.read(buffer, 0, buffer.length, fromByte);
-      const text = buffer.toString("utf8", 0, bytesRead);
+      // Consume only up to the last complete line. A trailing line caught
+      // mid-append is left for the next read instead of being skipped forever.
+      const lastNewline = bytesRead > 0 ? buffer.lastIndexOf(0x0a, bytesRead - 1) : -1;
+      if (lastNewline === -1) {
+        return { events: [], nextByte: fromByte };
+      }
+      const text = buffer.toString("utf8", 0, lastNewline + 1);
       const lines = text.split("\n").filter(Boolean);
       const events = [];
       for (const line of lines) {
@@ -55,7 +61,7 @@ export async function readEvents({ stateRoot, fromByte = 0, fs = defaultFs } = {
           // Skip malformed lines; the bus is best-effort.
         }
       }
-      return { events, nextByte: fromByte + bytesRead };
+      return { events, nextByte: fromByte + lastNewline + 1 };
     } finally {
       await fd.close();
     }

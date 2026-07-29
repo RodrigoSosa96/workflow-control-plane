@@ -712,3 +712,28 @@ test("lists runs with filters and writes private assignments", async (t) => {
   assert.deepEqual(listed.map((run) => run.id), [RUN_ID_1]);
   assert.equal(listed[0].directory, first.directory);
 });
+
+test("list skips unreadable run directories and reports them instead of failing wholesale", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const problems = [];
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: uuidSequence(RUN_ID_1),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    onListProblem: (problem) => problems.push(problem),
+  });
+  const created = await store.create(plannedInput({ primaryTicket: "A-1" }));
+  // Crash residue: a run directory without run.json (create() mkdirs before the
+  // first write). The no-cleanup policy preserves it; list() must not be poisoned.
+  await mkdir(join(stateRoot, RUN_ID_2), { recursive: true, mode: 0o700 });
+
+  const listed = await store.list({});
+  assert.deepEqual(listed.map((run) => run.id), [created.id]);
+  assert.equal(problems.length, 1);
+  assert.equal(problems[0].runId, RUN_ID_2);
+  assert.equal(problems[0].directory, join(stateRoot, RUN_ID_2));
+  assert.match(problems[0].message, /not found/i);
+
+  // Strict reads keep failing loudly for the poisoned run.
+  await assert.rejects(() => store.read(RUN_ID_2), /not found/i);
+});

@@ -536,7 +536,9 @@ export async function submitHandoff({ store, git, runId, generation, input, stat
 
   // Best-effort notification; never let a notifier script failure break the handoff.
   try {
-    await notifyHandoff({ run: settledRun, result, env: stateRoot ? { WORKFLOW_STATE_ROOT: stateRoot } : undefined });
+    // Preserve the caller's environment (WORKFLOW_HANDOFF_NOTIFIER, HOME) and
+    // only pin the authoritative state root on top of it.
+    await notifyHandoff({ run: settledRun, result, env: stateRoot ? { ...process.env, WORKFLOW_STATE_ROOT: stateRoot } : undefined });
   } catch {
     // swallow
   }

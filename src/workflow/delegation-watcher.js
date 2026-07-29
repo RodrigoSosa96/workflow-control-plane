@@ -81,6 +81,7 @@ export function createDelegationWatcher({
   originSessionId,
   onResult,
   onNotice = async () => {},
+  onError = () => {},
   intervalMs = 5_000,
   clock,
 } = {}) {
@@ -88,6 +89,7 @@ export function createDelegationWatcher({
   const sessionId = ensureString(originSessionId, "originSessionId");
   const deliverResult = ensureFunction(onResult, "onResult");
   const deliverNotice = ensureFunction(onNotice, "onNotice");
+  const reportError = ensureFunction(onError, "onError");
   const scheduler = ensureClock(clock);
   if (!Number.isInteger(intervalMs) || intervalMs < 1) fail("intervalMs must be a positive integer");
 
@@ -97,13 +99,25 @@ export function createDelegationWatcher({
   const seenNotices = noticeCache.get(store) ?? new Set();
   noticeCache.set(store, seenNotices);
 
+  function noteError(error) {
+    try {
+      reportError(error);
+    } catch {
+      // Error reporting is best-effort; it must never break the watcher.
+    }
+  }
+
   function schedule() {
     if (!running || timer) return;
     timer = scheduler.setTimeout(() => {
       timer = null;
-      Promise.resolve(poll()).finally(() => {
-        schedule();
-      });
+      // A poll failure must not become an unhandled rejection (it would tear
+      // down the extension host) and must not stop the polling loop.
+      Promise.resolve(poll())
+        .catch(noteError)
+        .finally(() => {
+          schedule();
+        });
     }, intervalMs);
     if (typeof timer?.unref === "function") timer.unref();
   }
@@ -125,27 +139,31 @@ export function createDelegationWatcher({
   async function runPoll() {
     const records = await store.list({ originSessionId: sessionId });
     for (const record of Array.isArray(records) ? records : []) {
-      if (currentTerminalResult(record, sessionId)) {
-        let consumed;
-        try {
-          consumed = await store.consumeResult({
+      // Per-record containment: one failing record must not block delivery for
+      // the rest of the origin session's delegations.
+      try {
+        if (currentTerminalResult(record, sessionId)) {
+          // Deliver before consuming. A failed delivery leaves the record
+          // unconsumed so the next poll retries it (at-least-once), instead of
+          // permanently consuming a result the origin session never saw.
+          await deliverResult(resultPayload(record));
+          await store.consumeResult({
             runId: record.parentRunId,
             delegationId: record.id,
             originSessionId: sessionId,
           });
-        } catch {
           continue;
         }
-        await deliverResult(resultPayload(consumed));
-        continue;
-      }
 
-      const reason = shouldNotice(record, sessionId);
-      if (!reason) continue;
-      const key = noticeKey(record, reason);
-      if (seenNotices.has(key)) continue;
-      seenNotices.add(key);
-      await deliverNotice(noticePayload(record, reason));
+        const reason = shouldNotice(record, sessionId);
+        if (!reason) continue;
+        const key = noticeKey(record, reason);
+        if (seenNotices.has(key)) continue;
+        seenNotices.add(key);
+        await deliverNotice(noticePayload(record, reason));
+      } catch (error) {
+        noteError(error);
+      }
     }
   }
 

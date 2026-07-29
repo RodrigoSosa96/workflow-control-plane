@@ -46,6 +46,7 @@ function baseEvent(run, result, notificationType, action = null) {
     type: notificationType,
     at: new Date().toISOString(),
     runId: run?.id ?? "",
+    generation: Number.isSafeInteger(run?.generation) ? run.generation : null,
     originSessionId: run?.originSessionId ?? null,
     harness: run?.harness ?? "",
     runState: run?.state ?? "",

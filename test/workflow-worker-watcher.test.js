@@ -132,3 +132,98 @@ test("worker watcher deduplicates by runId", async () => {
   watcher.stop();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("worker watcher recognizes hyphenated terminal run states", async () => {
+  const dir = await tempDir();
+  const events = [];
+  const clock = makeClock();
+  const watcher = createWorkerWatcher({
+    stateRoot: dir,
+    onEvent: (event) => events.push(event),
+    intervalMs: 1000,
+    clock,
+  });
+  // Run states are hyphenated (run-state.js); these must notify.
+  await appendEvent({ stateRoot: dir, event: { type: "run", runId: "r1", runState: "needs-input" } });
+  await appendEvent({ stateRoot: dir, event: { type: "run", runId: "r2", runState: "manual-handoff-required" } });
+  await watcher.poll();
+  assert.deepEqual(events.map((event) => event.runId), ["r1", "r2"]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("worker watcher re-notifies later generations and collapses events within one generation", async () => {
+  const dir = await tempDir();
+  const events = [];
+  const clock = makeClock();
+  const watcher = createWorkerWatcher({
+    stateRoot: dir,
+    onEvent: (event) => events.push(event),
+    intervalMs: 1000,
+    clock,
+  });
+  // Stopped in generation 1, resumed, completed in generation 2: both notify.
+  await appendEvent({ stateRoot: dir, event: { type: "run", runId: "r1", generation: 1, runState: "needs-input" } });
+  await appendEvent({ stateRoot: dir, event: { type: "handoff", runId: "r1", generation: 2, runState: "completed" } });
+  // The lifecycle event for the same completion collapses into the handoff notification.
+  await appendEvent({ stateRoot: dir, event: { type: "run", runId: "r1", generation: 2, runState: "completed" } });
+  await watcher.poll();
+  assert.equal(events.length, 2);
+  assert.equal(events[0].generation, 1);
+  assert.equal(events[1].type, "handoff");
+  assert.equal(events[1].generation, 2);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("worker watcher reports scheduled poll errors and keeps polling", async () => {
+  const dir = await tempDir();
+  const errors = [];
+  const clock = makeClock();
+  const failingFs = {
+    async stat() {
+      const error = new Error("permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+  };
+  const watcher = createWorkerWatcher({
+    stateRoot: dir,
+    onEvent: () => {},
+    onError: (error) => errors.push(error),
+    intervalMs: 1000,
+    clock,
+    fs: failingFs,
+  });
+  watcher.start();
+  clock.fire();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(errors.length, 1);
+  assert.equal(watcher.isRunning(), true);
+  // Direct callers still observe the rejection.
+  await assert.rejects(() => watcher.poll(), /permission denied/);
+  watcher.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("worker watcher contains a delivery failure and still delivers remaining events", async () => {
+  const dir = await tempDir();
+  const delivered = [];
+  const errors = [];
+  const clock = makeClock();
+  const watcher = createWorkerWatcher({
+    stateRoot: dir,
+    onEvent: (event) => {
+      if (event.runId === "r-bad") throw new Error("delivery failed");
+      delivered.push(event.runId);
+    },
+    onError: (error) => errors.push(error),
+    intervalMs: 1000,
+    clock,
+  });
+  await appendEvent({ stateRoot: dir, event: { type: "handoff", runId: "r-bad", runState: "completed" } });
+  await appendEvent({ stateRoot: dir, event: { type: "handoff", runId: "r-good", runState: "completed" } });
+  await watcher.poll();
+  assert.deepEqual(delivered, ["r-good"]);
+  assert.equal(errors.length, 1);
+  await rm(dir, { recursive: true, force: true });
+});

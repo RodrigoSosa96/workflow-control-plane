@@ -139,9 +139,12 @@ function parseRunJson(text, path, expectedRunId) {
   return validateRunRecord(parsed, expectedRunId, path);
 }
 
-export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = defaultRandomUUID } = {}) {
+export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = defaultRandomUUID, onListProblem = () => {} } = {}) {
   const root = resolveStateRoot(stateRoot);
   const now = createClock(clock);
+  if (typeof onListProblem !== "function") {
+    failStore("onListProblem must be a function");
+  }
   let tempCounter = 0;
   let eventCounter = 0;
   let lockCounter = 0;
@@ -712,8 +715,22 @@ export function createRunStore({ stateRoot, fs = defaultFs, clock, randomUUID = 
       if (!entry.isDirectory() || !RUN_ID_RE.test(entry.name)) continue;
       const runId = entry.name.toLowerCase();
       const directory = runDirectoryFor(runId);
-      await tightenExistingRunDirectory(directory);
-      const run = attachDirectory(await readRunInternal(runId, directory), directory);
+      // An unreadable run directory (for example crash residue between create()'s
+      // mkdir and the first run.json write, preserved by the no-cleanup policy)
+      // must not poison listing for every other run. Skip it, report it, and
+      // keep read()/update() strict.
+      let run;
+      try {
+        await tightenExistingRunDirectory(directory);
+        run = attachDirectory(await readRunInternal(runId, directory), directory);
+      } catch (error) {
+        try {
+          onListProblem({ runId, directory, message: String(error?.message ?? error).slice(0, 512) });
+        } catch {
+          // Problem reporting is best-effort; it must never break listing.
+        }
+        continue;
+      }
       if (filters.projectAlias !== undefined && run.projectAlias !== filters.projectAlias) continue;
       if (filters.originSessionId !== undefined && run.originSessionId !== filters.originSessionId) continue;
       if (filters.unconsumed === true && run.consumedAt) continue;
