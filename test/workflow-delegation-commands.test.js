@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { delegationReconcileCommand, delegationRemediateCommand, delegationResultCommand } from "../src/workflow/commands.js";
+import { delegationReconcileCommand, delegationReleaseCommand, delegationRemediateCommand, delegationResultCommand } from "../src/workflow/commands.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -491,4 +491,66 @@ test("delegation reconcile rejects mismatched explicit projects", async () => {
     })),
     /does not match run project/i,
   );
+});
+
+function releasableReservations(records) {
+  const released = [];
+  return {
+    released,
+    async list() {
+      return structuredClone(records);
+    },
+    async releaseForDelegation({ projectAlias, delegationId }) {
+      released.push({ projectAlias, delegationId });
+      const matching = records.filter((entry) => entry.delegationId === delegationId && entry.state === "active");
+      for (const entry of matching) entry.state = "released";
+      return matching.map((entry) => ({ ...entry, state: "released" }));
+    },
+  };
+}
+
+test("delegation release frees a retained lease only after confirmation and never while the delegation runs", async () => {
+  const lease = { id: "44444444-4444-4444-8444-444444444444", delegationId: DELEGATION_ID, state: "active", resources: ["totalInternal", "writersTotal"] };
+
+  // A live delegation keeps its lease: its child may still submit a result.
+  const running = releasableReservations([{ ...lease }]);
+  await assert.rejects(
+    () => delegationReleaseCommand(
+      { runId: RUN_ID, delegationId: DELEGATION_ID, confirmed: true },
+      { store: storeFor(runRecord(delegationRecord({ state: "running", result: null }))), reservations: running, registry: REGISTRY },
+    ),
+    (error) => /still running/i.test(error.message),
+  );
+  assert.deepEqual(running.released, []);
+
+  // A start failure retains its lease; the release is gated on confirmation.
+  const failed = delegationRecord({ state: "failed", result: null, startFailure: { reason: "Delegation transport start failed" } });
+  const reservations = releasableReservations([{ ...lease }]);
+  const pending = await delegationReleaseCommand(
+    { runId: RUN_ID, delegationId: DELEGATION_ID },
+    { store: storeFor(runRecord(failed)), reservations, registry: REGISTRY },
+  );
+  assert.equal(pending.action, "needs-confirmation");
+  assert.deepEqual(pending.pending.map((entry) => entry.id), [lease.id]);
+  assert.deepEqual(reservations.released, []);
+
+  const releasedReport = await delegationReleaseCommand(
+    { runId: RUN_ID, delegationId: DELEGATION_ID, confirmed: true },
+    { store: storeFor(runRecord(failed)), reservations, registry: REGISTRY },
+  );
+  assert.equal(releasedReport.action, "released");
+  assert.deepEqual(releasedReport.released.map((entry) => entry.id), [lease.id]);
+  assert.equal(releasedReport.cleanup, "none");
+  assert.deepEqual(reservations.released, [{ projectAlias: PROJECT_ALIAS, delegationId: DELEGATION_ID }]);
+});
+
+test("delegation release reports nothing to do when no active lease remains", async () => {
+  const reservations = releasableReservations([]);
+  const result = await delegationReleaseCommand(
+    { runId: RUN_ID, delegationId: DELEGATION_ID, confirmed: true },
+    { store: storeFor(runRecord(delegationRecord())), reservations, registry: REGISTRY },
+  );
+  assert.deepEqual(result.released, []);
+  assert.equal(result.reservation.state, "missing");
+  assert.deepEqual(reservations.released, []);
 });

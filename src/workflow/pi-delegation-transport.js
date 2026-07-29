@@ -262,6 +262,11 @@ function assignmentContext(approvedAssignment, { stateRoot, controlPlaneBin }) {
     cwd,
     briefPath,
     generation,
+    // The per-delegation secret minted at claim time. It reaches the child only
+    // through its private environment; the store requires it on every result.
+    claimToken: delegation.claimToken === undefined
+      ? null
+      : assertString(delegation.claimToken, "delegation claimToken", { limit: 128 }),
     task: assertPrompt(assignment.task, "delegation task"),
     brief: assertPrompt(assignment.brief, "delegation brief"),
   };
@@ -315,6 +320,7 @@ export function createPiDelegationTransport({
       runId: context.runId,
       delegationId: context.delegationId,
       generation: context.generation,
+      claimToken: context.claimToken,
       runDirectory: context.runDirectory,
       stateRoot: resolvedStateRoot,
       controlPlaneBin: resolvedControlPlaneBin,

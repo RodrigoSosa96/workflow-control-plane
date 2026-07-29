@@ -14,6 +14,7 @@ import {
   closeCommand as defaultCloseCommand,
   delegationHandoffCommand as defaultDelegationHandoffCommand,
   delegationReconcileCommand as defaultDelegationReconcileCommand,
+  delegationReleaseCommand as defaultDelegationReleaseCommand,
   delegationRemediateCommand as defaultDelegationRemediateCommand,
   delegationResultCommand as defaultDelegationResultCommand,
   doctorCommand as defaultDoctorCommand,
@@ -60,6 +61,7 @@ Commands:
   workflow delegation reconcile <run-id> <delegation-id> [--format compact|json]
   workflow delegation remediate <run-id> <delegation-id> --prompt-file <path> [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow delegation handoff <run-id> <delegation-id> --input <run-dir>/delegations/<delegation-id>/handoff-input.json [--format compact|json]
+  workflow delegation release <run-id> <delegation-id> [--format compact|json] [--yes]
 
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path
@@ -246,6 +248,18 @@ export function parseArgs(argv) {
         promptFile: options["prompt-file"],
         ...(options["dry-run"] ? { dryRun: true } : {}),
         ...(options["approval-digest"] ? { approvalDigest: options["approval-digest"] } : {}),
+        ...(options.yes ? { yes: true } : {}),
+        format,
+      };
+    }
+    if (subcommand === "release") {
+      validateShape("delegation release", positionals.slice(1), options, { min: 2, max: 2, allowedOptions: ["yes"] });
+      assertPathSafeUuidSyntax(positionals[1], "delegation release run ID");
+      assertPathSafeUuidSyntax(positionals[2], "delegation release delegation ID");
+      return {
+        command: "delegation-release",
+        runId: positionals[1],
+        delegationId: positionals[2],
         ...(options.yes ? { yes: true } : {}),
         format,
       };
@@ -697,8 +711,11 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         approvalDigest = command.preview.approvalDigest;
       }
 
+      // The execute report gets the same budget as the previews: launch JSON is
+      // sized up to ~77KiB by format.js, and emitting it with the default limit
+      // would truncate it mid-JSON for machine callers.
       const report = await command.execute({ approvalDigest });
-      emit(out, formatWorkflowResult("launch", report, args.format));
+      emit(out, formatWorkflowResult("launch", report, args.format), { limit: LAUNCH_OUTPUT_LIMIT });
       if (report.status === "partial") return 13;
       if (report.status === "failed") return 12;
       return 0;
@@ -762,6 +779,13 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const commandDependencies = await withLiveDelegationTransport(options, liveDependencies, dependencies);
       const result = await delegationReconcileCommand(options, commandDependencies);
       emit(out, formatWorkflowResult("delegation-reconcile", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "delegation-release") {
+      const delegationReleaseCommand = dependencies.delegationReleaseCommand ?? defaultDelegationReleaseCommand;
+      const result = await delegationReleaseCommand({ ...options, confirmed: Boolean(options.yes) }, liveDependencies);
+      emit(out, formatWorkflowResult("delegation-release", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

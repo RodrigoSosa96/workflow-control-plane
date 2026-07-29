@@ -65,8 +65,12 @@ async function safeInspectRepository(git, cwd) {
 async function safeStatus(git, cwd) {
   try {
     return await git.status({ cwd });
-  } catch {
-    return { dirty: false, entries: [] };
+  } catch (error) {
+    // dirty: null means "status could not be read" — the classifier must treat
+    // it as a conflict, never as clean-and-compatible: a failing `git status`
+    // (held index.lock, permissions, corruption) is the checkout at its most
+    // suspect, and this result feeds the launch preview and approval digest.
+    return { dirty: null, error: String(error?.message ?? error).slice(0, 256), entries: [] };
   }
 }
 
@@ -383,22 +387,38 @@ async function classifyWorktrees(plan, git, canonicalPath) {
         };
       } else {
         const status = await safeStatus(git, planned.path);
-        classified = {
-          ...planned,
-          status: "compatible",
-          reason: `Worktree ${planned.path} matches ${planned.branch}`,
-          canonicalPath: plannedCanonicalPath,
-          actual: {
-            path: exact.path,
-            canonicalPath: exact.canonicalPath,
-            branch: exact.normalizedBranch,
-            commonDirPath: expectedCommonDirPath,
-            rootPath: occupantRootPath ?? exact.canonicalPath,
-            dirty: Boolean(status?.dirty),
-            entries: status?.entries ?? [],
-          },
-          expectedCommonDirPath,
-        };
+        if (status.dirty === null) {
+          classified = {
+            ...planned,
+            status: "conflict",
+            reason: `Worktree ${planned.path} status could not be read: ${status.error}`,
+            canonicalPath: plannedCanonicalPath,
+            actual: {
+              path: exact.path,
+              canonicalPath: exact.canonicalPath,
+              branch: exact.normalizedBranch,
+              commonDirPath: expectedCommonDirPath,
+            },
+            expectedCommonDirPath,
+          };
+        } else {
+          classified = {
+            ...planned,
+            status: "compatible",
+            reason: `Worktree ${planned.path} matches ${planned.branch}`,
+            canonicalPath: plannedCanonicalPath,
+            actual: {
+              path: exact.path,
+              canonicalPath: exact.canonicalPath,
+              branch: exact.normalizedBranch,
+              commonDirPath: expectedCommonDirPath,
+              rootPath: occupantRootPath ?? exact.canonicalPath,
+              dirty: Boolean(status?.dirty),
+              entries: status?.entries ?? [],
+            },
+            expectedCommonDirPath,
+          };
+        }
       }
     } else if (sameBranch) {
       classified = {

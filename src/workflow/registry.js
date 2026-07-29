@@ -35,6 +35,13 @@ const FORBIDDEN_ARGUMENTS = [
   "--dangerously-bypass-approvals-and-sandbox",
   "--dangerously-bypass-hook-trust",
 ];
+// Flags the control plane itself generates (or that would replace its generated
+// wiring: lifecycle hooks, permission allowlist, session identity). Harness argv
+// is last-wins, so a profile argument would silently override the generated
+// value the launch approval digest gated.
+const CONTROL_PLANE_ARGUMENTS = {
+  claude: ["--settings", "--mcp-config", "--append-system-prompt", "--session-id", "--resume"],
+};
 const RAW_CONTROL_ARGUMENTS = {
   claude: [{ field: "permission_mode", options: ["--permission-mode"] }],
   codex: [
@@ -152,6 +159,12 @@ function validateArguments(values, profileName, harness) {
       }
     }
 
+    for (const owned of CONTROL_PLANE_ARGUMENTS[harness] ?? []) {
+      if (matchesRawOption(lower, owned)) {
+        fail("schema", `agent profile ${profileName} must not override control-plane-managed argument ${argument}`);
+      }
+    }
+
     for (const control of RAW_CONTROL_ARGUMENTS[harness] ?? []) {
       if (control.options.some((option) => matchesRawOption(lower, option))) {
         fail("schema", `agent profile ${profileName} must not override structured ${control.field} via raw argument ${argument}`);
@@ -261,8 +274,11 @@ function validateOrdinaryProject(project, projectName) {
   normalized.base_branch = validateString(normalized.base_branch, `${projectName}.base_branch`);
   normalized.worktree = validateWorktree(normalized.worktree, projectName);
   normalized.runtime = validateRuntime(normalized.runtime);
-  if (normalized.verify !== undefined && !Array.isArray(normalized.verify)) {
-    fail("schema", `${projectName}.verify must be an array of commands`);
+  if (normalized.verify !== undefined) {
+    if (!Array.isArray(normalized.verify)) {
+      fail("schema", `${projectName}.verify must be an array of commands`);
+    }
+    normalized.verify = normalized.verify.map((command, index) => validateString(command, `${projectName}.verify[${index}]`));
   }
   return normalized;
 }
@@ -299,8 +315,11 @@ function validateGroupProject(project, projectName) {
   }
   normalized.repositories = repositories;
   normalized.runtime = validateRuntime(normalized.runtime);
-  if (normalized.verify !== undefined && !Array.isArray(normalized.verify)) {
-    fail("schema", `${projectName}.verify must be an array of commands`);
+  if (normalized.verify !== undefined) {
+    if (!Array.isArray(normalized.verify)) {
+      fail("schema", `${projectName}.verify must be an array of commands`);
+    }
+    normalized.verify = normalized.verify.map((command, index) => validateString(command, `${projectName}.verify[${index}]`));
   }
   return normalized;
 }

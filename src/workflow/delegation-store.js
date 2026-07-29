@@ -58,9 +58,9 @@ function delegationId(randomUUID) {
   return value.toLowerCase();
 }
 
-function remediationClaimToken(randomUUID) {
+function mintClaimToken(randomUUID) {
   const value = randomUUID();
-  if (typeof value !== "string" || !UUID_RE.test(value)) fail("delegation remediation claim generator returned an invalid UUID");
+  if (typeof value !== "string" || !UUID_RE.test(value)) fail("delegation claim generator returned an invalid UUID");
   return value.toLowerCase();
 }
 
@@ -150,7 +150,7 @@ function validateTransportIdentityReplacement(value, runId, delegationId) {
   };
 }
 
-function validateClaimToken(value, context = "delegation remediation claim token") {
+function validateClaimToken(value, context = "delegation claim token") {
   const token = assertString(value, context, { limit: 128 });
   if (!UUID_RE.test(token)) fail(`${context} must be a UUID`);
   return token.toLowerCase();
@@ -277,7 +277,18 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       runId,
       delegationId: id,
       expectedStates: new Set(["prepared"]),
-      mutate: (record) => ({ ...record, state: "running", claimedAt: now(clock) }),
+      // Mint the per-delegation secret here, at the single point where a
+      // delegation becomes eligible to submit a result. The transport hands it
+      // to the child through its private env only, and recordResult requires it
+      // on every generation — otherwise any same-user process (including a
+      // sibling delegation, which can enumerate run-directory delegation IDs)
+      // could forge a first-generation advisory result for another role.
+      mutate: (record) => ({
+        ...record,
+        state: "running",
+        claimedAt: now(clock),
+        claimToken: mintClaimToken(randomUUID),
+      }),
     });
   }
 
@@ -409,7 +420,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           remediation: {
             state: "launching",
             generation: record.generation + 1,
-            claimToken: remediationClaimToken(randomUUID),
+            claimToken: mintClaimToken(randomUUID),
             claimedAt: now(clock),
           },
         };

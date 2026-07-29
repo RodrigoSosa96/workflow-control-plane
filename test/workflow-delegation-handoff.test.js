@@ -90,7 +90,7 @@ async function createFixture(t, { reserve = true } = {}) {
       remediationTurns: 2,
     },
   });
-  await delegations.claim({ runId: run.id, delegationId: DELEGATION_ID });
+  const claimed = await delegations.claim({ runId: run.id, delegationId: DELEGATION_ID });
   await delegations.recordTransportIdentity({ runId: run.id, delegationId: DELEGATION_ID, identity: transportIdentity() });
 
   if (reserve) {
@@ -104,11 +104,13 @@ async function createFixture(t, { reserve = true } = {}) {
     });
   }
 
-  return { stateRoot, store, run, delegations, reservations };
+  // The per-delegation claim token is the secret the child receives through its
+  // private env; every handoff must present it.
+  return { stateRoot, store, run, delegations, reservations, claimToken: claimed.claimToken };
 }
 
 test("submitDelegationHandoff records a bounded current-generation advisory result", async (t) => {
-  const { store, run, delegations, reservations } = await createFixture(t);
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
 
   const result = await submitDelegationHandoff({
     runId: run.id,
@@ -117,6 +119,7 @@ test("submitDelegationHandoff records a bounded current-generation advisory resu
     store,
     delegations,
     reservations,
+    claimToken,
     git: {},
   });
 
@@ -200,26 +203,26 @@ test("submitDelegationHandoff rejects unverified remediation children kept in ma
 });
 
 test("submitDelegationHandoff rejects wrong identity, stale generations, unbounded summaries, missing reservations, and duplicate results", async (t) => {
-  const { store, run, delegations, reservations } = await createFixture(t, { reserve: false });
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t, { reserve: false });
 
   await assert.rejects(
-    () => submitDelegationHandoff({ runId: "99999999-9999-4999-8999-999999999999", delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, git: {} }),
+    () => submitDelegationHandoff({ runId: "99999999-9999-4999-8999-999999999999", delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, claimToken, git: {} }),
     /run|not found/i,
   );
   await assert.rejects(
-    () => submitDelegationHandoff({ runId: run.id, delegationId: "99999999-9999-4999-8999-999999999999", input: advisoryInput(), store, delegations, reservations, git: {} }),
+    () => submitDelegationHandoff({ runId: run.id, delegationId: "99999999-9999-4999-8999-999999999999", input: advisoryInput(), store, delegations, reservations, claimToken, git: {} }),
     /delegation|not found/i,
   );
   await assert.rejects(
-    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput({ generation: 2 }), store, delegations, reservations, git: {} }),
+    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput({ generation: 2 }), store, delegations, reservations, claimToken, git: {} }),
     /generation|current|stale/i,
   );
   await assert.rejects(
-    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput({ summary: "x".repeat(5000) }), store, delegations, reservations, git: {} }),
+    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput({ summary: "x".repeat(5000) }), store, delegations, reservations, claimToken, git: {} }),
     /summary|bounded|limit/i,
   );
   await assert.rejects(
-    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, git: {} }),
+    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, claimToken, git: {} }),
     /reservation/i,
   );
 
@@ -231,15 +234,42 @@ test("submitDelegationHandoff rejects wrong identity, stale generations, unbound
     checkoutPath: CWD,
     policy: DEFAULT_DELEGATION_POLICY,
   });
-  await submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, git: {} });
+  await submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, claimToken, git: {} });
+  // A duplicate result stays rejected; the terminal handoff already released the
+  // lease, so the reservation check is now the first guard to refuse it.
   await assert.rejects(
-    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, git: {} }),
-    /allowed state|duplicate|running/i,
+    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, claimToken, git: {} }),
+    /allowed state|duplicate|running|reservation/i,
   );
 });
 
+test("a terminal handoff releases the delegation reservation so per-project capacity is not exhausted", async (t) => {
+  // release() could never be called (its owner token is never persisted outside
+  // the lease file), so every delegation leaked its lease: with
+  // writersPerCheckout: 1 a single successful writer delegation bricked the lane.
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
+
+  const before = await reservations.list({ projectAlias: PROJECT_ALIAS });
+  assert.deepEqual(before.filter((entry) => entry.state === "active").map((entry) => entry.delegationId), [DELEGATION_ID]);
+
+  await submitDelegationHandoff({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    input: advisoryInput(),
+    store,
+    delegations,
+    reservations,
+    claimToken,
+    git: {},
+  });
+
+  const after = await reservations.list({ projectAlias: PROJECT_ALIAS });
+  assert.equal(after.filter((entry) => entry.state === "active").length, 0);
+  assert.deepEqual(after.map((entry) => entry.state), ["released"]);
+});
+
 test("delegationHandoffCommand reads only the canonical delegation input path and verifies WORKFLOW identity", async (t) => {
-  const { store, run, delegations, reservations } = await createFixture(t);
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
   const canonicalInput = join(run.directory, "delegations", DELEGATION_ID, "handoff-input.json");
   await writeFile(canonicalInput, `${JSON.stringify(advisoryInput())}\n`);
 
@@ -251,6 +281,7 @@ test("delegationHandoffCommand reads only the canonical delegation input path an
       WORKFLOW_RUN_ID: run.id,
       WORKFLOW_DELEGATION_ID: DELEGATION_ID,
       WORKFLOW_DELEGATION_GENERATION: "1",
+      WORKFLOW_DELEGATION_CLAIM_TOKEN: claimToken,
     },
   }, {
     store,
@@ -262,11 +293,54 @@ test("delegationHandoffCommand reads only the canonical delegation input path an
   assert.equal(result.state, "completed");
 
   await assert.rejects(
-    () => delegationHandoffCommand({ runId: run.id, delegationId: DELEGATION_ID, input: "/tmp/attacker.json", env: { WORKFLOW_RUN_ID: run.id, WORKFLOW_DELEGATION_ID: DELEGATION_ID, WORKFLOW_DELEGATION_GENERATION: "1" } }, { store, delegations, reservations, fs: realFs, git: {} }),
+    () => delegationHandoffCommand({ runId: run.id, delegationId: DELEGATION_ID, input: "/tmp/attacker.json", env: { WORKFLOW_RUN_ID: run.id, WORKFLOW_DELEGATION_ID: DELEGATION_ID, WORKFLOW_DELEGATION_GENERATION: "1", WORKFLOW_DELEGATION_CLAIM_TOKEN: claimToken } }, { store, delegations, reservations, fs: realFs, git: {} }),
     /handoff-input\.json|canonical|arbitrary/i,
   );
   await assert.rejects(
-    () => delegationHandoffCommand({ runId: run.id, delegationId: DELEGATION_ID, input: canonicalInput, env: { WORKFLOW_RUN_ID: run.id, WORKFLOW_DELEGATION_ID: "other-delegation", WORKFLOW_DELEGATION_GENERATION: "1" } }, { store, delegations, reservations, fs: realFs, git: {} }),
+    () => delegationHandoffCommand({ runId: run.id, delegationId: DELEGATION_ID, input: canonicalInput, env: { WORKFLOW_RUN_ID: run.id, WORKFLOW_DELEGATION_ID: "other-delegation", WORKFLOW_DELEGATION_GENERATION: "1", WORKFLOW_DELEGATION_CLAIM_TOKEN: claimToken } }, { store, delegations, reservations, fs: realFs, git: {} }),
     /WORKFLOW_DELEGATION_ID|identity|mismatch/i,
   );
+});
+
+test("submitDelegationHandoff rejects a sibling forging a first-generation result without the claim token", async (t) => {
+  // Run ID, delegation ID, and generation are all discoverable by any same-user
+  // process: a sibling delegation can enumerate them under the run directory.
+  // Only the per-delegation secret, handed to the child through its private env,
+  // authenticates an advisory result.
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
+
+  await assert.rejects(
+    () => submitDelegationHandoff({ runId: run.id, delegationId: DELEGATION_ID, input: advisoryInput(), store, delegations, reservations, git: {} }),
+    /claim token/i,
+  );
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput(),
+      store,
+      delegations,
+      reservations,
+      claimToken: "99999999-9999-4999-8999-999999999999",
+      git: {},
+    }),
+    /claim token does not match/i,
+  );
+
+  // No forged attempt may leave a result behind.
+  const untouched = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(untouched.state, "running");
+  assert.equal(untouched.result, null);
+
+  const accepted = await submitDelegationHandoff({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    input: advisoryInput(),
+    store,
+    delegations,
+    reservations,
+    claimToken,
+    git: {},
+  });
+  assert.equal(accepted.state, "completed");
 });

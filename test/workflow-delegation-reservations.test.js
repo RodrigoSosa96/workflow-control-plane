@@ -228,3 +228,61 @@ test("does not remove an active foreign reservation gate", async (t) => {
   assert.equal((await stat(activeGate)).isDirectory(), true);
   assert.equal(await fileMode(activeGate), 0o755);
 });
+
+test("releaseForDelegation frees a lease without its owner token and restores writer capacity", async (t) => {
+  // The owner token reserve() mints is never persisted outside the lease file, so
+  // release({reservation}) can have no real caller: releasing by delegation
+  // identity is what actually lets capacity be reclaimed.
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createStore(stateRoot, [FIRST_ID, SECOND_ID, THIRD_ID, "44444444-4444-4444-8444-444444444444"]);
+  const writer = {
+    projectAlias: "fixture-single",
+    role: "sdd-implementer",
+    mode: "foreground",
+    checkoutPath: "/fixture/source",
+    policy,
+  };
+
+  await reservations.reserve({ ...writer, delegationId: FIRST_ID });
+  // writersPerCheckout is 1: a second writer on the same checkout is refused.
+  await assert.rejects(
+    () => reservations.reserve({ ...writer, delegationId: SECOND_ID }),
+    /capacity is exhausted/i,
+  );
+
+  const released = await reservations.releaseForDelegation({ projectAlias: "fixture-single", delegationId: FIRST_ID });
+  assert.equal(released.length, 1);
+  assert.equal(released[0].state, "released");
+  // The lease file never exposes the owner token to a caller.
+  assert.equal(released[0].ownerToken, undefined);
+
+  // Capacity is reclaimed, so the next writer proceeds.
+  const next = await reservations.reserve({ ...writer, delegationId: SECOND_ID });
+  assert.equal(next.state, "active");
+
+  const active = (await reservations.list({ projectAlias: "fixture-single" })).filter((entry) => entry.state === "active");
+  assert.deepEqual(active.map((entry) => entry.delegationId), [SECOND_ID]);
+});
+
+test("releaseForDelegation is a no-op for unknown delegations and untouched projects", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createStore(stateRoot);
+
+  assert.deepEqual(await reservations.releaseForDelegation({ projectAlias: "never-used", delegationId: FIRST_ID }), []);
+
+  await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+  assert.deepEqual(await reservations.releaseForDelegation({ projectAlias: "fixture-single", delegationId: THIRD_ID }), []);
+  const active = (await reservations.list({ projectAlias: "fixture-single" })).filter((entry) => entry.state === "active");
+  assert.equal(active.length, 1);
+
+  // Releasing twice is idempotent: the second call finds no active lease.
+  assert.equal((await reservations.releaseForDelegation({ projectAlias: "fixture-single", delegationId: FIRST_ID })).length, 1);
+  assert.deepEqual(await reservations.releaseForDelegation({ projectAlias: "fixture-single", delegationId: FIRST_ID }), []);
+});

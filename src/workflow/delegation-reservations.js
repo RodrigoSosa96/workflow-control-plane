@@ -296,6 +296,41 @@ export function createDelegationReservationStore({
     });
   }
 
+  // Release by delegation identity rather than by owner token. The token is
+  // minted inside reserve() and never persisted outside the lease file, so no
+  // later caller can present it — which is why release() had no callers and
+  // every lease leaked, permanently exhausting per-project capacity (one
+  // successful writer delegation was enough with writersPerCheckout: 1).
+  // Authorization is the caller's: both call sites verify against the
+  // authoritative run store that the delegation is no longer running.
+  async function releaseForDelegation({ projectAlias, delegationId } = {}) {
+    const alias = assertString(projectAlias, "reservation project alias", 512);
+    const id = assertString(delegationId, "reservation delegation ID", 128);
+    if (!UUID_RE.test(id)) fail("reservation delegation ID must be a UUID");
+    const projectDigest = digestKey(alias);
+    const target = id.toLowerCase();
+
+    try {
+      await fs.stat(projectPaths(projectDigest).leases);
+    } catch (error) {
+      if (error?.code === "ENOENT") return [];
+      fail(`Unable to inspect reservation records (${error?.code ?? "FS_ERROR"})`);
+    }
+
+    return await withProjectGate(projectDigest, async (paths) => {
+      const records = await readRecords(paths, projectDigest);
+      const released = [];
+      for (const record of records) {
+        if (record.state !== "active" || record.delegationId !== target) continue;
+        const next = { ...record, state: "released", releasedAt: timestamp(clock) };
+        const { path, ...persisted } = next;
+        await writeAtomicJson(path, persisted);
+        released.push({ ...persisted, path });
+      }
+      return released.map(({ ownerToken: _ownerToken, ...record }) => record);
+    });
+  }
+
   async function list({ projectAlias } = {}) {
     const alias = assertString(projectAlias, "reservation project alias", 512);
     const projectDigest = digestKey(alias);
@@ -310,5 +345,5 @@ export function createDelegationReservationStore({
     return records.map(({ ownerToken: _ownerToken, ...record }) => record);
   }
 
-  return Object.freeze({ reserve, release, list });
+  return Object.freeze({ reserve, release, releaseForDelegation, list });
 }

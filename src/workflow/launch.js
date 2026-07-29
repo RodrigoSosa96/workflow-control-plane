@@ -282,7 +282,9 @@ export async function createLaunchPreview(options = {}, deps = {}) {
     context: {
       project: planPreview.project,
       stage: executionOptions.stage ?? "implementation",
-      verificationCommands: executionOptions.verificationCommands,
+      // Explicit execution options win; otherwise the project's own registry
+      // `verify` commands reach the worker instead of a generic fallback.
+      verificationCommands: executionOptions.verificationCommands ?? planPreview.project?.verify,
     },
     plan: reconciliation,
     selection,

@@ -173,9 +173,10 @@ export function buildAssignmentTemplate({ request, context = {}, plan = {}, sele
     "- Do not roll back preserved workflow resources; use workflow reconcile when recovery is needed.",
     "",
     "## Verification commands:",
+    // No project-specific commands were configured: instruct the worker to
+    // discover the project's own checks rather than shipping another repo's.
     ...bulletLines(verificationCommands.length ? verificationCommands : [
-      "node --test test/workflow-launch.test.js test/workflow-handoff.test.js test/workflow-execute.test.js",
-      "npm test",
+      "Discover and run this project's own test and lint commands (package.json scripts, Makefile, or CI configuration) inside the assigned worktree.",
       "git diff --check",
     ]),
     "",

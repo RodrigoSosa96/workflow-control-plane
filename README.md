@@ -156,6 +156,7 @@ workflow reconcile [project] --run <run-id>
 workflow handoff <run-id> --input <run-directory>/handoff-input.json
 workflow delegation result <run-id> <delegation-id>
 workflow delegation reconcile <run-id> <delegation-id>
+workflow delegation release <run-id> <delegation-id> --yes
 workflow runtime ocr ASANA-123 --feature "Discovered Docs" --profile standard --yes
 workflow status ocr ASANA-123 --feature "Discovered Docs"
 workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel
@@ -182,6 +183,16 @@ workflow delegation handoff <run-id> <delegation-id> --input <run-directory>/del
 External exit `0` means a current terminal result was available; exit `20` means pending, exit `21` means `result-stale`, and exit `22` means `manual-handoff-required`. `workflow reconcile [project] --run <run-id>` performs no repair, launch, cleanup, or destructive action; it emits exact safe next actions such as `workflow result`, `workflow status`, and the canonical `workflow handoff` command.
 
 If the origin Pi session closes before an advisory delegation result is consumed, the result stays pending. A later coordinator session must explicitly adopt it; no cross-session result injection occurs automatically.
+
+### Delegation reservation capacity
+
+Each internal delegation holds a reservation lease that counts against the per-project delegation policy (`totalInternal`, `writersTotal`, `writersPerCheckout`). A terminal delegation handoff releases its own lease automatically. If a delegation fails to start, its lease is retained for inspection, and `workflow delegation reconcile` reports it as `reservation.state: active`. Release it explicitly with:
+
+```bash
+workflow delegation release <run-id> <delegation-id> --yes
+```
+
+The command refuses while the delegation is still running, releases capacity only, and never touches worktrees, processes, sessions, or run state.
 
 ### Handoff notifications
 

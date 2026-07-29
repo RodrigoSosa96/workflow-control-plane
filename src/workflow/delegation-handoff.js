@@ -129,5 +129,34 @@ export async function submitDelegationHandoff({ runId, delegationId, input, stor
   if (record.generation !== normalized.generation) fail("Delegation handoff generation is not current");
   const matches = (await reservations.list({ projectAlias: run.projectAlias })).filter((reservation) => reservationMatches(record, reservation));
   if (matches.length !== 1) fail("Delegation reservation is missing or has changed");
-  return await delegations.recordResult({ runId: run.id, delegationId: id, result: normalized, claimToken });
+
+  // This is the boundary an untrusted child crosses: run ID, delegation ID, and
+  // generation are all discoverable by any same-user process (a sibling
+  // delegation can enumerate them under the run directory), so identity alone
+  // cannot authenticate a result. The per-delegation secret minted at claim
+  // time and handed to the child through its private env only closes that.
+  // A remediation generation carries its own token, enforced by recordResult.
+  const activeRemediation = record.remediation?.state === "active"
+    && record.remediation?.generation === normalized.generation;
+  if (!activeRemediation && record.claimToken) {
+    const presented = assertString(claimToken, "delegation handoff claim token", 128);
+    if (presented.toLowerCase() !== record.claimToken) fail("Delegation handoff claim token does not match the active delegation");
+  }
+  const recorded = activeRemediation
+    ? await delegations.recordResult({ runId: run.id, delegationId: id, result: normalized, claimToken })
+    : await delegations.recordResult({ runId: run.id, delegationId: id, result: normalized });
+
+  // The delegation is terminal now, so its reservation must stop counting
+  // against per-project capacity. Best-effort: the advisory result is already
+  // recorded and must not be undone by a lease-file failure, and a lease that
+  // survives stays visible as `reservation.state: active` in
+  // `workflow delegation reconcile`, where `workflow delegation release` clears it.
+  if (typeof reservations.releaseForDelegation === "function") {
+    try {
+      await reservations.releaseForDelegation({ projectAlias: run.projectAlias, delegationId: id });
+    } catch {
+      // Reported by reconcile rather than failing a recorded handoff.
+    }
+  }
+  return recorded;
 }

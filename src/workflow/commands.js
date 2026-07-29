@@ -60,7 +60,13 @@ function binaryCheck(name, path) {
 
 function projectDescriptor(alias, project) {
   if (!project) return null;
-  return { alias, label: project.label, kind: project.kind, repository: project.repository };
+  return {
+    alias,
+    label: project.label,
+    kind: project.kind,
+    repository: project.repository,
+    ...(Array.isArray(project.verify) ? { verify: [...project.verify] } : {}),
+  };
 }
 
 function readinessCheck(id, status, extra = {}) {
@@ -1086,6 +1092,59 @@ export async function delegationReconcileCommand(options = {}, deps = {}) {
     nextActions: list(reconciled.nextActions).map(String),
     cleanup: "none",
     repairs: [],
+  };
+}
+
+export async function delegationReleaseCommand(options = {}, deps = {}) {
+  const context = await loadDelegationContext(options, deps, "delegation release");
+  const { run, record, reservations } = context;
+  if (typeof reservations.releaseForDelegation !== "function") {
+    delegationError("PREFLIGHT", "reservation store does not support delegation release", 10);
+  }
+  // A running delegation keeps its lease: its child may still submit a result,
+  // and that submission requires a live matching reservation.
+  if (record.state === "running") {
+    delegationError("CONFLICT", "Delegation is still running; its reservation was not released", 11);
+  }
+
+  const before = await reservations.list({ projectAlias: run.projectAlias });
+  const active = list(before).filter((reservation) => reservation?.delegationId === record.id && reservation?.state === "active");
+  if (!active.length) {
+    return {
+      command: "delegation-release",
+      ...delegationBase(run, record),
+      released: [],
+      reservation: { state: "missing", retained: false },
+      cleanup: "none",
+      nextActions: ["reconcile"],
+      exitCode: 0,
+    };
+  }
+  if (!options.confirmed) {
+    return {
+      command: "delegation-release",
+      ...delegationBase(run, record),
+      action: "needs-confirmation",
+      released: [],
+      pending: active.map((reservation) => ({ id: reservation.id, resources: [...(reservation.resources ?? [])] })),
+      cleanup: "none",
+      nextActions: ["confirm-release"],
+      exitCode: 0,
+    };
+  }
+
+  const released = await reservations.releaseForDelegation({ projectAlias: run.projectAlias, delegationId: record.id });
+  return {
+    command: "delegation-release",
+    ...delegationBase(run, record),
+    action: "released",
+    released: list(released).map((reservation) => ({ id: reservation.id, resources: [...(reservation.resources ?? [])] })),
+    reservation: { state: "released", retained: false },
+    // Releasing a lease frees capacity only; no worktree, process, session, or
+    // run state is touched.
+    cleanup: "none",
+    nextActions: ["reconcile"],
+    exitCode: 0,
   };
 }
 
