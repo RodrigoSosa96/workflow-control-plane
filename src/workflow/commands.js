@@ -18,6 +18,7 @@ import { reconcilePlan } from "./reconcile.js";
 import { executeResume as defaultExecuteResume } from "./resume.js";
 import { RUN_STATES } from "./run-state.js";
 import { createRunStore } from "./run-store.js";
+import { isTelemetrySupportedVersion, telemetrySupportedVersions } from "./telemetry-adapters.js";
 import { createTelemetryStore } from "./telemetry-store.js";
 import { publicTelemetrySnapshot } from "./telemetry.js";
 import { createWorkerWatch } from "./telemetry-watch.js";
@@ -132,6 +133,43 @@ async function resolveBinaries(lookupExecutable, selectedAgent) {
   };
   if (selectedAgent.profile.harness === "pi") binaries.pi = agent;
   return binaries;
+}
+
+// Reports the installed harness version against the versions telemetry pins.
+// Telemetry fails closed to "unknown" on an unpinned version and every hook
+// swallows its errors, so this is the one place a routine harness upgrade
+// silently blanking telemetry becomes visible to the operator.
+async function harnessTelemetryCheck(selectedAgent, harnessVersion) {
+  const harness = selectedAgent.profile.harness;
+  const expected = telemetrySupportedVersions(harness);
+  const base = { harness, profileName: selectedAgent.name, expected: [...expected] };
+  if (typeof harnessVersion !== "function") {
+    return readinessCheck(`telemetry:${harness}`, "unknown", {
+      ...base,
+      value: null,
+      reason: "Harness version inspection is unavailable",
+    });
+  }
+  let version = null;
+  try {
+    version = await harnessVersion(selectedAgent);
+  } catch (error) {
+    return readinessCheck(`telemetry:${harness}`, "unknown", {
+      ...base,
+      value: null,
+      reason: `Harness version could not be read: ${String(error?.message ?? error).slice(0, 200)}`,
+    });
+  }
+  if (isTelemetrySupportedVersion(harness, version)) {
+    return readinessCheck(`telemetry:${harness}`, "ready", { ...base, value: version });
+  }
+  return readinessCheck(`telemetry:${harness}`, "unknown", {
+    ...base,
+    value: version ?? null,
+    reason: version
+      ? `Installed ${harness} ${version} is not a telemetry-pinned version (${expected.join(", ") || "none"}); telemetry degrades to unknown`
+      : "Harness version could not be parsed",
+  });
 }
 
 async function resolvePreconditions(lookupExecutable, herdr, selectedAgent) {
@@ -367,10 +405,12 @@ export async function doctorCommand(options = {}, {
   git,
   herdr,
   lookupExecutable,
+  harnessVersion,
 } = {}) {
   const { registry, project } = await loadRegistryAndProject(options, injectedLoadRegistry, { requireProject: false });
   const selectedAgent = selectAgent(registry, project, options);
   const preconditions = await resolvePreconditions(lookupExecutable, herdr, selectedAgent);
+  const telemetryCheck = await harnessTelemetryCheck(selectedAgent, harnessVersion);
   const checks = [
     { id: "registry", status: "ready", path: options.registryPath },
     preconditions.git,
@@ -379,13 +419,16 @@ export async function doctorCommand(options = {}, {
     ...(project ? await inspectProjectRepositories(options.projectAlias, project, git) : []),
     preconditions.herdrStatus,
     preconditions.agentIntegration,
+    telemetryCheck,
   ];
 
   return {
     command: "doctor",
     project: projectDescriptor(options.projectAlias, project),
     checks,
-    ok: checks.every((check) => check.status === "ready"),
+    // A telemetry version mismatch degrades observability only; it must not
+    // make doctor report the environment as unusable for launching work.
+    ok: checks.every((check) => check.status === "ready" || check.id === telemetryCheck.id),
     registryPath: options.registryPath,
     agentProfiles: globalAgentProfileDiagnostics(registry, { include: !project && !options.agentProfile }),
   };

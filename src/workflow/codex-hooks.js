@@ -1,4 +1,4 @@
-import { readFile as defaultReadFile, writeFile as defaultWriteFile } from "node:fs/promises";
+import { readFile as defaultReadFile, rename as defaultRename, writeFile as defaultWriteFile } from "node:fs/promises";
 import { join } from "node:path";
 
 // The Codex analog of buildClaudeWorkerSettings (see harnesses.js), but merged into Codex's
@@ -16,11 +16,27 @@ function assertString(value, context) {
   return value;
 }
 
+// Stable marker identifying the workflow's own entries, independent of the
+// control-plane path embedded in the command. Idempotency keyed on the exact
+// command string duplicated the hooks whenever the control plane moved (or a
+// second checkout launched a Codex worker), and each duplicate invocation
+// re-ran the shared hook core, inflating the generation counter.
+const WORKFLOW_HOOK_OWNER = "workflow-control-plane:codex-lifecycle";
+
 function workflowHookCommand(controlPlaneRoot, event) {
   const script = join(controlPlaneRoot, "hooks", "codex-lifecycle.mjs");
   // The script path is absolute and per-machine/worktree, so it can contain spaces;
   // double-quote it so the shell keeps it a single argument (mirrors buildClaudeWorkerSettings).
   return `node "${script}" ${event}`;
+}
+
+function isWorkflowGroup(group) {
+  if (!group || typeof group !== "object" || Array.isArray(group)) return false;
+  if (group.owner === WORKFLOW_HOOK_OWNER) return true;
+  // Entries installed before the owner marker existed are still ours: they run
+  // this repo's hooks/codex-lifecycle.mjs, whatever path they were written with.
+  return Array.isArray(group.hooks)
+    && group.hooks.some((hook) => typeof hook?.command === "string" && hook.command.includes("hooks/codex-lifecycle.mjs"));
 }
 
 // Pure merge: given the current parsed contents of ~/.codex/hooks.json (or an empty
@@ -39,43 +55,59 @@ export function mergeCodexWorkerHooks(current, controlPlaneRoot) {
   for (const event of CODEX_WORKER_HOOK_EVENTS) {
     const command = workflowHookCommand(controlPlaneRoot, event);
     const existingGroups = Array.isArray(currentHooks[event]) ? currentHooks[event] : [];
-    const alreadyPresent = existingGroups.some(
-      (group) => Array.isArray(group?.hooks) && group.hooks.some((hook) => hook?.command === command),
-    );
-    mergedHooks[event] = alreadyPresent
-      ? existingGroups
-      : [...existingGroups, { hooks: [{ type: "command", command, timeout: 10 }] }];
+    // Replace the workflow's own entries (including stale ones pointing at a
+    // previous control-plane path) and preserve every entry it does not own.
+    const foreignGroups = existingGroups.filter((group) => !isWorkflowGroup(group));
+    mergedHooks[event] = [
+      ...foreignGroups,
+      { owner: WORKFLOW_HOOK_OWNER, hooks: [{ type: "command", command, timeout: 10 }] },
+    ];
   }
 
   return { ...base, hooks: mergedHooks };
 }
 
-// Read-merge-write over the real (or injected) filesystem. A missing or unparseable hooks
-// file is treated as an empty {hooks:{}} rather than an error, since a fresh machine simply
-// won't have ~/.codex/hooks.json yet. readFile/writeFile are injectable so callers (and tests)
-// never have to touch the real ~/.codex/hooks.json.
+// Read-merge-write over the real (or injected) filesystem. An ABSENT hooks file is treated as
+// an empty {hooks:{}} (a fresh machine simply won't have ~/.codex/hooks.json yet), but a file
+// that exists and does not parse is never overwritten: it is a shared file, so replacing
+// content this merge cannot read would destroy other tools' entries. The write goes through a
+// temp file plus rename so a crash mid-write cannot truncate the shared file. readFile/writeFile
+// and rename are injectable so callers (and tests) never touch the real ~/.codex/hooks.json.
 export async function ensureCodexWorkerHooks({
   hooksPath,
   controlPlaneRoot,
   readFile = defaultReadFile,
   writeFile = defaultWriteFile,
+  rename = defaultRename,
 } = {}) {
   assertString(hooksPath, "hooksPath");
   assertString(controlPlaneRoot, "controlPlaneRoot");
 
   let current = { hooks: {} };
+  let raw;
   try {
-    const raw = await readFile(hooksPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) current = parsed;
+    raw = await readFile(hooksPath, "utf8");
   } catch {
-    // Absent file or invalid JSON: fall back to the empty default rather than aborting the
-    // install — a fresh machine, or a hand-edited file that briefly doesn't parse, must not
-    // block launch.
-    current = { hooks: {} };
+    // Absent (or unreadable) file: install into the empty default.
+    raw = null;
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new TypeError(`Codex hooks file at ${hooksPath} is not valid JSON; it was left unchanged so other tools' hooks are preserved`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new TypeError(`Codex hooks file at ${hooksPath} is not a JSON object; it was left unchanged`);
+    }
+    current = parsed;
   }
 
   const merged = mergeCodexWorkerHooks(current, controlPlaneRoot);
-  await writeFile(hooksPath, `${JSON.stringify(merged, null, 2)}\n`);
+  const text = `${JSON.stringify(merged, null, 2)}\n`;
+  const tempPath = `${hooksPath}.workflow-tmp`;
+  await writeFile(tempPath, text);
+  await rename(tempPath, hooksPath);
   return merged;
 }

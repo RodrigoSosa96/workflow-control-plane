@@ -14,6 +14,20 @@ const SUPPORTED_VERSIONS = Object.freeze({
   opencode: new Set(["1.0.126"]),
 });
 const EMPTY_CAPABILITIES = Object.freeze({ model: false, usage: false, cost: false, context: false, session: false });
+
+// Telemetry pins exact harness versions and fails closed to "unknown" on any
+// other version. That is deliberate, but the degradation is silent (hook errors
+// are swallowed), so `workflow doctor` reports the pinned set against what is
+// actually installed — the in-repo drift this exposed (codex pinned at 0.144.3
+// while the Codex lane spec targets 0.145.0) is exactly the failure mode.
+export function telemetrySupportedVersions(harness) {
+  const versions = SUPPORTED_VERSIONS[harness];
+  return versions ? Object.freeze([...versions].sort()) : Object.freeze([]);
+}
+
+export function isTelemetrySupportedVersion(harness, version) {
+  return Boolean(typeof version === "string" && SUPPORTED_VERSIONS[harness]?.has(version));
+}
 const CODEX_TOOL_TYPES = new Set(["command_execution", "file_change", "mcp_tool_call", "web_search"]);
 
 function fail(message) {

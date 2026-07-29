@@ -26,6 +26,7 @@
 // needed beyond the `${harness}` prefix already baked into the field names below.
 import { RUN_STATES } from "../../src/workflow/run-state.js";
 import { notifyRun, notifyStop } from "../../src/workflow/notifier.js";
+import { recordHookDebug } from "./hook-debug-log.mjs";
 
 // Maps a lifecycle.onStop action to a telemetry phase. The telemetry phase vocabulary is
 // fixed (see TELEMETRY_PHASES), so the neutral run states are projected onto the closest
@@ -41,23 +42,27 @@ function stopPhaseForAction(action) {
 // staying on "starting". Wrapped so a telemetry-store failure is swallowed — a bookkeeping
 // error must never break the worker. The event's harness must match the run's own harness (the
 // telemetry store validates this), which is exactly the `harness` this hook was invoked for.
-async function recordPhase(telemetry, harness, runId, phase) {
+async function recordPhase(telemetry, harness, runId, phase, debug) {
   if (!telemetry) return;
   try {
     await telemetry.record({ runId, workerId: runId, event: { type: "lifecycle", harness, phase } });
-  } catch {
-    // Swallow: a telemetry-record failure must never break the worker.
+  } catch (error) {
+    // Swallow: a telemetry-record failure must never break the worker. It is
+    // recorded in the run's hook debug log so the degradation stays visible.
+    await debug?.("telemetry", error);
   }
 }
 
 // Persists a stateless field-merge marker on the run record (the subprocess analog of Pi's
 // in-memory startedOnce/pendingContinuation flags). Wrapped so a throw is swallowed — a marker
 // write must never break the worker.
-async function persistMarker(store, runId, patch) {
+async function persistMarker(store, runId, patch, debug) {
   try {
     await store.update(runId, () => ({ ...patch }));
-  } catch {
-    // Swallow: a marker write must never break the worker.
+  } catch (error) {
+    // Swallow: a marker write must never break the worker. A dropped marker
+    // silently shifts every later generation, so it is logged.
+    await debug?.("marker", error);
   }
 }
 
@@ -82,7 +87,11 @@ export async function runLifecycleHook({
   lifecycle,
   telemetry,
   hasValidHandoff,
+  recordDebug = recordHookDebug,
 } = {}) {
+  const debug = async (scope, error) => {
+    await recordDebug({ runDirectory: env.WORKFLOW_RUN_DIR, harness, event, scope, error });
+  };
   try {
     const runId = env.WORKFLOW_RUN_ID;
     if (!runId || env.WORKFLOW_HARNESS !== harness) return undefined;
@@ -105,17 +114,17 @@ export async function runLifecycleHook({
       if (!current[startedOnceField]) {
         source = "user";
         generation = current.generation;
-        await persistMarker(store, runId, { [startedOnceField]: true });
+        await persistMarker(store, runId, { [startedOnceField]: true }, debug);
       } else if (current[pendingContinuationField]) {
         source = "continuation";
         generation = current.generation;
-        await persistMarker(store, runId, { [pendingContinuationField]: false });
+        await persistMarker(store, runId, { [pendingContinuationField]: false }, debug);
       } else {
         source = "user";
         generation = current.generation + 1;
       }
       await lifecycle.onPrompt({ runId, generation, source });
-      await recordPhase(telemetry, harness, runId, "running");
+      await recordPhase(telemetry, harness, runId, "running", debug);
       return undefined;
     }
 
@@ -126,20 +135,21 @@ export async function runLifecycleHook({
         generation: current.generation,
         hasValidHandoff: await validHandoff(current.generation),
       });
-      await recordPhase(telemetry, harness, runId, stopPhaseForAction(action));
+      await recordPhase(telemetry, harness, runId, stopPhaseForAction(action), debug);
       // Best-effort notification for non-continuation stop states (settled / manual).
       if (action !== "continue" && action !== "none") {
         try {
           await notifyStop({ run: current, store, runId, action });
-        } catch {
+        } catch (error) {
           // swallow: a notifier must never break the lifecycle hook
+          await debug("notify-stop", error);
         }
       }
       if (action === "continue") {
         // Mark the continuation BEFORE returning the block decision, so the UserPromptSubmit it
         // may trigger is recognized as a continuation (reuses the generation) rather than a
         // user follow-up (which would bump it).
-        await persistMarker(store, runId, { [pendingContinuationField]: true });
+        await persistMarker(store, runId, { [pendingContinuationField]: true }, debug);
         return JSON.stringify({ decision: "block", reason: continuationPrompt(runId, current.generation) });
       }
       return undefined;
@@ -150,15 +160,19 @@ export async function runLifecycleHook({
       // Best-effort notification when the session ends without a handoff.
       try {
         await notifyRun({ store, runId });
-      } catch {
+      } catch (error) {
         // swallow: a notifier must never break the lifecycle hook
+        await debug("notify-run", error);
       }
       return undefined;
     }
 
     return undefined;
-  } catch {
-    // Swallow: a lifecycle bookkeeping error must never break the worker.
+  } catch (error) {
+    // Swallow: a lifecycle bookkeeping error must never break the worker. This
+    // is the one place a broken hook contract (a harness upgrade changing its
+    // payload shape) becomes observable.
+    await debug("lifecycle", error);
     return undefined;
   }
 }

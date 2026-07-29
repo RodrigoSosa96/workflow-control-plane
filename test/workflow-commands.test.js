@@ -198,11 +198,12 @@ function multiHarnessRegistry() {
   return value;
 }
 
-function deps({ git, herdr, lookup, registryValue = registry }) {
+function deps({ git, herdr, lookup, registryValue = registry, harnessVersion }) {
   return {
     git,
     herdr,
     lookupExecutable: lookup.lookupExecutable,
+    ...(harnessVersion ? { harnessVersion } : {}),
     loadRegistry: async (path) => {
       assert.equal(path, "/tmp/projects.yaml");
       return registryValue;
@@ -245,6 +246,7 @@ test("doctor reports registry, binaries, repositories, and Pi integration withou
     "repository:panel",
     "herdr:status",
     "herdr:integration:pi",
+    "telemetry:pi",
   ]);
   assert.deepEqual(lookup.calls, ["git", "herdr", "pi"]);
   assert.deepEqual(git.calls.map((call) => call.cwd), [
@@ -281,6 +283,7 @@ test("doctor without a project reports global prerequisites without repository i
     "binary:pi",
     "herdr:status",
     "herdr:integration:pi",
+    "telemetry:pi",
   ]);
   assert.deepEqual(git.calls, []);
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
@@ -323,6 +326,7 @@ test("doctor validates only the selected agent profile binary and Herdr integrat
     "repository:ocr",
     "herdr:status",
     "herdr:integration:codex",
+    "telemetry:codex",
   ]);
   assert.deepEqual(lookup.calls, ["git", "herdr", "codex"]);
   assert.deepEqual(herdr.calls.map((call) => call.kind), ["status", "integrationStatus"]);
@@ -669,4 +673,44 @@ test("formats bounded compact output and normalized JSON", () => {
     formatWorkflowResult("doctor", { z: 1, a: { y: 2, x: 1 } }, "json"),
     '{\n  "a": {\n    "x": 1,\n    "y": 2\n  },\n  "z": 1\n}',
   );
+});
+
+test("doctor reports an unpinned harness version as a telemetry warning without failing the environment", async () => {
+  // Telemetry pins exact harness versions and fails closed to "unknown"; every
+  // hook swallows its errors, so without this check a routine harness upgrade
+  // blanks telemetry with no signal anywhere.
+  const lookup = createLookup({ git: "/usr/bin/git", herdr: "/usr/bin/herdr", pi: "/usr/bin/pi" });
+  const herdr = createHerdr({
+    integrations: [{ name: "pi", status: "current", version: 5, path: "/home/you/.pi/agent/extensions/herdr-agent-state.ts" }],
+  });
+
+  const drifted = await doctorCommand(
+    { registryPath: "/tmp/projects.yaml" },
+    deps({ git: createGit({}), herdr, lookup, harnessVersion: async () => "9.9.9" }),
+  );
+  const driftedCheck = drifted.checks.find((check) => check.id === "telemetry:pi");
+  assert.equal(driftedCheck.status, "unknown");
+  assert.equal(driftedCheck.value, "9.9.9");
+  assert.ok(driftedCheck.expected.length > 0);
+  assert.match(driftedCheck.reason, /not a telemetry-pinned version/i);
+  // Observability degraded, but the environment can still launch work.
+  assert.equal(drifted.ok, true);
+
+  const pinnedVersion = driftedCheck.expected.at(-1);
+  const pinned = await doctorCommand(
+    { registryPath: "/tmp/projects.yaml" },
+    deps({ git: createGit({}), herdr, lookup, harnessVersion: async () => pinnedVersion }),
+  );
+  const pinnedCheck = pinned.checks.find((check) => check.id === "telemetry:pi");
+  assert.equal(pinnedCheck.status, "ready");
+  assert.equal(pinnedCheck.value, pinnedVersion);
+
+  const unreadable = await doctorCommand(
+    { registryPath: "/tmp/projects.yaml" },
+    deps({ git: createGit({}), herdr, lookup, harnessVersion: async () => { throw new Error("pi exited with 127"); } }),
+  );
+  const unreadableCheck = unreadable.checks.find((check) => check.id === "telemetry:pi");
+  assert.equal(unreadableCheck.status, "unknown");
+  assert.match(unreadableCheck.reason, /could not be read/i);
+  assert.equal(unreadable.ok, true);
 });

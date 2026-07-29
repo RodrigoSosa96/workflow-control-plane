@@ -28,7 +28,7 @@
     "smoke:fixture": "node scripts/smoke-workflow-fixture.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.18"
   },
   "dependencies": {
     "yaml": "^2.8.1"

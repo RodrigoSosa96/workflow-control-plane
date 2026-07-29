@@ -402,6 +402,16 @@ function createLiveDependencies(dependencies) {
     stateRoot,
     loadRegistry: dependencies.loadRegistry ?? defaultLoadRegistry,
     lookupExecutable: dependencies.lookupExecutable ?? ((name) => lookupExecutable(name, { env })),
+    // doctor-only: reads `<harness binary> --version` so a harness upgrade that
+    // silently blanks telemetry (versions are pinned and fail closed) becomes
+    // visible. Read-only and bounded; failures degrade to an "unknown" check.
+    harnessVersion: dependencies.harnessVersion ?? (async (selectedAgent) => {
+      const command = selectedAgent?.profile?.command;
+      if (typeof command !== "string" || !command) return null;
+      const { stdout } = await runner.run(command, ["--version"], { timeoutMs: 10_000, allowFailure: true });
+      const match = String(stdout ?? "").match(/\d+\.\d+\.\d+/);
+      return match ? match[0] : null;
+    }),
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
     store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot }) : undefined),

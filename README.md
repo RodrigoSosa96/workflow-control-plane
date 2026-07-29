@@ -91,6 +91,10 @@ These prompts intentionally stop before implementation. The expected flow is tri
 
 Pi is wired through `.pi/extensions/` because it supports in-process TypeScript extensions; Claude and Codex are wired through stateless scripts under `hooks/` because they expose lifecycle hooks via external subprocess calls. All three harnesses end up driving the same neutral run-state machine in `src/workflow/lifecycle.js`.
 
+Lifecycle hooks never break the worker they are attached to: every failure is swallowed. To keep that from hiding a broken hook contract after a harness upgrade, each swallowed error is also appended to a bounded, private `hooks-debug.log` inside the run directory. If generations stop advancing, a run sticks in `running`, or a statusline freezes, read that file first.
+
+Telemetry recognizes only pinned harness versions and reports `unknown` for anything else. `workflow doctor` runs `<harness> --version` and reports it against the pinned set as a `telemetry:<harness>` check, so an upgrade that silently degrades telemetry is visible. A mismatch is a warning: it does not make `doctor` report the environment as unusable.
+
 ## Project layout policy
 
 Use one Herdr workspace per product. Use a dedicated git worktree for each ticket or feature when an agent will write code. Keep runtime processes in a separate tab from interactive agent sessions.

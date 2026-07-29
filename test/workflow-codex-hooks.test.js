@@ -39,10 +39,11 @@ test("mergeCodexWorkerHooks tolerates an empty current object (no hooks key)", (
   }
 });
 
-test("ensureCodexWorkerHooks reads, merges, and writes back the hooks file", async () => {
+test("ensureCodexWorkerHooks reads, merges, and writes the shared file through temp + rename", async () => {
   const existing = { hooks: { SessionStart: [{ hooks: [{ type: "command", command: "bash '/h/herdr-agent-state.sh' session", timeout: 10 }] }] } };
   let writtenPath;
   let writtenText;
+  const renames = [];
   const result = await ensureCodexWorkerHooks({
     hooksPath: "/home/user/.codex/hooks.json",
     controlPlaneRoot: "/cp",
@@ -54,8 +55,11 @@ test("ensureCodexWorkerHooks reads, merges, and writes back the hooks file", asy
       writtenPath = path;
       writtenText = text;
     },
+    rename: async (from, to) => renames.push({ from, to }),
   });
-  assert.equal(writtenPath, "/home/user/.codex/hooks.json");
+  // A crash mid-write must never truncate a file shared with other tools.
+  assert.equal(writtenPath, "/home/user/.codex/hooks.json.workflow-tmp");
+  assert.deepEqual(renames, [{ from: "/home/user/.codex/hooks.json.workflow-tmp", to: "/home/user/.codex/hooks.json" }]);
   const written = JSON.parse(writtenText);
   assert.equal(written.hooks.SessionStart[0].hooks[0].command, "bash '/h/herdr-agent-state.sh' session");
   for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
@@ -74,41 +78,75 @@ test("ensureCodexWorkerHooks falls back to an empty hooks object when the file i
       throw error;
     },
     writeFile: async () => {},
+    rename: async () => {},
   });
   for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
     assert.equal(result.hooks[ev].length, 1);
   }
 });
 
-test("ensureCodexWorkerHooks falls back to an empty hooks object when the file is unparseable", async () => {
-  const result = await ensureCodexWorkerHooks({
-    hooksPath: "/bad/.codex/hooks.json",
-    controlPlaneRoot: "/cp",
-    readFile: async () => "not json{{{",
-    writeFile: async () => {},
-  });
-  for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
-    assert.equal(result.hooks[ev].length, 1);
-  }
+test("ensureCodexWorkerHooks refuses to overwrite an existing hooks file it cannot parse", async () => {
+  // The file is shared: replacing content this merge cannot read would destroy
+  // every other tool's hooks (previously it fell back to an empty object and
+  // wrote only the workflow's own entries).
+  let wrote = false;
+  await assert.rejects(
+    () => ensureCodexWorkerHooks({
+      hooksPath: "/bad/.codex/hooks.json",
+      controlPlaneRoot: "/cp",
+      readFile: async () => "not json{{{",
+      writeFile: async () => { wrote = true; },
+      rename: async () => { wrote = true; },
+    }),
+    /not valid JSON|left unchanged/i,
+  );
+  assert.equal(wrote, false);
 });
 
 test("ensureCodexWorkerHooks run twice via injected fs is idempotent end to end", async () => {
-  let stored = null;
-  const readFile = async () => {
-    if (stored === null) {
+  const files = new Map();
+  const readFile = async (path) => {
+    if (!files.has(path)) {
       const error = new Error("ENOENT");
       error.code = "ENOENT";
       throw error;
     }
-    return stored;
+    return files.get(path);
   };
-  const writeFile = async (_path, text) => {
-    stored = text;
+  const writeFile = async (path, text) => {
+    files.set(path, text);
   };
-  await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile });
-  const second = await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile });
+  const rename = async (from, to) => {
+    files.set(to, files.get(from));
+    files.delete(from);
+  };
+  await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile, rename });
+  const second = await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile, rename });
   for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
     const cmds = second.hooks[ev].flatMap((g) => g.hooks.map((h) => h.command)).filter((c) => c.includes("codex-lifecycle.mjs"));
     assert.equal(cmds.length, 1);
   }
+});
+
+test("mergeCodexWorkerHooks replaces its own stale entries after the control plane moves", () => {
+  // Idempotency keyed on the exact command string left one entry per path, so a
+  // moved repo (or a second checkout) fired the shared hook core twice per
+  // event, inflating the lifecycle generation counter.
+  const first = mergeCodexWorkerHooks({ hooks: {} }, "/old/cp");
+  const second = mergeCodexWorkerHooks(first, "/new/cp");
+  for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    const commands = second.hooks[ev].flatMap((group) => group.hooks.map((hook) => hook.command));
+    assert.deepEqual(commands, [`node "/new/cp/hooks/codex-lifecycle.mjs" ${ev}`]);
+  }
+});
+
+test("mergeCodexWorkerHooks preserves foreign entries while replacing workflow entries", () => {
+  const foreign = { hooks: [{ type: "command", command: "bash '/h/other-tool.sh' prompt", timeout: 5 }] };
+  const current = { hooks: { UserPromptSubmit: [foreign] } };
+  const merged = mergeCodexWorkerHooks(mergeCodexWorkerHooks(current, "/old/cp"), "/new/cp");
+  const commands = merged.hooks.UserPromptSubmit.flatMap((group) => group.hooks.map((hook) => hook.command));
+  assert.deepEqual(commands, [
+    "bash '/h/other-tool.sh' prompt",
+    'node "/new/cp/hooks/codex-lifecycle.mjs" UserPromptSubmit',
+  ]);
 });
