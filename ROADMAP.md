@@ -45,7 +45,7 @@ Son las fallas *silenciosas* en el camino crítico de estado y notificaciones. P
 
 ## Fase 1 — Recovery y unificación (deuda estructural)
 
-- [ ] **1.1** Owner markers `{pid, startToken, runId}` escritos al launch junto al worktree y run dir (startToken = tiempo de arranque del proceso vía `/proc/<pid>/stat` campo 22, inmune a pid reciclado — patrón de oh-my-pi `isolation-ownership.ts`). Después: `workflow unlock <run-id>` y clear del gate de reservas que **prueban** muerto al dueño antes de limpiar, y agregan pid+timestamp a `owner.json` del gate (`delegation-reservations.js:168-180` hoy no tiene datos de liveness). Hace real la recuperación manual que los specs prometen sin romper no-cleanup. *(D7)*
+- [ ] **1.1** Ownership demostrable en los mutex + `workflow unlock <run-id>` y `workflow delegation gate-clear <project>`, que **prueban** muerto al dueño antes de remover. Hace real la recuperación manual que los specs prometen sin romper no-cleanup. *(D7)* — **spec listo:** [`2026-07-30-provable-owner-recovery-design.md`](docs/superpowers/specs/2026-07-30-provable-owner-recovery-design.md). Nota de diseño: no hace falta inventar el startToken, el repo ya tiene el primitivo — `inspectExactProcessByPid` devuelve `startedAt` y solo devuelve `null` ante prueba positiva de ausencia; se reusa en vez de agregar una segunda vía de liveness.
 - [ ] **1.2** Lifecycle core único: convertir `.pi/extensions/workflow-worker-lifecycle.ts` en adapter delgado sobre `hooks/lib/lifecycle-hook-core.mjs` (markers persistidos; también corrige la divergencia de generaciones post-resume entre Pi y Claude/Codex). Un solo módulo dueño de `continuationPrompt`, `handoffExists`, discriminación de generación y condiciones de notify. *(D5)*
 - [ ] **1.3** Persistir el profile resuelto (permission_mode, sandbox, approval_policy, model) en el run record al launch, agregar variante resume a `buildHarnessLaunch`, y que `relaunchSession` (`commands.js:1281-1320`) la use en vez de armar argv a mano. Exportar `CLAUDE_WORKER_SETTINGS_FILE` de un solo lugar. Hoy un resume corre con permisos distintos a los aprobados. *(D6)*
 - [ ] **1.4** Módulo `delegation-invariants` compartido (lista de recursos de reserva, reservation-matches, shape de transport identity) consumido por services/handoff/reservations/coordinator-policy. Hoy hay 3–5 copias que ya divergen — `coordinator-policy.js:26-45` es la más débil (no compara checkoutDigest). *(D17)*
@@ -131,4 +131,13 @@ Un agente revisor verificó el diff completo ejecutando probes contra los stores
 
 ### Próximo paso sugerido
 
-Fase 1 (recovery y unificación), empezando por **1.1** (owner markers `{pid, startToken, runId}` + `workflow unlock`), que desbloquea **2.5** (`workflow archive`).
+**1.1 está especificado y listo para implementar** — ver el spec linkeado arriba. Rama preparada: `hardening/fase-1-ownership`. El spec queda en `Draft — awaiting approval`: aprobalo (o pedí cambios) antes de que se escriba código, siguiendo el flujo del repo.
+
+Orden sugerido para el resto de la Fase 1, por dependencia:
+
+1. **1.1** (spec listo) → desbloquea 2.5.
+2. **1.4** (módulo de invariantes compartidos) → el clasificador de ownership de 1.1 es su primer residente natural, junto a los predicados de reserva y claim token que hoy viven duplicados. Hacerlo justo después de 1.1 evita crear una tercera copia.
+3. **1.3** (profile persistido + argv de resume por `harnesses.js`) → independiente, y cierra el hueco de seguridad donde un resume corre con permisos distintos a los aprobados.
+4. **1.2** (lifecycle core único) → el más invasivo; conviene con 1.6 ya en su lugar.
+5. **1.6** (e2e por harness contra fakes) → red de seguridad para 1.2.
+6. **1.5** (chequeo de `version` en `run.json`) → chico e independiente.
