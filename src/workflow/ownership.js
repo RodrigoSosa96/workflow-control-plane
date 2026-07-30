@@ -6,6 +6,10 @@
 // here: an ambiguous observation can only ever yield "unprovable", never
 // "owner-gone" — a mutex must not be treated as recoverable on a guess.
 
+import { spawn } from "node:child_process";
+import { realpath } from "node:fs/promises";
+import { inspectExactProcessByPid } from "./process-observation.js";
+
 // Exported so commands.js's observe-and-classify plumbing (observeOwner, ownerMarkerVersion)
 // shares this one guard instead of hand-rolling the same "plain object, not an array" check --
 // review finding D17 was this predicate written four times across layers; a fresh, unexported
@@ -73,6 +77,68 @@ export function createOwnOwnershipReader({ inspectProcess, pid = String(process.
     if (!cached) cached = readOwnProcessOwnership({ inspectProcess, pid });
     return cached;
   };
+}
+
+// The one `ps` argv this module ever builds — byte-for-byte the same command and args
+// bin/workflow.js's inspectDelegationPid already runs (`ps -p <pid> -o lstart= -o state=`
+// through a process runner with allowFailure: true). Marker verdicts hinge on `startedAt`
+// string equality (classifyOwnership above), so a hook's own marker and unlock's later
+// observation of it must come from the exact same invocation and parse; a second, drifted
+// `ps` argv here would risk misclassifying a live owner as proven dead. Resolves rather than
+// rejects on a non-zero exit — inspectExactProcessByPid's runProcess contract needs that,
+// since a `ps` exit of 1 with empty stdout/stderr is how it proves a pid is gone.
+function spawnPsStatus(pid) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], { shell: false });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const settle = (callback) => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => settle(() => reject(error)));
+    child.on("close", (code, signal) => settle(() => {
+      if (signal) {
+        reject(new Error(`ps -p ${pid} exited via signal ${signal}`));
+        return;
+      }
+      resolve({ code: code ?? 1, stdout, stderr });
+    }));
+  });
+}
+
+// Memoized own-ownership reader for a process with no injected runner: lifecycle hooks and Pi
+// worker extensions, which build their own run store without threading a CLI-constructed
+// inspector through it (unlike bin/workflow.js, which already has a `runner` and composes
+// createOwnOwnershipReader directly). This is the one piece those call sites will share --
+// unwired here; a later task points their stores at it.
+//
+// Composes the existing pieces rather than reimplementing either: inspectExactProcessByPid does
+// the inspection and its proven-absent/ambiguous distinction, createOwnOwnershipReader does the
+// memoization (including caching a null outcome, so a broken environment costs one `ps` attempt
+// per process, not one per lock acquisition). Both seams default to real work so a caller can
+// write createSubprocessOwnOwnershipReader() with no arguments and get a working reader; both
+// stay injectable so tests never have to spawn a real `ps`.
+export function createSubprocessOwnOwnershipReader({ spawnProcess = spawnPsStatus, readCwd = realpath } = {}) {
+  return createOwnOwnershipReader({
+    inspectProcess: (pid) => inspectExactProcessByPid(pid, { runProcess: spawnProcess, readCwd }),
+  });
 }
 
 export const OBSERVATION_FAILED = Symbol("observation-failed");

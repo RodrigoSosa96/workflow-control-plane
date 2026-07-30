@@ -4,6 +4,7 @@ import {
   OBSERVATION_FAILED,
   classifyOwnership,
   createOwnOwnershipReader,
+  createSubprocessOwnOwnershipReader,
   isPlainMarker,
   readOwnProcessOwnership,
   sameOwnerDirectory,
@@ -282,6 +283,147 @@ test("createOwnOwnershipReader's reader resolves to null (never rejects) when in
   await assert.doesNotReject(async () => {
     assert.equal(await reader(), null);
   });
+});
+
+// --- createSubprocessOwnOwnershipReader -----------------------------------
+// The shared reader lifecycle hooks and Pi worker extensions will use once a later task wires it
+// in: unlike createOwnOwnershipReader (which needs an inspectProcess already built by a caller
+// with its own runner), this one builds real process inspection itself by composing
+// inspectExactProcessByPid with a `ps`-spawning default, so a hook can write
+// createSubprocessOwnOwnershipReader() with no arguments and get a working reader. Both seams
+// (spawnProcess, readCwd) stay injectable here so these tests never spawn a real `ps`, matching
+// how workflow-cli.test.js's unlock/gate-clear wiring tests fake the runner instead of the real
+// binary.
+
+test("createSubprocessOwnOwnershipReader resolves {pid, startedAt} for a healthy injected spawn", async () => {
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess(pid) {
+      assert.equal(pid, String(process.pid));
+      return { code: 0, stdout: "Thu Jul 30 05:06:13 2026 S\n", stderr: "" };
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  assert.deepEqual(await reader(), {
+    pid: String(process.pid),
+    startedAt: "2026-07-30T05:06:13.000Z",
+  });
+});
+
+test("createSubprocessOwnOwnershipReader invokes the spawn exactly once across many calls", async () => {
+  let calls = 0;
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      calls += 1;
+      return { code: 0, stdout: "Thu Jul 30 05:06:13 2026 S\n", stderr: "" };
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  const first = await reader();
+  const second = await reader();
+  const third = await reader();
+
+  assert.equal(calls, 1);
+  assert.deepEqual(second, first);
+  assert.deepEqual(third, first);
+});
+
+test("createSubprocessOwnOwnershipReader resolves null (never rejects) when spawnProcess throws", async () => {
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      throw new Error("spawn exploded");
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  await assert.doesNotReject(async () => {
+    assert.equal(await reader(), null);
+  });
+});
+
+test("createSubprocessOwnOwnershipReader resolves null (never rejects) on a non-zero, ambiguous exit", async () => {
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      // Not proven-missing (that requires exit 1 with empty stdout AND empty stderr): an
+      // ambiguous failure the classifier must never read as proof of anything.
+      return { code: 2, stdout: "", stderr: "permission denied" };
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  assert.equal(await reader(), null);
+});
+
+test("createSubprocessOwnOwnershipReader resolves null (never rejects) for empty stdout", async () => {
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  assert.equal(await reader(), null);
+});
+
+test("createSubprocessOwnOwnershipReader resolves null (never rejects) for unparseable stdout", async () => {
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      return { code: 0, stdout: "not a ps status line\n", stderr: "" };
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  assert.equal(await reader(), null);
+});
+
+test("createSubprocessOwnOwnershipReader resolves null (never rejects) when readCwd rejects", async () => {
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      return { code: 0, stdout: "Thu Jul 30 05:06:13 2026 S\n", stderr: "" };
+    },
+    async readCwd() {
+      throw new Error("permission denied reading /proc");
+    },
+  });
+
+  assert.equal(await reader(), null);
+});
+
+test("createSubprocessOwnOwnershipReader memoizes a null outcome and never re-invokes spawnProcess", async () => {
+  let calls = 0;
+  const reader = createSubprocessOwnOwnershipReader({
+    async spawnProcess() {
+      calls += 1;
+      throw new Error("spawn exploded");
+    },
+    async readCwd() {
+      return "/tmp/x";
+    },
+  });
+
+  assert.equal(await reader(), null);
+  assert.equal(await reader(), null);
+  assert.equal(calls, 1);
+});
+
+test("createSubprocessOwnOwnershipReader construction never throws when called with no arguments at all", () => {
+  // Construction must not itself spawn anything (the reader is lazy) -- this exercises the real
+  // ps-spawning and realpath defaults being built, without ever invoking the real `ps` binary
+  // that workflow-cli.test.js's wiring tests deliberately avoid too.
+  assert.doesNotThrow(() => createSubprocessOwnOwnershipReader());
 });
 
 // --- isPlainMarker -------------------------------------------------------
