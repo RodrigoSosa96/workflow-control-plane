@@ -331,6 +331,62 @@ test("creates a permanent private lock container and scoped active owner marker"
   assert.deepEqual(await realFs.readdir(lockContainer), []);
 });
 
+test("acquired lock marker is version 2 and carries pid, startedAt, and runId at mode 0600", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    readOwnOwnership: async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" }),
+  });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+
+  let marker;
+  let markerMode;
+  await store.update(RUN_ID_1, async () => {
+    const [markerName] = await realFs.readdir(activePath);
+    const markerPath = join(activePath, markerName);
+    markerMode = await fileMode(markerPath);
+    marker = JSON.parse(await readFile(markerPath, "utf8"));
+    return { state: RUN_STATES.LAUNCHING };
+  });
+
+  assert.equal(markerMode, 0o600);
+  assert.equal(marker.version, 2);
+  assert.equal(marker.runId, RUN_ID_1);
+  assert.equal(marker.pid, "4242");
+  assert.equal(marker.startedAt, "2024-12-31T00:00:00.000Z");
+  assert.match(marker.token, LOCK_OWNER_TOKEN_RE);
+});
+
+test("a readOwnOwnership that throws still permits acquisition and yields a marker without pid or startedAt", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    readOwnOwnership: async () => {
+      throw new Error("ps failed");
+    },
+  });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+
+  let marker;
+  const updated = await store.update(RUN_ID_1, async () => {
+    const [markerName] = await realFs.readdir(activePath);
+    marker = JSON.parse(await readFile(join(activePath, markerName), "utf8"));
+    return { state: RUN_STATES.LAUNCHING };
+  });
+
+  assert.equal(updated.state, RUN_STATES.LAUNCHING, "a throwing readOwnOwnership must not block acquisition");
+  assert.equal(marker.version, 2);
+  assert.equal(marker.runId, RUN_ID_1);
+  assert.equal("pid" in marker, false);
+  assert.equal("startedAt" in marker, false);
+});
+
 test("reports bounded active lock contention with injected clock without deleting it", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({
@@ -779,4 +835,131 @@ test("update stays fail-fast when the lock collision persists past the bounded r
   );
   // Bounded: exactly two backoffs for three attempts, then the contention error.
   assert.equal(sleeps.length, 2);
+});
+
+test("inspectLock returns null with no lock, and returns the marker with a stale flag without mutating anything", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+
+  assert.equal(await store.inspectLock(RUN_ID_1), null);
+
+  const lockContainer = join(run.directory, "run.lock");
+  const activePath = join(lockContainer, "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = {
+    version: 2,
+    token: "crashed-token",
+    runId: RUN_ID_1,
+    pid: "9999",
+    startedAt: "2024-12-31T00:00:00.000Z",
+  };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activePath, { recursive: true, mode: 0o755 });
+  await chmod(lockContainer, 0o755);
+  await chmod(activePath, 0o755);
+  await writeFile(markerPath, markerContent, { mode: 0o644 });
+  const staleTime = new Date("2025-01-01T00:00:00.000Z");
+  await utimes(activePath, staleTime, staleTime);
+
+  const inspected = await store.inspectLock(RUN_ID_1);
+
+  assert.equal(inspected.activePath, activePath);
+  assert.equal(inspected.markerPath, markerPath);
+  assert.deepEqual(inspected.marker, marker);
+  assert.equal(inspected.ageMs, 10 * 60 * 1000);
+  assert.equal(inspected.stale, true);
+
+  // Never mutates: a naive implementation could reuse the tighten-permissions helpers every
+  // other read/write path calls; inspectLock must not, so the permissive modes set above (and
+  // the marker's exact byte content) must survive untouched.
+  assert.equal(await fileMode(lockContainer), 0o755);
+  assert.equal(await fileMode(activePath), 0o755);
+  assert.equal(await fileMode(markerPath), 0o644);
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+});
+
+test("removeLock removes only when allow returns true, refuses without throwing when the marker changes first, and unblocks the run", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
+  });
+  const run = await store.create(plannedInput());
+  const lockContainer = join(run.directory, "run.lock");
+  const activePath = join(lockContainer, "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = {
+    version: 2,
+    token: "crashed-token",
+    runId: RUN_ID_1,
+    pid: "9999",
+    startedAt: "2024-12-31T00:00:00.000Z",
+  };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+  // Mark it stale (per the injected clock) so the wedged check below fails fast on the first
+  // attempt instead of burning through acquireLockWithRetry's bounded real-time backoff.
+  const staleTime = new Date("2025-01-01T00:00:00.000Z");
+  await utimes(activePath, staleTime, staleTime);
+
+  // The run is wedged behind the crash-residue lock until it is removed.
+  await assert.rejects(() => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })), /lock/i);
+
+  // allow() returning false: refuses without throwing, removes nothing.
+  const disallowed = await store.removeLock(RUN_ID_1, { allow: () => false });
+  assert.equal(disallowed.removed, false);
+  assert.match(disallowed.reason, /not permitted/i);
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+
+  // The marker changes inside the allow() callback (simulating a fresh acquisition racing the
+  // removal): removeLock must re-verify byte content immediately before deleting and refuse.
+  let allowCalls = 0;
+  const racedMarkerContent = `${JSON.stringify({ ...marker, token: "different-token" })}\n`;
+  const raced = await store.removeLock(RUN_ID_1, {
+    allow: async (seenMarker) => {
+      allowCalls += 1;
+      assert.deepEqual(seenMarker, marker);
+      await writeFile(markerPath, racedMarkerContent, { mode: 0o600 });
+      return true;
+    },
+  });
+  assert.equal(allowCalls, 1);
+  assert.equal(raced.removed, false);
+  assert.match(raced.reason, /marker changed/i);
+  assert.equal(await readFile(markerPath, "utf8"), racedMarkerContent, "the race-injected content must survive a refused removal");
+
+  // Restore the stable marker, then a permitting allow() actually removes it.
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+  const removed = await store.removeLock(RUN_ID_1, {
+    allow: (seenMarker) => {
+      assert.deepEqual(seenMarker, marker);
+      return true;
+    },
+  });
+  assert.deepEqual(removed, { removed: true, markerPath, activePath });
+  await assertNoPath(activePath);
+  assert.deepEqual(await realFs.readdir(lockContainer), []);
+
+  // The run accepts writes again.
+  const updated = await store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING }));
+  assert.equal(updated.state, RUN_STATES.LAUNCHING);
+  await store.appendEvent(RUN_ID_1, { type: "launch.output" });
+});
+
+test("removeLock refuses without throwing when there is no active lock to remove", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  await store.create(plannedInput());
+
+  const result = await store.removeLock(RUN_ID_1, { allow: () => true });
+
+  assert.equal(result.removed, false);
+  assert.match(result.reason, /no active lock/i);
 });

@@ -146,6 +146,7 @@ export function createRunStore({
   randomUUID = defaultRandomUUID,
   onListProblem = () => {},
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  readOwnOwnership = async () => null,
 } = {}) {
   const root = resolveStateRoot(stateRoot);
   const now = createClock(clock);
@@ -154,6 +155,9 @@ export function createRunStore({
   }
   if (typeof sleep !== "function") {
     failStore("sleep must be a function");
+  }
+  if (typeof readOwnOwnership !== "function") {
+    failStore("readOwnOwnership must be a function");
   }
   let tempCounter = 0;
   let eventCounter = 0;
@@ -456,7 +460,7 @@ export function createRunStore({
     }
   }
 
-  async function acquireLock(directory) {
+  async function acquireLock(directory, runId) {
     const lockContainer = await ensureLockContainer(directory);
     const activePath = join(lockContainer, ACTIVE_LOCK_DIR);
     try {
@@ -482,6 +486,23 @@ export function createRunStore({
     const markerName = `owner-${token}.json`;
     const markerPath = join(activePath, markerName);
     const ownership = { path: activePath, lockContainer, activePath, activeStat, markerPath, token };
+
+    // A throw here (a killed `ps`, a mis-wired reader) must never block acquisition — it
+    // just means this marker is written without a provable start time, same as a version-1
+    // marker. createOwnOwnershipReader (not this store) is the only place that memoizes.
+    let processOwnership = null;
+    try {
+      processOwnership = await readOwnOwnership();
+    } catch {
+      processOwnership = null;
+    }
+    const marker = {
+      version: 2,
+      token,
+      runId,
+      ...(processOwnership ? { pid: processOwnership.pid, startedAt: processOwnership.startedAt } : {}),
+    };
+
     let handle;
     try {
       handle = await fs.open(markerPath, "wx", PRIVATE_FILE_MODE);
@@ -492,7 +513,7 @@ export function createRunStore({
 
     let markerError;
     try {
-      await handle.writeFile(`${JSON.stringify({ version: 1, token })}\n`, "utf8");
+      await handle.writeFile(`${JSON.stringify(marker)}\n`, "utf8");
       await handle.sync();
     } catch (error) {
       markerError = error;
@@ -543,11 +564,11 @@ export function createRunStore({
   // silently, because hook callers swallow errors by design. A short bounded
   // retry makes those collisions survivable while staying fail-fast for stale
   // locks (crash residue), which are never waited on.
-  async function acquireLockWithRetry(directory) {
+  async function acquireLockWithRetry(directory, runId) {
     const maxAttempts = 3;
     for (let attempt = 1; ; attempt += 1) {
       try {
-        return await acquireLock(directory);
+        return await acquireLock(directory, runId);
       } catch (error) {
         const freshContention = error?.details?.stale === false;
         if (!freshContention || attempt >= maxAttempts) throw error;
@@ -556,8 +577,8 @@ export function createRunStore({
     }
   }
 
-  async function withLock(directory, callback) {
-    const ownership = await acquireLockWithRetry(directory);
+  async function withLock(directory, runId, callback) {
+    const ownership = await acquireLockWithRetry(directory, runId);
     let result;
     let callbackError;
     try {
@@ -580,6 +601,129 @@ export function createRunStore({
     }
     if (callbackError) throw callbackError;
     return result;
+  }
+
+  // Shared by inspectLock (read-only) and removeLock (which calls this twice
+  // to check-then-act). Never mkdirs, chmods, or writes anything — it only
+  // stats/reads what acquireLock/releaseLock already produced. Returns null
+  // when there is no active lock directory at all.
+  async function inspectLockInternal(runId) {
+    const id = ensureRunId(runId);
+    const directory = runDirectoryFor(id);
+    const lockContainer = join(directory, LOCK_FILE);
+    const activePath = join(lockContainer, ACTIVE_LOCK_DIR);
+
+    let activeStat;
+    try {
+      activeStat = await fs.stat(activePath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+      throwFs("stat active lock", activePath, error);
+    }
+    if (!activeStat.isDirectory()) return null;
+
+    let entries;
+    try {
+      entries = await fs.readdir(activePath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+      throwFs("list active lock", activePath, error);
+    }
+
+    const ageMs = Math.max(0, Date.parse(now()) - activeStat.mtimeMs);
+    const stale = ageMs >= STALE_LOCK_MS;
+    const [markerName] = entries;
+    if (!markerName) {
+      // Crash residue between the active-directory mkdir and the marker's wx write.
+      return { activePath, activeStat, markerPath: null, markerText: null, marker: null, ageMs, stale };
+    }
+
+    const markerPath = join(activePath, markerName);
+    let markerText = null;
+    try {
+      markerText = await fs.readFile(markerPath, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throwFs("read lock owner marker", markerPath, error);
+    }
+
+    let marker = null;
+    if (markerText !== null) {
+      try {
+        marker = JSON.parse(markerText);
+      } catch {
+        marker = null;
+      }
+    }
+
+    return { activePath, activeStat, markerPath, markerText, marker, ageMs, stale };
+  }
+
+  // Read-only diagnosis for `workflow unlock`: must never acquire the lock it
+  // inspects and must never mutate, unlike every other lock path in this file.
+  async function inspectLock(runId) {
+    const inspected = await inspectLockInternal(runId);
+    if (!inspected) return null;
+    const { activePath, markerPath, marker, ageMs, stale } = inspected;
+    return { activePath, markerPath, marker, ageMs, stale };
+  }
+
+  // Removes an active lock only when the caller's `allow` predicate approves the
+  // currently observed marker, then re-verifies both the active directory's identity
+  // (the same dev/ino comparison releaseLock performs via sameActiveDirectory) and the
+  // marker's raw bytes immediately before deleting anything. A change in that window —
+  // a fresh acquisition, a different marker — refuses instead of deleting unknown state,
+  // the same guarantee releaseLock gives its own owner. Refuses by returning a reason;
+  // it only throws for anomalies discovered after removal has already begun, mirroring
+  // releaseLock's own post-commit error handling.
+  async function removeLock(runId, { allow } = {}) {
+    if (typeof allow !== "function") {
+      failStore("removeLock allow must be a function");
+    }
+    const id = ensureRunId(runId);
+
+    const initial = await inspectLockInternal(id);
+    if (!initial || !initial.marker) {
+      return { removed: false, reason: "no active lock or the owner marker is unreadable" };
+    }
+
+    const permitted = await allow(initial.marker);
+    if (!permitted) {
+      return { removed: false, reason: "removal was not permitted for the current owner marker" };
+    }
+
+    const recheck = await inspectLockInternal(id);
+    if (!recheck || !recheck.marker) {
+      return { removed: false, reason: "the active lock or its owner marker disappeared before removal" };
+    }
+    if (!sameActiveDirectory(recheck.activeStat, initial.activeStat)) {
+      return { removed: false, reason: "the active lock directory was replaced before removal" };
+    }
+    if (recheck.markerPath !== initial.markerPath || recheck.markerText !== initial.markerText) {
+      return { removed: false, reason: "the owner marker changed before removal" };
+    }
+
+    try {
+      await fs.unlink(recheck.markerPath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        return { removed: false, reason: "the owner marker disappeared before removal" };
+      }
+      throwFs("remove lock owner marker", recheck.markerPath, error);
+    }
+
+    try {
+      await fs.rmdir(recheck.activePath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        throw lockOwnershipError(recheck.activePath, "active lock directory disappeared before removal");
+      }
+      if (error?.code === "ENOTEMPTY" || error?.code === "EEXIST") {
+        throw lockOwnershipError(recheck.activePath, "active lock directory is nonempty");
+      }
+      throw error;
+    }
+
+    return { removed: true, markerPath: recheck.markerPath, activePath: recheck.activePath };
   }
 
   function initialRun(input, runId) {
@@ -653,7 +797,7 @@ export function createRunStore({
     const directory = runDirectoryFor(runId);
     await ensureRunDirectory(directory);
 
-    return withLock(directory, async () => {
+    return withLock(directory, runId, async () => {
       const path = join(directory, RUN_FILE);
       if (await pathExists(path)) {
         failStore(`Run already exists: ${runId}`);
@@ -680,7 +824,7 @@ export function createRunStore({
     await tightenExistingStateRootDirectory();
     await tightenExistingRunDirectory(directory);
 
-    return withLock(directory, async () => {
+    return withLock(directory, id, async () => {
       const current = await readRunInternal(id, directory);
       const patch = await updater(cloneJson(attachDirectory(current, directory)));
       // An updater that returns an empty object is signalling "no change". Skip the write so a
@@ -704,7 +848,7 @@ export function createRunStore({
     await tightenExistingStateRootDirectory();
     await tightenExistingRunDirectory(directory);
 
-    return withLock(directory, async () => {
+    return withLock(directory, id, async () => {
       await readRunInternal(id, directory);
       const {
         id: _eventId,
@@ -778,7 +922,7 @@ export function createRunStore({
     await tightenExistingStateRootDirectory();
     await tightenExistingRunDirectory(directory);
 
-    return withLock(directory, async () => {
+    return withLock(directory, id, async () => {
       const current = await readRunInternal(id, directory);
       const writtenAt = now();
       const assignmentPath = join(directory, ASSIGNMENT_FILE);
@@ -806,7 +950,7 @@ export function createRunStore({
     await tightenExistingStateRootDirectory();
     await tightenExistingRunDirectory(directory);
 
-    return withLock(directory, async () => {
+    return withLock(directory, id, async () => {
       const current = await readRunInternal(id, directory);
       const patch = await updater(cloneJson(attachDirectory(current, directory)));
       if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
@@ -818,5 +962,15 @@ export function createRunStore({
     });
   }
 
-  return Object.freeze({ create, read, update, appendEvent, list, writeAssignment, writePrivateFile });
+  return Object.freeze({
+    create,
+    read,
+    update,
+    appendEvent,
+    list,
+    writeAssignment,
+    writePrivateFile,
+    inspectLock,
+    removeLock,
+  });
 }
