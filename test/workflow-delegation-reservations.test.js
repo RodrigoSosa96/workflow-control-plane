@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import * as realFs from "node:fs/promises";
-import { chmod, mkdir, mkdtemp, readFile, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -61,6 +61,48 @@ function createStore(stateRoot, ids = [FIRST_ID, SECOND_ID, THIRD_ID]) {
     ),
     canonicalPath: async (value) => value,
   });
+}
+
+function activeGatePathFor(stateRoot, projectAlias) {
+  const projectDigest = createHash("sha256").update(projectAlias, "utf8").digest("hex");
+  return join(stateRoot, "delegation-reservations", "projects", projectDigest, "gate", "active");
+}
+
+// Wraps fs.readFile to capture the raw bytes of a single target path the first time it is
+// read, without altering what the caller sees. Used to observe the gate owner marker's exact
+// content while releaseGate reads it (immediately before deleting it), since a successful
+// reserve() releases the gate before returning and leaves nothing on disk to inspect afterward.
+function fsCapturingRead(targetPath) {
+  const captured = { text: null };
+  const fs = {
+    ...realFs,
+    async readFile(path, encoding) {
+      const text = await realFs.readFile(path, encoding);
+      if (path === targetPath && captured.text === null) captured.text = text;
+      return text;
+    },
+  };
+  return { fs, captured };
+}
+
+// Fabricates a different `ino` for the Nth fs.stat(path) call, deterministically simulating
+// "this is a different directory now" without depending on how eagerly the underlying
+// filesystem reuses a freed inode after rmdir+mkdir — observed to be immediate on this
+// environment's tmpfs (WSL2), which makes a real rmdir+mkdir replacement indistinguishable
+// from the original directory via dev/ino alone. Mirrors workflow-run-store.test.js's helper
+// of the same name.
+function fsWithFabricatedIdentityOnNthStat(targetPath, targetCallNumber) {
+  let calls = 0;
+  return {
+    ...realFs,
+    async stat(path) {
+      const real = await realFs.stat(path);
+      if (path !== targetPath) return real;
+      calls += 1;
+      if (calls !== targetCallNumber) return real;
+      return { ...real, ino: (real.ino ?? 0) + 999999, isDirectory: () => real.isDirectory() };
+    },
+  };
 }
 
 test("reserves read-only background capacity with opaque private state", async (t) => {
@@ -285,4 +327,313 @@ test("releaseForDelegation is a no-op for unknown delegations and untouched proj
   // Releasing twice is idempotent: the second call finds no active lease.
   assert.equal((await reservations.releaseForDelegation({ projectAlias: "fixture-single", delegationId: FIRST_ID })).length, 1);
   assert.deepEqual(await reservations.releaseForDelegation({ projectAlias: "fixture-single", delegationId: FIRST_ID }), []);
+});
+
+test("gate marker written during a reserve is version 2 and carries pid and startedAt", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
+  const { fs, captured } = fsCapturingRead(markerPath);
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    fs,
+    randomUUID: uuidSequence(FIRST_ID, SECOND_ID, THIRD_ID),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    canonicalPath: async (value) => value,
+    readOwnOwnership: async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" }),
+  });
+
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+
+  assert.equal(reservation.state, "active");
+  assert.ok(captured.text, "expected releaseGate to have read the gate owner marker");
+  const marker = JSON.parse(captured.text);
+  assert.equal(marker.version, 2);
+  assert.equal(marker.pid, "4242");
+  assert.equal(marker.startedAt, "2024-12-31T00:00:00.000Z");
+  assert.match(marker.ownerToken, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+});
+
+test("a readOwnOwnership that throws still permits a reserve and writes a gate marker without pid or startedAt", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
+  const { fs, captured } = fsCapturingRead(markerPath);
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    fs,
+    randomUUID: uuidSequence(FIRST_ID, SECOND_ID, THIRD_ID),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    canonicalPath: async (value) => value,
+    readOwnOwnership: async () => {
+      throw new Error("ps failed");
+    },
+  });
+
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+
+  assert.equal(reservation.state, "active", "a throwing readOwnOwnership must not block gate acquisition");
+  assert.ok(captured.text);
+  const marker = JSON.parse(captured.text);
+  assert.equal(marker.version, 2);
+  assert.equal("pid" in marker, false);
+  assert.equal("startedAt" in marker, false);
+});
+
+test("releaseGate accepts a version-1 marker for backward compatibility while still comparing ownerToken", async (t) => {
+  // acquireGate itself never writes version 1 anymore; this proves releaseGate's version check
+  // was widened rather than merely happening to still pass because nothing exercises it. Only
+  // the byte content read back by releaseGate is swapped to a version-1 shape with the same
+  // ownerToken; everything else about the acquisition (paths, identity) is real.
+  const stateRoot = await tempStateRoot(t);
+  const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
+  let downgraded = false;
+  const fs = {
+    ...realFs,
+    async readFile(path, encoding) {
+      const text = await realFs.readFile(path, encoding);
+      if (path === markerPath && !downgraded) {
+        downgraded = true;
+        const parsed = JSON.parse(text);
+        return `${JSON.stringify({ version: 1, ownerToken: parsed.ownerToken })}\n`;
+      }
+      return text;
+    },
+  };
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    fs,
+    randomUUID: uuidSequence(FIRST_ID, SECOND_ID, THIRD_ID),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    canonicalPath: async (value) => value,
+  });
+
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+
+  assert.equal(reservation.state, "active");
+  assert.equal(downgraded, true, "expected the version-1 downgrade to have been exercised");
+  // The gate was actually released (not left wedged): a second reservation on the same project
+  // proceeds without hitting "gate is active; manual inspection required".
+  const second = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: SECOND_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy: { ...policy, readOnlyBackground: 2 },
+  });
+  assert.equal(second.state, "active");
+});
+
+test("inspectGate returns null for an untouched project and the marker for a held gate, mutating nothing", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createStore(stateRoot);
+
+  assert.equal(await reservations.inspectGate({ projectAlias: "never-used" }), null);
+
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const markerPath = join(activeGate, "owner.json");
+  const marker = { version: 2, ownerToken: FIRST_ID, pid: "9999", startedAt: "2024-12-31T00:00:00.000Z" };
+  const markerContent = `${JSON.stringify(marker, null, 2)}\n`;
+  await mkdir(activeGate, { recursive: true, mode: 0o755 });
+  await chmod(activeGate, 0o755);
+  await writeFile(markerPath, markerContent, { mode: 0o644 });
+
+  const inspected = await reservations.inspectGate({ projectAlias: "fixture-single" });
+  assert.equal(inspected.activeGate, activeGate);
+  assert.equal(inspected.markerPath, markerPath);
+  assert.deepEqual(inspected.marker, marker);
+
+  // Never mutates: the permissive modes and exact marker bytes set above must survive
+  // untouched, and inspectGate must never acquire the gate it inspects.
+  assert.equal(await fileMode(activeGate), 0o755);
+  assert.equal(await fileMode(markerPath), 0o644);
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+});
+
+test("inspectGate ignores a stray non-owner file and still finds the real marker", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createDelegationReservationStore({ stateRoot, canonicalPath: async (value) => value });
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const markerPath = join(activeGate, "owner.json");
+  const marker = { version: 2, ownerToken: "crashed-token" };
+  await mkdir(activeGate, { recursive: true, mode: 0o700 });
+  // Sorts before "owner.json" alphabetically: a naive "first readdir entry" implementation
+  // would pick this stray file instead of filtering for the real marker name.
+  await writeFile(join(activeGate, ".DS_Store"), "not a marker", { mode: 0o600 });
+  await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+
+  const inspected = await reservations.inspectGate({ projectAlias: "fixture-single" });
+
+  assert.deepEqual(inspected.marker, marker);
+  assert.equal(inspected.markerPath, markerPath);
+});
+
+test("clearGate clears only when allow returns true, refuses without throwing when the marker changes first, and unblocks reserve", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const ids = [FIRST_ID, SECOND_ID, THIRD_ID, "44444444-4444-4444-8444-444444444444"];
+  const reservations = createStore(stateRoot, ids);
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const markerPath = join(activeGate, "owner.json");
+  const marker = { version: 2, ownerToken: "crashed-token", pid: "9999", startedAt: "2024-12-31T00:00:00.000Z" };
+  const markerContent = `${JSON.stringify(marker, null, 2)}\n`;
+  await mkdir(activeGate, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+
+  // The project is wedged behind the crash-residue gate.
+  await assert.rejects(
+    () => reservations.reserve({
+      projectAlias: "fixture-single",
+      delegationId: FIRST_ID,
+      role: "scout",
+      mode: "foreground",
+      checkoutPath: "/fixture/source",
+      policy,
+    }),
+    /gate|manual/i,
+  );
+
+  // allow() returning false: refuses without throwing, removes nothing.
+  const disallowed = await reservations.clearGate({ projectAlias: "fixture-single", allow: () => false });
+  assert.equal(disallowed.cleared, false);
+  assert.match(disallowed.reason, /not permitted/i);
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+
+  // The marker changes inside the allow() callback (simulating a fresh acquisition racing the
+  // clear): clearGate must re-verify byte content immediately before deleting and refuse.
+  let allowCalls = 0;
+  const racedMarkerContent = `${JSON.stringify({ ...marker, ownerToken: "different-token" }, null, 2)}\n`;
+  const raced = await reservations.clearGate({
+    projectAlias: "fixture-single",
+    allow: async (seenMarker) => {
+      allowCalls += 1;
+      assert.deepEqual(seenMarker, marker);
+      await writeFile(markerPath, racedMarkerContent, { mode: 0o600 });
+      return true;
+    },
+  });
+  assert.equal(allowCalls, 1);
+  assert.equal(raced.cleared, false);
+  assert.match(raced.reason, /marker changed/i);
+  assert.equal(await readFile(markerPath, "utf8"), racedMarkerContent, "the race-injected content must survive a refused clear");
+
+  // Restore the stable marker, then a permitting allow() actually clears it.
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+  const cleared = await reservations.clearGate({
+    projectAlias: "fixture-single",
+    allow: (seenMarker) => {
+      assert.deepEqual(seenMarker, marker);
+      return true;
+    },
+  });
+  assert.deepEqual(cleared, { cleared: true, activeGate });
+  await assert.rejects(() => stat(activeGate), /ENOENT/);
+
+  // The project accepts reservations again.
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "scout",
+    mode: "foreground",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+  assert.equal(reservation.state, "active");
+});
+
+test("clearGate refuses without throwing when there is no active gate to clear", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createStore(stateRoot);
+
+  const result = await reservations.clearGate({ projectAlias: "never-used", allow: () => true });
+
+  assert.equal(result.cleared, false);
+  assert.match(result.reason, /no active gate/i);
+});
+
+test("clearGate's pre-unlink recheck refuses a same-content replacement gate via directory identity, not marker bytes", async (t) => {
+  // If the identity check inside clearGate's pre-unlink recheck were deleted, this test would
+  // fail: the fabricated identity below leaves the marker's path and byte content completely
+  // untouched, so only a dev/ino (directory identity) comparison can distinguish "the same
+  // gate we inspected" from "a replacement that happens to look identical".
+  const stateRoot = await tempStateRoot(t);
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const markerPath = join(activeGate, "owner.json");
+  const marker = { version: 2, ownerToken: "crashed-token" };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activeGate, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+
+  // clearGate's own fs.stat(activeGate) call sequence is: 1) inspectGateInternal for `initial`,
+  // 2) inspectGateInternal for `recheck` (this is the one under test — fabricate a different
+  // identity for it).
+  const fs = fsWithFabricatedIdentityOnNthStat(activeGate, 2);
+  const reservations = createDelegationReservationStore({ stateRoot, fs, canonicalPath: async (value) => value });
+
+  let allowCalls = 0;
+  const result = await reservations.clearGate({
+    projectAlias: "fixture-single",
+    allow: async (seenMarker) => {
+      allowCalls += 1;
+      assert.deepEqual(seenMarker, marker);
+      return true;
+    },
+  });
+
+  assert.equal(allowCalls, 1);
+  assert.equal(result.cleared, false);
+  assert.match(result.reason, /replaced/i);
+  // The gate must survive completely untouched: proof clearGate never unlinked the marker.
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+  await assert.doesNotReject(() => stat(activeGate));
+});
+
+test("clearGate's pre-rmdir recheck refuses a same-content replacement gate via directory identity, not marker bytes", async (t) => {
+  // Targets the second, later identity check that runs after the marker has already been
+  // unlinked and immediately before rmdir. If that check were deleted, this test would fail:
+  // the fabricated identity below leaves everything else (path, marker bytes) untouched, so
+  // only a fresh dev/ino comparison right before rmdir can catch it.
+  const stateRoot = await tempStateRoot(t);
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const markerPath = join(activeGate, "owner.json");
+  const marker = { version: 2, ownerToken: "crashed-token" };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activeGate, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+
+  // Calls 1 and 2 (the initial and recheck inspections) must see a consistent, real identity so
+  // clearGate actually proceeds to unlink; call 3 is clearGate's own postUnlinkStat, taken
+  // right after the unlink and immediately before rmdir — fabricate a different identity there
+  // specifically.
+  const fs = fsWithFabricatedIdentityOnNthStat(activeGate, 3);
+  const reservations = createDelegationReservationStore({ stateRoot, fs, canonicalPath: async (value) => value });
+
+  const result = await reservations.clearGate({ projectAlias: "fixture-single", allow: () => true });
+
+  assert.equal(result.cleared, false);
+  assert.match(result.reason, /replaced/i);
+  // The marker was legitimately unlinked (that part of removal did commit), but the directory
+  // itself must survive: proof clearGate refused to rmdir once the identity check caught the
+  // fabricated mismatch, rather than rmdir-ing a directory it never re-verified.
+  await assert.rejects(() => stat(markerPath), /ENOENT/);
+  await assert.doesNotReject(() => stat(activeGate));
 });

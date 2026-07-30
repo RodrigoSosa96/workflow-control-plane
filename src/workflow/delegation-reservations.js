@@ -8,6 +8,7 @@ const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RESERVATION_ROOT = "delegation-reservations";
+const GATE_MARKER_NAME = "owner.json";
 
 function fail(message, details) {
   throw new WorkflowError("delegation-reservation", message, { details });
@@ -86,10 +87,12 @@ export function createDelegationReservationStore({
   randomUUID = defaultRandomUUID,
   canonicalPath = defaultCanonicalPath,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  readOwnOwnership = async () => null,
 } = {}) {
   const root = resolve(assertString(stateRoot, "reservation state root"));
   if (typeof randomUUID !== "function" || typeof canonicalPath !== "function") fail("reservation store requires randomUUID and canonicalPath functions");
   if (typeof sleep !== "function") fail("reservation store requires a sleep function");
+  if (typeof readOwnOwnership !== "function") fail("reservation store requires a readOwnOwnership function");
   let tempCounter = 0;
 
   async function chmodDirectory(path) {
@@ -161,6 +164,19 @@ export function createDelegationReservationStore({
   }
 
   async function acquireGate(paths) {
+    // Read this process's own start time before touching any gate state. A slow `ps` spawn
+    // must never run while the mkdir-based mutex is held: it would eat into the bounded retry
+    // budget below, and it would widen the window where the active directory exists with no
+    // marker yet. A throw here must never block acquisition — the marker is simply written
+    // without a provable start time, same as a version-1 marker. createOwnOwnershipReader (not
+    // this store) is the only place that memoizes, so calling this again on a retry is cheap.
+    let processOwnership = null;
+    try {
+      processOwnership = await readOwnOwnership();
+    } catch {
+      processOwnership = null;
+    }
+
     await ensureDirectory(root);
     await ensureDirectory(join(root, RESERVATION_ROOT));
     await ensureDirectory(join(root, RESERVATION_ROOT, "projects"));
@@ -188,14 +204,19 @@ export function createDelegationReservationStore({
     }
     await chmodDirectory(paths.activeGate);
     const ownerToken = uuid(randomUUID, "reservation gate owner token");
-    const markerPath = join(paths.activeGate, "owner.json");
-    await writeAtomicJson(markerPath, { version: 1, ownerToken });
+    const markerPath = join(paths.activeGate, GATE_MARKER_NAME);
+    const marker = {
+      version: 2,
+      ownerToken,
+      ...(processOwnership ? { pid: processOwnership.pid, startedAt: processOwnership.startedAt } : {}),
+    };
+    await writeAtomicJson(markerPath, marker);
     return { ...paths, ownerToken, markerPath };
   }
 
   async function releaseGate(gate) {
     const marker = await readJson(gate.markerPath);
-    if (marker?.version !== 1 || marker.ownerToken !== gate.ownerToken) {
+    if ((marker?.version !== 1 && marker?.version !== 2) || marker.ownerToken !== gate.ownerToken) {
       fail("Reservation gate ownership could not be verified; manual inspection required");
     }
     try {
@@ -204,6 +225,156 @@ export function createDelegationReservationStore({
     } catch (error) {
       fail(`Reservation gate ownership could not be released (${error?.code ?? "FS_ERROR"}); manual inspection required`);
     }
+  }
+
+  function isGateMarkerName(name) {
+    return name === GATE_MARKER_NAME;
+  }
+
+  // Directory identity comparison shared by clearGate's two rechecks. Mirrors
+  // run-store.js's sameActiveDirectory so "the gate directory was replaced" is decided the
+  // same way everywhere a mutex owner marker is involved.
+  function sameGateDirectory(left, right) {
+    if (
+      Number.isFinite(left?.dev) && Number.isFinite(left?.ino)
+      && Number.isFinite(right?.dev) && Number.isFinite(right?.ino)
+    ) {
+      return left.dev === right.dev && left.ino === right.ino;
+    }
+    return left?.ctimeMs === right?.ctimeMs && left?.mtimeMs === right?.mtimeMs;
+  }
+
+  // Shared by inspectGate (read-only) and clearGate (which calls this twice to check-then-act).
+  // Never mkdirs, chmods, or writes anything — it only stats/reads what acquireGate/releaseGate
+  // already produced. Returns null when there is no active gate directory at all.
+  async function inspectGateInternal(paths) {
+    let activeStat;
+    try {
+      activeStat = await fs.stat(paths.activeGate);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+      fail(`Unable to inspect reservation project gate (${error?.code ?? "FS_ERROR"})`);
+    }
+    if (!activeStat.isDirectory()) return null;
+
+    let entries;
+    try {
+      entries = await fs.readdir(paths.activeGate);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+      fail(`Unable to list reservation project gate (${error?.code ?? "FS_ERROR"})`);
+    }
+
+    // Only the exact owner.json shape acquireGate ever writes counts as a marker. A stray file
+    // (an editor temp, a .DS_Store) must never be guessed at as "the" marker, and more than one
+    // candidate is exactly as unreadable as zero — never pick one arbitrarily.
+    const markerNames = entries.filter(isGateMarkerName);
+    if (markerNames.length !== 1) {
+      const markerAmbiguous = markerNames.length > 1;
+      return { activeGate: paths.activeGate, activeStat, markerPath: null, markerText: null, marker: null, markerAmbiguous };
+    }
+
+    const markerPath = join(paths.activeGate, markerNames[0]);
+    let markerText = null;
+    try {
+      markerText = await fs.readFile(markerPath, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") fail(`Unable to read reservation gate owner marker (${error?.code ?? "FS_ERROR"})`);
+    }
+
+    let marker = null;
+    if (markerText !== null) {
+      try {
+        marker = JSON.parse(markerText);
+      } catch {
+        marker = null;
+      }
+    }
+
+    return { activeGate: paths.activeGate, activeStat, markerPath, markerText, marker, markerAmbiguous: false };
+  }
+
+  // Read-only diagnosis for a future `workflow delegation gate-clear` command: must never
+  // acquire the gate it inspects and must never mutate, unlike every other gate path here.
+  async function inspectGate({ projectAlias } = {}) {
+    const alias = assertString(projectAlias, "reservation project alias", 512);
+    const projectDigest = digestKey(alias);
+    const inspected = await inspectGateInternal(projectPaths(projectDigest));
+    if (!inspected) return null;
+    const { activeGate, markerPath, marker } = inspected;
+    return { activeGate, markerPath, marker };
+  }
+
+  // Removes an active gate only when the caller's `allow` predicate approves the currently
+  // observed marker, then re-verifies both the active directory's identity (the same dev/ino
+  // comparison releaseGate's paired acquire/release implicitly trusts) and the marker's raw
+  // bytes immediately before deleting anything — and again, identity only, immediately before
+  // rmdir. A change in either window (a fresh acquisition, a different marker) refuses instead
+  // of deleting unknown state. Refuses by returning a reason; it only throws for anomalies
+  // discovered after the rmdir itself has already begun.
+  async function clearGate({ projectAlias, allow } = {}) {
+    if (typeof allow !== "function") fail("clearGate allow must be a function");
+    const alias = assertString(projectAlias, "reservation project alias", 512);
+    const projectDigest = digestKey(alias);
+    const paths = projectPaths(projectDigest);
+
+    const initial = await inspectGateInternal(paths);
+    if (!initial || !initial.marker) {
+      const reason = initial?.markerAmbiguous
+        ? "more than one owner marker is present; refusing rather than guessing which is authoritative"
+        : "no active gate or the owner marker is unreadable";
+      return { cleared: false, reason };
+    }
+
+    const permitted = await allow(initial.marker);
+    if (!permitted) {
+      return { cleared: false, reason: "removal was not permitted for the current owner marker" };
+    }
+
+    const recheck = await inspectGateInternal(paths);
+    if (!recheck || !recheck.marker) {
+      return { cleared: false, reason: "the active gate or its owner marker disappeared before removal" };
+    }
+    if (!sameGateDirectory(recheck.activeStat, initial.activeStat)) {
+      return { cleared: false, reason: "the active gate directory was replaced before removal" };
+    }
+    if (recheck.markerPath !== initial.markerPath || recheck.markerText !== initial.markerText) {
+      return { cleared: false, reason: "the owner marker changed before removal" };
+    }
+
+    try {
+      await fs.unlink(recheck.markerPath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        return { cleared: false, reason: "the owner marker disappeared before removal" };
+      }
+      fail(`Unable to remove reservation gate owner marker (${error?.code ?? "FS_ERROR"})`);
+    }
+
+    // The marker is gone; re-verify the directory itself one more time before rmdir-ing it.
+    // Nothing should legitimately replace an active-gate directory this fast, but if it
+    // happened (a fresh acquisition landing in the window between the unlink above and here),
+    // rmdir-ing it unverified would destroy a live acquisition we never inspected.
+    let postUnlinkStat;
+    try {
+      postUnlinkStat = await fs.stat(recheck.activeGate);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        return { cleared: false, reason: "the active gate directory disappeared before removal" };
+      }
+      fail(`Unable to inspect reservation project gate (${error?.code ?? "FS_ERROR"})`);
+    }
+    if (!postUnlinkStat.isDirectory() || !sameGateDirectory(postUnlinkStat, recheck.activeStat)) {
+      return { cleared: false, reason: "the active gate directory was replaced before removal" };
+    }
+
+    try {
+      await fs.rmdir(recheck.activeGate);
+    } catch (error) {
+      fail(`Reservation gate ownership could not be released (${error?.code ?? "FS_ERROR"}); manual inspection required`);
+    }
+
+    return { cleared: true, activeGate: recheck.activeGate };
   }
 
   async function withProjectGate(projectDigest, callback) {
@@ -358,5 +529,5 @@ export function createDelegationReservationStore({
     return records.map(({ ownerToken: _ownerToken, ...record }) => record);
   }
 
-  return Object.freeze({ reserve, release, releaseForDelegation, list });
+  return Object.freeze({ reserve, release, releaseForDelegation, list, inspectGate, clearGate });
 }
