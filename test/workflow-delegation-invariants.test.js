@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import {
   checkoutDigestFor,
+  claimTokenMatchesDigest,
   reservationMatchesDelegation,
   reservationResourceList,
   validateDelegationTransportIdentity,
@@ -259,4 +260,41 @@ test("validateDelegationTransportIdentity raises through the caller-supplied fai
     }),
     CustomError,
   );
+});
+
+function digestFor(token) {
+  return `sha256:${createHash("sha256").update(token, "utf8").digest("hex")}`;
+}
+
+test("claimTokenMatchesDigest matches a token against the digest it was minted from", () => {
+  const token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  assert.equal(claimTokenMatchesDigest(token, digestFor(token)), true);
+});
+
+test("claimTokenMatchesDigest rejects a token that does not match the stored digest", () => {
+  const token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const otherToken = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  assert.equal(claimTokenMatchesDigest(otherToken, digestFor(token)), false);
+});
+
+test("claimTokenMatchesDigest returns false rather than throwing when the digest is absent", () => {
+  const token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  assert.equal(claimTokenMatchesDigest(token, undefined), false);
+  assert.equal(claimTokenMatchesDigest(token, null), false);
+  assert.equal(claimTokenMatchesDigest(token, ""), false);
+});
+
+test("claimTokenMatchesDigest returns false rather than throwing when the presented token is absent", () => {
+  const token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const digest = digestFor(token);
+  assert.equal(claimTokenMatchesDigest(undefined, digest), false);
+  assert.equal(claimTokenMatchesDigest(null, digest), false);
+  assert.equal(claimTokenMatchesDigest("", digest), false);
+});
+
+test("claimTokenMatchesDigest is case-insensitive on the presented token", () => {
+  const token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const digest = digestFor(token);
+  assert.equal(claimTokenMatchesDigest(token.toUpperCase(), digest), true);
+  assert.equal(claimTokenMatchesDigest("AAAAAAAA-aaaa-4AAA-8aaa-AAAAAAAAAAAA", digest), true);
 });

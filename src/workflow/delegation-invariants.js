@@ -91,6 +91,25 @@ export function checkoutDigestFor(cwd) {
   return createHash("sha256").update(cwd, "utf8").digest("hex");
 }
 
+// True when `presentedToken`, lowercased, hashes to `storedDigest`. This is
+// the authentication check at the boundary an untrusted delegation child
+// crosses: the token is minted at claim time and reaches the child only
+// through its private environment, while the record persists only this
+// digest (so a sibling reading the run record cannot recover the token from
+// it). delegation-store.js (recordResult's remediation branch and its three
+// remediation-launch guards: completeRemediationLaunch,
+// rollbackRemediationLaunch, markRemediationLaunchManualRecovery) and
+// delegation-handoff.js each hand-rolled this same comparison; this is the
+// one definition. A predicate, not a validator — it returns false rather
+// than throwing on a missing token or digest, so callers keep their own
+// shape checks (delegation-store.js's validateClaimToken enforces the UUID
+// shape and throws) and their own failure messages around this.
+export function claimTokenMatchesDigest(presentedToken, storedDigest) {
+  if (typeof presentedToken !== "string" || !presentedToken) return false;
+  if (typeof storedDigest !== "string" || !storedDigest) return false;
+  return `sha256:${createHash("sha256").update(presentedToken.toLowerCase(), "utf8").digest("hex")}` === storedDigest;
+}
+
 // The resources a delegation of this role/mode/checkout consumes against
 // project capacity. Pure list-building only: whether a background writer or
 // an invalid mode is *allowed* is a lease-creation policy decision, not part

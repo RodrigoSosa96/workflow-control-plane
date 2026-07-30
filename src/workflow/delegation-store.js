@@ -1,7 +1,7 @@
 import { createHash, randomUUID as defaultRandomUUID } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { classifyDelegationRole } from "./delegation-policy.js";
-import { validateDelegationTransportIdentity } from "./delegation-invariants.js";
+import { claimTokenMatchesDigest, validateDelegationTransportIdentity } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -361,7 +361,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           ? record.remediation
           : null;
         if (activeRemediation) {
-          if (digest(validateClaimToken(claimToken)) !== activeRemediation.claimTokenDigest) fail("Delegation handoff claim is stale");
+          if (!claimTokenMatchesDigest(validateClaimToken(claimToken), activeRemediation.claimTokenDigest)) fail("Delegation handoff claim is stale");
         } else if (claimToken !== undefined) {
           validateClaimToken(claimToken);
           fail("Delegation handoff claim is not active for the current generation");
@@ -434,7 +434,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (record.remediation.claimTokenDigest !== digest(validatedClaimToken)) fail("Delegation remediation launch claim is stale");
+        if (!claimTokenMatchesDigest(validatedClaimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
         if (record.remediation.generation !== expectedGeneration + 1) fail("Delegation remediation launch generation is stale");
         if (!record.transportIdentity) fail("Delegation transport identity is missing");
         if (
@@ -477,7 +477,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (record.remediation.claimTokenDigest !== digest(validatedClaimToken)) fail("Delegation remediation launch claim is stale");
+        if (!claimTokenMatchesDigest(validatedClaimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
         return {
           ...record,
           remediation: null,
@@ -499,7 +499,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (record.remediation.claimTokenDigest !== digest(validatedClaimToken)) fail("Delegation remediation launch claim is stale");
+        if (!claimTokenMatchesDigest(validatedClaimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
         return {
           ...record,
           remediation: {

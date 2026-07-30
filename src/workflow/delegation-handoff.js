@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
 import { WorkflowError } from "./errors.js";
-import { reservationMatchesDelegation, validateDelegationTransportIdentity } from "./delegation-invariants.js";
+import { claimTokenMatchesDigest, reservationMatchesDelegation, validateDelegationTransportIdentity } from "./delegation-invariants.js";
 
 const ALLOWED_KEYS = new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]);
 const HANDOFF_STATUSES = new Set(["completed", "blocked", "failed"]);
@@ -27,10 +26,6 @@ function assertString(value, context, limit) {
     fail(`${context} must be a bounded non-empty string`);
   }
   return value.trim();
-}
-
-function digestKey(value) {
-  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function validateInputBytes(value) {
@@ -124,7 +119,7 @@ export async function submitDelegationHandoff({ runId, delegationId, input, stor
     && record.remediation?.generation === normalized.generation;
   if (!activeRemediation && record.claimTokenDigest) {
     const presented = assertString(claimToken, "delegation handoff claim token", 128);
-    if (`sha256:${digestKey(presented.toLowerCase())}` !== record.claimTokenDigest) {
+    if (!claimTokenMatchesDigest(presented, record.claimTokenDigest)) {
       fail("Delegation handoff claim token does not match the active delegation");
     }
   }
