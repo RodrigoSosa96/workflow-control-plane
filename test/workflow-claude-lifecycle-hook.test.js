@@ -12,7 +12,7 @@ import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
 import { publicTelemetrySnapshot } from "../src/workflow/telemetry.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 import { createSubprocessOwnOwnershipReader, classifyOwnership } from "../src/workflow/ownership.js";
-import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
+import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 
 const RUN_ID = "33333333-3333-4333-8333-333333333333";
@@ -292,7 +292,7 @@ test("a lock acquired through the shared lifecycle-hook core produces a marker w
   const runner = createProcessRunner();
   const observation = await inspectExactProcessByPid(observed.marker.pid, {
     async runProcess(pid) {
-      return runner.run("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
+      return runner.run("ps", psStatusArgv(pid), { allowFailure: true });
     },
     readCwd: realpath,
   });

@@ -47,12 +47,28 @@ async function observeViaUnlockPath(pid) {
 
 test("a hook's written startedAt is byte-identical to unlock's observed startedAt, for the same live process", async (t) => {
   const written = await createSubprocessOwnOwnershipReader()();
-  const observed = await observeViaUnlockPath(String(process.pid));
 
   // Degrade, don't silently pass: an environment where `ps` is unavailable or behaves
   // unexpectedly must skip with a named reason, never fall through to an assertion that
   // vacuously holds (e.g. asserting two nulls are equal) or, worse, pass no assertion at all.
-  if (!written || !observed) {
+  //
+  // This check must run BEFORE observeViaUnlockPath: createSubprocessOwnOwnershipReader swallows
+  // a missing `ps` binary and resolves null (see ownership.js's readOwnProcessOwnership), but
+  // observeViaUnlockPath calls runner.run("ps", ...) directly -- on a host with no `ps` at all,
+  // that rejects with "Failed to start ps" (process.js) regardless of allowFailure, which would
+  // make this test error instead of skip. Checking `written` first means a missing `ps` is caught
+  // here, before the second call can throw.
+  if (!written) {
+    t.skip(
+      `ps produced no usable output on this machine (written=${JSON.stringify(written)}) -- `
+      + "the write/read equality this test exists to prove could not be checked here",
+    );
+    return;
+  }
+
+  const observed = await observeViaUnlockPath(String(process.pid));
+
+  if (!observed) {
     t.skip(
       `ps produced no usable output on this machine (written=${JSON.stringify(written)}, `
       + `observed=${JSON.stringify(observed)}) -- the write/read equality this test exists to `
