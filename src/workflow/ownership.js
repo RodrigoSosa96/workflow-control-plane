@@ -6,10 +6,6 @@
 // here: an ambiguous observation can only ever yield "unprovable", never
 // "owner-gone" — a mutex must not be treated as recoverable on a guess.
 
-function fail(message) {
-  throw new TypeError(message);
-}
-
 function isPlainMarker(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -25,11 +21,12 @@ function frozenVerdict({ verdict, reason, pid, startedAt }) {
 
 // Marker fields both mutexes embed. Returns { pid, startedAt } or null when
 // the process's own start time cannot be read — acquisition must still
-// proceed even without a provable marker.
+// proceed even without a provable marker. Total: this sits on the
+// acquisition path, so it never throws, not even for a missing or
+// non-function inspectProcess — a mis-wired caller degrades to null like
+// any other "cannot read" case instead of aborting the lock.
 export async function readOwnProcessOwnership({ inspectProcess, pid = String(process.pid) } = {}) {
-  if (typeof inspectProcess !== "function") {
-    fail("readOwnProcessOwnership inspectProcess must be a function");
-  }
+  if (typeof inspectProcess !== "function") return null;
   try {
     const result = await inspectProcess(pid);
     if (!result || typeof result !== "object") return null;
@@ -46,10 +43,11 @@ export async function readOwnProcessOwnership({ inspectProcess, pid = String(pro
 // settled result — including null — is cached forever; inspectProcess is
 // never invoked again after the first call. This is the ONLY place
 // memoization lives: callers (the two mutex stores) must not add their own.
+// Total like readOwnProcessOwnership: a missing or non-function
+// inspectProcess is not validated here — it is left to readOwnProcessOwnership
+// to turn into a memoized null, so a mis-wired reader degrades instead of
+// throwing on the acquisition path.
 export function createOwnOwnershipReader({ inspectProcess, pid = String(process.pid) } = {}) {
-  if (typeof inspectProcess !== "function") {
-    fail("createOwnOwnershipReader inspectProcess must be a function");
-  }
   let cached;
   return function readOwnOwnership() {
     if (!cached) cached = readOwnProcessOwnership({ inspectProcess, pid });

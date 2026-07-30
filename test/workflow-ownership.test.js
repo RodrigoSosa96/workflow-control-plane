@@ -172,6 +172,20 @@ test("readOwnProcessOwnership defaults pid to the current process's own pid", as
   assert.equal(observedPid, String(process.pid));
 });
 
+test("readOwnProcessOwnership resolves to null (never rejects) when called with no arguments at all", async () => {
+  await assert.doesNotReject(async () => {
+    const result = await readOwnProcessOwnership();
+    assert.equal(result, null);
+  });
+});
+
+test("readOwnProcessOwnership resolves to null (never rejects) when inspectProcess is not a function", async () => {
+  await assert.doesNotReject(async () => {
+    const result = await readOwnProcessOwnership({ inspectProcess: "not-a-function", pid: "222" });
+    assert.equal(result, null);
+  });
+});
+
 // --- createOwnOwnershipReader: memoization ------------------------------
 
 test("createOwnOwnershipReader invokes inspectProcess exactly once across many calls", async () => {
@@ -245,4 +259,25 @@ test("createOwnOwnershipReader invokes inspectProcess exactly once even when cal
   assert.equal(calls, 1);
   assert.deepEqual(firstResult, { pid: "222", startedAt: "2026-07-29T09:00:00.000Z" });
   assert.deepEqual(secondResult, firstResult);
+});
+
+test("createOwnOwnershipReader construction never throws when called with no arguments at all", () => {
+  assert.doesNotThrow(() => createOwnOwnershipReader());
+});
+
+test("createOwnOwnershipReader's reader resolves to null (never rejects) when called with no arguments at all", async () => {
+  const reader = createOwnOwnershipReader();
+  await assert.doesNotReject(async () => {
+    assert.equal(await reader(), null);
+  });
+  // Memoization still holds for the degraded case: repeated calls settle
+  // to the same cached null instead of re-attempting inspection.
+  assert.equal(await reader(), null);
+});
+
+test("createOwnOwnershipReader's reader resolves to null (never rejects) when inspectProcess is not a function", async () => {
+  const reader = createOwnOwnershipReader({ inspectProcess: 42, pid: "222" });
+  await assert.doesNotReject(async () => {
+    assert.equal(await reader(), null);
+  });
 });
