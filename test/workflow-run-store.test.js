@@ -963,3 +963,198 @@ test("removeLock refuses without throwing when there is no active lock to remove
   assert.equal(result.removed, false);
   assert.match(result.reason, /no active lock/i);
 });
+
+test("inspectLock reports stale: false for a freshly created lock", async (t) => {
+  // Deliberately no injected clock: the real clock and the real mkdir mtime agree on "now",
+  // so ageMs comes out small and deterministic without needing utimes(). This exists because
+  // every other inspectLock test here pins a stale (5+ minute) lock, so a hardcoded `stale:
+  // true` in the implementation would otherwise pass the whole suite undetected.
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID_1 };
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+
+  const inspected = await store.inspectLock(RUN_ID_1);
+
+  assert.equal(inspected.stale, false);
+  assert.ok(Number.isFinite(inspected.ageMs), "ageMs must be a finite number, not null/NaN, for a normally-stat-able lock");
+  assert.ok(inspected.ageMs < 60 * 1000, `expected a fresh lock's age to be well under the 5-minute stale threshold, got ${inspected.ageMs}`);
+});
+
+test("inspectLock ignores a stray non-owner file and still finds the real marker", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID_1 };
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  // Sorts before "owner-..." alphabetically: a naive "first readdir entry" implementation
+  // would pick this stray file instead of the real marker.
+  await writeFile(join(activePath, ".DS_Store"), "not a marker", { mode: 0o600 });
+  await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+
+  const inspected = await store.inspectLock(RUN_ID_1);
+
+  assert.deepEqual(inspected.marker, marker);
+  assert.equal(inspected.markerPath, markerPath);
+});
+
+test("inspectLock and removeLock treat more than one owner marker as unreadable instead of guessing", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerA = { version: 2, token: "token-a", runId: RUN_ID_1 };
+  const markerB = { version: 2, token: "token-b", runId: RUN_ID_1 };
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(join(activePath, "owner-token-a.json"), `${JSON.stringify(markerA)}\n`, { mode: 0o600 });
+  await writeFile(join(activePath, "owner-token-b.json"), `${JSON.stringify(markerB)}\n`, { mode: 0o600 });
+
+  const inspected = await store.inspectLock(RUN_ID_1);
+  assert.equal(inspected.marker, null);
+  assert.equal(inspected.markerPath, null);
+  // A stray-file false negative and a genuine multi-marker ambiguity both surface as
+  // marker: null in the public shape; the age/stale fields must still be reported.
+  assert.equal(inspected.activePath, activePath);
+  assert.ok(Number.isFinite(inspected.ageMs));
+
+  const result = await store.removeLock(RUN_ID_1, { allow: () => true });
+  assert.equal(result.removed, false);
+  assert.match(result.reason, /more than one|multiple/i);
+  // Neither marker was touched: removeLock refused before ever calling allow() on a guess.
+  assert.equal(await readFile(join(activePath, "owner-token-a.json"), "utf8"), `${JSON.stringify(markerA)}\n`);
+  assert.equal(await readFile(join(activePath, "owner-token-b.json"), "utf8"), `${JSON.stringify(markerB)}\n`);
+});
+
+// Fabricates a different `ino` for the Nth fs.stat(path) call, deterministically simulating
+// "this is a different directory now" without depending on how eagerly the underlying
+// filesystem reuses a freed inode after rmdir+mkdir — observed to be immediate on this
+// environment's tmpfs, which made a real rmdir+mkdir replacement indistinguishable from the
+// original directory via dev/ino and made the two tests below flaky/silently-passing.
+function fsWithFabricatedIdentityOnNthStat(targetPath, targetCallNumber) {
+  let calls = 0;
+  return {
+    ...realFs,
+    async stat(path) {
+      const real = await realFs.stat(path);
+      if (path !== targetPath) return real;
+      calls += 1;
+      if (calls !== targetCallNumber) return real;
+      return { ...real, ino: (real.ino ?? 0) + 999999, isDirectory: () => real.isDirectory() };
+    },
+  };
+}
+
+test("removeLock's pre-unlink recheck refuses a same-content replacement lock via directory identity, not marker bytes", async (t) => {
+  // If sameActiveDirectory were deleted from removeLock's pre-unlink recheck, this test would
+  // fail: the fabricated identity below leaves the marker's path and byte content completely
+  // untouched, so only a dev/ino (directory identity) comparison can distinguish "the same
+  // lock we inspected" from "a replacement that happens to look identical".
+  const stateRoot = await tempStateRoot(t);
+  const run = await createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 }).create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID_1 };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+
+  // removeLock's own fs.stat(activePath) call sequence is: 1) inspectLockInternal for
+  // `initial`, 2) inspectLockInternal for `recheck` (this is the one under test — fabricate a
+  // different identity for it).
+  const fs = fsWithFabricatedIdentityOnNthStat(activePath, 2);
+  const store = createRunStore({ stateRoot, fs, randomUUID: () => RUN_ID_1 });
+
+  let allowCalls = 0;
+  const result = await store.removeLock(RUN_ID_1, {
+    allow: async (seenMarker) => {
+      allowCalls += 1;
+      assert.deepEqual(seenMarker, marker);
+      return true;
+    },
+  });
+
+  assert.equal(allowCalls, 1);
+  assert.equal(result.removed, false);
+  assert.match(result.reason, /replaced/i);
+  // The lock must survive completely untouched: proof removeLock never unlinked it.
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+  await assert.doesNotReject(() => stat(activePath));
+});
+
+test("removeLock's pre-rmdir recheck refuses a same-content replacement lock via directory identity, not marker bytes", async (t) => {
+  // Targets the second, later identity check that runs after the marker has already been
+  // unlinked and immediately before rmdir. If that check were deleted, this test would fail:
+  // the fabricated identity below leaves everything else (path, marker bytes) untouched, so
+  // only a fresh dev/ino comparison right before rmdir can catch it.
+  const stateRoot = await tempStateRoot(t);
+  const run = await createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 }).create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID_1 };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+
+  // Calls 1 and 2 (the initial and recheck inspections) must see a consistent, real identity
+  // so removeLock actually proceeds to unlink; call 3 is removeLock's own postUnlinkStat,
+  // taken right after the unlink and immediately before rmdir — fabricate a different identity
+  // there specifically.
+  const fs = fsWithFabricatedIdentityOnNthStat(activePath, 3);
+  const store = createRunStore({ stateRoot, fs, randomUUID: () => RUN_ID_1 });
+
+  const result = await store.removeLock(RUN_ID_1, { allow: () => true });
+
+  assert.equal(result.removed, false);
+  assert.match(result.reason, /replaced/i);
+  // The marker was legitimately unlinked (that part of removal did commit), but the directory
+  // itself must survive: proof removeLock refused to rmdir once the identity check caught the
+  // fabricated mismatch, rather than rmdir-ing a directory it never re-verified.
+  await assertNoPath(markerPath);
+  await assert.doesNotReject(() => stat(activePath));
+});
+
+test("removeLock refuses without throwing when the marker disappears at the final unlink", async (t) => {
+  // Targets the exact judgment call from the previous review round: treating ENOENT on the
+  // final unlink as a graceful refusal, not a throw. This is the path that stops removeLock
+  // from ever reaching rmdir on a directory it never re-inspected. Simulated by making the
+  // marker disappear (via another actor, in effect) right as removeLock's own unlink call
+  // fires — a window the earlier recheck cannot observe because it already ran.
+  const stateRoot = await tempStateRoot(t);
+  const injection = { markerPath: null, fired: false };
+  const fs = {
+    ...realFs,
+    async unlink(path) {
+      if (!injection.fired && injection.markerPath && path === injection.markerPath) {
+        injection.fired = true;
+        await realFs.unlink(path);
+        const error = new Error("ENOENT: no such file or directory, unlink");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return realFs.unlink(path);
+    },
+  };
+  const store = createRunStore({ stateRoot, fs, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID_1 };
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+  injection.markerPath = markerPath;
+
+  const result = await store.removeLock(RUN_ID_1, { allow: () => true });
+
+  assert.equal(result.removed, false);
+  assert.match(result.reason, /disappeared/i);
+  await assertNoPath(markerPath);
+  // The active directory itself must be left alone: a buggy implementation that pressed on to
+  // rmdir despite the refused unlink would make this stat reject with ENOENT.
+  await assert.doesNotReject(() => stat(activePath));
+});

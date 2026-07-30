@@ -357,20 +357,36 @@ export function createRunStore({
     await chmodPrivateFile(path, "append file");
   }
 
-  async function activeLockContentionError(activePath) {
+  // Shared by activeLockContentionError and inspectLockInternal so `stale` can never drift
+  // between the two: NaN-safe against a clock that throws or returns something Date.parse
+  // can't parse, reporting ageMs: null rather than a confidently-wrong stale: false.
+  function lockAgeFromStat(activeStat) {
     let ageMs = Number.NaN;
     try {
-      const activeStat = await fs.stat(activePath);
       ageMs = Math.max(0, Date.parse(now()) - activeStat.mtimeMs);
+    } catch (_error) {
+      // Treat a throwing/unparseable clock as an unknown age rather than propagating.
+    }
+    if (!Number.isFinite(ageMs)) {
+      return { ageMs: null, stale: false };
+    }
+    return { ageMs, stale: ageMs >= STALE_LOCK_MS };
+  }
+
+  async function activeLockContentionError(activePath) {
+    let ageMs = null;
+    let stale = false;
+    try {
+      const activeStat = await fs.stat(activePath);
+      ({ ageMs, stale } = lockAgeFromStat(activeStat));
     } catch (_error) {
       // Keep the recovery message bounded and avoid deleting or inspecting further.
     }
-    const stale = Number.isFinite(ageMs) && ageMs >= STALE_LOCK_MS;
     const prefix = stale ? "Stale active run lock" : "Run is locked by an active lock";
     return new WorkflowError(
       "run-lock",
       `${prefix} at ${activePath}; age ${formatAge(ageMs)}. Manual inspection required; active lock was not removed.`,
-      { details: { lockPath: activePath, activePath, ageMs: Number.isFinite(ageMs) ? ageMs : null, stale } },
+      { details: { lockPath: activePath, activePath, ageMs, stale } },
     );
   }
 
@@ -461,6 +477,21 @@ export function createRunStore({
   }
 
   async function acquireLock(directory, runId) {
+    // Read this process's own start time before touching any lock state. A slow `ps` spawn
+    // must never run while the mkdir-based mutex is held: it would eat into
+    // acquireLockWithRetry's bounded real-time budget for contenders below, and it would widen
+    // the window where the active dir exists with no marker yet (during which a concurrent
+    // inspectLock/removeLock would see marker: null). A throw here (a killed `ps`, a mis-wired
+    // reader) must never block acquisition — it just means the marker is written without a
+    // provable start time, same as a version-1 marker. createOwnOwnershipReader (not this
+    // store) is the only place that memoizes, so calling this again on a retry is cheap.
+    let processOwnership = null;
+    try {
+      processOwnership = await readOwnOwnership();
+    } catch {
+      processOwnership = null;
+    }
+
     const lockContainer = await ensureLockContainer(directory);
     const activePath = join(lockContainer, ACTIVE_LOCK_DIR);
     try {
@@ -486,16 +517,6 @@ export function createRunStore({
     const markerName = `owner-${token}.json`;
     const markerPath = join(activePath, markerName);
     const ownership = { path: activePath, lockContainer, activePath, activeStat, markerPath, token };
-
-    // A throw here (a killed `ps`, a mis-wired reader) must never block acquisition — it
-    // just means this marker is written without a provable start time, same as a version-1
-    // marker. createOwnOwnershipReader (not this store) is the only place that memoizes.
-    let processOwnership = null;
-    try {
-      processOwnership = await readOwnOwnership();
-    } catch {
-      processOwnership = null;
-    }
     const marker = {
       version: 2,
       token,
@@ -603,6 +624,10 @@ export function createRunStore({
     return result;
   }
 
+  function isOwnerMarkerName(name) {
+    return name.startsWith("owner-") && name.endsWith(".json");
+  }
+
   // Shared by inspectLock (read-only) and removeLock (which calls this twice
   // to check-then-act). Never mkdirs, chmods, or writes anything — it only
   // stats/reads what acquireLock/releaseLock already produced. Returns null
@@ -630,15 +655,17 @@ export function createRunStore({
       throwFs("list active lock", activePath, error);
     }
 
-    const ageMs = Math.max(0, Date.parse(now()) - activeStat.mtimeMs);
-    const stale = ageMs >= STALE_LOCK_MS;
-    const [markerName] = entries;
-    if (!markerName) {
-      // Crash residue between the active-directory mkdir and the marker's wx write.
-      return { activePath, activeStat, markerPath: null, markerText: null, marker: null, ageMs, stale };
+    const { ageMs, stale } = lockAgeFromStat(activeStat);
+    // Only the exact owner-*.json shape acquireLock ever writes counts as a marker. A stray
+    // file (an editor temp, a .DS_Store) must never be guessed at as "the" marker, and more
+    // than one candidate is exactly as unreadable as zero — never pick one arbitrarily.
+    const markerNames = entries.filter(isOwnerMarkerName);
+    if (markerNames.length !== 1) {
+      const markerAmbiguous = markerNames.length > 1;
+      return { activePath, activeStat, markerPath: null, markerText: null, marker: null, ageMs, stale, markerAmbiguous };
     }
 
-    const markerPath = join(activePath, markerName);
+    const markerPath = join(activePath, markerNames[0]);
     let markerText = null;
     try {
       markerText = await fs.readFile(markerPath, "utf8");
@@ -655,7 +682,7 @@ export function createRunStore({
       }
     }
 
-    return { activePath, activeStat, markerPath, markerText, marker, ageMs, stale };
+    return { activePath, activeStat, markerPath, markerText, marker, ageMs, stale, markerAmbiguous: false };
   }
 
   // Read-only diagnosis for `workflow unlock`: must never acquire the lock it
@@ -670,11 +697,13 @@ export function createRunStore({
   // Removes an active lock only when the caller's `allow` predicate approves the
   // currently observed marker, then re-verifies both the active directory's identity
   // (the same dev/ino comparison releaseLock performs via sameActiveDirectory) and the
-  // marker's raw bytes immediately before deleting anything. A change in that window —
-  // a fresh acquisition, a different marker — refuses instead of deleting unknown state,
-  // the same guarantee releaseLock gives its own owner. Refuses by returning a reason;
-  // it only throws for anomalies discovered after removal has already begun, mirroring
-  // releaseLock's own post-commit error handling.
+  // marker's raw bytes immediately before deleting anything — and again, identity only,
+  // immediately before rmdir, mirroring releaseLock's own two statOwnedActive calls (one
+  // before unlink, one before rmdir). A change in either window — a fresh
+  // acquisition, a different marker — refuses instead of deleting unknown state, the same
+  // guarantee releaseLock gives its own owner. Refuses by returning a reason; it only throws
+  // for anomalies discovered after the rmdir itself has already begun, mirroring releaseLock's
+  // own post-commit error handling.
   async function removeLock(runId, { allow } = {}) {
     if (typeof allow !== "function") {
       failStore("removeLock allow must be a function");
@@ -683,7 +712,10 @@ export function createRunStore({
 
     const initial = await inspectLockInternal(id);
     if (!initial || !initial.marker) {
-      return { removed: false, reason: "no active lock or the owner marker is unreadable" };
+      const reason = initial?.markerAmbiguous
+        ? "more than one owner marker is present; refusing rather than guessing which is authoritative"
+        : "no active lock or the owner marker is unreadable";
+      return { removed: false, reason };
     }
 
     const permitted = await allow(initial.marker);
@@ -709,6 +741,25 @@ export function createRunStore({
         return { removed: false, reason: "the owner marker disappeared before removal" };
       }
       throwFs("remove lock owner marker", recheck.markerPath, error);
+    }
+
+    // The marker is gone; re-verify the directory itself one more time before rmdir-ing it.
+    // Nothing should legitimately replace an active-lock directory this fast, but if it
+    // happened (a fresh acquisition landing in the window between the unlink above and here),
+    // rmdir-ing it unverified would destroy a live acquisition we never inspected — exactly
+    // the hazard the "release does not unlink a replacement active directory" regression test
+    // guards on the releaseLock side.
+    let postUnlinkStat;
+    try {
+      postUnlinkStat = await fs.stat(recheck.activePath);
+    } catch (error) {
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+        return { removed: false, reason: "the active lock directory disappeared before removal" };
+      }
+      throwFs("stat active lock", recheck.activePath, error);
+    }
+    if (!postUnlinkStat.isDirectory() || !sameActiveDirectory(postUnlinkStat, recheck.activeStat)) {
+      return { removed: false, reason: "the active lock directory was replaced before removal" };
     }
 
     try {
