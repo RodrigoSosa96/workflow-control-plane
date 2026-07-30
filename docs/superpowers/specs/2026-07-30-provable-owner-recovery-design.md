@@ -1,8 +1,9 @@
 # Provable Owner Recovery Design
 
 **Date:** 2026-07-30
-**Status:** Draft — awaiting approval
+**Status:** Approved (2026-07-30)
 **Roadmap item:** 1.1 (review finding D7). Unblocks 2.5 (`workflow archive`).
+**Implementation plan:** [`../plans/2026-07-30-provable-owner-recovery.md`](../plans/2026-07-30-provable-owner-recovery.md)
 
 ## Problem
 
