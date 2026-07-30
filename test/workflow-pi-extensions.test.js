@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { createPreparedDelegationRequest } from "../src/workflow/coordinator-policy.js";
+import { checkoutDigestFor } from "../src/workflow/delegation-invariants.js";
 import { createWorkflowDelegationChildExtension } from "../.pi/extensions/workflow-delegation-child.ts";
 import { createWorkflowCoordinatorExtension, createWorkflowCoordinatorRuntime } from "../.pi/extensions/workflow-coordinator/index.ts";
 
@@ -675,6 +676,12 @@ test("coordinator tool_call blocks only unsafe or unprepared subagent requests a
   const reservation = {
     state: "active",
     delegationId: DELEGATION_ID,
+    // Matches the prepared delegation's role/mode/cwd above: the shared
+    // predicate now checks all three plus checkoutDigest, not just the
+    // resources list.
+    role: "code-reviewer",
+    mode: "background",
+    checkoutDigest: checkoutDigestFor(CWD),
     resources: ["totalInternal", "readOnlyBackground"],
   };
 

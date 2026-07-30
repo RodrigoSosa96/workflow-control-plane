@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { createPreparedDelegationRequest, validateSubagentRequestPolicy } from "../src/workflow/coordinator-policy.js";
+import { checkoutDigestFor } from "../src/workflow/delegation-invariants.js";
 
 const DELEGATION_ID = "11111111-1111-4111-8111-111111111111";
 const task = "Review the frozen brief.";
@@ -47,6 +48,12 @@ function reservation(overrides = {}) {
   return {
     state: "active",
     delegationId: DELEGATION_ID,
+    // Matches the default delegation()'s role/mode/cwd: the shared predicate
+    // now checks all three, plus the checkoutDigest below, not just the
+    // resources list.
+    role: "code-reviewer",
+    mode: "background",
+    checkoutDigest: checkoutDigestFor("/fixture/review"),
     resources: ["totalInternal", "readOnlyBackground"],
     ...overrides,
   };
@@ -95,12 +102,20 @@ test("requires writer reservations and keeps background writers disabled", () =>
   const prepared = createPreparedDelegationRequest({ delegation: writer, policy });
   const foreground = request({ agent: "sdd-implementer", async: false });
 
+  const writerCheckoutDigest = checkoutDigestFor(writer.cwd);
   assert.deepEqual(
     validateSubagentRequestPolicy({
       request: foreground,
       prepared,
       policy,
-      reservation: { state: "active", delegationId: DELEGATION_ID, resources: ["totalInternal", "foreground", "writersTotal", "checkout:abc"] },
+      reservation: {
+        state: "active",
+        delegationId: DELEGATION_ID,
+        role: "sdd-implementer",
+        mode: "foreground",
+        checkoutDigest: writerCheckoutDigest,
+        resources: ["totalInternal", "foreground", "writersTotal", `checkout:${writerCheckoutDigest}`],
+      },
     }),
     { allowed: true, fingerprint: prepared.requestFingerprint },
   );
@@ -134,4 +149,68 @@ test("validation never rewrites the incoming subagent request", () => {
 
   assert.equal(result.allowed, false);
   assert.deepEqual(incoming, before);
+});
+
+test("rejects a writer reservation whose checkout digest belongs to a different checkout", () => {
+  // Same shape of hole the shared predicate closes: a reservation only ever
+  // proved it held *some* checkout:-prefixed resource, never that the digest
+  // matched *this* delegation's cwd. A writer reservation minted for a
+  // different checkout must not authorize this one.
+  const writer = delegation({ role: "sdd-implementer", mode: "foreground" });
+  const prepared = createPreparedDelegationRequest({ delegation: writer, policy });
+  const foreground = request({ agent: "sdd-implementer", async: false });
+  const otherCheckoutDigest = checkoutDigestFor("/fixture/other-checkout");
+
+  const result = validateSubagentRequestPolicy({
+    request: foreground,
+    prepared,
+    policy,
+    reservation: {
+      state: "active",
+      delegationId: DELEGATION_ID,
+      role: "sdd-implementer",
+      mode: "foreground",
+      checkoutDigest: otherCheckoutDigest,
+      resources: ["totalInternal", "foreground", "writersTotal", `checkout:${otherCheckoutDigest}`],
+    },
+  });
+
+  assert.equal(result.allowed, false);
+  assert.match(result.reason, /reservation/i);
+});
+
+test("rejects a reservation reserved for a different role or mode", () => {
+  const prepared = createPreparedDelegationRequest({ delegation: delegation(), policy });
+
+  const wrongRole = validateSubagentRequestPolicy({
+    request: request(),
+    prepared,
+    policy,
+    reservation: {
+      state: "active",
+      delegationId: DELEGATION_ID,
+      role: "scout",
+      mode: "background",
+      checkoutDigest: checkoutDigestFor("/fixture/review"),
+      resources: ["totalInternal", "readOnlyBackground"],
+    },
+  });
+  assert.equal(wrongRole.allowed, false);
+  assert.match(wrongRole.reason, /reservation/i);
+
+  const wrongMode = validateSubagentRequestPolicy({
+    request: request(),
+    prepared,
+    policy,
+    reservation: {
+      state: "active",
+      delegationId: DELEGATION_ID,
+      role: "code-reviewer",
+      mode: "foreground",
+      checkoutDigest: checkoutDigestFor("/fixture/review"),
+      resources: ["totalInternal", "readOnlyBackground"],
+    },
+  });
+  assert.equal(wrongMode.allowed, false);
+  assert.match(wrongMode.reason, /reservation/i);
 });

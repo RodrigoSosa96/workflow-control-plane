@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { reservationMatchesDelegation } from "./delegation-invariants.js";
 import { classifyDelegationRole, validateDelegationPolicy } from "./delegation-policy.js";
 
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
@@ -21,27 +22,6 @@ function canonicalFingerprint(value) {
 
 function reject(reason) {
   return { allowed: false, reason };
-}
-
-function reservationResources(role, mode) {
-  const kind = classifyDelegationRole(role);
-  const resources = ["totalInternal"];
-  if (mode === "foreground") resources.push("foreground");
-  if (kind === "read-only" && mode === "background") resources.push("readOnlyBackground");
-  if (kind === "writer") resources.push("writersTotal");
-  return resources;
-}
-
-function reservationAllows(reservation, role, mode, delegationId) {
-  if (!reservation || typeof reservation !== "object" || reservation.state !== "active" || reservation.delegationId !== delegationId || !Array.isArray(reservation.resources)) {
-    return false;
-  }
-  const required = reservationResources(role, mode);
-  if (!required.every((resource) => reservation.resources.includes(resource))) return false;
-  if (role === WRITER_ROLE && !reservation.resources.some((resource) => typeof resource === "string" && resource.startsWith("checkout:"))) {
-    return false;
-  }
-  return true;
 }
 
 function validPrepared(prepared) {
@@ -141,7 +121,13 @@ export function validateSubagentRequestPolicy({ request, prepared, policy, reser
   if (request.agent === WRITER_ROLE && request.concurrency > effectivePolicy.writersTotal) {
     return reject("Writer concurrency exceeds policy");
   }
-  if (!reservationAllows(reservation, request.agent, prepared.mode, prepared.delegationId)) {
+  // reservationMatchesDelegation takes a delegation record (id/role/mode/cwd), not
+  // this gate's request/prepared pair, so build that record-shape from `prepared`
+  // — the fields it was validated from above — rather than from the untrusted
+  // `request`. It is a predicate, not a validator: it returns a boolean, so a
+  // false here still goes through this gate's own reject(), never a throw.
+  const preparedDelegationRecord = { id: prepared.delegationId, role: prepared.role, mode: prepared.mode, cwd: prepared.cwd };
+  if (!reservationMatchesDelegation(preparedDelegationRecord, reservation)) {
     return reject("Subagent reservation is missing or incompatible");
   }
 
