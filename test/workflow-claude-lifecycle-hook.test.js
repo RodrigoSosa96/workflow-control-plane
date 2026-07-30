@@ -267,9 +267,25 @@ test("a lock acquired through the shared lifecycle-hook core produces a marker w
   await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle });
 
   assert.ok(observed, "the owner marker should have been observed while the lock was held");
-  assert.equal(typeof observed.marker.pid, "string");
-  assert.ok(observed.marker.startedAt);
+  // The marker's file mode is set by acquireLock unconditionally (see run-store.js), regardless
+  // of whether the reader could observe this process's own identity, so this check does not
+  // depend on ps/proc availability and is not behind the skip guard below.
   assert.equal(observed.mode, 0o600);
+
+  // createSubprocessOwnOwnershipReader resolves null (never throws) when this host's `ps -o
+  // lstart=` or /proc/<pid>/cwd cannot be read (see src/workflow/ownership.js), in which case
+  // acquireLock still succeeds but the marker simply omits pid/startedAt (proven by the next
+  // test). Review finding 2 (Task 3 review round 1): skip rather than hard-fail in that case,
+  // mirroring test/workflow-hook-ownership.test.js's t.skip convention for this exact host
+  // dependency -- a failure here would misreport "the wiring is broken" when it actually means
+  // "this host cannot report its own process identity."
+  if (typeof observed.marker.pid !== "string" || !observed.marker.startedAt) {
+    t.skip(
+      `this host could not report this process's own identity via ps/proc (marker=${JSON.stringify(observed.marker)}) `
+      + "-- the provable-ownership property this test exists to prove could not be checked here",
+    );
+    return;
+  }
 
   // Independently observe the same live process the same way `workflow unlock` does, so
   // classifyOwnership sees a real (not fabricated) observation.
@@ -281,7 +297,11 @@ test("a lock acquired through the shared lifecycle-hook core produces a marker w
     readCwd: realpath,
   });
   const verdict = classifyOwnership(observed.marker, observation);
-  assert.notEqual(verdict.verdict, "unprovable");
+  // Review finding 3 (Task 3 review round 1): assert the exact verdict that matters, not just
+  // "not unprovable" -- notEqual(verdict, "unprovable") would also pass for "owner-gone", i.e. a
+  // live owner misclassified as dead. The lock is held by this live process at this point, so
+  // the only correct verdict is "owner-alive".
+  assert.equal(verdict.verdict, "owner-alive");
 });
 
 // The other half of the same property: when the reader cannot observe this process at all (a
