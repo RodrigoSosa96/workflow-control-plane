@@ -34,6 +34,21 @@ function uuidSequence(...values) {
   return () => values[index++] ?? values.at(-1);
 }
 
+// Unlike uuidSequence, never repeats: every gate acquisition and every reserve() call consumes
+// at least one UUID (reservationId, gate ownerToken, lease ownerToken), so a test that calls
+// reserve() more than once must not rely on a short fixed sequence freezing on its last value —
+// that silently defeats the "Reservation ID already exists" collision check instead of
+// exercising it, since a repeated ownerToken/reservationId only actually collides against
+// records already persisted under an earlier, different value. Use this whenever a test's exact
+// draw count isn't the point being tested.
+function distinctUuidSequence() {
+  let counter = 0;
+  return () => {
+    counter += 1;
+    return `00000000-0000-4000-8000-${counter.toString(16).padStart(12, "0")}`;
+  };
+}
+
 function clockSequence(...values) {
   let index = 0;
   return {
@@ -415,7 +430,7 @@ test("releaseGate accepts a version-1 marker for backward compatibility while st
   const reservations = createDelegationReservationStore({
     stateRoot,
     fs,
-    randomUUID: uuidSequence(FIRST_ID, SECOND_ID, THIRD_ID),
+    randomUUID: distinctUuidSequence(),
     clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
     canonicalPath: async (value) => value,
   });
@@ -635,5 +650,45 @@ test("clearGate's pre-rmdir recheck refuses a same-content replacement gate via 
   // itself must survive: proof clearGate refused to rmdir once the identity check caught the
   // fabricated mismatch, rather than rmdir-ing a directory it never re-verified.
   await assert.rejects(() => stat(markerPath), /ENOENT/);
+  await assert.doesNotReject(() => stat(activeGate));
+});
+
+test("clearGate refuses to unlink the marker when a stray entry would make rmdir fail, preserving the ownership evidence", async (t) => {
+  // If clearGate unlinked the marker first and only then discovered the stray entry (via
+  // rmdir's ENOTEMPTY), the gate would end up wedged with NO marker at all: every later
+  // clearGate/inspectGate would see "no active gate or the owner marker is unreadable" and the
+  // pid/startedAt evidence this whole mechanism exists to preserve would be gone for good. This
+  // test proves clearGate checks first and refuses before deleting anything.
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createDelegationReservationStore({ stateRoot, canonicalPath: async (value) => value });
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const markerPath = join(activeGate, "owner.json");
+  const marker = { version: 2, ownerToken: "crashed-token", pid: "9999", startedAt: "2024-12-31T00:00:00.000Z" };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activeGate, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+  // A stray file inspectGate already tolerates when identifying the marker (see the
+  // "ignores a stray non-owner file" test above) — but it would make a naive rmdir fail.
+  await writeFile(join(activeGate, ".DS_Store"), "not a marker", { mode: 0o600 });
+
+  let allowCalls = 0;
+  const result = await reservations.clearGate({
+    projectAlias: "fixture-single",
+    allow: async (seenMarker) => {
+      allowCalls += 1;
+      assert.deepEqual(seenMarker, marker);
+      return true;
+    },
+  });
+
+  assert.equal(allowCalls, 1);
+  assert.equal(result.cleared, false);
+  assert.match(result.reason, /entries besides|evidence/i);
+  // The marker must survive completely untouched — this is the actual evidence-preservation
+  // guarantee under test: a buggy implementation that unlinked first and only discovered the
+  // stray entry at rmdir would fail this exact assertion (the marker would already be gone).
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+  // The stray file and the gate directory itself must also survive: nothing was touched.
+  assert.equal(await readFile(join(activeGate, ".DS_Store"), "utf8"), "not a marker");
   await assert.doesNotReject(() => stat(activeGate));
 });

@@ -1158,3 +1158,43 @@ test("removeLock refuses without throwing when the marker disappears at the fina
   // rmdir despite the refused unlink would make this stat reject with ENOENT.
   await assert.doesNotReject(() => stat(activePath));
 });
+
+test("removeLock refuses to unlink the marker when a stray entry would make rmdir fail, preserving the ownership evidence", async (t) => {
+  // If removeLock unlinked the marker first and only then discovered the stray entry (via
+  // rmdir's ENOTEMPTY), the lock would end up wedged with NO marker at all: every later
+  // removeLock/inspectLock would see "no active lock or the owner marker is unreadable" and the
+  // pid/startedAt evidence this whole mechanism exists to preserve would be gone for good. This
+  // test proves removeLock checks first and refuses before deleting anything.
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  const run = await store.create(plannedInput());
+  const activePath = join(run.directory, "run.lock", "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID_1, pid: "9999", startedAt: "2024-12-31T00:00:00.000Z" };
+  const markerContent = `${JSON.stringify(marker)}\n`;
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, markerContent, { mode: 0o600 });
+  // A stray file inspectLock already tolerates when identifying the marker (see the
+  // "ignores a stray non-owner file" test above) — but it would make a naive rmdir fail.
+  await writeFile(join(activePath, ".DS_Store"), "not a marker", { mode: 0o600 });
+
+  let allowCalls = 0;
+  const result = await store.removeLock(RUN_ID_1, {
+    allow: async (seenMarker) => {
+      allowCalls += 1;
+      assert.deepEqual(seenMarker, marker);
+      return true;
+    },
+  });
+
+  assert.equal(allowCalls, 1);
+  assert.equal(result.removed, false);
+  assert.match(result.reason, /entries besides|evidence/i);
+  // The marker must survive completely untouched — this is the actual evidence-preservation
+  // guarantee under test: a buggy implementation that unlinked first and only discovered the
+  // stray entry at rmdir would fail this exact assertion (the marker would already be gone).
+  assert.equal(await readFile(markerPath, "utf8"), markerContent);
+  // The stray file and the active lock directory itself must also survive: nothing was touched.
+  assert.equal(await readFile(join(activePath, ".DS_Store"), "utf8"), "not a marker");
+  await assert.doesNotReject(() => stat(activePath));
+});

@@ -662,7 +662,7 @@ export function createRunStore({
     const markerNames = entries.filter(isOwnerMarkerName);
     if (markerNames.length !== 1) {
       const markerAmbiguous = markerNames.length > 1;
-      return { activePath, activeStat, markerPath: null, markerText: null, marker: null, ageMs, stale, markerAmbiguous };
+      return { activePath, activeStat, entries, markerPath: null, markerText: null, marker: null, ageMs, stale, markerAmbiguous };
     }
 
     const markerPath = join(activePath, markerNames[0]);
@@ -682,7 +682,7 @@ export function createRunStore({
       }
     }
 
-    return { activePath, activeStat, markerPath, markerText, marker, ageMs, stale, markerAmbiguous: false };
+    return { activePath, activeStat, entries, markerPath, markerText, marker, ageMs, stale, markerAmbiguous: false };
   }
 
   // Read-only diagnosis for `workflow unlock`: must never acquire the lock it
@@ -732,6 +732,14 @@ export function createRunStore({
     }
     if (recheck.markerPath !== initial.markerPath || recheck.markerText !== initial.markerText) {
       return { removed: false, reason: "the owner marker changed before removal" };
+    }
+    // A directory holding anything besides the marker (a stray .DS_Store, an editor temp —
+    // exactly what inspectLock already tolerates when identifying the marker) would make the
+    // rmdir below fail with ENOTEMPTY *after* the marker is already gone: the lock stays
+    // wedged, but now with no marker to recover from, destroying the pid/startedAt evidence
+    // this whole mechanism exists to preserve. Refuse before unlinking anything instead.
+    if (recheck.entries.length !== 1) {
+      return { removed: false, reason: "the active lock directory holds entries besides the owner marker; refusing before deleting anything to avoid destroying ownership evidence" };
     }
 
     try {

@@ -266,12 +266,13 @@ export function createDelegationReservationStore({
     }
 
     // Only the exact owner.json shape acquireGate ever writes counts as a marker. A stray file
-    // (an editor temp, a .DS_Store) must never be guessed at as "the" marker, and more than one
-    // candidate is exactly as unreadable as zero — never pick one arbitrarily.
+    // (an editor temp, a .DS_Store) must never be guessed at as "the" marker. (Unlike
+    // run-store's owner-<token>.json pattern match, this exact-name filter can only ever find
+    // zero or one match — a directory cannot hold two entries with an identical name — so there
+    // is no genuinely ambiguous case to track here.)
     const markerNames = entries.filter(isGateMarkerName);
     if (markerNames.length !== 1) {
-      const markerAmbiguous = markerNames.length > 1;
-      return { activeGate: paths.activeGate, activeStat, markerPath: null, markerText: null, marker: null, markerAmbiguous };
+      return { activeGate: paths.activeGate, activeStat, entries, markerPath: null, markerText: null, marker: null };
     }
 
     const markerPath = join(paths.activeGate, markerNames[0]);
@@ -291,7 +292,7 @@ export function createDelegationReservationStore({
       }
     }
 
-    return { activeGate: paths.activeGate, activeStat, markerPath, markerText, marker, markerAmbiguous: false };
+    return { activeGate: paths.activeGate, activeStat, entries, markerPath, markerText, marker };
   }
 
   // Read-only diagnosis for a future `workflow delegation gate-clear` command: must never
@@ -320,10 +321,7 @@ export function createDelegationReservationStore({
 
     const initial = await inspectGateInternal(paths);
     if (!initial || !initial.marker) {
-      const reason = initial?.markerAmbiguous
-        ? "more than one owner marker is present; refusing rather than guessing which is authoritative"
-        : "no active gate or the owner marker is unreadable";
-      return { cleared: false, reason };
+      return { cleared: false, reason: "no active gate or the owner marker is unreadable" };
     }
 
     const permitted = await allow(initial.marker);
@@ -340,6 +338,14 @@ export function createDelegationReservationStore({
     }
     if (recheck.markerPath !== initial.markerPath || recheck.markerText !== initial.markerText) {
       return { cleared: false, reason: "the owner marker changed before removal" };
+    }
+    // A directory holding anything besides the marker (a stray .DS_Store, an editor temp —
+    // exactly what inspectGate already tolerates when identifying the marker) would make the
+    // rmdir below fail with ENOTEMPTY *after* the marker is already gone: the gate stays
+    // wedged, but now with no marker to recover from, destroying the pid/startedAt evidence
+    // this whole mechanism exists to preserve. Refuse before unlinking anything instead.
+    if (recheck.entries.length !== 1) {
+      return { cleared: false, reason: "the active gate directory holds entries besides the owner marker; refusing before deleting anything to avoid destroying ownership evidence" };
     }
 
     try {
