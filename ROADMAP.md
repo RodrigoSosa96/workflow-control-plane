@@ -45,7 +45,7 @@ Son las fallas *silenciosas* en el camino crítico de estado y notificaciones. P
 
 ## Fase 1 — Recovery y unificación (deuda estructural)
 
-- [ ] **1.1** Ownership demostrable en los mutex + `workflow unlock <run-id>` y `workflow delegation gate-clear <project>`, que **prueban** muerto al dueño antes de remover. Hace real la recuperación manual que los specs prometen sin romper no-cleanup. *(D7)* — **spec listo:** [`2026-07-30-provable-owner-recovery-design.md`](docs/superpowers/specs/2026-07-30-provable-owner-recovery-design.md). Nota de diseño: no hace falta inventar el startToken, el repo ya tiene el primitivo — `inspectExactProcessByPid` devuelve `startedAt` y solo devuelve `null` ante prueba positiva de ausencia; se reusa en vez de agregar una segunda vía de liveness.
+- [x] **1.1** Ownership demostrable en los mutex + `workflow unlock <run-id>` y `workflow delegation gate-clear <project>`, que **prueban** muerto al dueño antes de remover. Hace real la recuperación manual que los specs prometen sin romper no-cleanup. *(D7)* — **spec listo:** [`2026-07-30-provable-owner-recovery-design.md`](docs/superpowers/specs/2026-07-30-provable-owner-recovery-design.md). Nota de diseño: no hace falta inventar el startToken, el repo ya tiene el primitivo — `inspectExactProcessByPid` devuelve `startedAt` y solo devuelve `null` ante prueba positiva de ausencia; se reusa en vez de agregar una segunda vía de liveness. *(c7d1067..b1058b2)*
 - [ ] **1.2** Lifecycle core único: convertir `.pi/extensions/workflow-worker-lifecycle.ts` en adapter delgado sobre `hooks/lib/lifecycle-hook-core.mjs` (markers persistidos; también corrige la divergencia de generaciones post-resume entre Pi y Claude/Codex). Un solo módulo dueño de `continuationPrompt`, `handoffExists`, discriminación de generación y condiciones de notify. *(D5)*
 - [ ] **1.3** Persistir el profile resuelto (permission_mode, sandbox, approval_policy, model) en el run record al launch, agregar variante resume a `buildHarnessLaunch`, y que `relaunchSession` (`commands.js:1281-1320`) la use en vez de armar argv a mano. Exportar `CLAUDE_WORKER_SETTINGS_FILE` de un solo lugar. Hoy un resume corre con permisos distintos a los aprobados. *(D6)*
 - [ ] **1.4** Módulo `delegation-invariants` compartido (lista de recursos de reserva, reservation-matches, shape de transport identity) consumido por services/handoff/reservations/coordinator-policy. Hoy hay 3–5 copias que ya divergen — `coordinator-policy.js:26-45` es la más débil (no compara checkoutDigest). *(D17)*
@@ -104,6 +104,7 @@ Referencia: artículo "The new rules of context engineering" — Anthropic borr�
 | 2026-07-29 | 0.11–0.16 (Batch C) | `006d179` | Assignment/config, claim tokens y liberación de reservas. Nuevo comando `workflow delegation release`. Suite: 683 pass. |
 | 2026-07-29 | 0.17–0.19 (Batch D) | `05274f1` | CI, `hooks-debug.log`, versiones de harness en doctor, merge seguro de hooks.json. Suite: 690 pass. |
 | 2026-07-30 | Review adversarial de la Fase 0 | `27734d1` + fixes | 16 defectos verificados en el código nuevo, todos corregidos. Suite: 698 pass. Detalle abajo. |
+| 2026-07-30 | 1.1 | `c7d1067..b1058b2` | Ownership demostrable + `workflow unlock`/`workflow delegation gate-clear`. Seis tareas subagent-driven, seis rondas de fix (una por review), más la review final de rama completa. Suite: 794 pass, 1 skip. |
 
 **Fase 0 completa y revisada.** Rama `hardening/fase-0`, 699 tests (698 pass, 1 skip — el smoke de Herdr vivo, ítem 1.6).
 
@@ -131,13 +132,12 @@ Un agente revisor verificó el diff completo ejecutando probes contra los stores
 
 ### Próximo paso sugerido
 
-**1.1 está especificado y listo para implementar** — ver el spec linkeado arriba. Rama preparada: `hardening/fase-1-ownership`. El spec queda en `Draft — awaiting approval`: aprobalo (o pedí cambios) antes de que se escriba código, siguiendo el flujo del repo.
+**1.1 completa:** ownership demostrable en ambos mutex, `workflow unlock <run-id>` y `workflow delegation gate-clear <project>` implementados, revisados (seis rondas de fix, una por review, más la review final de rama completa) y mergeados en `hardening/fase-1-ownership` — ver el Registro de progreso arriba para el rango de commits. `workflow reconcile` expone el mismo veredicto de ownership en modo solo-lectura. Desbloquea **2.5**.
 
 Orden sugerido para el resto de la Fase 1, por dependencia:
 
-1. **1.1** (spec listo) → desbloquea 2.5.
-2. **1.4** (módulo de invariantes compartidos) → el clasificador de ownership de 1.1 es su primer residente natural, junto a los predicados de reserva y claim token que hoy viven duplicados. Hacerlo justo después de 1.1 evita crear una tercera copia.
-3. **1.3** (profile persistido + argv de resume por `harnesses.js`) → independiente, y cierra el hueco de seguridad donde un resume corre con permisos distintos a los aprobados.
-4. **1.2** (lifecycle core único) → el más invasivo; conviene con 1.6 ya en su lugar.
-5. **1.6** (e2e por harness contra fakes) → red de seguridad para 1.2.
-6. **1.5** (chequeo de `version` en `run.json`) → chico e independiente.
+1. **1.4** (módulo de invariantes compartidos) — **próximo paso.** El clasificador de ownership de 1.1 es su primer residente natural, junto a los predicados de reserva y claim token que hoy viven duplicados. La review final de 1.1 encontró un segundo residente concreto y ya verificado: `removeLock` (`run-store.js`) y `clearGate` (`delegation-reservations.js`) duplican ~70 líneas de coreografía de remoción casi idéntica (inspección interna → `allow` → recheck de identidad+bytes → guarda de entrada única → unlink → stat post-unlink → rmdir), que ya exigió un fix sincronizado entre ambos archivos durante este mismo plan (`dc55ba4`, preservar evidencia de ownership cuando una entrada extraña bloquea el rmdir). Hacerlo ahora evita que esa duplicación se convierta en una tercera copia divergente.
+2. **1.3** (profile persistido + argv de resume por `harnesses.js`) → independiente, y cierra el hueco de seguridad donde un resume corre con permisos distintos a los aprobados.
+3. **1.2** (lifecycle core único) → el más invasivo; conviene con 1.6 ya en su lugar.
+4. **1.6** (e2e por harness contra fakes) → red de seguridad para 1.2.
+5. **1.5** (chequeo de `version` en `run.json`) → chico e independiente.
