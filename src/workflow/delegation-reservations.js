@@ -2,6 +2,7 @@ import { createHash, randomUUID as defaultRandomUUID } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { classifyDelegationRole, validateDelegationPolicy } from "./delegation-policy.js";
+import { checkoutDigestFor, reservationResourceList } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
 import { sameOwnerDirectory as sameGateDirectory } from "./ownership.js";
 
@@ -50,18 +51,17 @@ async function defaultCanonicalPath(value) {
   return resolve(value);
 }
 
+// Lease-creation policy decisions (a valid mode, whether policy allows a
+// background writer) live here, not in the shared resource list — that list
+// only says what a role/mode/checkout consumes, not whether creating a
+// lease for it is currently permitted.
 function resourceList({ role, mode, checkoutDigest, policy }) {
   const kind = classifyDelegationRole(role);
   if (mode !== "foreground" && mode !== "background") fail("reservation mode must be foreground or background");
   if (kind === "writer" && mode === "background" && policy.allowBackgroundWriters !== true) {
     fail("background writer reservations are disabled by policy");
   }
-
-  const resources = ["totalInternal"];
-  if (mode === "foreground") resources.push("foreground");
-  if (kind === "read-only" && mode === "background") resources.push("readOnlyBackground");
-  if (kind === "writer") resources.push("writersTotal", `checkout:${checkoutDigest}`);
-  return resources;
+  return reservationResourceList({ role, mode, checkoutDigest });
 }
 
 function capacityFor(resource, policy) {
@@ -424,7 +424,7 @@ export function createDelegationReservationStore({
     const canonicalCheckout = await canonicalPath(assertString(checkoutPath, "reservation checkout path"));
     const normalizedCheckout = assertString(canonicalCheckout, "canonical reservation checkout path");
     const projectDigest = digestKey(alias);
-    const checkoutDigest = digestKey(normalizedCheckout);
+    const checkoutDigest = checkoutDigestFor(normalizedCheckout);
     const resources = resourceList({ role, mode, checkoutDigest, policy: effectivePolicy });
     const reservationId = uuid(randomUUID, "reservation ID");
 

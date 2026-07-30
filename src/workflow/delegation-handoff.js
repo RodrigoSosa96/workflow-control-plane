@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { WorkflowError } from "./errors.js";
-import { classifyDelegationRole } from "./delegation-policy.js";
+import { reservationMatchesDelegation } from "./delegation-invariants.js";
 
 const ALLOWED_KEYS = new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]);
 const HANDOFF_STATUSES = new Set(["completed", "blocked", "failed"]);
@@ -31,26 +31,6 @@ function assertString(value, context, limit) {
 
 function digestKey(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
-}
-
-function expectedReservationResources(role, mode, checkoutDigest) {
-  const kind = classifyDelegationRole(role);
-  const resources = ["totalInternal"];
-  if (mode === "foreground") resources.push("foreground");
-  if (kind === "read-only" && mode === "background") resources.push("readOnlyBackground");
-  if (kind === "writer") resources.push("writersTotal", `checkout:${checkoutDigest}`);
-  return resources;
-}
-
-function reservationMatches(record, reservation) {
-  if (!reservation || typeof reservation !== "object") return false;
-  if (reservation.state !== "active" || reservation.delegationId !== record.id || reservation.role !== record.role || reservation.mode !== record.mode) {
-    return false;
-  }
-  const checkoutDigest = digestKey(record.cwd);
-  if (reservation.checkoutDigest !== checkoutDigest || !Array.isArray(reservation.resources)) return false;
-  const expected = expectedReservationResources(record.role, record.mode, checkoutDigest);
-  return expected.every((resource) => reservation.resources.includes(resource));
 }
 
 function validateInputBytes(value) {
@@ -127,7 +107,7 @@ export async function submitDelegationHandoff({ runId, delegationId, input, stor
   assertTransportIdentity(record, run.id, id);
   const normalized = validateInput(input);
   if (record.generation !== normalized.generation) fail("Delegation handoff generation is not current");
-  const matches = (await reservations.list({ projectAlias: run.projectAlias })).filter((reservation) => reservationMatches(record, reservation));
+  const matches = (await reservations.list({ projectAlias: run.projectAlias })).filter((reservation) => reservationMatchesDelegation(record, reservation));
   if (matches.length !== 1) fail("Delegation reservation is missing or has changed");
 
   // This is the boundary an untrusted child crosses: run ID, delegation ID, and
