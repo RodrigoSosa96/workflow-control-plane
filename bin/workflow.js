@@ -12,6 +12,7 @@ import { ASSIGNMENT_LIMITS } from "../src/workflow/assignment.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import {
   closeCommand as defaultCloseCommand,
+  delegationGateClearCommand as defaultDelegationGateClearCommand,
   delegationHandoffCommand as defaultDelegationHandoffCommand,
   delegationReconcileCommand as defaultDelegationReconcileCommand,
   delegationReleaseCommand as defaultDelegationReleaseCommand,
@@ -31,6 +32,7 @@ import {
 } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { ensureCodexWorkerHooks as defaultEnsureCodexWorkerHooks } from "../src/workflow/codex-hooks.js";
+import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
 import { createOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
@@ -65,6 +67,7 @@ Commands:
   workflow delegation remediate <run-id> <delegation-id> --prompt-file <path> [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow delegation handoff <run-id> <delegation-id> --input <run-dir>/delegations/<delegation-id>/handoff-input.json [--format compact|json]
   workflow delegation release <run-id> <delegation-id> [--format compact|json] [--yes]
+  workflow delegation gate-clear <project> [--format compact|json] [--yes]
 
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path
@@ -263,6 +266,15 @@ export function parseArgs(argv) {
         command: "delegation-release",
         runId: positionals[1],
         delegationId: positionals[2],
+        ...(options.yes ? { yes: true } : {}),
+        format,
+      };
+    }
+    if (subcommand === "gate-clear") {
+      validateShape("delegation gate-clear", positionals.slice(1), options, { min: 1, max: 1, allowedOptions: ["yes"] });
+      return {
+        command: "delegation-gate-clear",
+        projectAlias: positionals[1],
         ...(options.yes ? { yes: true } : {}),
         format,
       };
@@ -471,7 +483,11 @@ function createLiveDependencies(dependencies) {
     ensureCodexWorkerHooks: dependencies.ensureCodexWorkerHooks ?? defaultEnsureCodexWorkerHooks,
     transport: dependencies.transport,
     delegations: dependencies.delegations,
-    reservations: dependencies.reservations,
+    // Same readOwnOwnership reader as `store` above -- constructed exactly once per process, not
+    // once per store. Without this, real reservation gate markers carry no pid/startedAt (the
+    // store's own default is `readOwnOwnership: async () => null`) and `workflow delegation
+    // gate-clear` would report every gate as unprovable, never removable.
+    reservations: dependencies.reservations ?? (stateRoot ? createDelegationReservationStore({ stateRoot, readOwnOwnership }) : undefined),
     roles: dependencies.roles,
     createDelegationServices: dependencies.createDelegationServices,
     telemetry: dependencies.telemetry,
@@ -693,6 +709,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const delegationResultCommand = dependencies.delegationResultCommand ?? defaultDelegationResultCommand;
   const delegationReconcileCommand = dependencies.delegationReconcileCommand ?? defaultDelegationReconcileCommand;
   const delegationRemediateCommand = dependencies.delegationRemediateCommand ?? defaultDelegationRemediateCommand;
+  const delegationGateClearCommand = dependencies.delegationGateClearCommand ?? defaultDelegationGateClearCommand;
   const handoffCommand = dependencies.handoffCommand ?? defaultHandoffCommand;
   const delegationHandoffCommand = dependencies.delegationHandoffCommand ?? defaultDelegationHandoffCommand;
   const executeStart = dependencies.executeStart ?? defaultExecuteStart;
@@ -860,6 +877,19 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const delegationReleaseCommand = dependencies.delegationReleaseCommand ?? defaultDelegationReleaseCommand;
       const result = await delegationReleaseCommand({ ...options, confirmed: Boolean(options.yes) }, liveDependencies);
       emit(out, formatWorkflowResult("delegation-release", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "delegation-gate-clear") {
+      // No delegation transport is needed: gate-clear only inspects/removes a project
+      // reservation gate, via liveDependencies' reservations and inspectProcessByPid -- the same
+      // wiring unlock uses for the run lock (see the naming note above on why inspectProcess is
+      // aliased fresh here rather than exposed on liveDependencies itself).
+      const result = await delegationGateClearCommand(
+        { ...options, confirmed: Boolean(options.yes) },
+        { ...liveDependencies, inspectProcess: liveDependencies.inspectProcessByPid },
+      );
+      emit(out, formatWorkflowResult("delegation-gate-clear", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

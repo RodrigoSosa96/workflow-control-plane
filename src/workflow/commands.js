@@ -736,13 +736,23 @@ export async function workerWatchCommand(options = {}, deps = {}) {
   }
 }
 
+// Shared by every command that needs the delegation reservation store: reuses an injected
+// deps.reservations verbatim (the live CLI path wires one, with readOwnOwnership, once per
+// process -- see bin/workflow.js), otherwise constructs one from the state root. stateRoot is
+// only resolved when actually needed, so an injected deps.reservations never forces a registry
+// load just to compute a state root nothing will use.
+async function reservationsForCommand(options = {}, deps = {}) {
+  if (deps.reservations) return deps.reservations;
+  const stateRoot = await stateRootForCommand(options, deps);
+  return createDelegationReservationStore({ stateRoot });
+}
+
 async function delegationStoresForCommand(options = {}, deps = {}) {
   const store = await storeForCommand(options, deps);
-  const stateRoot = deps.reservations ? undefined : await stateRootForCommand(options, deps);
   return {
     store,
     delegations: deps.delegations ?? createDelegationStore({ store }),
-    reservations: deps.reservations ?? createDelegationReservationStore({ stateRoot }),
+    reservations: await reservationsForCommand(options, deps),
   };
 }
 
@@ -953,8 +963,7 @@ async function loadDelegationContext(options = {}, deps = {}, command = "delegat
   const runId = assertPathSafeUuid(options.runId, "run ID");
   const delegationId = assertPathSafeUuid(options.delegationId, "delegation ID");
   const store = await storeForCommand(options, deps);
-  const stateRoot = deps.reservations ? undefined : await stateRootForCommand(options, deps);
-  const reservations = deps.reservations ?? createDelegationReservationStore({ stateRoot });
+  const reservations = await reservationsForCommand(options, deps);
   const run = await store.read(runId);
   ensureMatchingRunProject(options, run, command);
   const registry = deps.registry ?? await (deps.loadRegistry ?? loadRegistry)(options.registryPath);
@@ -1491,18 +1500,20 @@ export async function closeCommand(options = {}, deps = {}) {
   };
 }
 
-// unlock's process-liveness probe. `null` is classifyOwnership's OWN sentinel for "a completed
-// observation found nothing" (proven missing, owner-gone); it must never stand in for "this
-// function did not observe at all", or the correctness of this repo's only destructive command
-// would depend on classifyOwnership checking pid/startedAt nullity before it looks at the
-// observation -- reorder those checks (or introduce a marker shape that reaches the observation
-// branch pid-less) and "I didn't look" silently becomes "proven dead". So every "did not
-// observe" case returns OBSERVATION_FAILED here, unconditionally: a marker without BOTH a
-// provable pid and startedAt (classifyOwnership requires both; the version-1 shape has neither),
-// a missing inspector, or a throwing one (an ambiguous observation, by design). An ambiguous or
-// unobserved owner is a verdict the operator sees ("unprovable"), never a command crash -- same
-// fail-closed contract acquireLock's readOwnOwnership gives a throwing inspectProcess.
-async function observeLockOwner(marker, inspectProcess) {
+// Shared by unlock (run lock) and delegation gate-clear (project reservation gate): the
+// process-liveness probe for whichever mutex owner marker the caller is classifying. `null` is
+// classifyOwnership's OWN sentinel for "a completed observation found nothing" (proven missing,
+// owner-gone); it must never stand in for "this function did not observe at all", or the
+// correctness of this repo's two destructive commands would depend on classifyOwnership checking
+// pid/startedAt nullity before it looks at the observation -- reorder those checks (or introduce
+// a marker shape that reaches the observation branch pid-less) and "I didn't look" silently
+// becomes "proven dead". So every "did not observe" case returns OBSERVATION_FAILED here,
+// unconditionally: a marker without BOTH a provable pid and startedAt (classifyOwnership requires
+// both; a version-1 shape has neither), a missing inspector, or a throwing one (an ambiguous
+// observation, by design). An ambiguous or unobserved owner is a verdict the operator sees
+// ("unprovable"), never a command crash -- same fail-closed contract acquireLock's/acquireGate's
+// readOwnOwnership gives a throwing inspectProcess.
+async function observeOwner(marker, inspectProcess) {
   const provable = marker && typeof marker === "object" && !Array.isArray(marker)
     && marker.pid !== null && marker.pid !== undefined
     && marker.startedAt !== null && marker.startedAt !== undefined;
@@ -1515,13 +1526,72 @@ async function observeLockOwner(marker, inspectProcess) {
   }
 }
 
-// version 2 is the only shape acquireLock ever writes with an explicit `version` field; a
-// marker object with no `version` predates that (a version-1 marker, in classifyOwnership's own
-// terms) rather than being unversioned nothing. Only a missing/unreadable marker (inspectLock's
-// marker: null, whether truly absent or ambiguous) reports markerVersion: null.
-function unlockMarkerVersion(marker) {
+// version 2 is the only shape acquireLock/acquireGate ever write with an explicit `version`
+// field; a marker object with no `version` predates that (a version-1 marker, in
+// classifyOwnership's own terms) rather than being unversioned nothing. Only a missing/unreadable
+// marker (inspectLock's/inspectGate's marker: null, whether truly absent or ambiguous) reports
+// markerVersion: null. Shared by unlock and delegation gate-clear -- both mutexes embed the same
+// `version` field in the same place.
+function ownerMarkerVersion(marker) {
   if (!marker || typeof marker !== "object" || Array.isArray(marker)) return null;
   return Number.isInteger(marker.version) ? marker.version : 1;
+}
+
+// The one place this repo's provable-owner-recovery predicate is written: wrap the inspector so
+// a throw becomes OBSERVATION_FAILED (observeOwner), classify the marker, map (verdict x
+// confirmed) to an action and an exit code, and re-classify inside `allow` against whatever
+// marker `remove` actually re-reads -- never the up-front snapshot, which may be stale by the
+// time confirmation arrives. `unlockCommand` and `delegationGateClearCommand` are this flow's
+// only two callers; before this existed, each command re-derived (a variant of) this predicate by
+// hand, which is exactly review finding D17 this roadmap phase exists to stop repeating.
+//
+// `inspect` and `remove` are the mutex-specific operations (store.inspectLock/removeLock, or
+// reservations.inspectGate/clearGate). `remove` must normalize its store's outcome to
+// `{ success, reason, raw }` so this flow never needs to know whether the underlying store calls
+// its boolean `removed` or `cleared`. `buildReport` turns the flow's generic
+// `{ inspected, ownership, action, outcome, reason, exitCode }` into the command's own public
+// shape; `action` is one of "no-target" | "refused" | "needs-confirmation" | "success", and each
+// `buildReport` maps those onto its own vocabulary ("no-lock"/"removed" vs "no-gate"/"cleared").
+async function mutexOwnerRecoveryFlow({ confirmed, inspectProcess, inspect, remove, buildReport }) {
+  async function classify(marker) {
+    return classifyOwnership(marker, await observeOwner(marker, inspectProcess));
+  }
+
+  const inspected = await inspect();
+  if (!inspected) {
+    return buildReport({ inspected: null, ownership: null, action: "no-target", outcome: null, reason: null, exitCode: 0 });
+  }
+
+  const ownership = await classify(inspected.marker);
+
+  if (!ownership.removable) {
+    return buildReport({ inspected, ownership, action: "refused", outcome: null, reason: ownership.reason, exitCode: 11 });
+  }
+
+  if (!confirmed) {
+    return buildReport({ inspected, ownership, action: "needs-confirmation", outcome: null, reason: null, exitCode: 0 });
+  }
+
+  // `remove` re-reads the marker itself and hands THAT marker to `allow` -- it may differ from
+  // the one classified above (time passed waiting on confirmation; a new owner may have since
+  // acquired the mutex), so removal must be authorized against the freshly re-read marker, not
+  // the earlier snapshot. `latestOwnership` captures whatever `allow` actually classified so the
+  // final report reflects the verdict removal was authorized (or refused) against, not the
+  // now-possibly-stale up-front one -- a machine caller must never see a removable verdict next
+  // to a refused report, or vice versa.
+  let latestOwnership = ownership;
+  const outcome = await remove({
+    allow: async (marker) => {
+      latestOwnership = await classify(marker);
+      return latestOwnership.removable;
+    },
+  });
+
+  if (!outcome.success) {
+    return buildReport({ inspected, ownership: latestOwnership, action: "refused", outcome: null, reason: outcome.reason, exitCode: 11 });
+  }
+
+  return buildReport({ inspected, ownership: latestOwnership, action: "success", outcome, reason: null, exitCode: 0 });
 }
 
 function unlockReport({ runId, lock, ownership, action, removed, reason = null, exitCode }) {
@@ -1546,58 +1616,84 @@ function unlockReport({ runId, lock, ownership, action, removed, reason = null, 
 // owner is PROVEN dead (classifyOwnership's `removable`), only with `confirmed: true`. A
 // non-removable verdict ("owner-alive" or "unprovable") refuses regardless of `confirmed` --
 // confirmation authorizes deleting proven-dead evidence, it can never override the proof itself.
+// Built on mutexOwnerRecoveryFlow, shared with delegationGateClearCommand below.
 export async function unlockCommand(options = {}, deps = {}) {
   const runId = assertPathSafeUuid(options.runId, "run ID");
   const store = await storeForCommand(options, deps);
-  const inspectProcess = deps.inspectProcess;
 
-  const inspected = await store.inspectLock(runId);
-  if (!inspected) {
-    return unlockReport({ runId, lock: null, ownership: null, action: "no-lock", removed: null, exitCode: 0 });
-  }
-
-  const lock = { ageMs: inspected.ageMs, stale: inspected.stale, markerVersion: unlockMarkerVersion(inspected.marker) };
-
-  async function classify(marker) {
-    return classifyOwnership(marker, await observeLockOwner(marker, inspectProcess));
-  }
-
-  const ownership = await classify(inspected.marker);
-
-  if (!ownership.removable) {
-    return unlockReport({ runId, lock, ownership, action: "refused", removed: null, reason: ownership.reason, exitCode: 11 });
-  }
-
-  if (!options.confirmed) {
-    return unlockReport({ runId, lock, ownership, action: "needs-confirmation", removed: null, exitCode: 0 });
-  }
-
-  // removeLock re-reads the marker itself and hands THAT marker to `allow` -- it may differ from
-  // the one classified above (time passed waiting on confirmation; a new owner may have since
-  // acquired the lock), so the removal must be authorized against the freshly re-read marker,
-  // not the earlier snapshot. `latestOwnership` captures whatever `allow` actually classified so
-  // the final report reflects the verdict removal was authorized (or refused) against, not the
-  // now-possibly-stale up-front one -- a machine caller must never see a removable verdict next
-  // to a refused report, or vice versa.
-  let latestOwnership = ownership;
-  const outcome = await store.removeLock(runId, {
-    allow: async (marker) => {
-      latestOwnership = await classify(marker);
-      return latestOwnership.removable;
+  return mutexOwnerRecoveryFlow({
+    confirmed: Boolean(options.confirmed),
+    inspectProcess: deps.inspectProcess,
+    inspect: () => store.inspectLock(runId),
+    remove: async ({ allow }) => {
+      const outcome = await store.removeLock(runId, { allow });
+      return { success: outcome.removed, reason: outcome.reason, raw: outcome };
+    },
+    buildReport({ inspected, ownership, action, outcome, reason, exitCode }) {
+      const lock = inspected ? { ageMs: inspected.ageMs, stale: inspected.stale, markerVersion: ownerMarkerVersion(inspected.marker) } : null;
+      const reportedAction = action === "no-target" ? "no-lock" : action === "success" ? "removed" : action;
+      return unlockReport({
+        runId,
+        lock,
+        ownership,
+        action: reportedAction,
+        removed: outcome ? { markerPath: outcome.raw.markerPath, activePath: outcome.raw.activePath } : null,
+        reason,
+        exitCode,
+      });
     },
   });
+}
 
-  if (!outcome.removed) {
-    return unlockReport({ runId, lock, ownership: latestOwnership, action: "refused", removed: null, reason: outcome.reason, exitCode: 11 });
-  }
+function gateClearReport({ projectAlias, gate, ownership, action, cleared, reason = null, exitCode }) {
+  return {
+    command: "delegation-gate-clear",
+    projectAlias,
+    gate,
+    ownership,
+    action,
+    cleared,
+    reason,
+    // Clearing a gate only unblocks future reserve()/release() calls for the project; it never
+    // touches leases, run state, worktrees, tabs, sessions, or processes.
+    cleanup: "none",
+    nextActions: action === "needs-confirmation" ? ["confirm-gate-clear"] : [],
+    exitCode,
+  };
+}
 
-  return unlockReport({
-    runId,
-    lock,
-    ownership: latestOwnership,
-    action: "removed",
-    removed: { markerPath: outcome.markerPath, activePath: outcome.activePath },
-    exitCode: 0,
+// unlock's sibling for the per-project reservation gate: removes an active gate only when its
+// owner is PROVEN dead, and only with `confirmed: true` -- same non-negotiable rule, `--yes` can
+// never override proof. Unlike unlock, there is no run or delegation id to key off; the project
+// is resolved through the registry alone (never loadDelegationContext, which requires both), so
+// an unknown alias fails as a preflight error before any filesystem access. Built on
+// mutexOwnerRecoveryFlow, shared with unlockCommand above.
+export async function delegationGateClearCommand(options = {}, deps = {}) {
+  await loadRegistryAndProject(options, deps.loadRegistry ?? loadRegistry);
+  const projectAlias = options.projectAlias;
+  const reservations = await reservationsForCommand(options, deps);
+
+  return mutexOwnerRecoveryFlow({
+    confirmed: Boolean(options.confirmed),
+    inspectProcess: deps.inspectProcess,
+    inspect: () => reservations.inspectGate({ projectAlias }),
+    remove: async ({ allow }) => {
+      const outcome = await reservations.clearGate({ projectAlias, allow });
+      return { success: outcome.cleared, reason: outcome.reason, raw: outcome };
+    },
+    buildReport({ inspected, ownership, action, outcome, reason, exitCode }) {
+      const gate = inspected ? { markerVersion: ownerMarkerVersion(inspected.marker) } : null;
+      const reportedAction = action === "no-target" ? "no-gate" : action === "success" ? "cleared" : action;
+      return gateClearReport({
+        projectAlias,
+        gate,
+        ownership,
+        action: reportedAction,
+        cleared: outcome ? { activeGate: outcome.raw.activeGate } : null,
+        reason,
+        exitCode,
+      });
+    },
   });
 }
 

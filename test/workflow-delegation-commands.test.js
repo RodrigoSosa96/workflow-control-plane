@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { delegationReconcileCommand, delegationReleaseCommand, delegationRemediateCommand, delegationResultCommand } from "../src/workflow/commands.js";
+import { delegationGateClearCommand, delegationReconcileCommand, delegationReleaseCommand, delegationRemediateCommand, delegationResultCommand } from "../src/workflow/commands.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -553,4 +553,268 @@ test("delegation release reports nothing to do when no active lease remains", as
   assert.deepEqual(result.released, []);
   assert.equal(result.reservation.state, "missing");
   assert.deepEqual(reservations.released, []);
+});
+
+// --- delegationGateClearCommand ------------------------------------------
+
+function gateMarker(overrides = {}) {
+  return { version: 2, ownerToken: "11111111-1111-4111-8111-111111111111", pid: "4242", startedAt: "2025-01-01T10:00:00.000Z", ...overrides };
+}
+
+function inspectedGate(overrides = {}) {
+  return {
+    activeGate: "/state/workflow/delegation-reservations/projects/fixture-digest/gate/active",
+    markerPath: "/state/workflow/delegation-reservations/projects/fixture-digest/gate/active/owner.json",
+    marker: gateMarker(),
+    ...overrides,
+  };
+}
+
+// Mirrors workflow-commands.test.js's lockStoreFor, for the project reservation gate: a fake
+// reservations store exposing only inspectGate/clearGate, call-recording so tests can prove the
+// unconfirmed path never reaches a mutating call. clearGate mirrors the real store's contract
+// (delegation-reservations.js): it calls `allow` with the marker it "re-read" internally, which
+// defaults to the same one inspectGate already reported but can be overridden via `recheckMarker`
+// to a DIFFERENT marker -- simulating the marker changing (a new owner acquiring the gate)
+// between the command's own up-front classification and clearGate's internal re-read, exactly
+// what `allow` exists to re-authorize against. clearGateResult lets a test force clearGate's own
+// refusal for reasons unrelated to `allow` (a store-level race `allow` itself cannot see, e.g.
+// the active directory changing identity underneath).
+function gateStoreFor({ inspected = null, recheckMarker, clearGateResult } = {}) {
+  const inspectGateCalls = [];
+  const clearGateCalls = [];
+  return {
+    inspectGateCalls,
+    clearGateCalls,
+    async inspectGate({ projectAlias }) {
+      inspectGateCalls.push(projectAlias);
+      return inspected;
+    },
+    async clearGate({ projectAlias, allow }) {
+      clearGateCalls.push(projectAlias);
+      const marker = recheckMarker !== undefined ? recheckMarker : (inspected?.marker ?? null);
+      const permitted = await allow(marker);
+      if (!permitted) return { cleared: false, reason: "removal was not permitted for the current owner marker" };
+      if (clearGateResult) return clearGateResult;
+      return { cleared: true, activeGate: inspected.activeGate };
+    },
+  };
+}
+
+// deps.inspectProcess is `(pid) => Promise<observation|null>`, throwing on ambiguity -- the same
+// shape unlockCommand's tests already give it (see workflow-commands.test.js).
+function inspectProcessReturning(result) {
+  const calls = [];
+  return {
+    calls,
+    inspectProcess: async (pid) => {
+      calls.push(pid);
+      if (result instanceof Error) throw result;
+      return result;
+    },
+  };
+}
+
+test("delegation gate-clear reports no-gate and exits 0 without inspecting any process when there is no active gate", async () => {
+  const reservations = gateStoreFor({ inspected: null });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+
+  assert.deepEqual(result, {
+    command: "delegation-gate-clear",
+    projectAlias: PROJECT_ALIAS,
+    gate: null,
+    ownership: null,
+    action: "no-gate",
+    cleared: null,
+    reason: null,
+    cleanup: "none",
+    nextActions: [],
+    exitCode: 0,
+  });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(reservations.clearGateCalls, []);
+});
+
+test("delegation gate-clear refuses an alive owner with exit 11 even when confirmed, and never calls clearGate", async () => {
+  const marker = gateMarker();
+  const inspected = inspectedGate({ marker });
+  const reservations = gateStoreFor({ inspected });
+  const { inspectProcess } = inspectProcessReturning({ pid: marker.pid, startedAt: marker.startedAt, cwd: "/wt", active: true });
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: true, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "owner-alive");
+  assert.equal(result.ownership.removable, false);
+  assert.equal(result.gate.markerVersion, 2);
+  assert.equal(result.cleared, null);
+  assert.deepEqual(reservations.clearGateCalls, []);
+});
+
+test("delegation gate-clear refuses an unreadable/ambiguous marker (inspectGate's marker: null) as unprovable", async () => {
+  // inspectGate reports marker: null when the marker is absent, unreadable, or ambiguous while
+  // the active gate directory itself still exists -- realistic wedged-gate residue.
+  const inspected = inspectedGate({ marker: null });
+  const reservations = gateStoreFor({ inspected });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: true, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+  assert.match(result.ownership.reason, /is not a recognizable marker object/);
+  assert.equal(result.gate.markerVersion, null);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(reservations.clearGateCalls, []);
+});
+
+test("delegation gate-clear reports needs-confirmation for a proven-missing owner, then clears it once confirmed", async () => {
+  const marker = gateMarker();
+  const inspected = inspectedGate({ marker });
+  const reservations = gateStoreFor({ inspected });
+  const { inspectProcess } = inspectProcessReturning(null); // proven gone: no matching process
+
+  const pending = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: false, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+  assert.equal(pending.action, "needs-confirmation");
+  assert.equal(pending.exitCode, 0);
+  assert.equal(pending.cleared, null);
+  assert.deepEqual(pending.nextActions, ["confirm-gate-clear"]);
+  assert.deepEqual(reservations.clearGateCalls, []);
+
+  const cleared = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: true, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+  assert.equal(cleared.action, "cleared");
+  assert.equal(cleared.exitCode, 0);
+  assert.deepEqual(cleared.cleared, { activeGate: inspected.activeGate });
+  assert.equal(cleared.cleanup, "none");
+  assert.deepEqual(reservations.clearGateCalls, [PROJECT_ALIAS]);
+});
+
+test("delegation gate-clear authorizes removal against the marker clearGate re-reads, not the one classified up front", async () => {
+  // Up front, the gate's marker is proven-missing (removable). By the time clearGate re-reads
+  // the marker (recheckMarker), a DIFFERENT owner has since acquired the gate and is alive --
+  // `allow` must re-classify THAT marker, not reuse the up-front verdict, or a live owner's gate
+  // would be destroyed. Mirrors workflow-commands.test.js's discriminating unlock test: an
+  // implementation that authorizes against the stale up-front snapshot instead (e.g. `allow:
+  // async () => ownership.removable`, ignoring the marker `allow` actually receives) would still
+  // incorrectly report this case as cleared.
+  const staleMarker = gateMarker(); // classified below as proven-missing (removable)
+  const freshAliveMarker = gateMarker({ ownerToken: "22222222-2222-4222-8222-222222222222", pid: "5151", startedAt: "2025-01-01T13:00:00.000Z" });
+  const inspected = inspectedGate({ marker: staleMarker });
+  const reservations = gateStoreFor({ inspected, recheckMarker: freshAliveMarker });
+  const inspectProcess = async (pid) => {
+    if (pid === freshAliveMarker.pid) {
+      return { pid: freshAliveMarker.pid, startedAt: freshAliveMarker.startedAt, cwd: "/wt", active: true };
+    }
+    return null; // staleMarker's pid: proven gone
+  };
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: true, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.cleared, null);
+  // The report reflects the FRESH (alive) verdict `allow` actually computed, not the stale
+  // (proven-missing) one classified up front -- proof the re-classification, not merely a
+  // refusal, actually happened.
+  assert.equal(result.ownership.verdict, "owner-alive");
+  assert.deepEqual(reservations.clearGateCalls, [PROJECT_ALIAS]);
+});
+
+test("even though allow authorized removal, a store-level clearGate refusal (a race allow cannot see) surfaces as refused with its reason, not a crash", async () => {
+  const marker = gateMarker();
+  const inspected = inspectedGate({ marker });
+  const reservations = gateStoreFor({
+    inspected,
+    clearGateResult: { cleared: false, reason: "the active gate directory was replaced before removal" },
+  });
+  const { inspectProcess } = inspectProcessReturning(null);
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: true, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations, inspectProcess }),
+  );
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.cleared, null);
+  assert.equal(result.reason, "the active gate directory was replaced before removal");
+  // allow's own re-classification still ran (and still authorized removal) before clearGate's
+  // own, separate, post-authorization identity check refused -- the report carries that fresh
+  // verdict, matching what removal was actually authorized against.
+  assert.equal(result.ownership.verdict, "owner-gone");
+  assert.equal(result.ownership.removable, true);
+});
+
+test("delegation gate-clear without a wired inspectProcess degrades to unprovable rather than throwing", async () => {
+  const marker = gateMarker();
+  const inspected = inspectedGate({ marker });
+  const reservations = gateStoreFor({ inspected });
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, confirmed: true, registryPath: "/tmp/projects.yaml" },
+    deps({ reservations }),
+  );
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+});
+
+test("the unconfirmed path never calls clearGate, across no-gate, refused, and needs-confirmation outcomes", async () => {
+  const aliveMarker = gateMarker();
+  const cases = [
+    { inspected: null, observation: null }, // no-gate
+    { inspected: inspectedGate({ marker: aliveMarker }), observation: { pid: aliveMarker.pid, startedAt: aliveMarker.startedAt, cwd: "/wt", active: true } }, // alive -> refused
+    { inspected: inspectedGate({ marker: gateMarker() }), observation: null }, // proven-gone -> needs-confirmation
+  ];
+  for (const { inspected, observation } of cases) {
+    const reservations = gateStoreFor({ inspected });
+    const { inspectProcess } = inspectProcessReturning(observation);
+    await delegationGateClearCommand(
+      { projectAlias: PROJECT_ALIAS, confirmed: false, registryPath: "/tmp/projects.yaml" },
+      deps({ reservations, inspectProcess }),
+    );
+    assert.deepEqual(reservations.clearGateCalls, []);
+  }
+});
+
+test("delegation gate-clear rejects an unknown project alias as a preflight failure before touching the reservation store", async () => {
+  const reservations = {
+    async inspectGate() {
+      assert.fail("delegation gate-clear must not inspect any gate for an unknown project");
+    },
+    async clearGate() {
+      assert.fail("delegation gate-clear must not clear any gate for an unknown project");
+    },
+  };
+
+  await assert.rejects(
+    () => delegationGateClearCommand(
+      { projectAlias: "not-a-real-project", confirmed: true, registryPath: "/tmp/projects.yaml" },
+      deps({ reservations }),
+    ),
+    (error) => /Unknown workflow project/i.test(error.message),
+  );
 });

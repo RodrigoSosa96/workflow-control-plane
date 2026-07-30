@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -313,6 +314,7 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow delegation reconcile <run-id> <delegation-id>/);
   assert.match(result.stdout, /workflow delegation remediate <run-id> <delegation-id> --prompt-file <path> .*--dry-run.*--approval-digest <digest>.*--yes/);
   assert.match(result.stdout, /workflow delegation handoff <run-id> <delegation-id> --input <run-dir>\/delegations\/<delegation-id>\/handoff-input.json/);
+  assert.match(result.stdout, /workflow delegation gate-clear <project>/);
   const doctorLine = result.stdout.split(/\r?\n/u).find((line) => line.includes("workflow doctor"));
   assert.doesNotMatch(doctorLine, /--tickets/);
 });
@@ -470,6 +472,19 @@ test("parses documented workflow commands and options", () => {
     input: "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
     format: "compact",
   });
+
+  assert.deepEqual(parseArgs(["delegation", "gate-clear", "acme"]), {
+    command: "delegation-gate-clear",
+    projectAlias: "acme",
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["delegation", "gate-clear", "acme", "--yes", "--format", "json"]), {
+    command: "delegation-gate-clear",
+    projectAlias: "acme",
+    yes: true,
+    format: "json",
+  });
 });
 
 test("rejects unknown, duplicate, and disallowed options", () => {
@@ -515,6 +530,9 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "prompt text", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--yes", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /does not accept --yes|Unknown option: --yes/i);
   assert.throws(() => parseArgs(["delegation", "handoff", RUN_ID, DELEGATION_ID, "--output", "/tmp/result.json", "--input", "/state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json"]), /Unknown option: --output/i);
+  assert.throws(() => parseArgs(["delegation", "gate-clear"]), /requires an argument/i);
+  assert.throws(() => parseArgs(["delegation", "gate-clear", "acme", "extra"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["delegation", "gate-clear", "acme", "--tickets", "ASANA-150"]), /does not accept --tickets/i);
 
   for (const input of [
     "state/run/delegations/22222222-2222-4222-8222-222222222222/handoff-input.json",
@@ -1571,6 +1589,156 @@ test("workflow unlock end-to-end: classifies a proven-missing owner from a real 
   assert.deepEqual(output.stderr, []);
 
   // The lock is actually gone from disk -- not just reported as gone.
+  await assert.rejects(() => readdir(activePath));
+});
+
+test("delegation gate-clear --yes passes confirmed: true through to delegationGateClearCommand; without it, confirmed is false, and no delegation transport is built", async () => {
+  const output = io();
+  const confirmedValues = [];
+  const code1 = await main(["delegation", "gate-clear", FIXTURE_PROJECT_ALIAS], {
+    ...output,
+    loadRegistry: async () => FIXTURE_REGISTRY,
+    lookupExecutable: async () => {
+      assert.fail("delegation gate-clear must never resolve a delegation transport executable");
+    },
+    createPiDelegationTransport: () => {
+      assert.fail("delegation gate-clear must never build a delegation transport");
+    },
+    delegationGateClearCommand: async (options) => {
+      confirmedValues.push(options.confirmed);
+      return { command: "delegation-gate-clear", projectAlias: options.projectAlias, action: "needs-confirmation", exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+  const code2 = await main(["delegation", "gate-clear", FIXTURE_PROJECT_ALIAS, "--yes"], {
+    ...output,
+    loadRegistry: async () => FIXTURE_REGISTRY,
+    delegationGateClearCommand: async (options) => {
+      confirmedValues.push(options.confirmed);
+      return { command: "delegation-gate-clear", projectAlias: options.projectAlias, action: "cleared", exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+
+  assert.equal(code1, 0);
+  assert.equal(code2, 0);
+  assert.deepEqual(confirmedValues, [false, true]);
+  assert.deepEqual(output.stdout, ["delegation-gate-clear:needs-confirmation", "delegation-gate-clear:cleared"]);
+});
+
+test("delegation gate-clear propagates a non-zero exitCode (the refused/11 conflict case) from the command report", async () => {
+  const output = io();
+  const code = await main(["delegation", "gate-clear", FIXTURE_PROJECT_ALIAS, "--yes"], {
+    ...output,
+    loadRegistry: async () => FIXTURE_REGISTRY,
+    delegationGateClearCommand: async (options) => ({ command: "delegation-gate-clear", projectAlias: options.projectAlias, action: "refused", reason: "the owner process is still running", exitCode: 11 }),
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+  assert.equal(code, 11);
+  assert.deepEqual(output.stdout, ["delegation-gate-clear:refused"]);
+});
+
+test("main wires delegation gate-clear with the real reservation store, sharing (not rebuilding) the run store's own ps-based readOwnOwnership reader", async () => {
+  // Proves the wiring the task brief calls out explicitly: bin/workflow.js must construct
+  // exactly one readOwnOwnership reader per process and pass that SAME reader to both the run
+  // store and the reservation store -- never a second one for reservations. If a second reader
+  // were constructed, this test's two independent mutex acquisitions (one through each store)
+  // would spend two `ps` calls instead of one.
+  const dir = await mkdtemp(join(tmpdir(), "workflow-gate-clear-wiring-"));
+  const stateRoot = join(dir, "state");
+  const psCalls = [];
+  const runner = {
+    async run(command, argv, options) {
+      psCalls.push({ command, argv, options });
+      return { code: 0, stdout: "Wed Jan  1 00:10:00 2025 S\n" };
+    },
+  };
+
+  const output = io();
+  const code = await main(["delegation", "gate-clear", FIXTURE_PROJECT_ALIAS], {
+    ...output,
+    stateRoot,
+    runner,
+    loadRegistry: async () => FIXTURE_REGISTRY,
+    delegationGateClearCommand: async (_options, gateDeps) => {
+      // delegationGateClearCommand's documented interface reads deps.inspectProcess by that
+      // literal name -- same aliasing unlock's dispatch does, for the same reason (see the
+      // naming note where inspectProcessByPid is constructed).
+      assert.equal(typeof gateDeps.inspectProcess, "function");
+      assert.equal(gateDeps.inspectProcess, gateDeps.inspectProcessByPid);
+      assert.ok(gateDeps.store);
+      assert.ok(gateDeps.reservations);
+      await gateDeps.store.create({ runId: RUN_ID, projectAlias: FIXTURE_PROJECT_ALIAS, task: "ASANA-1" });
+      await gateDeps.reservations.reserve({
+        projectAlias: FIXTURE_PROJECT_ALIAS,
+        delegationId: DELEGATION_ID,
+        role: "code-reviewer",
+        mode: "background",
+        checkoutPath: FIXTURE_CWD,
+        policy: FIXTURE_POLICY,
+      });
+      return { command: "delegation-gate-clear", projectAlias: FIXTURE_PROJECT_ALIAS, action: "no-gate", exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(output.stdout, ["delegation-gate-clear:no-gate"]);
+  // Exactly one `ps` call for the whole invocation, shared across both mutex acquisitions.
+  assert.deepEqual(psCalls, [{
+    command: "ps",
+    argv: ["-p", String(process.pid), "-o", "lstart=", "-o", "state="],
+    options: { allowFailure: true },
+  }]);
+});
+
+test("workflow delegation gate-clear end-to-end: classifies a proven-missing owner from a real crashed gate and clears it, using the reused ps wiring", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-gate-clear-e2e-"));
+  const stateRoot = join(dir, "state");
+  const projectDigest = createHash("sha256").update(FIXTURE_PROJECT_ALIAS, "utf8").digest("hex");
+  const gateContainer = join(stateRoot, "delegation-reservations", "projects", projectDigest, "gate");
+  const activePath = join(gateContainer, "active");
+  const markerPath = join(activePath, "owner.json");
+  const deadPid = "999999";
+  const marker = { version: 2, ownerToken: "33333333-3333-4333-8333-333333333333", pid: deadPid, startedAt: "2024-12-31T00:00:00.000Z" };
+  // Simulate crash residue directly on disk: no acquireGate/releaseGate cycle ever completes
+  // for a crashed operator, so there is no store API that leaves a gate lingering -- only raw
+  // fs mirrors what a real crash leaves behind.
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+
+  const psCalls = [];
+  const runner = {
+    async run(command, argv, options) {
+      psCalls.push({ command, argv, options });
+      // `ps -p <deadPid>` finds nothing: exit 1, no output -- proven gone.
+      return { code: 1, stdout: "", stderr: "" };
+    },
+  };
+
+  const output = io();
+  const code = await main(["delegation", "gate-clear", FIXTURE_PROJECT_ALIAS, "--yes"], {
+    ...output,
+    stateRoot,
+    runner,
+    loadRegistry: async () => FIXTURE_REGISTRY,
+  });
+
+  assert.equal(code, 0);
+  // delegationGateClearCommand classifies the marker twice by design: once up front, and once
+  // more inside clearGate's `allow` against whatever marker clearGate itself re-reads (which may
+  // differ from the first read) -- so this is two `ps` calls, both against the same real pid
+  // here since nothing raced.
+  const expectedPsCall = { command: "ps", argv: ["-p", deadPid, "-o", "lstart=", "-o", "state="], options: { allowFailure: true } };
+  assert.deepEqual(psCalls, [expectedPsCall, expectedPsCall]);
+  const report = JSON.parse(output.stdout[0]);
+  assert.equal(report.action, "cleared");
+  assert.equal(report.ownership.verdict, "owner-gone");
+  assert.equal(report.cleared.activeGate, activePath);
+  assert.equal(report.cleanup, "none");
+  assert.deepEqual(output.stderr, []);
+
+  // The gate is actually gone from disk -- not just reported as gone.
   await assert.rejects(() => readdir(activePath));
 });
 
