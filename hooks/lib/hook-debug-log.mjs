@@ -1,4 +1,4 @@
-import { appendFile as defaultAppendFile } from "node:fs/promises";
+import { appendFile as defaultAppendFile, stat as defaultStat } from "node:fs/promises";
 import { join } from "node:path";
 
 // Every lifecycle hook, extension handler, telemetry recorder, and notifier
@@ -35,11 +35,14 @@ export async function recordHookDebug({
   error,
   at = new Date().toISOString(),
   appendFile = defaultAppendFile,
-  stat = null,
+  stat = defaultStat,
 } = {}) {
   if (typeof runDirectory !== "string" || !runDirectory) return false;
   try {
     const path = hookDebugLogPath(runDirectory);
+    // Enforced on every append: a hook failing once per turn for days must not
+    // grow without limit. Once the cap is reached the log stops accepting entries
+    // rather than rotating, so the first (most diagnostic) failures are kept.
     if (typeof stat === "function") {
       try {
         const stats = await stat(path);

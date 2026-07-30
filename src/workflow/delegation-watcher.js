@@ -1,5 +1,6 @@
 const TERMINAL_STATES = new Set(["completed", "blocked", "failed"]);
 const noticeCache = new WeakMap();
+const deliveredCache = new WeakMap();
 
 function fail(message) {
   throw new TypeError(message);
@@ -69,6 +70,10 @@ function noticeKey(record, reason) {
   return `${record.parentRunId}:${record.id}:${record.generation}:${reason}`;
 }
 
+function resultKey(record) {
+  return `${record.parentRunId}:${record.id}:${record.generation}`;
+}
+
 function shouldNotice(record, originSessionId) {
   if (!record || typeof record !== "object" || record.originSessionId !== originSessionId) return null;
   if (record.startFailure?.reason) return `manual review required: ${record.startFailure.reason}`;
@@ -98,6 +103,11 @@ export function createDelegationWatcher({
   let inFlight = null;
   const seenNotices = noticeCache.get(store) ?? new Set();
   noticeCache.set(store, seenNotices);
+  // Delivery happens before consuming so a failed delivery is retried, but a
+  // consume that keeps failing (a stale run lock is crash residue the design
+  // never clears) would otherwise re-deliver the same result every poll forever.
+  const deliveredResults = deliveredCache.get(store) ?? new Set();
+  deliveredCache.set(store, deliveredResults);
 
   function noteError(error) {
     try {
@@ -146,7 +156,11 @@ export function createDelegationWatcher({
           // Deliver before consuming. A failed delivery leaves the record
           // unconsumed so the next poll retries it (at-least-once), instead of
           // permanently consuming a result the origin session never saw.
-          await deliverResult(resultPayload(record));
+          const key = resultKey(record);
+          if (!deliveredResults.has(key)) {
+            await deliverResult(resultPayload(record));
+            deliveredResults.add(key);
+          }
           await store.consumeResult({
             runId: record.parentRunId,
             delegationId: record.id,
@@ -159,8 +173,10 @@ export function createDelegationWatcher({
         if (!reason) continue;
         const key = noticeKey(record, reason);
         if (seenNotices.has(key)) continue;
-        seenNotices.add(key);
+        // Marked only after the notice actually reached the session; the
+        // per-record catch below would otherwise suppress it permanently.
         await deliverNotice(noticePayload(record, reason));
+        seenNotices.add(key);
       } catch (error) {
         noteError(error);
       }

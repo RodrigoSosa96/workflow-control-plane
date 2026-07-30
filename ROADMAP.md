@@ -12,34 +12,34 @@ Son las fallas *silenciosas* en el camino crítico de estado y notificaciones. P
 
 ### Batch A — Watchers y pipeline de notificaciones (D2, D3, D12)
 
-- [ ] **0.1** Agregar `.catch()` a los schedule de ambos watchers (`worker-watcher.js:74-76`, `delegation-watcher.js:104-106`): registrar el error de forma acotada y seguir polleando. Hoy cualquier error de poll es un unhandled rejection que puede matar el proceso host del coordinador Pi.
-- [ ] **0.2** Delegation watcher: entregar antes de consumir, o marcar `delivery-failed` redeliverable si `deliverResult` lanza tras `consumeResult` (`delegation-watcher.js:128-140`). Hoy un fallo de entrega pierde el resultado advisory para siempre.
-- [ ] **0.3** `run-store.list()`: skip por entrada con warning acotado en vez de propagar el throw (`run-store.js:711-721`). Un run dir sin `run.json` (ventana de crash en `create()`, `:619-632`) hoy envenena el listing de todos los runs y cascadea a los watchers. Mantener `read()`/`update()` estrictos.
-- [ ] **0.4** Corregir `TERMINAL_RUN_STATES` en `worker-watcher.js:3`: usa `needs_input`/`manual_handoff_required` con guion bajo pero los estados reales llevan guion (`run-state.js:8,13`) — esas notificaciones nunca matchean.
-- [ ] **0.5** Dedupe del worker-watcher por `(runId, generation)` en vez de runId-para-siempre (`worker-watcher.js:106-108`), espejando el `noticeKey` del delegation watcher. Hoy un run que paró, se resumió y completó no re-notifica.
-- [ ] **0.6** `events-bus.readEvents`: avanzar el cursor solo hasta el último `\n` (`events-bus.js:47-58`). Hoy una línea cortada a mitad de escritura se salta para siempre.
-- [ ] **0.7** `handoff.js:539`: spread de `process.env` en el env del notifier. Hoy `WORKFLOW_HANDOFF_NOTIFIER` (y `HOME`) se ignoran justo en el path de handoff.
+- [x] **0.1** Agregar `.catch()` a los schedule de ambos watchers (`worker-watcher.js:74-76`, `delegation-watcher.js:104-106`): registrar el error de forma acotada y seguir polleando. Hoy cualquier error de poll es un unhandled rejection que puede matar el proceso host del coordinador Pi. *(9eebba2)*
+- [x] **0.2** Delegation watcher: entregar antes de consumir, o marcar `delivery-failed` redeliverable si `deliverResult` lanza tras `consumeResult` (`delegation-watcher.js:128-140`). Hoy un fallo de entrega pierde el resultado advisory para siempre. *(9eebba2)*
+- [x] **0.3** `run-store.list()`: skip por entrada con warning acotado en vez de propagar el throw (`run-store.js:711-721`). Un run dir sin `run.json` (ventana de crash en `create()`, `:619-632`) hoy envenena el listing de todos los runs y cascadea a los watchers. Mantener `read()`/`update()` estrictos. *(9eebba2)*
+- [x] **0.4** Corregir `TERMINAL_RUN_STATES` en `worker-watcher.js:3`: usa `needs_input`/`manual_handoff_required` con guion bajo pero los estados reales llevan guion (`run-state.js:8,13`) — esas notificaciones nunca matchean. *(9eebba2)*
+- [x] **0.5** Dedupe del worker-watcher por `(runId, generation)` en vez de runId-para-siempre (`worker-watcher.js:106-108`), espejando el `noticeKey` del delegation watcher. Hoy un run que paró, se resumió y completó no re-notifica. *(9eebba2)*
+- [x] **0.6** `events-bus.readEvents`: avanzar el cursor solo hasta el último `\n` (`events-bus.js:47-58`). Hoy una línea cortada a mitad de escritura se salta para siempre. *(9eebba2)*
+- [x] **0.7** `handoff.js:539`: spread de `process.env` en el env del notifier. Hoy `WORKFLOW_HANDOFF_NOTIFIER` (y `HOME`) se ignoran justo en el path de handoff. *(9eebba2)*
 
 ### Batch B — Correctitud de la máquina de estados (D4, D6, D7)
 
-- [ ] **0.8** Write final del launcher consciente del estado: en el updater, transicionar a RUNNING solo desde PLANNED/LAUNCHING y estampar FAILED solo desde LAUNCHING; devolver `{}` si el worker ya avanzó (`launch.js:734-743`, `:549-551`). Hoy puede regresar COMPLETED→RUNNING o marcar FAILED a un worker vivo.
-- [ ] **0.9** Retry acotado (3 intentos, backoff 25–100ms con jitter) en `acquireLock` solo para contención (`run-store.js:446-460`). Hoy una colisión de milisegundos entre el launcher y el hook `onStop` del worker pierde la transición COMPLETED sin diagnóstico.
-- [ ] **0.10** Lock alrededor de observe→relaunch en `executeResume` (`resume.js:25-50`): re-leer el run bajo el lock, verificar que `transportIdentity` no cambió desde `planResume`, rehusar con conflicto si se movió. Hoy dos `resume --yes` concurrentes doble-relanzan al mismo worktree.
+- [x] **0.8** Write final del launcher consciente del estado: en el updater, transicionar a RUNNING solo desde PLANNED/LAUNCHING y estampar FAILED solo desde LAUNCHING; devolver `{}` si el worker ya avanzó (`launch.js:734-743`, `:549-551`). Hoy puede regresar COMPLETED→RUNNING o marcar FAILED a un worker vivo. *(ffc6929)*
+- [x] **0.9** Retry acotado (3 intentos, backoff 25–100ms con jitter) en `acquireLock` solo para contención (`run-store.js:446-460`). Hoy una colisión de milisegundos entre el launcher y el hook `onStop` del worker pierde la transición COMPLETED sin diagnóstico. *(ffc6929)*
+- [x] **0.10** Lock alrededor de observe→relaunch en `executeResume` (`resume.js:25-50`): re-leer el run bajo el lock, verificar que `transportIdentity` no cambió desde `planResume`, rehusar con conflicto si se movió. Hoy dos `resume --yes` concurrentes doble-relanzan al mismo worktree. *(ffc6929)*
 
 ### Batch C — Assignment, config y delegación (D1, D8, D10, D11, D13, D14)
 
-- [ ] **0.11** Cablear `project.verify` del registry → plan → `buildAssignmentTemplate` y eliminar el fallback hardcodeado (`assignment.js:176-180`; el fallback referencia los tests *de este repo*). Fallback nuevo: instrucción genérica de descubrir y correr los checks propios del proyecto. **Prerequisito de 2.3 (workflow verify).**
-- [ ] **0.12** `bin/workflow.js:701`: pasar `{limit: LAUNCH_OUTPUT_LIMIT}` en el emit del execute report, como ya hacen los previews (`:679,:686`). Hoy reportes entre 12k y ~77.5k chars salen como JSON truncado inválido.
-- [ ] **0.13** Extender `RAW_CONTROL_ARGUMENTS` de Claude con `--settings`, `--mcp-config`, `--append-system-prompt`, `--session-id`, `--resume` (`registry.js:32-39`). Hoy un profile puede pisar el `--settings` generado que el digest aprobó (`harnesses.js:160-164`, last-wins).
-- [ ] **0.14** `reconcile.safeStatus`: devolver `{dirty: null, error}` y que el clasificador trate status desconocido como conflicto (`reconcile.js:65-71`). Hoy un `git status` que falla se reporta como clean y alimenta el flujo de aprobación.
-- [ ] **0.15** Requerir claim token por delegación en **toda** generación, no solo remediaciones: mintearlo al claim, pasarlo al child solo por su env privado, exigirlo en `recordResult` (`delegation-handoff.js:120-132`, `delegation-store.js:361-367`). Hoy un child con bash puede forjar el resultado de un sibling.
-- [ ] **0.16** Reservas de delegación: liberar el lease dentro de `recordResult` (con el ownerToken ya almacenado) + comando `workflow delegation release <run-id> <delegation-id>` para el residuo de start-failures (`delegation-services.js:397-462`, `delegation-reservations.js:278-297` — `release()` hoy tiene cero llamadores). Test de integración: dos delegaciones writer secuenciales al mismo checkout. **Hoy una sola delegación writer exitosa brickea el lane para siempre.**
+- [x] **0.11** Cablear `project.verify` del registry → plan → `buildAssignmentTemplate` y eliminar el fallback hardcodeado (`assignment.js:176-180`; el fallback referencia los tests *de este repo*). Fallback nuevo: instrucción genérica de descubrir y correr los checks propios del proyecto. **Prerequisito de 2.3 (workflow verify).** *(006d179)*
+- [x] **0.12** `bin/workflow.js:701`: pasar `{limit: LAUNCH_OUTPUT_LIMIT}` en el emit del execute report, como ya hacen los previews (`:679,:686`). Hoy reportes entre 12k y ~77.5k chars salen como JSON truncado inválido. *(006d179)*
+- [x] **0.13** Extender `RAW_CONTROL_ARGUMENTS` de Claude con `--settings`, `--mcp-config`, `--append-system-prompt`, `--session-id`, `--resume` (`registry.js:32-39`). Hoy un profile puede pisar el `--settings` generado que el digest aprobó (`harnesses.js:160-164`, last-wins). *(006d179)*
+- [x] **0.14** `reconcile.safeStatus`: devolver `{dirty: null, error}` y que el clasificador trate status desconocido como conflicto (`reconcile.js:65-71`). Hoy un `git status` que falla se reporta como clean y alimenta el flujo de aprobación. *(006d179)*
+- [x] **0.15** Requerir claim token por delegación en **toda** generación, no solo remediaciones: mintearlo al claim, pasarlo al child solo por su env privado, exigirlo al recibir el resultado. Un child con bash podía forjar el resultado de un sibling. *(006d179)* — **implementado en `submitDelegationHandoff`** (el borde que cruza el child), no en `recordResult`: así el primitivo del store sigue usable por los llamadores internos de confianza y hay un solo punto de enforcement por caso (remediación vs generación normal).
+- [x] **0.16** Reservas de delegación: liberar el lease al aterrizar un resultado terminal + comando `workflow delegation release <run-id> <delegation-id>` para el residuo de start-failures. Una sola delegación writer exitosa brickeaba el lane para siempre. *(006d179)* — **implementado con `releaseForDelegation({projectAlias, delegationId})`** en vez de `release({reservation})`: el ownerToken se mintea dentro de `reserve()` y nunca se persiste fuera del lease, así que ningún llamador posterior puede presentarlo (por eso `release()` no tenía llamadores). La autorización viene de que ambos call sites verifican contra el run store que la delegación ya no corre.
 
 ### Batch D — Calidad e infraestructura (D9, D15, D18)
 
-- [ ] **0.17** CI: GitHub Actions corriendo `npm test` en push/PR, y corregir `engines` a `>=22.18` (los tests importan `.ts` con type stripping nativo; `package.json:31` hoy declara `>=20`).
-- [ ] **0.18** Observabilidad de hooks: append best-effort a `hooks-debug.log` dentro del run dir en los catch blocks (acotado), y `workflow doctor` reportando versión instalada de cada harness vs `SUPPORTED_VERSIONS` (`telemetry-adapters.js:10-15` — ya driftió: pinnea codex 0.144.3, el spec del lane verifica 0.145.0).
-- [ ] **0.19** `codex-hooks.js`: rehusar escribir si el hooks.json existente no parsea (reportar, no clobberear con `{hooks:{}}`), escribir con temp+rename, e idempotencia por marker estable (nombre de hook) en vez de string exacto de comando con path absoluto (`codex-hooks.js:40-47,66-79`). Hoy puede destruir hooks de terceros y duplica entradas tras mover el repo.
+- [x] **0.17** CI: GitHub Actions corriendo `npm test` en push/PR, y corregir `engines` a `>=22.18` (los tests importan `.ts` con type stripping nativo; `package.json:31` hoy declara `>=20`). *(05274f1)*
+- [x] **0.18** Observabilidad de hooks: append best-effort a `hooks-debug.log` dentro del run dir en los catch blocks (acotado), y `workflow doctor` reportando versión instalada de cada harness vs `SUPPORTED_VERSIONS` (`telemetry-adapters.js:10-15` — ya driftió: pinnea codex 0.144.3, el spec del lane verifica 0.145.0). *(05274f1)*
+- [x] **0.19** `codex-hooks.js`: rehusar escribir si el hooks.json existente no parsea (reportar, no clobberear con `{hooks:{}}`), escribir con temp+rename, e idempotencia por marker estable (nombre de hook) en vez de string exacto de comando con path absoluto (`codex-hooks.js:40-47,66-79`). Hoy puede destruir hooks de terceros y duplica entradas tras mover el repo. *(05274f1)*
 
 ---
 
@@ -98,4 +98,10 @@ Referencia: artículo "The new rules of context engineering" — Anthropic borr�
 
 | Fecha | Ítems | Commit(s) | Notas |
 |---|---|---|---|
-| 2026-07-29 | — | — | Roadmap creado a partir de la review multi-agente. Nada implementado aún. |
+| 2026-07-29 | — | — | Roadmap creado a partir de la review multi-agente. |
+| 2026-07-29 | 0.1–0.7 (Batch A) | `9eebba2` | Watchers y pipeline de notificaciones. Suite: 670 pass. |
+| 2026-07-29 | 0.8–0.10 (Batch B) | `ffc6929` | Correctitud de la máquina de estados. Suite: 677 pass. |
+| 2026-07-29 | 0.11–0.16 (Batch C) | `006d179` | Assignment/config, claim tokens y liberación de reservas. Nuevo comando `workflow delegation release`. Suite: 683 pass. |
+| 2026-07-29 | 0.17–0.19 (Batch D) | `05274f1` | CI, `hooks-debug.log`, versiones de harness en doctor, merge seguro de hooks.json. Suite: 690 pass. |
+
+**Fase 0 completa.** Rama `hardening/fase-0`, 691 tests (690 pass, 1 skip — el smoke de Herdr vivo, ítem 1.6). Próximo paso sugerido: Fase 1 (recovery y unificación), empezando por 1.1 (owner markers + `workflow unlock`), que desbloquea 2.5 (`workflow archive`).

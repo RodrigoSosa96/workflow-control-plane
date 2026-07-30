@@ -85,9 +85,11 @@ export function createDelegationReservationStore({
   clock = () => new Date().toISOString(),
   randomUUID = defaultRandomUUID,
   canonicalPath = defaultCanonicalPath,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   const root = resolve(assertString(stateRoot, "reservation state root"));
   if (typeof randomUUID !== "function" || typeof canonicalPath !== "function") fail("reservation store requires randomUUID and canonicalPath functions");
+  if (typeof sleep !== "function") fail("reservation store requires a sleep function");
   let tempCounter = 0;
 
   async function chmodDirectory(path) {
@@ -165,13 +167,24 @@ export function createDelegationReservationStore({
     await ensureDirectory(paths.project);
     await ensureDirectory(paths.leases);
     await ensureDirectory(paths.gate);
-    try {
-      await fs.mkdir(paths.activeGate, { mode: PRIVATE_DIR_MODE });
-    } catch (error) {
-      if (error?.code === "EEXIST") {
-        fail("Reservation project gate is active; manual inspection required");
+    // The gate is a mkdir mutex held for a single read-modify-write. Concurrent
+    // holders are millisecond-scale, so a bounded retry absorbs a live collision
+    // instead of telling the operator to inspect a gate that is about to clear.
+    // Crash residue still ends in the manual-inspection error, unchanged.
+    const maxAttempts = 3;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await fs.mkdir(paths.activeGate, { mode: PRIVATE_DIR_MODE });
+        break;
+      } catch (error) {
+        if (error?.code !== "EEXIST") {
+          fail(`Unable to acquire reservation project gate (${error?.code ?? "FS_ERROR"})`);
+        }
+        if (attempt >= maxAttempts) {
+          fail("Reservation project gate is active; manual inspection required");
+        }
+        await sleep(25 + Math.floor(Math.random() * 75));
       }
-      fail(`Unable to acquire reservation project gate (${error?.code ?? "FS_ERROR"})`);
     }
     await chmodDirectory(paths.activeGate);
     const ownerToken = uuid(randomUUID, "reservation gate owner token");

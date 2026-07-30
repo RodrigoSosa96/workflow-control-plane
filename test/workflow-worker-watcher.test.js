@@ -227,3 +227,41 @@ test("worker watcher contains a delivery failure and still delivers remaining ev
   assert.equal(errors.length, 1);
   await rm(dir, { recursive: true, force: true });
 });
+
+test("a solitary terminal event whose delivery fails is retried on the next poll", async () => {
+  // The byte cursor advances per batch, so an undelivered event cannot be re-read
+  // from the bus. A run event from SessionEnd-without-handoff is the only terminal
+  // event for that run: dropping it loses the notification entirely.
+  const dir = await tempDir();
+  const delivered = [];
+  const errors = [];
+  const clock = makeClock();
+  let failNext = true;
+  const watcher = createWorkerWatcher({
+    stateRoot: dir,
+    onEvent: (event) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("extension host hiccup");
+      }
+      delivered.push(event.runId);
+    },
+    onError: (error) => errors.push(error),
+    intervalMs: 1000,
+    clock,
+  });
+
+  await appendEvent({ stateRoot: dir, event: { type: "run", runId: "r-lonely", generation: 1, runState: "interrupted" } });
+  await watcher.poll();
+  assert.deepEqual(delivered, []);
+  assert.equal(errors.length, 1);
+
+  // No new bytes arrive; the queued payload is retried.
+  await watcher.poll();
+  assert.deepEqual(delivered, ["r-lonely"]);
+
+  // Delivered once: the retry queue does not re-deliver it.
+  await watcher.poll();
+  assert.deepEqual(delivered, ["r-lonely"]);
+  await rm(dir, { recursive: true, force: true });
+});

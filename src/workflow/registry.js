@@ -40,7 +40,11 @@ const FORBIDDEN_ARGUMENTS = [
 // is last-wins, so a profile argument would silently override the generated
 // value the launch approval digest gated.
 const CONTROL_PLANE_ARGUMENTS = {
-  claude: ["--settings", "--mcp-config", "--append-system-prompt", "--session-id", "--resume"],
+  // Pi's session id and worker extensions are generated per run: overriding them
+  // breaks the exact-session-identity contract resume/close/telemetry rely on.
+  pi: ["--session-id", "--extension", "--add-dir", "--continue", "--resume"],
+  claude: ["--settings", "--mcp-config", "--append-system-prompt", "--session-id", "--resume", "--add-dir"],
+  codex: ["--add-dir", "--cd"],
 };
 const RAW_CONTROL_ARGUMENTS = {
   claude: [{ field: "permission_mode", options: ["--permission-mode"] }],

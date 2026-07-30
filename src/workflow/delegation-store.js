@@ -273,23 +273,29 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   }
 
   async function claim({ runId, delegationId: id } = {}) {
-    return await updateRecord({
+    const claimToken = mintClaimToken(randomUUID);
+    const claimed = await updateRecord({
       runId,
       delegationId: id,
       expectedStates: new Set(["prepared"]),
       // Mint the per-delegation secret here, at the single point where a
-      // delegation becomes eligible to submit a result. The transport hands it
-      // to the child through its private env only, and recordResult requires it
-      // on every generation — otherwise any same-user process (including a
-      // sibling delegation, which can enumerate run-directory delegation IDs)
-      // could forge a first-generation advisory result for another role.
+      // delegation becomes eligible to submit a result. Only its DIGEST is
+      // persisted: the record lives in run.json inside the run directory, whose
+      // path every delegation child receives, so storing the secret itself
+      // would hand it to the very siblings it defends against. The raw token
+      // is returned to the caller (in memory only) and reaches the child through
+      // its private environment. Enforcement lives at the child-facing boundary
+      // (submitDelegationHandoff), so recordResult stays usable by trusted
+      // internal callers; it validates only the remediation token.
       mutate: (record) => ({
         ...record,
         state: "running",
         claimedAt: now(clock),
-        claimToken: mintClaimToken(randomUUID),
+        claimTokenDigest: digest(claimToken),
       }),
     });
+    // Attached to the returned record only; never persisted.
+    return { ...claimed, claimToken };
   }
 
   async function recordSession({ runId, delegationId: id, session } = {}) {

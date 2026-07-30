@@ -491,7 +491,19 @@ export async function createWorkflowCoordinatorRuntime({
     fail("Pi executable must resolve to an absolute path for delegation");
   }
 
-  const store = createRunStoreImpl({ stateRoot });
+  // Bounded diagnostics for channels that must never throw into a poll loop or a
+  // listing: crash residue that list() now skips, and watcher poll failures.
+  const diagnostics: string[] = [];
+  const noteDiagnostic = (scope: string, detail: string) => {
+    if (diagnostics.length >= 50) diagnostics.shift();
+    diagnostics.push(`${scope}: ${String(detail).slice(0, 300)}`);
+  };
+  const store = createRunStoreImpl({
+    stateRoot,
+    onListProblem: (problem: { runId?: string; message?: string }) => {
+      noteDiagnostic("run-store.list", `skipped ${problem?.runId ?? "unknown"}: ${problem?.message ?? "unreadable"}`);
+    },
+  });
   const runner = createProcessRunnerImpl();
   const git = createGitAdapterImpl({ runner });
   const herdr = createHerdrAdapterImpl({ runner });
@@ -520,6 +532,8 @@ export async function createWorkflowCoordinatorRuntime({
   return {
     delegations,
     stateRoot,
+    diagnostics,
+    noteDiagnostic,
     async createLaunchCommand(options) {
       return await createLaunchCommandImpl({
         ...options,
@@ -636,6 +650,9 @@ export function createWorkflowCoordinatorExtension({
             triggerTurn: false,
           });
         },
+        onError(error) {
+          rt.noteDiagnostic("delegation-watcher", error?.message ?? String(error));
+        },
       });
       watcher.start();
 
@@ -655,6 +672,9 @@ export function createWorkflowCoordinatorExtension({
               deliverAs: "followUp",
               triggerTurn: ctx.isIdle(),
             });
+          },
+          onError(error) {
+            rt.noteDiagnostic("worker-watcher", error?.message ?? String(error));
           },
         });
         workerWatcher.start();

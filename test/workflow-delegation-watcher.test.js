@@ -308,3 +308,82 @@ test("watcher reports scheduled poll failures and keeps polling", async () => {
   assert.equal(clock.pending().length, 1);
   watcher.stop();
 });
+
+test("a result whose consume keeps failing is delivered once, not on every poll", async () => {
+  // Delivery precedes consume so a failed delivery retries, but a persistently
+  // failing consume (a stale run lock is crash residue the design never clears)
+  // must not re-deliver the same result every 5 seconds forever.
+  const clock = createClock();
+  const records = [delegationRecord()];
+  const deliveries = [];
+  const errors = [];
+  let consumeAttempts = 0;
+  const delegations = {
+    async list() {
+      return structuredClone(records);
+    },
+    async consumeResult() {
+      consumeAttempts += 1;
+      throw new Error("Run is locked by an active lock");
+    },
+  };
+  const watcher = createDelegationWatcher({
+    delegations,
+    originSessionId: ORIGIN_SESSION_ID,
+    clock,
+    async onResult(result) {
+      deliveries.push(result);
+    },
+    onError: (error) => errors.push(error),
+  });
+
+  for (let poll = 0; poll < 5; poll += 1) await watcher.poll();
+
+  assert.equal(deliveries.length, 1);
+  assert.equal(consumeAttempts, 5);
+  assert.equal(errors.length, 5);
+});
+
+test("a notice whose delivery fails is retried instead of being permanently suppressed", async () => {
+  const clock = createClock();
+  const records = [delegationRecord({
+    state: "failed",
+    result: { ...delegationRecord().result, generation: 0 },
+    startFailure: { reason: "Delegation transport start failed", failedAt: "2025-01-01T00:00:00.000Z" },
+  })];
+  const notices = [];
+  const errors = [];
+  let failNext = true;
+  const watcher = createDelegationWatcher({
+    delegations: {
+      async list() {
+        return structuredClone(records);
+      },
+      async consumeResult() {
+        assert.fail("a start failure has no consumable result");
+      },
+    },
+    originSessionId: ORIGIN_SESSION_ID,
+    clock,
+    onResult: async () => {},
+    async onNotice(notice) {
+      if (failNext) {
+        failNext = false;
+        throw new Error("extension host hiccup");
+      }
+      notices.push(notice);
+    },
+    onError: (error) => errors.push(error),
+  });
+
+  await watcher.poll();
+  assert.deepEqual(notices, []);
+  assert.equal(errors.length, 1);
+
+  await watcher.poll();
+  assert.equal(notices.length, 1);
+
+  // Delivered once it succeeded; not repeated afterwards.
+  await watcher.poll();
+  assert.equal(notices.length, 1);
+});

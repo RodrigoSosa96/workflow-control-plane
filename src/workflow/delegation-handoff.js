@@ -134,13 +134,16 @@ export async function submitDelegationHandoff({ runId, delegationId, input, stor
   // generation are all discoverable by any same-user process (a sibling
   // delegation can enumerate them under the run directory), so identity alone
   // cannot authenticate a result. The per-delegation secret minted at claim
-  // time and handed to the child through its private env only closes that.
+  // time and handed to the child through its private env only closes that; the
+  // record stores only its digest, so reading run.json does not reveal it.
   // A remediation generation carries its own token, enforced by recordResult.
   const activeRemediation = record.remediation?.state === "active"
     && record.remediation?.generation === normalized.generation;
-  if (!activeRemediation && record.claimToken) {
+  if (!activeRemediation && record.claimTokenDigest) {
     const presented = assertString(claimToken, "delegation handoff claim token", 128);
-    if (presented.toLowerCase() !== record.claimToken) fail("Delegation handoff claim token does not match the active delegation");
+    if (`sha256:${digestKey(presented.toLowerCase())}` !== record.claimTokenDigest) {
+      fail("Delegation handoff claim token does not match the active delegation");
+    }
   }
   const recorded = activeRemediation
     ? await delegations.recordResult({ runId: run.id, delegationId: id, result: normalized, claimToken })

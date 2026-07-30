@@ -57,9 +57,10 @@ test("ensureCodexWorkerHooks reads, merges, and writes the shared file through t
     },
     rename: async (from, to) => renames.push({ from, to }),
   });
-  // A crash mid-write must never truncate a file shared with other tools.
-  assert.equal(writtenPath, "/home/user/.codex/hooks.json.workflow-tmp");
-  assert.deepEqual(renames, [{ from: "/home/user/.codex/hooks.json.workflow-tmp", to: "/home/user/.codex/hooks.json" }]);
+  // A crash mid-write must never truncate a file shared with other tools, and the
+  // temp name is per-process so concurrent launches cannot interleave into one blob.
+  assert.match(writtenPath, /^\/home\/user\/\.codex\/hooks\.json\.workflow-\d+-\d+\.tmp$/);
+  assert.deepEqual(renames, [{ from: writtenPath, to: "/home/user/.codex/hooks.json" }]);
   const written = JSON.parse(writtenText);
   assert.equal(written.hooks.SessionStart[0].hooks[0].command, "bash '/h/herdr-agent-state.sh' session");
   for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
@@ -149,4 +150,42 @@ test("mergeCodexWorkerHooks preserves foreign entries while replacing workflow e
     "bash '/h/other-tool.sh' prompt",
     'node "/new/cp/hooks/codex-lifecycle.mjs" UserPromptSubmit',
   ]);
+});
+
+test("ensureCodexWorkerHooks refuses to write when an existing hooks file cannot be read", async () => {
+  // EACCES means a file exists whose contents are invisible; writing would delete
+  // every other tool's hooks. Only ENOENT may be treated as empty.
+  let touched = false;
+  await assert.rejects(
+    () => ensureCodexWorkerHooks({
+      hooksPath: "/locked/.codex/hooks.json",
+      controlPlaneRoot: "/cp",
+      readFile: async () => {
+        const error = new Error("EACCES");
+        error.code = "EACCES";
+        throw error;
+      },
+      writeFile: async () => { touched = true; },
+      rename: async () => { touched = true; },
+    }),
+    /could not be read|left unchanged/i,
+  );
+  assert.equal(touched, false);
+});
+
+test("ensureCodexWorkerHooks writes the temp file with private permissions", async () => {
+  const writes = [];
+  await ensureCodexWorkerHooks({
+    hooksPath: "/home/user/.codex/hooks.json",
+    controlPlaneRoot: "/cp",
+    readFile: async () => {
+      const error = new Error("ENOENT");
+      error.code = "ENOENT";
+      throw error;
+    },
+    writeFile: async (path, text, options) => writes.push({ path, options }),
+    rename: async () => {},
+  });
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].options, { mode: 0o600 });
 });

@@ -127,3 +127,22 @@ test("a swallowed marker-write failure is recorded while the prompt still advanc
   assert.deepEqual(entries.map((entry) => entry.scope), ["marker"]);
   assert.match(entries[0].error, /locked/i);
 });
+
+test("the debug log stops accepting entries at its size cap", async (t) => {
+  // The cap must be enforced on the real append path: a marker-write collision
+  // repeating every turn is precisely the scenario this file exists for, and an
+  // unbounded log would be a disk-fill risk of its own.
+  const runDirectory = await tempRunDirectory(t);
+  const line = "y".repeat(400);
+  let accepted = 0;
+  for (let index = 0; index < 900; index += 1) {
+    if (await recordHookDebug({ runDirectory, harness: "pi", event: "Stop", scope: "marker", error: line })) {
+      accepted += 1;
+    }
+  }
+  const size = (await fs.stat(hookDebugLogPath(runDirectory))).size;
+  assert.ok(size <= 256 * 1024 + 600, `log must stay near its cap, got ${size}`);
+  assert.ok(accepted < 900, "appends must stop once the cap is reached");
+  // Refusals are reported, not thrown.
+  assert.equal(await recordHookDebug({ runDirectory, harness: "pi", event: "Stop", scope: "marker", error: line }), false);
+});

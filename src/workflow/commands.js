@@ -1149,6 +1149,12 @@ export async function delegationReleaseCommand(options = {}, deps = {}) {
   if (record.state === "running") {
     delegationError("CONFLICT", "Delegation is still running; its reservation was not released", 11);
   }
+  // A remediation in flight keeps a terminal-looking state while a follow-up
+  // child has been (or may have been) spawned; releasing here would make that
+  // child's handoff unrecordable.
+  if (record.remediation?.state) {
+    delegationError("CONFLICT", `Delegation remediation is ${record.remediation.state}; its reservation was not released`, 11);
+  }
 
   const before = await reservations.list({ projectAlias: run.projectAlias });
   const active = list(before).filter((reservation) => reservation?.delegationId === record.id && reservation?.state === "active");

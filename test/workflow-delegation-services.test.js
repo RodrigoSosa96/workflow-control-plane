@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createPreparedDelegationRequest, validateSubagentRequestPolicy } from "../src/workflow/coordinator-policy.js";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
+import { submitDelegationHandoff } from "../src/workflow/delegation-handoff.js";
 import { createDelegationServices } from "../src/workflow/delegation-services.js";
 import { createDelegationStore } from "../src/workflow/delegation-store.js";
 import { createRunStore } from "../src/workflow/run-store.js";
@@ -67,6 +68,18 @@ async function tempStateRoot(t) {
 function uuidSequence(...values) {
   let index = 0;
   return () => values[index++] ?? values.at(-1);
+}
+
+// Yields the given ids first, then deterministic distinct ids instead of
+// repeating the last value.
+function uniqueUuidSequence(...values) {
+  let index = 0;
+  return () => {
+    const value = values[index++];
+    if (value) return value;
+    const suffix = String(index).padStart(12, "0");
+    return `bbbbbbbb-bbbb-4bbb-8bbb-${suffix}`;
+  };
 }
 
 function completedResult(generation, summary = "Review completed") {
@@ -140,11 +153,18 @@ async function createFixture(t, { transport, repositories = [{ id: "repository",
   });
   const delegations = createDelegationStore({
     store,
-    randomUUID: uuidSequence(DELEGATION_ID),
+    // Delegation ids and claim tokens both draw from here, so the generator must
+    // yield distinct values — a repeating sequence would make the secret equal
+    // the (freely readable) delegation id.
+    randomUUID: uniqueUuidSequence(DELEGATION_ID),
   });
   const reservations = createDelegationReservationStore({
     stateRoot,
-    randomUUID: uuidSequence(RESERVATION_ID, RESERVATION_OWNER),
+    // Every gate acquisition, reservation id, and owner token draws from this
+    // generator, and a remediation reserves fresh capacity, so ids must be
+    // unique like production's randomUUID — a fixed sequence repeats its last
+    // value and collides. Deterministic and reproducible, just not constant.
+    randomUUID: uniqueUuidSequence(RESERVATION_ID, RESERVATION_OWNER),
     canonicalPath: async (value) => value,
   });
   const effectiveTransport = transport ?? createTransport({
@@ -172,11 +192,26 @@ async function createFixture(t, { transport, repositories = [{ id: "repository",
   return { stateRoot, store, run, delegations, reservations, services, transport: effectiveTransport };
 }
 
+// Mirrors submitDelegationHandoff: a terminal result also releases the child's
+// reservation lease. Tests that land results directly must do the same, or leases
+// accumulate and a later remediation fails on capacity instead of the behavior
+// under test.
+async function landResult(fixture, result, claimToken) {
+  const recorded = await fixture.delegations.recordResult({
+    runId: fixture.run.id,
+    delegationId: DELEGATION_ID,
+    result,
+    ...(claimToken === undefined ? {} : { claimToken }),
+  });
+  await fixture.reservations.releaseForDelegation({ projectAlias: PROJECT_ALIAS, delegationId: DELEGATION_ID });
+  return recorded;
+}
+
 async function createCompletedDelegation(t, { transport } = {}) {
   const fixture = await createFixture(t, { transport });
   const preview = await fixture.services.createPreview({ runId: fixture.run.id, input: reviewInput });
   await fixture.services.executeApproved({ preview, approvalDigest: preview.approvalDigest });
-  await fixture.delegations.recordResult({ runId: fixture.run.id, delegationId: DELEGATION_ID, result: completedResult(1) });
+  await landResult(fixture, completedResult(1));
   return fixture;
 }
 
@@ -413,13 +448,12 @@ test("beginRemediation races claim atomically so only one follow-up child launch
   const settled = await Promise.allSettled([first, second]);
   assert.equal(settled.filter((entry) => entry.status === "fulfilled").length, 1);
   assert.equal(settled.filter((entry) => entry.status === "rejected").length, 1);
-  // The loser may fail on lock contention (fast collision), on the claim guard,
-  // or — since lock acquisition retries briefly — on the record having already
-  // moved past a remediable state once the winner finished. All are fail-closed
-  // rejections before any side effect.
+  // The loser is refused by the claim guard (or by the record having already
+  // moved past a remediable state once the winner finished) — never by gate or
+  // lock contention, which bounded retries absorb.
   assert.match(
     settled.find((entry) => entry.status === "rejected").reason.message,
-    /claimed|launch|stale|remediation|locked|active lock|allowed state/i,
+    /already claimed|allowed state/i,
   );
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
 });
@@ -573,7 +607,8 @@ test("beginRemediation persists replacement identities and later observation/rem
       { state: "missing", identity: secondIdentity },
     ],
   });
-  const { services, delegations, store, run } = await createCompletedDelegation(t, { transport });
+  const fixture = await createCompletedDelegation(t, { transport });
+  const { services, store, run } = fixture;
 
   const first = await services.beginRemediation({
     runId: run.id,
@@ -587,12 +622,7 @@ test("beginRemediation persists replacement identities and later observation/rem
   assert.deepEqual(first.identity, secondIdentity);
   assert.deepEqual((await store.read(run.id)).delegations[DELEGATION_ID].transportIdentity, secondIdentity);
 
-  await delegations.recordResult({
-    runId: run.id,
-    delegationId: DELEGATION_ID,
-    result: completedResult(2, "First remediation done"),
-    claimToken: (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken,
-  });
+  await landResult(fixture, completedResult(2, "First remediation done"), (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken);
   const reconciled = await services.reconcile({ runId: run.id, delegationId: DELEGATION_ID });
   assert.deepEqual(reconciled.identity, secondIdentity);
 
@@ -636,7 +666,8 @@ test("beginRemediation permits only two turns with matching review evidence and 
       { state: "missing", identity: thirdIdentity },
     ],
   });
-  const { services, delegations, store, run } = await createCompletedDelegation(t, { transport });
+  const fixture = await createCompletedDelegation(t, { transport });
+  const { services, store, run } = fixture;
 
   const first = await services.beginRemediation({
     runId: run.id,
@@ -648,12 +679,7 @@ test("beginRemediation permits only two turns with matching review evidence and 
   assert.equal(first.state, "running");
   assert.equal(first.generation, 2);
 
-  await delegations.recordResult({
-    runId: run.id,
-    delegationId: DELEGATION_ID,
-    result: completedResult(2, "First remediation done"),
-    claimToken: (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken,
-  });
+  await landResult(fixture, completedResult(2, "First remediation done"), (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken);
   const second = await services.beginRemediation({
     runId: run.id,
     delegationId: DELEGATION_ID,
@@ -663,12 +689,7 @@ test("beginRemediation permits only two turns with matching review evidence and 
   });
   assert.equal(second.generation, 3);
 
-  await delegations.recordResult({
-    runId: run.id,
-    delegationId: DELEGATION_ID,
-    result: completedResult(3, "Second remediation done"),
-    claimToken: (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken,
-  });
+  await landResult(fixture, completedResult(3, "Second remediation done"), (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken);
   await assert.rejects(
     () => services.beginRemediation({
       runId: run.id,
@@ -844,4 +865,94 @@ test("beginRemediation leaves the current generation and result intact when foll
   assert.equal(record.remediation, null);
   assert.deepEqual(record.transportIdentity, expectedIdentity);
   assert.doesNotMatch(JSON.stringify(result), /SECRET-DELIVERY-FAILURE|SECRET-FOLLOW-UP-PROMPT/);
+});
+
+test("a real handoff leaves a delegation remediable: the released lease is re-reserved by the follow-up", async (t) => {
+  // Regression: releasing the lease on a terminal handoff, while beginRemediation
+  // still asserted an ACTIVE lease, silently killed the entire remediation lane.
+  // Every other remediation test lands results via recordResult directly, so only
+  // an end-to-end handoff catches it.
+  const firstIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  const secondIdentity = nextTransportIdentity(RUN_ID, DELEGATION_ID);
+  const transport = createTransport({
+    startImpl: async () => ({ identity: firstIdentity }),
+    deliverFollowUpImpl: async () => ({ delivered: true, identity: secondIdentity }),
+    observations: [{ state: "missing", identity: firstIdentity }],
+  });
+  const fixture = await createFixture(t, { transport });
+  const { services, store, run, delegations, reservations } = fixture;
+  const preview = await services.createPreview({ runId: run.id, input: reviewInput });
+  await services.executeApproved({ preview, approvalDigest: preview.approvalDigest });
+
+  // The child receives its claim token the way production delivers it: in the
+  // approved assignment handed to the transport, which puts it in the child's
+  // private env. The record itself keeps only the digest.
+  const startCall = transport.calls.find((call) => call.method === "start");
+  const claimToken = startCall.assignment.delegation.claimToken;
+  assert.match(claimToken, /^[0-9a-f-]{36}$/);
+  const persisted = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(persisted.claimToken, undefined);
+  assert.match(persisted.claimTokenDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.doesNotMatch(JSON.stringify(persisted), new RegExp(claimToken));
+
+  await submitDelegationHandoff({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    input: completedResult(1),
+    store,
+    delegations,
+    reservations,
+    claimToken,
+  });
+
+  // The child's lease is gone: no live child holds the checkout.
+  const afterHandoff = (await reservations.list({ projectAlias: PROJECT_ALIAS })).filter((entry) => entry.state === "active");
+  assert.deepEqual(afterHandoff, []);
+
+  // Remediation still works: it reserves fresh capacity for the follow-up child.
+  const remediated = await services.beginRemediation({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  });
+  assert.equal(remediated.state, "running");
+  assert.equal(remediated.generation, 2);
+  const afterRemediation = (await reservations.list({ projectAlias: PROJECT_ALIAS })).filter((entry) => entry.state === "active");
+  assert.deepEqual(afterRemediation.map((entry) => entry.delegationId), [DELEGATION_ID]);
+});
+
+test("a remediation whose follow-up delivery fails releases the fresh lease so a retry can reserve again", async (t) => {
+  const firstIdentity = transportIdentity(RUN_ID, DELEGATION_ID);
+  let deliveries = 0;
+  const transport = createTransport({
+    startImpl: async () => ({ identity: firstIdentity }),
+    deliverFollowUpImpl: async () => {
+      deliveries += 1;
+      throw new Error("pi process could not be resumed");
+    },
+    observations: [
+      { state: "missing", identity: firstIdentity },
+      { state: "missing", identity: firstIdentity },
+    ],
+  });
+  const fixture = await createCompletedDelegation(t, { transport });
+  const { services, run, reservations } = fixture;
+  const request = {
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    expectedGeneration: 1,
+    reviewEvidence: { generation: 1, summary: "One bounded defect", insideFrozenBrief: true },
+    prompt: "Address the approved correction.",
+  };
+
+  const rolledBack = await services.beginRemediation(request);
+  assert.ok(rolledBack.nextActions.includes("begin-remediation"));
+  assert.deepEqual((await reservations.list({ projectAlias: PROJECT_ALIAS })).filter((entry) => entry.state === "active"), []);
+
+  // The retry reserves again instead of hitting a lease its own failed attempt leaked.
+  const retried = await services.beginRemediation(request);
+  assert.ok(retried.nextActions.includes("begin-remediation"));
+  assert.equal(deliveries, 2);
 });

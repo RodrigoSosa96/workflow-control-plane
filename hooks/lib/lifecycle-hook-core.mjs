@@ -90,7 +90,9 @@ export async function runLifecycleHook({
   recordDebug = recordHookDebug,
 } = {}) {
   const debug = async (scope, error) => {
-    await recordDebug({ runDirectory: env.WORKFLOW_RUN_DIR, harness, event, scope, error });
+    // Called from the outermost catch, so it must tolerate a missing env rather
+    // than turning "never throws" into a rejection.
+    await recordDebug({ runDirectory: env?.WORKFLOW_RUN_DIR, harness, event, scope, error });
   };
   try {
     const runId = env.WORKFLOW_RUN_ID;

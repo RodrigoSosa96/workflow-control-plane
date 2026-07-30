@@ -42,10 +42,6 @@ function digest(text) {
   return `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}`;
 }
 
-function digestKey(text) {
-  return createHash("sha256").update(text, "utf8").digest("hex");
-}
-
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (!value || typeof value !== "object") return value;
@@ -231,26 +227,6 @@ function previewInput(preview) {
   };
 }
 
-function expectedReservationResources(role, mode, checkoutDigest) {
-  const kind = classifyDelegationRole(role);
-  const resources = ["totalInternal"];
-  if (mode === "foreground") resources.push("foreground");
-  if (kind === "read-only" && mode === "background") resources.push("readOnlyBackground");
-  if (kind === "writer") resources.push("writersTotal", `checkout:${checkoutDigest}`);
-  return resources;
-}
-
-function reservationMatches(record, reservation) {
-  if (!reservation || typeof reservation !== "object") return false;
-  if (reservation.state !== "active" || reservation.delegationId !== record.id || reservation.role !== record.role || reservation.mode !== record.mode) {
-    return false;
-  }
-  const checkoutDigest = digestKey(record.cwd);
-  if (reservation.checkoutDigest !== checkoutDigest || !Array.isArray(reservation.resources)) return false;
-  const expected = expectedReservationResources(record.role, record.mode, checkoutDigest);
-  return expected.every((resource) => reservation.resources.includes(resource));
-}
-
 function publicState(record, identity, nextActions, observation) {
   return {
     state: record.state,
@@ -364,12 +340,6 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
   async function readRecord(runId, delegationId) {
     const run = await runStore.read(runId);
     return recordFor(run, assertString(delegationId, "delegation ID", { limit: 128 }));
-  }
-
-  async function activeReservation(record) {
-    const matches = (await reservations.list({ projectAlias })).filter((reservation) => reservationMatches(record, reservation));
-    if (matches.length !== 1) fail("Delegation reservation is missing or has changed");
-    return matches[0];
   }
 
   async function createPreview({ runId, input } = {}) {
@@ -511,20 +481,59 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     }
     if (!record.transportIdentity) fail("Delegation is missing its exact transport identity");
     if (record.transportIdentity.cwd !== record.cwd) fail("Delegation cwd no longer matches the recorded identity");
-    await activeReservation(record);
+    // A remediation already in flight (launching, active, or parked in manual
+    // recovery) blocks a second one. Checked here, before any reservation, so a
+    // rejected attempt performs no mutation at all — claimRemediationLaunch
+    // enforces the same rule under the run lock.
+    if (record.remediation?.state) {
+      fail(`Delegation remediation launch is already ${record.remediation.state}`);
+    }
 
     const observation = await workerTransport.observeExact(record.transportIdentity);
     if (observation?.state !== "missing") {
       fail(`Delegation remediation observation is ${observation?.state ?? "unknown"}; exact worker must be proven gone`);
     }
 
-    const claimed = await delegations.claimRemediationLaunch({
-      runId,
+    // A reservation lease covers a LIVE child, not a terminal record: the
+    // previous child's lease was released when its result landed, so a
+    // remediation follow-up reserves fresh capacity. That keeps the
+    // one-writer-per-checkout invariant honest — if another delegation took this
+    // checkout in the meantime, the remediation is refused instead of joining it.
+    // Reserved only after every read-only validation, so a rejected remediation
+    // never leaves a lease behind.
+    await reservations.reserve({
+      projectAlias,
       delegationId,
-      expectedGeneration,
+      role: record.role,
+      mode: record.mode,
+      checkoutPath: record.cwd,
+      policy,
     });
-    const claimToken = claimed.remediation?.claimToken;
-    if (typeof claimToken !== "string" || !claimToken) fail("Delegation remediation claim is missing");
+    const releaseRemediationReservation = async () => {
+      try {
+        await reservations.releaseForDelegation({ projectAlias, delegationId });
+      } catch {
+        // Surfaced by `workflow delegation reconcile` as a still-active lease;
+        // `workflow delegation release` clears it.
+      }
+    };
+
+    let claimed;
+    let claimToken;
+    try {
+      claimed = await delegations.claimRemediationLaunch({
+        runId,
+        delegationId,
+        expectedGeneration,
+      });
+      claimToken = claimed.remediation?.claimToken;
+      if (typeof claimToken !== "string" || !claimToken) fail("Delegation remediation claim is missing");
+    } catch (error) {
+      // No follow-up child exists yet, so the fresh lease must not outlive the
+      // failed claim.
+      await releaseRemediationReservation();
+      throw error;
+    }
 
     let delivered;
     try {
@@ -544,6 +553,9 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
         expectedGeneration,
         claimToken,
       });
+      // Delivery never reached a child, so the fresh lease is released and a
+      // retried remediation can reserve again instead of hitting its own leak.
+      await releaseRemediationReservation();
       return publicState(rolledBack, rolledBack.transportIdentity, ["begin-remediation", "manual-review"]);
     }
 

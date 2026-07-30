@@ -77,6 +77,12 @@ export function createWorkerWatcher({
   let inFlight = null;
   let nextByte = initialByte;
   const seenKeys = new Set();
+  // The byte cursor advances per batch, so an event whose delivery failed cannot
+  // be re-read from the bus. Undelivered payloads are queued (bounded) and
+  // retried on the next poll: a run event from SessionEnd-without-handoff is the
+  // only terminal event for that run, so dropping it loses the notification.
+  const pending = [];
+  const MAX_PENDING = 64;
   const sessionId = originSessionId ?? null;
 
   function noteError(error) {
@@ -116,7 +122,28 @@ export function createWorkerWatcher({
     schedule();
   }
 
+  async function deliver(payload, key) {
+    try {
+      await deliverEvent(payload);
+      // Marked only after a successful delivery so a failed one is retried.
+      seenKeys.add(key);
+      return true;
+    } catch (error) {
+      noteError(error);
+      return false;
+    }
+  }
+
   async function runPoll() {
+    // Retry anything a previous poll could not deliver before reading new bytes.
+    const retries = pending.splice(0, pending.length);
+    for (const entry of retries) {
+      if (seenKeys.has(entry.key)) continue;
+      if (!await deliver(entry.payload, entry.key) && pending.length < MAX_PENDING) {
+        pending.push(entry);
+      }
+    }
+
     const { events, nextByte: newNextByte } = await readEvents({ stateRoot, fromByte: nextByte, fs });
     nextByte = newNextByte;
     for (const event of events) {
@@ -128,15 +155,9 @@ export function createWorkerWatcher({
       }
       const key = dedupeKey(event);
       if (seenKeys.has(key)) continue;
-      try {
-        await deliverEvent(eventPayload(event));
-        // Mark seen only after a successful delivery so a later terminal event
-        // for the same generation still gets a chance if this delivery failed.
-        seenKeys.add(key);
-      } catch (error) {
-        // The cursor already advanced past this batch; a delivery failure is
-        // reported and the remaining events still get delivered.
-        noteError(error);
+      const payload = eventPayload(event);
+      if (!await deliver(payload, key) && pending.length < MAX_PENDING) {
+        pending.push({ key, payload });
       }
     }
   }

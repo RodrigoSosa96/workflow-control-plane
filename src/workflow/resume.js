@@ -23,7 +23,9 @@ function identityKey(identity) {
 function claimIsFresh(claimedAt, nowIso) {
   const claimed = Date.parse(claimedAt ?? "");
   const now = Date.parse(nowIso);
-  if (!Number.isFinite(claimed) || !Number.isFinite(now)) return false;
+  // Fail closed: a claim we cannot date is treated as held, not as absent.
+  // Otherwise a malformed timestamp would wave a concurrent relaunch through.
+  if (!Number.isFinite(claimed) || !Number.isFinite(now)) return true;
   return now - claimed < RESUME_CLAIM_FRESH_MS;
 }
 

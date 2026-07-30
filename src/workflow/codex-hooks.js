@@ -9,6 +9,8 @@ import { join } from "node:path";
 // only add the workflow's own entries and must never remove or replace an entry it doesn't own.
 export const CODEX_WORKER_HOOK_EVENTS = Object.freeze(["UserPromptSubmit", "Stop", "SessionEnd"]);
 
+let tempCounter = 0;
+
 function assertString(value, context) {
   if (typeof value !== "string" || value.length === 0) {
     throw new TypeError(`${context} must be a non-empty string`);
@@ -87,8 +89,13 @@ export async function ensureCodexWorkerHooks({
   let raw;
   try {
     raw = await readFile(hooksPath, "utf8");
-  } catch {
-    // Absent (or unreadable) file: install into the empty default.
+  } catch (error) {
+    // ONLY an absent file may be treated as empty. Any other read failure
+    // (EACCES, EIO) means a file exists whose contents we cannot see, and
+    // writing then would delete every other tool's hooks.
+    if (error?.code !== "ENOENT") {
+      throw new TypeError(`Codex hooks file at ${hooksPath} could not be read (${error?.code ?? "FS_ERROR"}); it was left unchanged so other tools' hooks are preserved`);
+    }
     raw = null;
   }
   if (typeof raw === "string" && raw.trim()) {
@@ -106,8 +113,11 @@ export async function ensureCodexWorkerHooks({
 
   const merged = mergeCodexWorkerHooks(current, controlPlaneRoot);
   const text = `${JSON.stringify(merged, null, 2)}\n`;
-  const tempPath = `${hooksPath}.workflow-tmp`;
-  await writeFile(tempPath, text);
+  // Per-process unique temp name: two concurrent launches writing one fixed temp
+  // path would interleave into a corrupt blob and rename it over the shared file.
+  tempCounter += 1;
+  const tempPath = `${hooksPath}.workflow-${process.pid}-${tempCounter}.tmp`;
+  await writeFile(tempPath, text, { mode: 0o600 });
   await rename(tempPath, hooksPath);
   return merged;
 }

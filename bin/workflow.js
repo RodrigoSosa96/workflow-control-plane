@@ -396,6 +396,12 @@ function createLiveDependencies(dependencies) {
   const env = dependencies.env ?? process.env;
   const runner = dependencies.runner ?? createProcessRunner();
   const stateRoot = dependencies.stateRoot ?? env.WORKFLOW_STATE_ROOT;
+  // list() skips run directories it cannot read (crash residue the no-cleanup
+  // policy preserves) instead of failing wholesale. Report each skip on stderr so
+  // a run silently vanishing from status/close is visible to the operator.
+  const reportListProblem = dependencies.onListProblem ?? ((problem) => {
+    process.stderr.write(bound(`WARNING: skipped unreadable run ${problem?.runId ?? "unknown"} (${problem?.message ?? "unreadable"})\n`, 1024));
+  });
   return {
     env,
     runner,
@@ -408,13 +414,17 @@ function createLiveDependencies(dependencies) {
     harnessVersion: dependencies.harnessVersion ?? (async (selectedAgent) => {
       const command = selectedAgent?.profile?.command;
       if (typeof command !== "string" || !command) return null;
-      const { stdout } = await runner.run(command, ["--version"], { timeoutMs: 10_000, allowFailure: true });
+      // Resolve through PATH once and exec the absolute path, matching every
+      // other exec site: doctor must not run whatever happens to shadow the name.
+      const resolved = await lookupExecutable(command, { env });
+      if (!resolved) return null;
+      const { stdout } = await runner.run(resolved, ["--version"], { timeoutMs: 10_000, allowFailure: true });
       const match = String(stdout ?? "").match(/\d+\.\d+\.\d+/);
       return match ? match[0] : null;
     }),
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
-    store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot }) : undefined),
+    store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot, onListProblem: reportListProblem }) : undefined),
     // Real wiring for launch.js's best-effort Codex hook install (see isCodexInteractiveAgent
     // there): only assembled here, at the live-dependency boundary, so that unit tests of
     // launch.js — which exercise the default codex-worker interactive profile pervasively —
