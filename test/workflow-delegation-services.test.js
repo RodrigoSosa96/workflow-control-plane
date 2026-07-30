@@ -93,6 +93,14 @@ function completedResult(generation, summary = "Review completed") {
   };
 }
 
+// The child receives its remediation token the way production delivers it: in the
+// follow-up context the transport hands to the resumed process. The record keeps
+// only the digest.
+function remediationTokenFrom(transport) {
+  const calls = transport.calls.filter((call) => call.method === "deliverFollowUp");
+  return calls.at(-1)?.resume?.claimToken;
+}
+
 function transportIdentity(runId, delegationId) {
   return {
     kind: "pi-delegation",
@@ -409,7 +417,11 @@ test("beginRemediation allows follow-up only after the exact prior process is pr
   const persisted = (await store.read(run.id)).delegations[DELEGATION_ID];
   assert.equal(persisted.generation, 2);
   assert.equal(persisted.remediation?.state, "active");
-  assert.match(persisted.remediation?.claimToken ?? "", /^[0-9a-f-]{36}$/i);
+  // Only the digest is persisted; the secret reached the child through the
+  // follow-up context.
+  assert.equal(persisted.remediation?.claimToken, undefined);
+  assert.match(persisted.remediation?.claimTokenDigest ?? "", /^sha256:[0-9a-f]{64}$/);
+  assert.match(remediationTokenFrom(transport) ?? "", /^[0-9a-f-]{36}$/i);
   assert.equal(transport.calls.filter((call) => call.method === "deliverFollowUp").length, 1);
 });
 
@@ -622,7 +634,7 @@ test("beginRemediation persists replacement identities and later observation/rem
   assert.deepEqual(first.identity, secondIdentity);
   assert.deepEqual((await store.read(run.id)).delegations[DELEGATION_ID].transportIdentity, secondIdentity);
 
-  await landResult(fixture, completedResult(2, "First remediation done"), (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken);
+  await landResult(fixture, completedResult(2, "First remediation done"), remediationTokenFrom(fixture.transport));
   const reconciled = await services.reconcile({ runId: run.id, delegationId: DELEGATION_ID });
   assert.deepEqual(reconciled.identity, secondIdentity);
 
@@ -679,7 +691,7 @@ test("beginRemediation permits only two turns with matching review evidence and 
   assert.equal(first.state, "running");
   assert.equal(first.generation, 2);
 
-  await landResult(fixture, completedResult(2, "First remediation done"), (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken);
+  await landResult(fixture, completedResult(2, "First remediation done"), remediationTokenFrom(fixture.transport));
   const second = await services.beginRemediation({
     runId: run.id,
     delegationId: DELEGATION_ID,
@@ -689,7 +701,7 @@ test("beginRemediation permits only two turns with matching review evidence and 
   });
   assert.equal(second.generation, 3);
 
-  await landResult(fixture, completedResult(3, "Second remediation done"), (await store.read(run.id)).delegations[DELEGATION_ID].remediation.claimToken);
+  await landResult(fixture, completedResult(3, "Second remediation done"), remediationTokenFrom(fixture.transport));
   await assert.rejects(
     () => services.beginRemediation({
       runId: run.id,

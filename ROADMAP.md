@@ -103,5 +103,32 @@ Referencia: artículo "The new rules of context engineering" — Anthropic borr�
 | 2026-07-29 | 0.8–0.10 (Batch B) | `ffc6929` | Correctitud de la máquina de estados. Suite: 677 pass. |
 | 2026-07-29 | 0.11–0.16 (Batch C) | `006d179` | Assignment/config, claim tokens y liberación de reservas. Nuevo comando `workflow delegation release`. Suite: 683 pass. |
 | 2026-07-29 | 0.17–0.19 (Batch D) | `05274f1` | CI, `hooks-debug.log`, versiones de harness en doctor, merge seguro de hooks.json. Suite: 690 pass. |
+| 2026-07-30 | Review adversarial de la Fase 0 | `27734d1` + fixes | 16 defectos verificados en el código nuevo, todos corregidos. Suite: 698 pass. Detalle abajo. |
 
-**Fase 0 completa.** Rama `hardening/fase-0`, 691 tests (690 pass, 1 skip — el smoke de Herdr vivo, ítem 1.6). Próximo paso sugerido: Fase 1 (recovery y unificación), empezando por 1.1 (owner markers + `workflow unlock`), que desbloquea 2.5 (`workflow archive`).
+**Fase 0 completa y revisada.** Rama `hardening/fase-0`, 699 tests (698 pass, 1 skip — el smoke de Herdr vivo, ítem 1.6).
+
+### Qué encontró la review adversarial de la Fase 0
+
+Un agente revisor verificó el diff completo ejecutando probes contra los stores reales. Encontró **1 regresión alta que introdujo el propio Batch C** y 15 defectos más, todos corregidos:
+
+- **Regresión (la más grave):** liberar el lease en el handoff terminal, mientras `beginRemediation` seguía exigiendo un lease **activo**, mataba por completo el lane de remediación. Ningún test lo cazó porque todos los tests de remediación graban resultados con `recordResult` directo en vez de pasar por el handoff. **Corrección:** el lease ahora cubre un child **vivo** — el handoff lo libera y la remediación **re-reserva** capacidad fresca, lo que además mantiene honesto el invariante de un writer por checkout a través del hueco. Se agregó el test end-to-end handoff→remediación que faltaba.
+- **El claim token no cerraba el agujero que decía cerrar:** estaba en claro en `run.json`, dentro del run dir cuyo path recibe *todo* child. El probe del revisor forjó un resultado leyéndolo. **Corrección:** se persiste solo el `sha256` (del token de delegación y también del de remediación); el secreto llega al child solo por su env privado. **Pendiente real:** un sibling del mismo uid todavía podría leer `/proc/<pid>/environ` del child vivo — el cierre completo requiere aislamiento a nivel OS (**ítem 4.1**).
+- Entrega duplicada sin límite en el delegation watcher (un consume que falla siempre re-entregaba cada 5s para siempre) → ahora una entrega por generación.
+- Un evento terminal solitario (`run` de SessionEnd sin handoff) se perdía si su entrega fallaba, porque el cursor de bytes ya había avanzado → cola de reintento acotada.
+- El merge de `hooks.json` todavía clobbereaba hooks ajenos cuando el archivo existía pero no se podía **leer** (EACCES), y usaba un temp path fijo que dos launches concurrentes corrompían → solo ENOENT cuenta como ausente; temp único por proceso con modo 0600.
+- El cap de tamaño del `hooks-debug.log` era código muerto (`stat` venía en `null`): 4000 errores producían 2 MB. Ahora se aplica de verdad.
+- `onListProblem` y `onError` no tenían llamador en producción, así que un run ilegible desaparecía en silencio → cableados a stderr (CLI) y a diagnósticos acotados (coordinador).
+- `CONTROL_PLANE_ARGUMENTS` solo cubría Claude: un profile de Pi podía pisar el `--session-id`/`--extension` generados → extendido a pi y codex.
+- Más: `delegation release` ahora rehúsa con una remediación en vuelo; el gate de reservas reintenta una colisión viva en vez de pedir inspección manual; el claim de resume falla cerrado ante un timestamp ilegible; `doctor` ejecuta el path absoluto del harness en vez del nombre a secas; el recorder del log tolera un `env` ausente.
+
+**Calidad de tests:** se cerraron las 3 brechas que dejaron pasar los defectos (integración handoff→remediación, re-entrega sin límite, cap del log) y se apretó un regex de 7 alternativas a las dos guardas que realmente pueden disparar.
+
+### Pendientes conocidos (anotados, no implementados)
+
+- **Aislamiento same-uid:** ningún secreto en el filesystem defiende contra un sibling del mismo usuario que lea `/proc/<pid>/environ`. Cierre real = **4.1** (sandbox bwrap).
+- **`workflow delegation release` no tiene approval digest**, solo `--yes` — muta capacidad compartida. Considerar la gramática de digest si el comando se usa seguido.
+- **`remediation.claimToken` y el claim de delegación ya usan digest**, pero la comparación vive en dos lugares (`submitDelegationHandoff` y `recordResult`). Candidato natural para el módulo de invariantes compartidos del **ítem 1.4**.
+
+### Próximo paso sugerido
+
+Fase 1 (recovery y unificación), empezando por **1.1** (owner markers `{pid, startToken, runId}` + `workflow unlock`), que desbloquea **2.5** (`workflow archive`).

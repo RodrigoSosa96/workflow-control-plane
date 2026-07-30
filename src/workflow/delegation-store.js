@@ -379,7 +379,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           ? record.remediation
           : null;
         if (activeRemediation) {
-          if (validateClaimToken(claimToken) !== activeRemediation.claimToken) fail("Delegation handoff claim is stale");
+          if (digest(validateClaimToken(claimToken)) !== activeRemediation.claimTokenDigest) fail("Delegation handoff claim is stale");
         } else if (claimToken !== undefined) {
           validateClaimToken(claimToken);
           fail("Delegation handoff claim is not active for the current generation");
@@ -409,7 +409,10 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
     if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
       fail("expected delegation generation must be a positive integer");
     }
-    return await updateRecord({
+    // Same rule as claim(): only the digest is persisted, because the record is
+    // readable by every delegation child through its run directory.
+    const claimToken = mintClaimToken(randomUUID);
+    const claimed = await updateRecord({
       runId,
       delegationId: id,
       expectedStates: REMEDIABLE_STATES,
@@ -426,12 +429,14 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           remediation: {
             state: "launching",
             generation: record.generation + 1,
-            claimToken: mintClaimToken(randomUUID),
+            claimTokenDigest: digest(claimToken),
             claimedAt: now(clock),
           },
         };
       },
     });
+    // Attached to the returned record only; never persisted.
+    return { ...claimed, remediation: { ...claimed.remediation, claimToken } };
   }
 
   async function completeRemediationLaunch({ runId, delegationId: id, expectedGeneration, claimToken, identity } = {}) {
@@ -447,7 +452,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (record.remediation.claimToken !== validatedClaimToken) fail("Delegation remediation launch claim is stale");
+        if (record.remediation.claimTokenDigest !== digest(validatedClaimToken)) fail("Delegation remediation launch claim is stale");
         if (record.remediation.generation !== expectedGeneration + 1) fail("Delegation remediation launch generation is stale");
         if (!record.transportIdentity) fail("Delegation transport identity is missing");
         if (
@@ -490,7 +495,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (record.remediation.claimToken !== validatedClaimToken) fail("Delegation remediation launch claim is stale");
+        if (record.remediation.claimTokenDigest !== digest(validatedClaimToken)) fail("Delegation remediation launch claim is stale");
         return {
           ...record,
           remediation: null,
@@ -512,7 +517,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
         if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (record.remediation.claimToken !== validatedClaimToken) fail("Delegation remediation launch claim is stale");
+        if (record.remediation.claimTokenDigest !== digest(validatedClaimToken)) fail("Delegation remediation launch claim is stale");
         return {
           ...record,
           remediation: {

@@ -1098,7 +1098,10 @@ test("live CLI remediation keeps manual recovery when post-spawn identity verifi
   assert.equal(blockedRecord.generation, 1);
   assert.equal(blockedRecord.remediation?.state, "manual-recovery");
   assert.equal(blockedRecord.remediation?.reason, "spawned-but-unverified");
-  assert.ok(blockedRecord.remediation?.claimToken);
+  // The claim is retained so only the exact spawned child could still be
+  // reconciled — as a digest, never as a readable secret in the run record.
+  assert.equal(blockedRecord.remediation?.claimToken, undefined);
+  assert.match(blockedRecord.remediation?.claimTokenDigest ?? "", /^sha256:[0-9a-f]{64}$/);
   assert.equal(spawnCalls.length, 1);
   assert.equal(unrefCount, 1);
   assert.deepEqual(psCalls, [{
