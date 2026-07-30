@@ -694,7 +694,7 @@ test("delegation gate-clear reports needs-confirmation for a proven-missing owne
   assert.equal(pending.action, "needs-confirmation");
   assert.equal(pending.exitCode, 0);
   assert.equal(pending.cleared, null);
-  assert.deepEqual(pending.nextActions, ["confirm-gate-clear"]);
+  assert.deepEqual(pending.nextActions, [`workflow delegation gate-clear ${PROJECT_ALIAS} --yes`]);
   assert.deepEqual(reservations.clearGateCalls, []);
 
   const cleared = await delegationGateClearCommand(

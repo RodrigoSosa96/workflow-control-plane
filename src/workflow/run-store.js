@@ -678,11 +678,15 @@ export function createRunStore({
 
   // Read-only diagnosis for `workflow unlock`: must never acquire the lock it
   // inspects and must never mutate, unlike every other lock path in this file.
+  // markerAmbiguous surfaces the specific "more than one owner marker" case removeLock's own
+  // refusal already distinguishes (see below) -- without it, a wedged lock with two markers and
+  // one missing/unreadable would both report the same generic "marker: null" shape here, and the
+  // read-only path (the one an operator actually reaches first) could never tell them apart.
   async function inspectLock(runId) {
     const inspected = await inspectLockInternal(runId);
     if (!inspected) return null;
-    const { activePath, markerPath, marker, ageMs, stale } = inspected;
-    return { activePath, markerPath, marker, ageMs, stale };
+    const { activePath, markerPath, marker, ageMs, stale, markerAmbiguous } = inspected;
+    return { activePath, markerPath, marker, ageMs, stale, markerAmbiguous };
   }
 
   // Removes an active lock only when the caller's `allow` predicate approves the
@@ -768,7 +772,13 @@ export function createRunStore({
         throw lockOwnershipError(recheck.activePath, "active lock directory disappeared before removal");
       }
       if (error?.code === "ENOTEMPTY" || error?.code === "EEXIST") {
-        throw lockOwnershipError(recheck.activePath, "active lock directory is nonempty");
+        // At this point the owner marker is already unlinked (above) -- only the directory
+        // removal itself failed, because something else appeared in it after the entries-length
+        // guard ran. Say both facts: what removal already committed (the marker, the ownership
+        // evidence) and what it could not finish (the directory), matching this spec's "reports
+        // exactly what was removed and what remains" requirement instead of leaving an operator
+        // to guess whether the marker survived.
+        throw lockOwnershipError(recheck.activePath, "the owner marker was already removed, but the active lock directory could not be removed because it holds a stray entry that appeared after the pre-removal check");
       }
       throw error;
     }

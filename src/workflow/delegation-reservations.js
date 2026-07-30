@@ -365,7 +365,12 @@ export function createDelegationReservationStore({
     try {
       await fs.rmdir(recheck.activeGate);
     } catch (error) {
-      fail(`Reservation gate ownership could not be released (${error?.code ?? "FS_ERROR"}); manual inspection required`);
+      // At this point the owner marker is already unlinked (above) -- only the directory removal
+      // itself failed. Say both facts: what removal already committed (the marker, the ownership
+      // evidence) and what it could not finish (the directory), matching this spec's "reports
+      // exactly what was removed and what remains" requirement instead of leaving an operator to
+      // guess whether the marker survived.
+      fail(`The reservation gate owner marker was already removed, but the active gate directory could not be removed (${error?.code ?? "FS_ERROR"}); manual inspection required`);
     }
 
     return { cleared: true, activeGate: recheck.activeGate };

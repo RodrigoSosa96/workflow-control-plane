@@ -1652,9 +1652,28 @@ function unlockReport({ runId, lock, ownership, action, removed, reason = null, 
     // Removing a lock only unblocks future writes; it never touches run state, worktrees,
     // Herdr tabs/panes, sessions, processes, or reservation leases.
     cleanup: "none",
-    nextActions: action === "needs-confirmation" ? ["confirm-unlock"] : [],
+    // Runnable, not a bare token: matches this repo's convention (and reconcile's own
+    // nextActions, in this very branch) of emitting the exact command an operator or script can
+    // paste/exec, not an opaque label they have to translate themselves.
+    nextActions: action === "needs-confirmation" ? [`workflow unlock ${runId} --yes`] : [],
     exitCode,
   };
+}
+
+// unlock's read-only report otherwise reuses classifyOwnership's generic "not a recognizable
+// marker object" reason for inspectLock's marker: null, which also covers the specific "more
+// than one owner marker present" case inspectLock's own markerAmbiguous flag distinguishes
+// (run-store.js) -- exactly the reason removeLock's refusal path already uses for it, but that
+// path is never reached from here (a non-removable verdict refuses before `remove` is ever
+// called; see mutexOwnerRecoveryFlow below). Sharpens the diagnostic text an operator sees on
+// exactly the wedged-lock case that needs it; verdict/removable are untouched either way, so
+// ambiguity still fails closed as "unprovable" regardless of which reason string is shown.
+function withAmbiguousMarkerReason(inspected, ownership) {
+  if (!ownership || !inspected?.markerAmbiguous) return ownership;
+  return Object.freeze({
+    ...ownership,
+    reason: "more than one owner marker is present; refusing rather than guessing which is authoritative",
+  });
 }
 
 // The blessed, confirmed exception to this repo's "crash residue is preserved and reported,
@@ -1681,7 +1700,7 @@ export async function unlockCommand(options = {}, deps = {}) {
       return unlockReport({
         runId,
         lock,
-        ownership,
+        ownership: withAmbiguousMarkerReason(inspected, ownership),
         action: reportedAction,
         removed: outcome ? { markerPath: outcome.raw.markerPath, activePath: outcome.raw.activePath } : null,
         reason,
@@ -1703,7 +1722,8 @@ function gateClearReport({ projectAlias, gate, ownership, action, cleared, reaso
     // Clearing a gate only unblocks future reserve()/release() calls for the project; it never
     // touches leases, run state, worktrees, tabs, sessions, or processes.
     cleanup: "none",
-    nextActions: action === "needs-confirmation" ? ["confirm-gate-clear"] : [],
+    // Runnable, not a bare token -- see unlockReport's identical note above.
+    nextActions: action === "needs-confirmation" ? [`workflow delegation gate-clear ${projectAlias} --yes`] : [],
     exitCode,
   };
 }
@@ -1746,7 +1766,16 @@ export async function delegationGateClearCommand(options = {}, deps = {}) {
 export async function launchCommand(options = {}, deps = {}) {
   const stateRoot = await stateRootForCommand(options, deps);
   const controlPlaneBin = options.controlPlaneBin ?? deps.controlPlaneBin;
-  const store = deps.store ?? (deps.createRunStore ?? createRunStore)({ stateRoot });
+  // deps.readOwnOwnership is bin/workflow.js's single per-process reader (see
+  // createLiveDependencies). Threading it through here matters exactly like storeForCommand's own
+  // threading above: whenever deps.store was NOT pre-built there -- i.e. WORKFLOW_STATE_ROOT is
+  // unset, the documented default -- this is the fallback construction. Without it, every lock
+  // launch's own writes acquire (create, writeAssignment, the LAUNCHING/RUNNING/FAILED
+  // transitions) would carry no pid/startedAt, and a crash mid-launch -- the single most
+  // crash-prone window in the whole system -- would leave residue `workflow unlock`/`reconcile`
+  // can never prove dead. Final-review finding 1: this call site bypassed storeForCommand
+  // entirely and was the one createRunStore call this roadmap item's own acquisition path missed.
+  const store = deps.store ?? (deps.createRunStore ?? createRunStore)({ stateRoot, readOwnOwnership: deps.readOwnOwnership });
   const registry = deps.registry ?? await loadRegistry(options.registryPath, { fs: deps.fs });
   const command = await createWorkflowLaunchCommand({ ...options, stateRoot, controlPlaneBin }, {
     ...deps,

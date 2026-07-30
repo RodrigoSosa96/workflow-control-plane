@@ -873,6 +873,9 @@ test("inspectLock returns null with no lock, and returns the marker with a stale
   assert.deepEqual(inspected.marker, marker);
   assert.equal(inspected.ageMs, 10 * 60 * 1000);
   assert.equal(inspected.stale, true);
+  // A single valid marker is the non-ambiguous case: markerAmbiguous must read false here, the
+  // complement of the multi-marker test below asserting it true.
+  assert.equal(inspected.markerAmbiguous, false);
 
   // Never mutates: a naive implementation could reuse the tighten-permissions helpers every
   // other read/write path calls; inspectLock must not, so the permissive modes set above (and
@@ -1022,6 +1025,10 @@ test("inspectLock and removeLock treat more than one owner marker as unreadable 
   // marker: null in the public shape; the age/stale fields must still be reported.
   assert.equal(inspected.activePath, activePath);
   assert.ok(Number.isFinite(inspected.ageMs));
+  // Final-review finding 5: markerAmbiguous distinguishes THIS case (more than one owner marker)
+  // from a merely absent/corrupt one, so a caller (commands.js's unlockCommand) can surface the
+  // specific reason instead of the generic "unreadable" one on the read-only path.
+  assert.equal(inspected.markerAmbiguous, true);
 
   const result = await store.removeLock(RUN_ID_1, { allow: () => true });
   assert.equal(result.removed, false);

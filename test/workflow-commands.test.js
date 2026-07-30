@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { doctorCommand, planCommand, reconcileCommand, resultCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
+import { doctorCommand, launchCommand, planCommand, reconcileCommand, resultCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 
@@ -880,7 +880,7 @@ test("unlock reports needs-confirmation for a proven-missing owner, then removes
   assert.equal(pending.action, "needs-confirmation");
   assert.equal(pending.exitCode, 0);
   assert.equal(pending.removed, null);
-  assert.deepEqual(pending.nextActions, ["confirm-unlock"]);
+  assert.deepEqual(pending.nextActions, [`workflow unlock ${UNLOCK_RUN_ID} --yes`]);
   assert.deepEqual(store.removeLockCalls, []);
 
   const removed = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
@@ -974,6 +974,30 @@ test("unlock refuses an unreadable/ambiguous marker (inspectLock's marker: null)
   assert.deepEqual(store.removeLockCalls, []);
 });
 
+test("unlock surfaces the ambiguous-marker reason, not the generic unreadable one, when inspectLock reports more than one owner marker", async () => {
+  // Final-review finding 5: inspectLock's markerAmbiguous flag (run-store.js) distinguishes "more
+  // than one owner-*.json present" from a merely absent/corrupt marker -- exactly the wedged-lock
+  // case an operator most needs explained. Before this, unlock's read-only report showed the same
+  // generic classifyOwnership reason ("not a recognizable marker object", asserted in the previous
+  // test) for both cases: the ambiguity-specific text only ever lived on removeLock's own refusal
+  // path, which a non-removable up-front verdict never reaches (mutexOwnerRecoveryFlow refuses
+  // before `remove` is ever called). Refusal behavior itself (verdict/removable/exitCode) is
+  // unchanged either way -- only the diagnostic text sharpens.
+  const inspected = inspectedLock({ marker: null, ageMs: 42, stale: false, markerAmbiguous: true });
+  const store = lockStoreFor({ inspected });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+  assert.equal(result.ownership.removable, false);
+  assert.match(result.ownership.reason, /more than one owner marker/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(store.removeLockCalls, []);
+});
+
 test("unlock without a wired inspectProcess degrades to unprovable rather than throwing", async () => {
   const marker = lockMarker();
   const inspected = inspectedLock({ marker });
@@ -1030,6 +1054,49 @@ test("unlock threads deps.readOwnOwnership into storeForCommand's fallback store
   );
 
   assert.equal(result.action, "no-lock");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].stateRoot, "/state/workflow");
+  assert.equal(calls[0].readOwnOwnership, fakeReadOwnOwnership);
+});
+
+// --- launchCommand --------------------------------------------------------
+
+test("launch threads deps.readOwnOwnership into its own fallback run-store construction when deps.store is not pre-supplied", async () => {
+  // Final-review finding 1: launchCommand -- this file's OWN wrapper around launch.js's
+  // launchCommand, the one bin/workflow.js actually dispatches to for `workflow launch` -- built
+  // its run store as createRunStore({ stateRoot }), bypassing storeForCommand entirely and
+  // dropping deps.readOwnOwnership: the one createRunStore call site this roadmap item's own
+  // acquisition path missed. In the default configuration (WORKFLOW_STATE_ROOT unset, the
+  // documented default), every lock launch's own writes acquire -- create, writeAssignment, the
+  // LAUNCHING/RUNNING/FAILED transitions in launch.js -- would carry no pid/startedAt, and a
+  // crash mid-launch (the single most crash-prone window in the whole system) would leave residue
+  // `workflow unlock`/`workflow reconcile` could never prove dead. Mirrors the unlock wiring test
+  // above: a spy stands in for the real factory (an existing injection seam launchCommand already
+  // had) so this observes exactly what launchCommand passed it, without needing a real preview.
+  const calls = [];
+  const fakeReadOwnOwnership = async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" });
+  const stubStore = {};
+  const createRunStoreSpy = (args) => {
+    calls.push(args);
+    return stubStore;
+  };
+
+  // controlPlaneBin is deliberately left unset on both options and deps: launch.js's own preview
+  // validates it and rejects before ever reaching planCommand -- a clean, deterministic stop that
+  // still lands AFTER the store construction under test, without needing a real project/agent
+  // fixture wired all the way through a full preview.
+  await assert.rejects(
+    () => launchCommand(
+      { stateRoot: "/state/workflow", registryPath: "/tmp/projects.yaml" },
+      {
+        readOwnOwnership: fakeReadOwnOwnership,
+        createRunStore: createRunStoreSpy,
+        registry,
+      },
+    ),
+    /controlPlaneBin/,
+  );
+
   assert.equal(calls.length, 1);
   assert.equal(calls[0].stateRoot, "/state/workflow");
   assert.equal(calls[0].readOwnOwnership, fakeReadOwnOwnership);
