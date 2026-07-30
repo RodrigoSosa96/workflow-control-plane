@@ -833,7 +833,15 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
 
     if (args.command === "reconcile") {
-      const result = await reconcileCommand(options, liveDependencies);
+      // reconcileCommand's read-only lock diagnostic expects deps.inspectProcess by that literal
+      // name, same aliasing unlock's and gate-clear's dispatch do below for the same reason (see
+      // the naming note where inspectProcessByPid is constructed): it stays off liveDependencies
+      // itself so it never collides with the delegation transport's differently-shaped,
+      // identity-based inspectProcess.
+      const result = await reconcileCommand(
+        options,
+        { ...liveDependencies, inspectProcess: liveDependencies.inspectProcessByPid },
+      );
       emit(out, formatWorkflowResult("reconcile", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }

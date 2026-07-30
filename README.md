@@ -121,6 +121,7 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 - Real Acme meta-repository setup remains a separate explicit checkpoint after disposable verification; the launcher branch must not initialize or modify the real work project automatically.
 - Native lifecycle hooks, exact external resume, and explicit close remain planned downstream work. They are not commands available in this release; if implemented, they will operate only on exact recorded worker identity and will never guess a recent session, scrape a terminal, or inject a result into another Pi session automatically.
 - No external or internal lane performs automatic cleanup, reservation release, or process kill; preserved resources remain available for manual inspection.
+- The one documented exception to that no-cleanup policy: `workflow unlock <run-id>` and `workflow delegation gate-clear <project>` can each remove exactly one piece of crash residue (a wedged run lock or reservation gate) — but only when the mutex's owner is proven dead, never when elapsed time alone suggests it. See "Recovering a wedged run lock or reservation gate" below.
 
 ### Two-lane operator model
 
@@ -184,7 +185,7 @@ workflow delegation handoff <run-id> <delegation-id> --input <run-directory>/del
 
 `workflow result <run-id>` reads the canonical external worker result. `workflow delegation result <run-id> <delegation-id>` reads the current advisory internal delegation result, and `workflow delegation reconcile <run-id> <delegation-id>` reports exact private-session/process state plus next actions.
 
-External exit `0` means a current terminal result was available; exit `20` means pending, exit `21` means `result-stale`, and exit `22` means `manual-handoff-required`. `workflow reconcile [project] --run <run-id>` performs no repair, launch, cleanup, or destructive action; it emits exact safe next actions such as `workflow result`, `workflow status`, and the canonical `workflow handoff` command.
+External exit `0` means a current terminal result was available; exit `20` means pending, exit `21` means `result-stale`, and exit `22` means `manual-handoff-required`. `workflow reconcile [project] --run <run-id>` performs no repair, launch, cleanup, or destructive action; it emits exact safe next actions such as `workflow result`, `workflow status`, and the canonical `workflow handoff` command. When the run's lock is currently held, it also reports the lock's age and ownership verdict — never inferring liveness from elapsed time — and, only once that verdict proves the owner dead, adds `workflow unlock <run-id> --yes` to those next actions; see "Recovering a wedged run lock or reservation gate" below.
 
 If the origin Pi session closes before an advisory delegation result is consumed, the result stays pending. A later coordinator session must explicitly adopt it; no cross-session result injection occurs automatically.
 
@@ -197,6 +198,27 @@ workflow delegation release <run-id> <delegation-id> --yes
 ```
 
 The command refuses while the delegation is still running, releases capacity only, and never touches worktrees, processes, sessions, or run state.
+
+### Recovering a wedged run lock or reservation gate
+
+The per-run write lock (`run.lock`) and the per-project delegation reservation gate are both mkdir-based mutexes: whichever process acquires one first embeds its own pid and start time in an owner marker before continuing. If that process crashes while holding one, the mutex stays wedged, and — following the no-cleanup policy above — nothing removes it automatically. Two commands can:
+
+```bash
+workflow unlock <run-id> [--yes]
+workflow delegation gate-clear <project> [--yes]
+```
+
+Both are the one documented exception to the no-cleanup policy, and both are held to the same rule: they remove crash residue only when the mutex's owner is **proven dead**, never when elapsed time alone suggests it. `--yes` authorizes deleting proven-dead evidence; it can never substitute for the proof itself:
+
+- The owner is proven dead only when the recorded pid no longer maps to the recorded start time: either no process holds that pid at all, or a different, unrelated process now does. A recycled pid is detected by comparing start times rather than trusting the pid number alone — the exact case a pid-only liveness check gets wrong, and the one that would otherwise leave the mutex wedged forever after a pid wraps around to a new process.
+- A live owner (matching pid and start time) is always refused, `--yes` or not.
+- A marker written before this mechanism existed (no recorded pid/start time — a "version 1" marker) is refused as unprovable, never treated as removable just because it predates provable ownership. An ambiguous observation — process inspection itself failed, or more than one owner marker is present — is refused the same way, with a distinct reason.
+- The lock/gate's age is reported (`ageMs`/`stale`) for context, but age alone is never grounds for removal.
+- Without `--yes`, both commands are read-only: they report the verdict and, when it is proven-dead, that confirmation is needed — no filesystem mutation happens. A marker that changes between classification and confirmation is re-classified against what removal actually reads at that moment, so a race can never remove a lock or gate that was reacquired while waiting on the operator.
+- Neither command touches worktrees, Herdr tabs/panes, sessions, processes, run state, or reservation leases: `workflow unlock` only unblocks a future write to the run, and `workflow delegation gate-clear` only unblocks a future `reserve()`/`release()` call for the project.
+- Exit `0` covers no lock/gate present, awaiting confirmation, and successful removal. Exit `11` means refused — the owner is alive, the verdict is unprovable, or a store-level race prevented removal even though the marker itself was approved.
+
+`workflow reconcile --run <run-id>` surfaces the same verdict for a held run lock without ever removing anything, per "Worker handoff and results" above.
 
 ### Handoff notifications
 

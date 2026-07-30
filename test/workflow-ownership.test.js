@@ -4,7 +4,9 @@ import {
   OBSERVATION_FAILED,
   classifyOwnership,
   createOwnOwnershipReader,
+  isPlainMarker,
   readOwnProcessOwnership,
+  sameOwnerDirectory,
 } from "../src/workflow/ownership.js";
 
 const MARKER = { pid: "111", startedAt: "2026-07-29T10:00:00.000Z" };
@@ -280,4 +282,52 @@ test("createOwnOwnershipReader's reader resolves to null (never rejects) when in
   await assert.doesNotReject(async () => {
     assert.equal(await reader(), null);
   });
+});
+
+// --- isPlainMarker -------------------------------------------------------
+// Exported so commands.js's observeOwner/ownerMarkerVersion share this exact guard instead of
+// each hand-rolling their own copy (the consolidation this task adds on top of classifyOwnership,
+// which already used this guard internally before it was exported).
+
+test("isPlainMarker: true for a plain object, false for null, arrays, and primitives", () => {
+  assert.equal(isPlainMarker({ pid: "1" }), true);
+  assert.equal(isPlainMarker({}), true);
+  assert.equal(isPlainMarker(null), false);
+  assert.equal(isPlainMarker(undefined), false);
+  assert.equal(isPlainMarker([]), false);
+  assert.equal(isPlainMarker(["pid", "1"]), false);
+  assert.equal(isPlainMarker("marker"), false);
+  assert.equal(isPlainMarker(42), false);
+});
+
+// --- sameOwnerDirectory ---------------------------------------------------
+// The directory-identity comparison both mutex stores (run-store.js's removeLock,
+// delegation-reservations.js's clearGate) now import from here instead of each carrying a
+// byte-for-byte identical copy.
+
+test("sameOwnerDirectory: true when dev/ino match, even if mtimeMs/ctimeMs differ", () => {
+  const left = { dev: 1, ino: 100, mtimeMs: 1000, ctimeMs: 1000 };
+  const right = { dev: 1, ino: 100, mtimeMs: 2000, ctimeMs: 2000 };
+  assert.equal(sameOwnerDirectory(left, right), true);
+});
+
+test("sameOwnerDirectory: false when dev/ino differ (a replaced directory)", () => {
+  const left = { dev: 1, ino: 100, mtimeMs: 1000, ctimeMs: 1000 };
+  const right = { dev: 1, ino: 200, mtimeMs: 1000, ctimeMs: 1000 };
+  assert.equal(sameOwnerDirectory(left, right), false);
+});
+
+test("sameOwnerDirectory: falls back to ctimeMs/mtimeMs when dev/ino are not finite numbers", () => {
+  const left = { mtimeMs: 1000, ctimeMs: 1000 };
+  const right = { mtimeMs: 1000, ctimeMs: 1000 };
+  assert.equal(sameOwnerDirectory(left, right), true);
+
+  const replaced = { mtimeMs: 2000, ctimeMs: 2000 };
+  assert.equal(sameOwnerDirectory(left, replaced), false);
+});
+
+test("sameOwnerDirectory: tolerates missing/undefined stats without throwing", () => {
+  assert.equal(sameOwnerDirectory(undefined, undefined), true);
+  assert.doesNotThrow(() => sameOwnerDirectory(null, { dev: 1, ino: 1 }));
+  assert.equal(typeof sameOwnerDirectory(null, { dev: 1, ino: 1 }), "boolean");
 });

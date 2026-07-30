@@ -2,6 +2,7 @@ import { randomUUID as defaultRandomUUID } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
+import { sameOwnerDirectory as sameActiveDirectory } from "./ownership.js";
 import { RUN_STATES, isRunState, transitionRun } from "./run-state.js";
 
 const PRIVATE_DIR_MODE = 0o700;
@@ -410,16 +411,6 @@ export function createRunStore({
       `Run lock ownership could not be verified at ${lockPath}; ${reason}. Manual inspection required; active lock was not removed.`,
       { details: { lockPath, reason } },
     );
-  }
-
-  function sameActiveDirectory(left, right) {
-    if (
-      Number.isFinite(left?.dev) && Number.isFinite(left?.ino)
-      && Number.isFinite(right?.dev) && Number.isFinite(right?.ino)
-    ) {
-      return left.dev === right.dev && left.ino === right.ino;
-    }
-    return left?.ctimeMs === right?.ctimeMs && left?.mtimeMs === right?.mtimeMs;
   }
 
   async function ensureLockContainer(directory) {

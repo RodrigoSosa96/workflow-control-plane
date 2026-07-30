@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { doctorCommand, planCommand, resultCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
+import { doctorCommand, planCommand, reconcileCommand, resultCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 
@@ -1033,4 +1033,149 @@ test("unlock threads deps.readOwnOwnership into storeForCommand's fallback store
   assert.equal(calls.length, 1);
   assert.equal(calls[0].stateRoot, "/state/workflow");
   assert.equal(calls[0].readOwnOwnership, fakeReadOwnOwnership);
+});
+
+// --- reconcileCommand's lock diagnostic ----------------------------------
+
+const RECONCILE_RUN_ID = "88888888-8888-4888-8888-888888888888";
+
+function reconcileRun(overrides = {}) {
+  return {
+    id: RECONCILE_RUN_ID,
+    directory: `/state/workflow/${RECONCILE_RUN_ID}`,
+    state: RUN_STATES.RUNNING,
+    ...overrides,
+  };
+}
+
+function reconcileLockMarker(overrides = {}) {
+  return { version: 2, token: "t1", runId: RECONCILE_RUN_ID, pid: "9090", startedAt: "2026-07-29T09:00:00.000Z", ...overrides };
+}
+
+function reconcileInspectedLock(overrides = {}) {
+  return {
+    activePath: `/state/workflow/${RECONCILE_RUN_ID}/run.lock/active`,
+    markerPath: `/state/workflow/${RECONCILE_RUN_ID}/run.lock/active/owner-t1.json`,
+    marker: reconcileLockMarker(),
+    ageMs: 45000,
+    stale: false,
+    ...overrides,
+  };
+}
+
+// A fake run store for reconcileCommand: `read` returns the fixed run, `update` fails the test
+// outright if ever called (reconcile's read-only contract), and `inspectLock` is present or
+// omitted per `includeInspectLock` so the same fixture covers both the normal path and the
+// "store predates inspectLock" degradation path.
+function reconcileStoreFor({ run, inspected = null, includeInspectLock = true } = {}) {
+  const store = {
+    async read(runId) {
+      assert.equal(runId, run.id);
+      return run;
+    },
+    async update() {
+      assert.fail("reconcile must remain read-only and never call store.update");
+    },
+  };
+  if (includeInspectLock) {
+    const inspectLockCalls = [];
+    store.inspectLockCalls = inspectLockCalls;
+    store.inspectLock = async (runId) => {
+      inspectLockCalls.push(runId);
+      return inspected;
+    };
+  }
+  return store;
+}
+
+test("reconcile reports a held lock whose owner is proven gone and appends workflow unlock to nextActions", async () => {
+  const run = reconcileRun();
+  const marker = reconcileLockMarker();
+  const inspected = reconcileInspectedLock({ marker, ageMs: 999999, stale: true });
+  const store = reconcileStoreFor({ run, inspected });
+  const { inspectProcess } = inspectProcessReturning(null); // proven gone: no matching process
+
+  const result = await reconcileCommand({ runId: run.id }, { store, inspectProcess });
+
+  assert.deepEqual(result.lock, {
+    ageMs: 999999,
+    stale: true,
+    ownership: {
+      verdict: "owner-gone",
+      reason: "the owner process is proven gone: no matching process exists",
+      pid: marker.pid,
+      startedAt: marker.startedAt,
+      removable: true,
+    },
+  });
+  assert.deepEqual(result.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+    `workflow unlock ${run.id} --yes`,
+  ]);
+  assert.deepEqual(store.inspectLockCalls, [run.id]);
+});
+
+test("reconcile reports a live owner's verdict but does not suggest unlock", async () => {
+  const run = reconcileRun();
+  const marker = reconcileLockMarker();
+  const inspected = reconcileInspectedLock({ marker });
+  const store = reconcileStoreFor({ run, inspected });
+  const { inspectProcess } = inspectProcessReturning({ pid: marker.pid, startedAt: marker.startedAt, cwd: "/wt", active: true });
+
+  const result = await reconcileCommand({ runId: run.id }, { store, inspectProcess });
+
+  assert.equal(result.lock.ownership.verdict, "owner-alive");
+  assert.equal(result.lock.ownership.removable, false);
+  assert.deepEqual(result.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+  ]);
+});
+
+test("reconcile has no lock field and unchanged nextActions when no lock is held", async () => {
+  const run = reconcileRun();
+  const store = reconcileStoreFor({ run, inspected: null });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await reconcileCommand({ runId: run.id }, { store, inspectProcess });
+
+  assert.equal("lock" in result, false);
+  assert.deepEqual(result.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+  ]);
+  // No lock to classify -- classifyMarkerOwnership (and therefore inspectProcess) is never reached.
+  assert.deepEqual(calls, []);
+});
+
+test("reconcile still reconciles, with no lock field, when the injected store predates inspectLock", async () => {
+  const run = reconcileRun();
+  const store = reconcileStoreFor({ run, includeInspectLock: false });
+  assert.equal(typeof store.inspectLock, "undefined");
+
+  const result = await reconcileCommand({ runId: run.id }, { store });
+
+  assert.equal("lock" in result, false);
+  assert.deepEqual(result.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+  ]);
+  assert.equal(result.command, "reconcile");
+});
+
+test("reconcile performs no mutation even when the lock is removable", async () => {
+  const run = reconcileRun();
+  const inspected = reconcileInspectedLock(); // proven-missing owner below -> removable
+  const store = reconcileStoreFor({ run, inspected });
+  // Deliberately no removeLock on this store fake: if reconcile ever called it, this would throw
+  // "store.removeLock is not a function" and fail the test, on top of the read-only store.update
+  // assertion already wired into reconcileStoreFor.
+  assert.equal(typeof store.removeLock, "undefined");
+  const { inspectProcess } = inspectProcessReturning(null);
+
+  const result = await reconcileCommand({ runId: run.id, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.lock.ownership.removable, true);
+  assert.deepEqual(result.nextActions.at(-1), `workflow unlock ${run.id} --yes`);
 });

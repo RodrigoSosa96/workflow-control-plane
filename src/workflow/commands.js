@@ -10,7 +10,7 @@ import { createDelegationServices as defaultCreateDelegationServices } from "./d
 import { createDelegationStore } from "./delegation-store.js";
 import { buildClaudeWorkerSettings, CONTROL_PLANE_ROOT, PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
-import { classifyOwnership, OBSERVATION_FAILED } from "./ownership.js";
+import { classifyOwnership, isPlainMarker, OBSERVATION_FAILED } from "./ownership.js";
 import { createSessionTransport as buildSessionTransport } from "./session-transport.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
@@ -1287,6 +1287,21 @@ export async function resultCommand(options = {}, deps = {}) {
   };
 }
 
+// reconcile's own read-only lock diagnostic: reuses inspectLock (never removeLock) and
+// classifyMarkerOwnership -- the same observe-and-classify step mutexOwnerRecoveryFlow's
+// `classify` runs through below -- so an operator sees a recoverable lock's verdict exactly where
+// they already look, without reconcile gaining a mutation path of its own. Returns undefined
+// (the field must be ABSENT, not `lock: null`) both when no lock is held and when the injected
+// store predates inspectLock: a diagnostic must never break reconcile for a caller still on an
+// older store fake, so a missing method degrades silently rather than throwing.
+async function reconcileLockDiagnostic(store, runId, inspectProcess) {
+  if (typeof store.inspectLock !== "function") return undefined;
+  const inspected = await store.inspectLock(runId);
+  if (!inspected) return undefined;
+  const ownership = await classifyMarkerOwnership(inspected.marker, inspectProcess);
+  return { ageMs: inspected.ageMs, stale: inspected.stale, ownership };
+}
+
 export async function reconcileCommand(options = {}, deps = {}) {
   const store = await storeForCommand(options, deps);
   const runId = assertRunId(options.runId);
@@ -1294,10 +1309,12 @@ export async function reconcileCommand(options = {}, deps = {}) {
   ensureMatchingRunProject(options, run, "reconcile");
   const base = runOutputBase(run);
   const status = reconcileStatusForRun(run);
+  const lock = await reconcileLockDiagnostic(store, runId, deps.inspectProcess);
   const nextActions = [
     base.resultCommand,
     ...(base.statusCommand ? [base.statusCommand] : []),
     base.handoffCommand,
+    ...(lock?.ownership?.removable ? [`workflow unlock ${runId} --yes`] : []),
   ];
 
   return {
@@ -1308,6 +1325,7 @@ export async function reconcileCommand(options = {}, deps = {}) {
     nextActions,
     cleanup: "none",
     repairs: [],
+    ...(lock ? { lock } : {}),
   };
 }
 
@@ -1525,7 +1543,7 @@ export async function closeCommand(options = {}, deps = {}) {
 // ("unprovable"), never a command crash -- same fail-closed contract acquireLock's/acquireGate's
 // readOwnOwnership gives a throwing inspectProcess.
 async function observeOwner(marker, inspectProcess) {
-  const provable = marker && typeof marker === "object" && !Array.isArray(marker)
+  const provable = isPlainMarker(marker)
     && marker.pid !== null && marker.pid !== undefined
     && marker.startedAt !== null && marker.startedAt !== undefined;
   if (!provable) return OBSERVATION_FAILED;
@@ -1544,17 +1562,28 @@ async function observeOwner(marker, inspectProcess) {
 // markerVersion: null. Shared by unlock and delegation gate-clear -- both mutexes embed the same
 // `version` field in the same place.
 function ownerMarkerVersion(marker) {
-  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return null;
+  if (!isPlainMarker(marker)) return null;
   return Number.isInteger(marker.version) ? marker.version : 1;
 }
 
-// The one place this repo's provable-owner-recovery predicate is written: wrap the inspector so
-// a throw becomes OBSERVATION_FAILED (observeOwner), classify the marker, map (verdict x
-// confirmed) to an action and an exit code, and re-classify inside `allow` against whatever
-// marker `remove` actually re-reads -- never the up-front snapshot, which may be stale by the
-// time confirmation arrives. `unlockCommand` and `delegationGateClearCommand` are this flow's
-// only two callers; before this existed, each command re-derived (a variant of) this predicate by
-// hand, which is exactly review finding D17 this roadmap phase exists to stop repeating.
+// The observe-then-classify step: wrap the inspector so a throw becomes OBSERVATION_FAILED
+// (observeOwner), then classify. This is the ONE place that combination is written -- both
+// mutexOwnerRecoveryFlow's `classify` below and reconcileCommand's read-only lock diagnostic
+// (above, in this file) call it, so reconcile surfacing the same verdict never becomes a third
+// hand-rolled copy of this predicate. Exactly what review finding D17 this roadmap phase exists
+// to stop repeating flagged: the same predicate hand-written four times, one copy weaker than the
+// others.
+async function classifyMarkerOwnership(marker, inspectProcess) {
+  return classifyOwnership(marker, await observeOwner(marker, inspectProcess));
+}
+
+// The one place this repo's provable-owner-recovery predicate is written: classify the marker via
+// classifyMarkerOwnership above, map (verdict x confirmed) to an action and an exit code, and
+// re-classify inside `allow` against whatever marker `remove` actually re-reads -- never the
+// up-front snapshot, which may be stale by the time confirmation arrives. `unlockCommand` and
+// `delegationGateClearCommand` are this flow's only two callers; before this existed, each
+// command re-derived (a variant of) this predicate by hand, which is exactly review finding D17
+// this roadmap phase exists to stop repeating.
 //
 // `inspect` and `remove` are the mutex-specific operations (store.inspectLock/removeLock, or
 // reservations.inspectGate/clearGate). `remove` must normalize its store's outcome to
@@ -1565,7 +1594,7 @@ function ownerMarkerVersion(marker) {
 // `buildReport` maps those onto its own vocabulary ("no-lock"/"removed" vs "no-gate"/"cleared").
 async function mutexOwnerRecoveryFlow({ confirmed, inspectProcess, inspect, remove, buildReport }) {
   async function classify(marker) {
-    return classifyOwnership(marker, await observeOwner(marker, inspectProcess));
+    return classifyMarkerOwnership(marker, inspectProcess);
   }
 
   const inspected = await inspect();

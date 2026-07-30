@@ -1368,6 +1368,26 @@ test("reconcile is read-only, accepts --run, and emits exact safe next actions",
   assert.deepEqual(output.stderr, []);
 });
 
+test("main wires reconcile with the same ps-based process inspector unlock and gate-clear use, so its lock diagnostic can actually classify an owner", async () => {
+  // reconcileCommand's read-only lock diagnostic expects deps.inspectProcess by that literal
+  // name -- same aliasing unlock's and gate-clear's dispatch do (see the naming note where
+  // inspectProcessByPid is constructed). Without this wiring, reconcile's lock verdict would be
+  // "unprovable" for every held lock in real use, defeating the point of surfacing it at all.
+  const output = io();
+  const code = await main(["reconcile", "ocr", "--run", RUN_ID, "--format", "json"], {
+    ...output,
+    reconcileCommand: async (_options, reconcileDeps) => {
+      assert.equal(typeof reconcileDeps.inspectProcess, "function");
+      assert.equal(reconcileDeps.inspectProcess, reconcileDeps.inspectProcessByPid);
+      return { command: "reconcile", runId: RUN_ID, status: "pending", nextActions: [] };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.status}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(output.stdout, ["reconcile:pending"]);
+});
+
 test("resume and close subcommands dispatch to their commands read-only until confirmed, wired with the live Pi delegation transport", async () => {
   const calls = [];
   const output = io();

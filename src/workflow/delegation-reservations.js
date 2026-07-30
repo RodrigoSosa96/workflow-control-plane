@@ -3,6 +3,7 @@ import * as defaultFs from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { classifyDelegationRole, validateDelegationPolicy } from "./delegation-policy.js";
 import { WorkflowError } from "./errors.js";
+import { sameOwnerDirectory as sameGateDirectory } from "./ownership.js";
 
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -229,19 +230,6 @@ export function createDelegationReservationStore({
 
   function isGateMarkerName(name) {
     return name === GATE_MARKER_NAME;
-  }
-
-  // Directory identity comparison shared by clearGate's two rechecks. Mirrors
-  // run-store.js's sameActiveDirectory so "the gate directory was replaced" is decided the
-  // same way everywhere a mutex owner marker is involved.
-  function sameGateDirectory(left, right) {
-    if (
-      Number.isFinite(left?.dev) && Number.isFinite(left?.ino)
-      && Number.isFinite(right?.dev) && Number.isFinite(right?.ino)
-    ) {
-      return left.dev === right.dev && left.ino === right.ino;
-    }
-    return left?.ctimeMs === right?.ctimeMs && left?.mtimeMs === right?.mtimeMs;
   }
 
   // Shared by inspectGate (read-only) and clearGate (which calls this twice to check-then-act).
