@@ -8,16 +8,18 @@
 
 Item 1.1 made owner markers carry `{pid, startedAt}` so `workflow unlock` can prove a lock's owner dead before removing it. That works for every lock the `workflow` CLI acquires, because `bin/workflow.js` constructs one ownership reader per process and threads it into every store.
 
-It does **not** work for locks acquired by any *other* process, and those are the most frequent ones. Six sites build their own run store with no reader:
+It does **not** work for locks acquired by any *other* process, and those are the most frequent ones. Six sites build their own run store with no reader; five of them actually acquire the lock:
 
 | Site | Acquires the lock? |
 |---|---|
 | `hooks/claude-lifecycle.mjs:54` | yes — `lifecycle-hook-core.mjs:61` calls `store.update` |
 | `hooks/codex-lifecycle.mjs:49` | yes — same core |
-| `hooks/claude-statusline.mjs:123` | yes — telemetry writes go through `writePrivateFile` |
+| `hooks/claude-statusline.mjs:123` | **no** — its read path (`main` → `loadSnapshot` → `readSnapshot` → `store.read`) never calls `withLock`; `readOwnOwnership` is only invoked from inside `acquireLock` |
 | `.pi/extensions/workflow-worker-lifecycle.ts:17` | yes — same lifecycle calls, in-process |
 | `.pi/extensions/workflow-worker-observability.ts:66` | yes — telemetry writes |
 | `scripts/smoke-workflow-fixture.js:171` | test-only |
+
+**Correction (recorded during implementation, task 3 of the plan):** this table originally listed `hooks/claude-statusline.mjs:123` as acquiring the lock. It does not — investigated end-to-end and proven never to reach `withLock`, with a regression test guarding the finding (`test/workflow-claude-statusline-hook.test.js`, "the statusline hook's telemetry read path never acquires the run lock, so no readOwnOwnership wiring is needed there"). Five sites needed wiring, not six; the "Decision" and "Verification Strategy" sections below were already written in terms of five and did not need correcting.
 
 Lifecycle hooks fire on **every prompt and every stop of every worker**, so they take the run lock far more often than the CLI does. A crash while one holds it leaves residue whose marker has no `pid`/`startedAt`, and `workflow unlock` refuses it as `unprovable` — permanently. The command that exists to recover wedged locks cannot recover the ones most likely to wedge.
 
