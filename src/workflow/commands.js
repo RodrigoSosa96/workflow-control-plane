@@ -1491,19 +1491,25 @@ export async function closeCommand(options = {}, deps = {}) {
   };
 }
 
-// unlock's process-liveness probe. A marker missing `pid` (the version-1 shape
-// classifyOwnership already treats as unprovable on its own) has nothing to observe, so this
-// skips the inspector rather than spending a `ps` call on a verdict that is already decided.
-// When there IS a pid to check, a throwing inspector — an ambiguous observation — must become
-// OBSERVATION_FAILED rather than propagate: an ambiguous owner is a verdict the operator sees
-// ("unprovable"), never a command crash. Same fail-closed contract acquireLock's
-// readOwnOwnership gives a throwing inspectProcess.
+// unlock's process-liveness probe. `null` is classifyOwnership's OWN sentinel for "a completed
+// observation found nothing" (proven missing, owner-gone); it must never stand in for "this
+// function did not observe at all", or the correctness of this repo's only destructive command
+// would depend on classifyOwnership checking pid/startedAt nullity before it looks at the
+// observation -- reorder those checks (or introduce a marker shape that reaches the observation
+// branch pid-less) and "I didn't look" silently becomes "proven dead". So every "did not
+// observe" case returns OBSERVATION_FAILED here, unconditionally: a marker without BOTH a
+// provable pid and startedAt (classifyOwnership requires both; the version-1 shape has neither),
+// a missing inspector, or a throwing one (an ambiguous observation, by design). An ambiguous or
+// unobserved owner is a verdict the operator sees ("unprovable"), never a command crash -- same
+// fail-closed contract acquireLock's readOwnOwnership gives a throwing inspectProcess.
 async function observeLockOwner(marker, inspectProcess) {
-  const pid = marker && typeof marker === "object" && !Array.isArray(marker) ? marker.pid : null;
-  if (pid === null || pid === undefined) return null;
+  const provable = marker && typeof marker === "object" && !Array.isArray(marker)
+    && marker.pid !== null && marker.pid !== undefined
+    && marker.startedAt !== null && marker.startedAt !== undefined;
+  if (!provable) return OBSERVATION_FAILED;
   if (typeof inspectProcess !== "function") return OBSERVATION_FAILED;
   try {
-    return await inspectProcess(String(pid));
+    return await inspectProcess(String(marker.pid));
   } catch {
     return OBSERVATION_FAILED;
   }
@@ -1566,21 +1572,29 @@ export async function unlockCommand(options = {}, deps = {}) {
     return unlockReport({ runId, lock, ownership, action: "needs-confirmation", removed: null, exitCode: 0 });
   }
 
-  // removeLock re-reads the marker itself and hands THAT marker to `allow` -- it may differ
-  // from the one classified above (time passed waiting on confirmation), so the removal must be
-  // authorized against the freshly re-read marker, not the earlier snapshot.
+  // removeLock re-reads the marker itself and hands THAT marker to `allow` -- it may differ from
+  // the one classified above (time passed waiting on confirmation; a new owner may have since
+  // acquired the lock), so the removal must be authorized against the freshly re-read marker,
+  // not the earlier snapshot. `latestOwnership` captures whatever `allow` actually classified so
+  // the final report reflects the verdict removal was authorized (or refused) against, not the
+  // now-possibly-stale up-front one -- a machine caller must never see a removable verdict next
+  // to a refused report, or vice versa.
+  let latestOwnership = ownership;
   const outcome = await store.removeLock(runId, {
-    allow: async (marker) => (await classify(marker)).removable,
+    allow: async (marker) => {
+      latestOwnership = await classify(marker);
+      return latestOwnership.removable;
+    },
   });
 
   if (!outcome.removed) {
-    return unlockReport({ runId, lock, ownership, action: "refused", removed: null, reason: outcome.reason, exitCode: 11 });
+    return unlockReport({ runId, lock, ownership: latestOwnership, action: "refused", removed: null, reason: outcome.reason, exitCode: 11 });
   }
 
   return unlockReport({
     runId,
     lock,
-    ownership,
+    ownership: latestOwnership,
     action: "removed",
     removed: { markerPath: outcome.markerPath, activePath: outcome.activePath },
     exitCode: 0,

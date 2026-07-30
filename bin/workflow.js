@@ -422,12 +422,23 @@ function createLiveDependencies(dependencies) {
   // (via readOwnOwnership, memoized just below) and to let `workflow unlock` observe an
   // arbitrary lock owner's pid. Constructed exactly once per process, here — never per store,
   // per command, or per unlock invocation.
-  const inspectProcess = dependencies.inspectProcess ?? ((pid) => inspectDelegationPid(pid, { runner }));
+  //
+  // Deliberately NOT named `inspectProcess` on liveDependencies (the bag returned below, which
+  // withLiveDelegationTransport and every delegation command spread wholesale): the delegation
+  // transport already has its own `inspectProcess` with an INCOMPATIBLE contract --
+  // `(identity) => ...` in pi-delegation-transport.js, vs. this one's `(pid) => ...`. Two
+  // same-named, different-shaped functions sitting in the same routinely-spread bag would let a
+  // future mis-wire (e.g. a command destructuring `deps.inspectProcess` expecting the identity
+  // form) fail silently, since transport construction only validates `typeof === "function"`.
+  // The distinct name costs nothing; only unlock's own dispatch (bin/workflow.js's `main`)
+  // aliases this back to the literal `inspectProcess` key unlockCommand's documented interface
+  // expects, and only on the small deps object built for that one call.
+  const inspectProcessByPid = dependencies.inspectProcessByPid ?? ((pid) => inspectDelegationPid(pid, { runner }));
   // One reader per process, memoized to a single `ps` call for this process's own pid --
   // createOwnOwnershipReader (not the store) owns that memoization; constructing a fresh reader
   // per store/command would spend a `ps` call on every lock acquisition instead of one per CLI
   // invocation.
-  const readOwnOwnership = dependencies.readOwnOwnership ?? createOwnOwnershipReader({ inspectProcess });
+  const readOwnOwnership = dependencies.readOwnOwnership ?? createOwnOwnershipReader({ inspectProcess: inspectProcessByPid });
   return {
     env,
     runner,
@@ -450,7 +461,7 @@ function createLiveDependencies(dependencies) {
     }),
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
-    inspectProcess,
+    inspectProcessByPid,
     store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot, onListProblem: reportListProblem, readOwnOwnership }) : undefined),
     // Real wiring for launch.js's best-effort Codex hook install (see isCodexInteractiveAgent
     // there): only assembled here, at the live-dependency boundary, so that unit tests of
@@ -819,9 +830,15 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
 
     if (args.command === "unlock") {
       // No delegation transport is needed: unlock only inspects/removes a run lock, via
-      // liveDependencies' store and inspectProcess (the same generic ps-based inspector the
-      // store's own readOwnOwnership uses, wired once per process above).
-      const result = await unlockCommand({ ...options, confirmed: Boolean(options.yes) }, liveDependencies);
+      // liveDependencies' store and inspectProcessByPid (the same generic ps-based inspector the
+      // store's own readOwnOwnership uses, wired once per process above). unlockCommand's
+      // documented interface expects deps.inspectProcess by that literal name; the alias is
+      // built fresh here, scoped to this one call, rather than exposing `inspectProcess` on
+      // liveDependencies itself (see the naming note where inspectProcessByPid is constructed).
+      const result = await unlockCommand(
+        { ...options, confirmed: Boolean(options.yes) },
+        { ...liveDependencies, inspectProcess: liveDependencies.inspectProcessByPid },
+      );
       emit(out, formatWorkflowResult("unlock", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }

@@ -1498,13 +1498,19 @@ test("main wires unlock with the real run store and the shared ps-based process 
     ...output,
     stateRoot,
     runner,
-    unlockCommand: async (_options, liveDependencies) => {
-      assert.equal(typeof liveDependencies.inspectProcess, "function");
-      assert.ok(liveDependencies.store);
+    unlockCommand: async (_options, unlockDeps) => {
+      // unlockCommand's documented interface reads deps.inspectProcess by that literal name --
+      // main's unlock dispatch aliases it there from liveDependencies.inspectProcessByPid (kept
+      // distinctly named on the widely-shared liveDependencies bag so it never collides with the
+      // delegation transport's differently-shaped, identity-based inspectProcess). Both names
+      // resolve to the exact same function here.
+      assert.equal(typeof unlockDeps.inspectProcess, "function");
+      assert.equal(unlockDeps.inspectProcess, unlockDeps.inspectProcessByPid);
+      assert.ok(unlockDeps.store);
       // Two independent lock acquisitions through the real, non-overridden store -- if
       // readOwnOwnership were not wired through, acquireLock would never call `ps` at all.
-      await liveDependencies.store.create({ runId: RUN_ID, projectAlias: "ocr", task: "ASANA-1" });
-      await liveDependencies.store.update(RUN_ID, () => ({}));
+      await unlockDeps.store.create({ runId: RUN_ID, projectAlias: "ocr", task: "ASANA-1" });
+      await unlockDeps.store.update(RUN_ID, () => ({}));
       return { command: "unlock", runId: RUN_ID, action: "no-lock", exitCode: 0 };
     },
     formatWorkflowResult: (command, value) => `${command}:${value.action}`,

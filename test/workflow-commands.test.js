@@ -736,11 +736,14 @@ function inspectedLock(overrides = {}) {
 
 // A fake run store exposing only inspectLock/removeLock, call-recording so tests can prove the
 // unconfirmed path never reaches a mutating call. removeLock mirrors the real store's contract
-// (run-store.js): it calls `allow` with the marker it "re-read" (here, the same one inspectLock
-// already reported) and only removes when allow returns true; removeLockResult lets a test force
-// its own refusal to simulate a race the command itself cannot see (e.g. the marker changing
-// between the command's own classification and removeLock's internal re-read).
-function lockStoreFor({ inspected = null, removeLockResult } = {}) {
+// (run-store.js): it calls `allow` with the marker it "re-read" internally, which defaults to
+// the same one inspectLock already reported but can be overridden via `recheckMarker` to a
+// DIFFERENT marker -- simulating the marker changing (a new owner, or the same owner's marker
+// mutating) between the command's own up-front classification and removeLock's internal
+// re-read, exactly what `allow` exists to re-authorize against. removeLockResult lets a test
+// force removeLock's own refusal for reasons unrelated to `allow` (a store-level race `allow`
+// itself cannot see, e.g. the active directory changing identity underneath).
+function lockStoreFor({ inspected = null, recheckMarker, removeLockResult } = {}) {
   const inspectLockCalls = [];
   const removeLockCalls = [];
   return {
@@ -752,7 +755,8 @@ function lockStoreFor({ inspected = null, removeLockResult } = {}) {
     },
     async removeLock(runId, { allow } = {}) {
       removeLockCalls.push(runId);
-      const permitted = await allow(inspected?.marker ?? null);
+      const marker = recheckMarker !== undefined ? recheckMarker : (inspected?.marker ?? null);
+      const permitted = await allow(marker);
       if (!permitted) return { removed: false, reason: "removal was not permitted for the current owner marker" };
       if (removeLockResult) return removeLockResult;
       return { removed: true, markerPath: inspected.markerPath, activePath: inspected.activePath };
@@ -798,7 +802,9 @@ test("unlock reports no-lock and exits 0 without inspecting any process when the
 
 test("unlock refuses an alive owner with exit 11 even when confirmed, and never calls removeLock", async () => {
   const marker = lockMarker();
-  const inspected = inspectedLock({ marker });
+  // Distinctive, non-default ageMs/stale so the passthrough assertions below can't coincidentally
+  // match some hardcoded value in the implementation.
+  const inspected = inspectedLock({ marker, ageMs: 87654, stale: true });
   const store = lockStoreFor({ inspected });
   const { inspectProcess } = inspectProcessReturning({ pid: marker.pid, startedAt: marker.startedAt, cwd: "/wt", active: true });
 
@@ -808,6 +814,9 @@ test("unlock refuses an alive owner with exit 11 even when confirmed, and never 
   assert.equal(result.exitCode, 11);
   assert.equal(result.ownership.verdict, "owner-alive");
   assert.equal(result.ownership.removable, false);
+  assert.equal(result.lock.markerVersion, 2);
+  assert.equal(result.lock.ageMs, 87654);
+  assert.equal(result.lock.stale, true);
   assert.equal(result.removed, null);
   assert.deepEqual(store.removeLockCalls, []);
 });
@@ -882,12 +891,47 @@ test("unlock reports needs-confirmation for a proven-missing owner, then removes
   assert.deepEqual(store.removeLockCalls, [UNLOCK_RUN_ID]);
 });
 
-test("a removeLock refusal (e.g. the marker changed underneath) surfaces as refused with its reason, not a crash", async () => {
+test("unlock authorizes removal against the marker removeLock re-reads, not the one classified up front", async () => {
+  // Up front, the lock's marker is proven-missing (removable). By the time removeLock re-reads
+  // the marker (recheckMarker), a DIFFERENT owner has since acquired the lock and is alive --
+  // `allow` must re-classify THAT marker, not reuse the up-front verdict, or a live owner's lock
+  // would be destroyed. This is the discriminating test for that re-classification: an
+  // implementation that authorizes against the stale up-front snapshot instead (e.g. `allow:
+  // async () => ownership.removable`, ignoring the marker `allow` actually receives) passes
+  // every other test in this file -- including the "recycled pid" and "needs-confirmation, then
+  // removes it once confirmed" tests above, since none of them ever hand `allow` a marker that
+  // differs from the one already classified -- and would still incorrectly report this case as
+  // removed. Confirmed load-bearing empirically: reverting `allow` to close over the up-front
+  // `ownership` (ignoring its `marker` argument) fails this test alone; see the task report.
+  const staleMarker = lockMarker(); // classified below as proven-missing (removable)
+  const freshAliveMarker = lockMarker({ token: "t2", pid: "5151", startedAt: "2026-07-29T13:00:00.000Z" });
+  const inspected = inspectedLock({ marker: staleMarker });
+  const store = lockStoreFor({ inspected, recheckMarker: freshAliveMarker });
+  const inspectProcess = async (pid) => {
+    if (pid === freshAliveMarker.pid) {
+      return { pid: freshAliveMarker.pid, startedAt: freshAliveMarker.startedAt, cwd: "/wt", active: true };
+    }
+    return null; // staleMarker's pid: proven gone
+  };
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.removed, null);
+  // The report reflects the FRESH (alive) verdict `allow` actually computed, not the stale
+  // (proven-missing) one classified up front -- proof the re-classification, not merely a
+  // refusal, actually happened.
+  assert.equal(result.ownership.verdict, "owner-alive");
+  assert.deepEqual(store.removeLockCalls, [UNLOCK_RUN_ID]);
+});
+
+test("even though allow authorized removal, a store-level removeLock refusal (a race allow cannot see) surfaces as refused with its reason, not a crash", async () => {
   const marker = lockMarker();
   const inspected = inspectedLock({ marker });
   const store = lockStoreFor({
     inspected,
-    removeLockResult: { removed: false, reason: "the owner marker changed before removal" },
+    removeLockResult: { removed: false, reason: "the active lock directory was replaced before removal" },
   });
   const { inspectProcess } = inspectProcessReturning(null);
 
@@ -896,10 +940,38 @@ test("a removeLock refusal (e.g. the marker changed underneath) surfaces as refu
   assert.equal(result.action, "refused");
   assert.equal(result.exitCode, 11);
   assert.equal(result.removed, null);
-  assert.equal(result.reason, "the owner marker changed before removal");
-  // The ownership verdict computed before the removal attempt is still reported; only the
-  // removal itself failed underneath the command.
+  assert.equal(result.reason, "the active lock directory was replaced before removal");
+  // allow's own re-classification still ran (and still authorized removal) before removeLock's
+  // own, separate, post-authorization identity check refused -- the report carries that fresh
+  // verdict, matching what removal was actually authorized against.
   assert.equal(result.ownership.verdict, "owner-gone");
+  assert.equal(result.ownership.removable, true);
+});
+
+test("unlock refuses an unreadable/ambiguous marker (inspectLock's marker: null) as unprovable, with markerVersion null and the lock's ageMs/stale passed through", async () => {
+  // inspectLock reports marker: null when the marker is absent, unreadable, or ambiguous (e.g.
+  // more than one owner-*.json file in the active lock directory) while the active lock
+  // directory itself still exists -- a realistic wedged-lock shape a previous task's fix
+  // specifically preserves evidence for, and exactly what this command's operator hits on a
+  // genuinely crashed run with stray residue in the lock directory.
+  const inspected = inspectedLock({ marker: null, ageMs: 555555, stale: true });
+  const store = lockStoreFor({ inspected });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+  assert.match(result.ownership.reason, /is not a recognizable marker object/);
+  // markerVersion: null is distinct from the version-1 test above's markerVersion: 1 -- a helper
+  // that just hardcoded 1 for any non-version-2 input would wrongly pass here too if this case
+  // weren't asserted on its own.
+  assert.equal(result.lock.markerVersion, null);
+  assert.equal(result.lock.ageMs, 555555);
+  assert.equal(result.lock.stale, true);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(store.removeLockCalls, []);
 });
 
 test("unlock without a wired inspectProcess degrades to unprovable rather than throwing", async () => {
