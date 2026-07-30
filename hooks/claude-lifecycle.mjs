@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { createLifecycle } from "../src/workflow/lifecycle.js";
 import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
+import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { runLifecycleHook, continuationPrompt, handoffExists } from "./lib/lifecycle-hook-core.mjs";
 
 export { continuationPrompt, handoffExists };
@@ -31,6 +32,13 @@ export { continuationPrompt, handoffExists };
 export async function runClaudeLifecycleHook(args = {}) {
   return runLifecycleHook({ ...args, harness: "claude" });
 }
+
+// One reader per process: acquireLock calls readOwnOwnership() on every lock it takes (every
+// prompt, every stop), and createOwnOwnershipReader's memoization only pays for one `ps` spawn
+// when every caller shares the SAME reader instance. Module scope (not inside main()) is what
+// guarantees that -- this hook process only ever runs one event, but a fresh reader per call
+// would still defeat the memoization's purpose the moment main() ran more than once.
+const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 async function readStdinJson() {
   const chunks = [];
@@ -46,12 +54,20 @@ async function readStdinJson() {
   }
 }
 
-async function main() {
+// dependencies is the minimal DI seam bin/workflow.js's own main(argv, dependencies) already
+// established for this codebase: every piece defaults to the real thing, so `main()` with no
+// arguments is the normal entrypoint call, while tests can override individual pieces (notably
+// createRunStore, to observe what it was constructed with) without spawning a subprocess.
+export async function main({
+  env = process.env,
+  readStdin = readStdinJson,
+  createRunStore: createRunStoreImpl = createRunStore,
+  readOwnOwnership = defaultReadOwnOwnership,
+} = {}) {
   try {
     const event = process.argv[2];
-    const env = process.env;
-    const stdinJson = await readStdinJson();
-    const store = createRunStore({ stateRoot: env.WORKFLOW_STATE_ROOT });
+    const stdinJson = await readStdin();
+    const store = createRunStoreImpl({ stateRoot: env.WORKFLOW_STATE_ROOT, readOwnOwnership });
     const lifecycle = createLifecycle({ store });
     let telemetry;
     try {

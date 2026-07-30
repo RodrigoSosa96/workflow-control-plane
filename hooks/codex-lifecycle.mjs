@@ -20,12 +20,18 @@ import { fileURLToPath } from "node:url";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { createLifecycle } from "../src/workflow/lifecycle.js";
 import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
+import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { runLifecycleHook } from "./lib/lifecycle-hook-core.mjs";
 
 // Thin wrapper: the actual behavior lives in the shared core, parameterized harness="codex".
 export async function runCodexLifecycleHook(args = {}) {
   return runLifecycleHook({ ...args, harness: "codex" });
 }
+
+// One reader per process: see hooks/claude-lifecycle.mjs's identical comment. Module scope so
+// every lock acquisition in this process (every prompt, every stop) shares the same memoized
+// reader instead of paying for a fresh `ps` spawn each time.
+const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 async function readStdinJson() {
   const chunks = [];
@@ -41,12 +47,19 @@ async function readStdinJson() {
   }
 }
 
-async function main() {
+// dependencies is the same minimal DI seam as hooks/claude-lifecycle.mjs's main(): every piece
+// defaults to the real thing, so `main()` with no arguments is the normal entrypoint call, while
+// tests can override individual pieces (notably createRunStore) without spawning a subprocess.
+export async function main({
+  env = process.env,
+  readStdin = readStdinJson,
+  createRunStore: createRunStoreImpl = createRunStore,
+  readOwnOwnership = defaultReadOwnOwnership,
+} = {}) {
   try {
     const event = process.argv[2];
-    const env = process.env;
-    const stdinJson = await readStdinJson();
-    const store = createRunStore({ stateRoot: env.WORKFLOW_STATE_ROOT });
+    const stdinJson = await readStdin();
+    const store = createRunStoreImpl({ stateRoot: env.WORKFLOW_STATE_ROOT, readOwnOwnership });
     const lifecycle = createLifecycle({ store });
     let telemetry;
     try {

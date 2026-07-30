@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { runClaudeLifecycleHook } from "../hooks/claude-lifecycle.mjs";
+import { runClaudeLifecycleHook, main } from "../hooks/claude-lifecycle.mjs";
 import { renderClaudeStatusLine } from "../hooks/claude-statusline.mjs";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { createLifecycle } from "../src/workflow/lifecycle.js";
 import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
 import { publicTelemetrySnapshot } from "../src/workflow/telemetry.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
+import { createSubprocessOwnOwnershipReader, classifyOwnership } from "../src/workflow/ownership.js";
+import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
+import { createProcessRunner } from "../src/workflow/process.js";
 
 const RUN_ID = "33333333-3333-4333-8333-333333333333";
 
@@ -194,4 +198,121 @@ test("onStop records 'settled' when the run completes with a valid handoff", asy
 
   const [raw] = await telemetry.read({ runId: RUN_ID });
   assert.equal(publicTelemetrySnapshot(raw).phase, "settled");
+});
+
+// --- Task 3: readOwnOwnership threaded into main()'s store construction ------------------
+
+// Load-bearing: with the readOwnOwnership argument dropped from main()'s createRunStoreImpl
+// call (verified by temporarily reverting that one argument), capturedArgs.readOwnOwnership is
+// undefined and this assertion fails. Confirmed by hand during implementation; see the task
+// report for the before/after run.
+test("main constructs the run store with a readOwnOwnership function", async () => {
+  let capturedArgs = null;
+  const fakeCreateRunStore = (args) => {
+    capturedArgs = args;
+    return { async read() { return null; }, async update() { return null; } };
+  };
+  // No WORKFLOW_RUN_ID: runClaudeLifecycleHook returns undefined immediately after the store is
+  // constructed, so this fake store's read/update are never actually invoked -- only their
+  // presence (required by createLifecycle's own constructor check) matters here.
+  await main({ env: {}, readStdin: async () => ({}), createRunStore: fakeCreateRunStore });
+  assert.ok(capturedArgs, "createRunStore should have been called");
+  assert.equal(typeof capturedArgs.readOwnOwnership, "function");
+});
+
+// Wraps a real run store's update() so the owner marker can be read straight off disk WHILE the
+// lock is still held -- mirroring test/workflow-cli.test.js's "main wires unlock..." test, since
+// releaseLock deletes the marker the instant the callback returns and there is no other window
+// to observe it.
+function observingStore(realStore, onObserve) {
+  return {
+    ...realStore,
+    async update(runId, originalUpdater) {
+      return realStore.update(runId, async (run) => {
+        const patch = await originalUpdater(run);
+        const activePath = join(run.directory, "run.lock", "active");
+        const [markerName] = await fs.readdir(activePath);
+        const markerPath = join(activePath, markerName);
+        const marker = JSON.parse(await fs.readFile(markerPath, "utf8"));
+        const { mode } = await fs.stat(markerPath);
+        onObserve({ marker, mode: mode & 0o777 });
+        return patch;
+      });
+    },
+  };
+}
+
+// This is the actual point of the task: before this wiring, every lock a hook acquired produced
+// a marker with no pid/startedAt at all, so `workflow unlock` could never classify it as
+// anything but "unprovable" -- forever. This proves that is no longer true for a lock acquired
+// through the shared lifecycle-hook core.
+test("a lock acquired through the shared lifecycle-hook core produces a marker with pid/startedAt at mode 0600, and classifyOwnership is not unprovable", async (t) => {
+  const root = await fs.mkdtemp(join(tmpdir(), "workflow-claude-lifecycle-ownership-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const OWNER_RUN_ID = "55555555-5555-4555-8555-555555555555";
+
+  const realStore = createRunStore({
+    stateRoot: join(root, "state"),
+    randomUUID: () => OWNER_RUN_ID,
+    readOwnOwnership: createSubprocessOwnOwnershipReader(),
+  });
+  await realStore.create({ harness: "claude", profileName: "claude-worker", generation: 1 });
+  await realStore.update(OWNER_RUN_ID, () => ({ state: RUN_STATES.LAUNCHING }));
+
+  let observed = null;
+  const store = observingStore(realStore, (result) => { observed = result; });
+  const lifecycle = createLifecycle({ store });
+  const env = { WORKFLOW_RUN_ID: OWNER_RUN_ID, WORKFLOW_HARNESS: "claude" };
+
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle });
+
+  assert.ok(observed, "the owner marker should have been observed while the lock was held");
+  assert.equal(typeof observed.marker.pid, "string");
+  assert.ok(observed.marker.startedAt);
+  assert.equal(observed.mode, 0o600);
+
+  // Independently observe the same live process the same way `workflow unlock` does, so
+  // classifyOwnership sees a real (not fabricated) observation.
+  const runner = createProcessRunner();
+  const observation = await inspectExactProcessByPid(observed.marker.pid, {
+    async runProcess(pid) {
+      return runner.run("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
+    },
+    readCwd: realpath,
+  });
+  const verdict = classifyOwnership(observed.marker, observation);
+  assert.notEqual(verdict.verdict, "unprovable");
+});
+
+// The other half of the same property: when the reader cannot observe this process at all (a
+// killed `ps`, a sandboxed environment), acquisition must still succeed and the marker must
+// simply omit the fields rather than writing them as empty/undefined -- "pid" in marker, not
+// marker.pid === undefined, because a writer that wrote the key explicitly with value undefined
+// would also pass the weaker check.
+test("a reader whose spawn fails still permits lock acquisition, with the marker's pid/startedAt keys absent", async (t) => {
+  const root = await fs.mkdtemp(join(tmpdir(), "workflow-claude-lifecycle-ownership-failed-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const OWNER_RUN_ID = "66666666-6666-4666-8666-666666666666";
+
+  const failingReader = createSubprocessOwnOwnershipReader({
+    spawnProcess: async () => { throw new Error("spawn failed"); },
+  });
+  const realStore = createRunStore({
+    stateRoot: join(root, "state"),
+    randomUUID: () => OWNER_RUN_ID,
+    readOwnOwnership: failingReader,
+  });
+  await realStore.create({ harness: "claude", profileName: "claude-worker", generation: 1 });
+  await realStore.update(OWNER_RUN_ID, () => ({ state: RUN_STATES.LAUNCHING }));
+
+  let observed = null;
+  const store = observingStore(realStore, (result) => { observed = result; });
+  const lifecycle = createLifecycle({ store });
+  const env = { WORKFLOW_RUN_ID: OWNER_RUN_ID, WORKFLOW_HARNESS: "claude" };
+
+  await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env, store, lifecycle });
+
+  assert.ok(observed, "the owner marker should have been observed while the lock was held");
+  assert.equal("pid" in observed.marker, false);
+  assert.equal("startedAt" in observed.marker, false);
 });

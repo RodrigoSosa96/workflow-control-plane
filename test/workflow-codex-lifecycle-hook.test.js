@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { runCodexLifecycleHook } from "../hooks/codex-lifecycle.mjs";
+import { runCodexLifecycleHook, main } from "../hooks/codex-lifecycle.mjs";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { createLifecycle } from "../src/workflow/lifecycle.js";
 import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
@@ -196,4 +196,25 @@ test("codex: onStop records 'settled' when the run completes with a valid handof
 
   const [raw] = await telemetry.read({ runId: RUN_ID });
   assert.equal(publicTelemetrySnapshot(raw).phase, "settled");
+});
+
+// --- Task 3: readOwnOwnership threaded into main()'s store construction ------------------
+
+// Load-bearing: with the readOwnOwnership argument dropped from main()'s createRunStoreImpl
+// call (verified by temporarily reverting that one argument), capturedArgs.readOwnOwnership is
+// undefined and this assertion fails. Confirmed by hand during implementation; see the task
+// report for the before/after run. The marker-carries-provable-ownership property itself (and
+// the failed-reader / absent-keys property) are proven once, through the shared core, in
+// test/workflow-claude-lifecycle-hook.test.js -- Codex drives the exact same
+// hooks/lib/lifecycle-hook-core.mjs code path, so this file only needs its own site's wiring
+// assertion, not a duplicate of those two.
+test("codex: main constructs the run store with a readOwnOwnership function", async () => {
+  let capturedArgs = null;
+  const fakeCreateRunStore = (args) => {
+    capturedArgs = args;
+    return { async read() { return null; }, async update() { return null; } };
+  };
+  await main({ env: {}, readStdin: async () => ({}), createRunStore: fakeCreateRunStore });
+  assert.ok(capturedArgs, "createRunStore should have been called");
+  assert.equal(typeof capturedArgs.readOwnOwnership, "function");
 });
