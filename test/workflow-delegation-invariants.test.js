@@ -5,11 +5,41 @@ import {
   checkoutDigestFor,
   reservationMatchesDelegation,
   reservationResourceList,
+  validateDelegationTransportIdentity,
 } from "../src/workflow/delegation-invariants.js";
 
 const READ_ONLY_ROLES = ["scout", "spec-reviewer", "code-reviewer"];
 const WRITER_ROLE = "sdd-implementer";
 const CHECKOUT_DIGEST = createHash("sha256").update("/fixture/checkout", "utf8").digest("hex");
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
+
+function transportIdentity(overrides = {}) {
+  return {
+    kind: "pi-delegation",
+    runId: RUN_ID,
+    delegationId: DELEGATION_ID,
+    sessionPath: "/private/session.jsonl",
+    cwd: "/fixture/review",
+    pid: "12345",
+    processStartedAt: "2025-01-01T00:10:00.000Z",
+    ...overrides,
+  };
+}
+
+function collectFailure(fn) {
+  const messages = [];
+  const fail = (message) => {
+    messages.push(message);
+    throw new Error(message);
+  };
+  try {
+    fn(fail);
+    return { threw: false, messages };
+  } catch {
+    return { threw: true, messages };
+  }
+}
 
 function record(overrides = {}) {
   return {
@@ -148,4 +178,85 @@ test("reservationMatchesDelegation derives the expected checkout digest from rec
   // The reservation's checkoutDigest was minted for /fixture/checkout, so a record claiming a
   // different cwd must not match even though every other field lines up.
   assert.equal(reservationMatchesDelegation(otherCwdRecord, reservation()), false);
+});
+
+test("validateDelegationTransportIdentity accepts a well-formed identity and returns it normalized", () => {
+  const { threw, messages } = collectFailure((fail) => {
+    const result = validateDelegationTransportIdentity(transportIdentity(), RUN_ID, DELEGATION_ID, fail);
+    assert.deepEqual(result, transportIdentity());
+  });
+  assert.equal(threw, false);
+  assert.deepEqual(messages, []);
+});
+
+test("validateDelegationTransportIdentity rejects a non-object value", () => {
+  const { threw, messages } = collectFailure((fail) => validateDelegationTransportIdentity(null, RUN_ID, DELEGATION_ID, fail));
+  assert.equal(threw, true);
+  assert.match(messages[0], /must be an object/);
+});
+
+test("validateDelegationTransportIdentity rejects an identity carrying an unsupported field", () => {
+  const { threw, messages } = collectFailure((fail) => (
+    validateDelegationTransportIdentity(transportIdentity({ extra: "unexpected" }), RUN_ID, DELEGATION_ID, fail)
+  ));
+  assert.equal(threw, true);
+  assert.match(messages[0], /unsupported field extra/);
+});
+
+test("validateDelegationTransportIdentity rejects an identity missing a required field", () => {
+  const value = transportIdentity();
+  delete value.cwd;
+  const { threw, messages } = collectFailure((fail) => validateDelegationTransportIdentity(value, RUN_ID, DELEGATION_ID, fail));
+  assert.equal(threw, true);
+  assert.match(messages[0], /transport identity cwd/);
+});
+
+test("validateDelegationTransportIdentity rejects an unsupported kind", () => {
+  const { threw, messages } = collectFailure((fail) => (
+    validateDelegationTransportIdentity(transportIdentity({ kind: "codex-delegation" }), RUN_ID, DELEGATION_ID, fail)
+  ));
+  assert.equal(threw, true);
+  assert.match(messages[0], /kind is unsupported/);
+});
+
+test("validateDelegationTransportIdentity rejects a relative sessionPath or cwd", () => {
+  const relativeSessionPath = collectFailure((fail) => (
+    validateDelegationTransportIdentity(transportIdentity({ sessionPath: "relative/session.jsonl" }), RUN_ID, DELEGATION_ID, fail)
+  ));
+  assert.equal(relativeSessionPath.threw, true);
+  assert.match(relativeSessionPath.messages[0], /sessionPath must be an absolute path/);
+
+  const relativeCwd = collectFailure((fail) => (
+    validateDelegationTransportIdentity(transportIdentity({ cwd: "relative/checkout" }), RUN_ID, DELEGATION_ID, fail)
+  ));
+  assert.equal(relativeCwd.threw, true);
+  assert.match(relativeCwd.messages[0], /cwd must be an absolute path/);
+});
+
+test("validateDelegationTransportIdentity rejects an oversized field", () => {
+  const { threw, messages } = collectFailure((fail) => (
+    validateDelegationTransportIdentity(transportIdentity({ pid: "1".repeat(129) }), RUN_ID, DELEGATION_ID, fail)
+  ));
+  assert.equal(threw, true);
+  assert.match(messages[0], /transport identity pid/);
+});
+
+test("validateDelegationTransportIdentity rejects an identity whose runId or delegationId does not match the caller's expectation", () => {
+  const wrongRun = collectFailure((fail) => validateDelegationTransportIdentity(transportIdentity(), "99999999-9999-4999-8999-999999999999", DELEGATION_ID, fail));
+  assert.equal(wrongRun.threw, true);
+  assert.match(wrongRun.messages[0], /does not match the delegation/);
+
+  const wrongDelegation = collectFailure((fail) => validateDelegationTransportIdentity(transportIdentity(), RUN_ID, "99999999-9999-4999-8999-999999999999", fail));
+  assert.equal(wrongDelegation.threw, true);
+  assert.match(wrongDelegation.messages[0], /does not match the delegation/);
+});
+
+test("validateDelegationTransportIdentity raises through the caller-supplied fail function rather than a fixed exception type", () => {
+  class CustomError extends Error {}
+  assert.throws(
+    () => validateDelegationTransportIdentity(null, RUN_ID, DELEGATION_ID, (message) => {
+      throw new CustomError(message);
+    }),
+    CustomError,
+  );
 });

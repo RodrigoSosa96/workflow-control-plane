@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { WorkflowError } from "./errors.js";
-import { reservationMatchesDelegation } from "./delegation-invariants.js";
+import { reservationMatchesDelegation, validateDelegationTransportIdentity } from "./delegation-invariants.js";
 
 const ALLOWED_KEYS = new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]);
 const HANDOFF_STATUSES = new Set(["completed", "blocked", "failed"]);
@@ -89,12 +89,15 @@ function recordFor(run, delegationId) {
   return structuredClone(record);
 }
 
+// Was the loosest of the four transport-identity checks: it verified only
+// kind/runId/delegationId, so a persisted identity missing sessionPath/cwd/
+// pid/processStartedAt, carrying the wrong type for any of them, or carrying
+// extra fields, passed through untouched. Delegating to the shared definition
+// (see delegation-invariants.js) makes this the same strict shape check
+// delegation-store.js already enforces when it first records the identity —
+// this call now catches state that drifted or was tampered with after that.
 function assertTransportIdentity(record, runId, delegationId) {
-  const identity = record.transportIdentity;
-  if (!identity || typeof identity !== "object") fail("Delegation transport identity is missing");
-  if (identity.kind !== "pi-delegation" || identity.runId !== runId || identity.delegationId !== delegationId) {
-    fail("Delegation transport identity does not match the active delegation");
-  }
+  validateDelegationTransportIdentity(record.transportIdentity, runId, delegationId, fail);
 }
 
 export async function submitDelegationHandoff({ runId, delegationId, input, store, delegations, reservations, claimToken } = {}) {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID as defaultRandomUUID } from "node:crypto";
 import { isAbsolute, join } from "node:path";
 import { classifyDelegationRole } from "./delegation-policy.js";
+import { validateDelegationTransportIdentity } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -104,25 +105,6 @@ function validateSession(value) {
   return session;
 }
 
-function validateTransportIdentity(value, runId, delegationId) {
-  assertObject(value, "transport identity");
-  assertExactKeys(value, new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]), "transport identity");
-  if (value.kind !== "pi-delegation") fail("transport identity kind is unsupported");
-  const identity = {
-    kind: "pi-delegation",
-    runId: assertString(value.runId, "transport identity runId", { limit: 128 }),
-    delegationId: assertString(value.delegationId, "transport identity delegationId", { limit: 128 }),
-    sessionPath: assertString(value.sessionPath, "transport identity sessionPath", { limit: MAX_SHORT_TEXT, absolute: true }),
-    cwd: assertString(value.cwd, "transport identity cwd", { limit: MAX_SHORT_TEXT, absolute: true }),
-    pid: assertString(value.pid, "transport identity pid", { limit: 128 }),
-    processStartedAt: assertString(value.processStartedAt, "transport identity processStartedAt", { limit: 128 }),
-  };
-  if (identity.runId !== runId || identity.delegationId !== delegationId) {
-    fail("transport identity does not match the delegation");
-  }
-  return identity;
-}
-
 function sameTransportIdentity(left, right) {
   return Boolean(
     left
@@ -146,7 +128,7 @@ function validateTransportIdentityReplacement(value, runId, delegationId) {
   }
   return {
     previousGeneration: value.previousGeneration,
-    previousIdentity: validateTransportIdentity(value.previousIdentity, runId, delegationId),
+    previousIdentity: validateDelegationTransportIdentity(value.previousIdentity, runId, delegationId, fail),
   };
 }
 
@@ -309,7 +291,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   }
 
   async function recordTransportIdentity({ runId, delegationId: id, identity, replacement } = {}) {
-    const transportIdentity = validateTransportIdentity(identity, runId, id);
+    const transportIdentity = validateDelegationTransportIdentity(identity, runId, id, fail);
     const transportReplacement = validateTransportIdentityReplacement(replacement, runId, id);
     return await updateRecord({
       runId,
@@ -444,7 +426,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       fail("expected delegation generation must be a positive integer");
     }
     const validatedClaimToken = validateClaimToken(claimToken);
-    const nextIdentity = validateTransportIdentity(identity, runId, id);
+    const nextIdentity = validateDelegationTransportIdentity(identity, runId, id, fail);
     return await updateRecord({
       runId,
       delegationId: id,

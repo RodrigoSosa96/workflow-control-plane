@@ -78,6 +78,18 @@ function assertAbsolutePath(value, context) {
   return resolve(assertString(value, context, { absolute: true }));
 }
 
+// Not migrated to delegation-invariants.js's validateDelegationTransportIdentity,
+// even though the two check the same key set and kind. That shared definition
+// validates an untrusted `value` against a caller-known-good runId/delegationId;
+// here there is no such reference to cross-check against — this transport is
+// handed back its own previously-issued identity (to observe, resume, or close),
+// so identity IS the source of truth, not a claim to verify. It also
+// canonicalizes sessionPath/cwd with path.resolve() (assertAbsolutePath) rather
+// than only checking isAbsolute(), because sessionDirectoryFromIdentity() and
+// ensureContained() compare these paths for containment: this module's whole
+// security model depends on paths being resolved consistently, which the shared
+// definition intentionally does not do. Two different jobs, not a laxer copy of
+// one.
 function assertTransportIdentity(value) {
   const identity = assertObject(value, "transport identity");
   assertExactKeys(identity, IDENTITY_KEYS, "transport identity");

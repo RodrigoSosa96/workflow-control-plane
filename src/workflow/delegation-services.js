@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { createPreparedDelegationRequest, validateSubagentRequestPolicy } from "./coordinator-policy.js";
 import { classifyDelegationRole, resolveDelegationPolicy } from "./delegation-policy.js";
+import { validateDelegationTransportIdentity } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
 import { assertWorkerTransport } from "./worker-transport.js";
 
@@ -244,25 +245,6 @@ function recordFor(run, delegationId) {
   return clone(record);
 }
 
-function validateTransportIdentity(identity, runId, delegationId) {
-  assertObject(identity, "transport identity");
-  assertExactKeys(identity, new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]), "transport identity");
-  if (identity.kind !== "pi-delegation") fail("transport identity kind is unsupported");
-  const validated = {
-    kind: "pi-delegation",
-    runId: assertString(identity.runId, "transport identity runId", { limit: 128 }),
-    delegationId: assertString(identity.delegationId, "transport identity delegationId", { limit: 128 }),
-    sessionPath: assertString(identity.sessionPath, "transport identity sessionPath", { limit: MAX_SHORT_TEXT, absolute: true }),
-    cwd: assertString(identity.cwd, "transport identity cwd", { limit: MAX_SHORT_TEXT, absolute: true }),
-    pid: assertString(identity.pid, "transport identity pid", { limit: 128 }),
-    processStartedAt: assertString(identity.processStartedAt, "transport identity processStartedAt", { limit: 128 }),
-  };
-  if (validated.runId !== runId || validated.delegationId !== delegationId) {
-    fail("transport identity does not match the approved delegation");
-  }
-  return validated;
-}
-
 function validateRemediationDelivery(delivered, runId, delegationId) {
   const value = assertObject(delivered, "transport remediation delivery");
   if (value.delivered === false) {
@@ -272,7 +254,7 @@ function validateRemediationDelivery(delivered, runId, delegationId) {
   }
   return {
     delivered: true,
-    identity: validateTransportIdentity(value.identity ?? value, runId, delegationId),
+    identity: validateDelegationTransportIdentity(value.identity ?? value, runId, delegationId, fail),
   };
 }
 
@@ -415,7 +397,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
         budget: clone(fresh.budget),
         remediationTurns: fresh.remediationTurns,
       });
-      const identity = validateTransportIdentity(started?.identity ?? started, fresh.runId, claimed.id);
+      const identity = validateDelegationTransportIdentity(started?.identity ?? started, fresh.runId, claimed.id, fail);
       const recorded = await delegations.recordTransportIdentity({
         runId: fresh.runId,
         delegationId: claimed.id,

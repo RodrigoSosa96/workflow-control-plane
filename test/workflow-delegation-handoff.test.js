@@ -302,6 +302,103 @@ test("delegationHandoffCommand reads only the canonical delegation input path an
   );
 });
 
+test("submitDelegationHandoff now rejects a transport identity with a malformed field even when kind/runId/delegationId still match", async (t) => {
+  // assertTransportIdentity used to check only kind/runId/delegationId, so a
+  // record whose persisted identity drifted or was tampered with after
+  // delegation-store.js recorded it (which validates the full strict shape)
+  // would still pass this layer's check as long as those three fields lined
+  // up. It now delegates to the same shared, strict shape check
+  // delegation-store.js uses, so a malformed field is caught here too.
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
+
+  await store.update(run.id, (current) => {
+    const record = current.delegations[DELEGATION_ID];
+    return {
+      delegations: {
+        ...current.delegations,
+        [DELEGATION_ID]: {
+          ...record,
+          transportIdentity: { ...record.transportIdentity, cwd: "relative/not-absolute" },
+        },
+      },
+    };
+  });
+
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput(),
+      store,
+      delegations,
+      reservations,
+      claimToken,
+      git: {},
+    }),
+    /transport identity cwd|absolute path/i,
+  );
+});
+
+test("submitDelegationHandoff now rejects a transport identity carrying an extra field the old check used to ignore", async (t) => {
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
+
+  await store.update(run.id, (current) => {
+    const record = current.delegations[DELEGATION_ID];
+    return {
+      delegations: {
+        ...current.delegations,
+        [DELEGATION_ID]: {
+          ...record,
+          transportIdentity: { ...record.transportIdentity, injected: "unexpected-field" },
+        },
+      },
+    };
+  });
+
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput(),
+      store,
+      delegations,
+      reservations,
+      claimToken,
+      git: {},
+    }),
+    /unsupported field injected/i,
+  );
+});
+
+test("submitDelegationHandoff now rejects a transport identity missing a required field the old check never inspected", async (t) => {
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
+
+  await store.update(run.id, (current) => {
+    const record = current.delegations[DELEGATION_ID];
+    const { pid, ...rest } = record.transportIdentity;
+    return {
+      delegations: {
+        ...current.delegations,
+        [DELEGATION_ID]: { ...record, transportIdentity: rest },
+      },
+    };
+  });
+
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput(),
+      store,
+      delegations,
+      reservations,
+      claimToken,
+      git: {},
+    }),
+    /transport identity pid/i,
+  );
+});
+
 test("submitDelegationHandoff rejects a sibling forging a first-generation result without the claim token", async (t) => {
   // Run ID, delegation ID, and generation are all discoverable by any same-user
   // process: a sibling delegation can enumerate them under the run directory.
