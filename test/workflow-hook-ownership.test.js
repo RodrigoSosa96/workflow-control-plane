@@ -13,18 +13,21 @@
 // its start time cannot change between them; that is what makes asserting equality (not just
 // "looks like an ISO string") sound without sleeps or retries.
 //
-// The `ps -p <pid> -o lstart= -o state=` argv is written a third time below, in
-// observeViaUnlockPath: it already exists, unexported, as ownership.js's spawnPsStatus (the
-// write side) and inside bin/workflow.js's inspectDelegationPid (the read side), and neither is
-// exported for a test to import instead. Noted in this task's report; a deferred finding already
-// tracks the two existing copies.
+// The `ps -p <pid> -o lstart= -o state=` argv observeViaUnlockPath below runs comes from
+// process-observation.js's exported psStatusArgv -- the single source ownership.js's
+// spawnPsStatus (the write side) and bin/workflow.js's inspectDelegationPid (the read side) also
+// route through, so this test can never drift from what production actually runs.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { realpath } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
-import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
+import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
 import { createProcessRunner } from "../src/workflow/process.js";
+import { createRunStore } from "../src/workflow/run-store.js";
+import { RUN_STATES } from "../src/workflow/run-state.js";
 
 // The exact runner wiring bin/workflow.js's inspectDelegationPid uses for `workflow unlock`'s
 // observation side: the real createProcessRunner, `ps` invoked with allowFailure so a non-zero
@@ -36,7 +39,7 @@ const runner = createProcessRunner();
 async function observeViaUnlockPath(pid) {
   return inspectExactProcessByPid(pid, {
     async runProcess(resolvedPid) {
-      return runner.run("ps", ["-p", String(resolvedPid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
+      return runner.run("ps", psStatusArgv(resolvedPid), { allowFailure: true });
     },
     readCwd: realpath,
   });
@@ -75,3 +78,61 @@ test("createSubprocessOwnOwnershipReader's pid is String(process.pid)", async (t
 
   assert.equal(result.pid, String(process.pid));
 });
+
+// --- ordering: the read must happen before the mutex is acquired, never while held -----------
+//
+// 1.1's task-2 review deliberately moved the own-ownership read out of acquireLock's/acquireGate's
+// critical section: a slow `ps` spawn must never run while the mkdir-based mutex is held, both to
+// protect the bounded lock-contention retry budget and to avoid widening the window where the
+// active-lock directory exists with no marker yet. Nothing pins that ordering as a checkable
+// property -- it is only true because of where the `await readOwnOwnership()` line happens to sit
+// in run-store.js's acquireLock (see the comment there). This test makes it a fact a future edit
+// cannot silently break: readOwnOwnership records whether the active-lock directory exists at the
+// exact moment it is invoked, and the read must observe it does NOT exist yet.
+
+test("readOwnOwnership is invoked before the active lock directory exists (the read precedes acquisition, never runs while the mutex is held)", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "workflow-hook-ownership-ordering-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const runId = "11111111-1111-4111-8111-111111111111";
+  // Mirrors run-store.js's own layout (runDirectoryFor -> resolve(root, id); acquireLock's
+  // lockContainer -> join(directory, "run.lock"); activePath -> join(lockContainer, "active") --
+  // ACTIVE_LOCK_DIR). Computed independently here, from the fixed stateRoot/runId this test
+  // controls, rather than imported from run-store.js's internals.
+  const activeLockPath = join(root, runId, "run.lock", "active");
+
+  let activeLockExistedDuringRead;
+  const store = createRunStore({
+    stateRoot: root,
+    randomUUID: () => runId,
+    clock: { now: () => "2025-01-01T00:00:00.000Z" },
+    async readOwnOwnership() {
+      activeLockExistedDuringRead = await pathExists(activeLockPath);
+      return { pid: "1", startedAt: "2025-01-01T00:00:00.000Z" };
+    },
+  });
+
+  await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    relatedTickets: [],
+    state: RUN_STATES.PLANNED,
+  });
+
+  assert.equal(
+    activeLockExistedDuringRead,
+    false,
+    "readOwnOwnership ran while the active lock directory already existed -- the ownership read "
+    + "must complete before the mutex is acquired, not during or after",
+  );
+});
+
+async function pathExists(path) {
+  try {
+    await realpath(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return false;
+    throw error;
+  }
+}

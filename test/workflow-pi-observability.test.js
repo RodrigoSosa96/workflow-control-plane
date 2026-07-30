@@ -103,6 +103,13 @@ test("records lifecycle, tool, usage, and model through Pi events and renders re
       WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
       WORKFLOW_GENERATION: "1",
     },
+    // This suite is hermetic by default (mkdtemp isolation, injected clocks/runners); a real
+    // `ps` spawn is opt-in only, never incidental. Without this, the extension's fallback store
+    // construction uses its real, module-scope createSubprocessOwnOwnershipReader default,
+    // which spawns actual `ps` on the first lock acquisition. These tests exercise a real
+    // temp-dir-backed store on purpose (filesystem fidelity for telemetry/widget assertions) --
+    // only the process inspection needs to be inert here.
+    readOwnOwnership: async () => null,
   })(pi);
 
   const ctx = createContext();
@@ -166,6 +173,13 @@ test("does not render widget in json/print mode but still records telemetry", as
       WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
       WORKFLOW_GENERATION: "1",
     },
+    // This suite is hermetic by default (mkdtemp isolation, injected clocks/runners); a real
+    // `ps` spawn is opt-in only, never incidental. Without this, the extension's fallback store
+    // construction uses its real, module-scope createSubprocessOwnOwnershipReader default,
+    // which spawns actual `ps` on the first lock acquisition. These tests exercise a real
+    // temp-dir-backed store on purpose (filesystem fidelity for telemetry/widget assertions) --
+    // only the process inspection needs to be inert here.
+    readOwnOwnership: async () => null,
   })(pi);
 
   const ctx = createContext({ mode: "json", hasUI: false });
@@ -198,6 +212,13 @@ test("ignores non-assistant message_end without crashing", async () => {
       WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
       WORKFLOW_GENERATION: "1",
     },
+    // This suite is hermetic by default (mkdtemp isolation, injected clocks/runners); a real
+    // `ps` spawn is opt-in only, never incidental. Without this, the extension's fallback store
+    // construction uses its real, module-scope createSubprocessOwnOwnershipReader default,
+    // which spawns actual `ps` on the first lock acquisition. These tests exercise a real
+    // temp-dir-backed store on purpose (filesystem fidelity for telemetry/widget assertions) --
+    // only the process inspection needs to be inert here.
+    readOwnOwnership: async () => null,
   })(pi);
 
   const ctx = createContext();

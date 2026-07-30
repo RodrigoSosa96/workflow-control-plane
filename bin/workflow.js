@@ -36,7 +36,7 @@ import { createDelegationReservationStore } from "../src/workflow/delegation-res
 import { createOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
-import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
+import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
 import { createPiDelegationTransport as defaultCreatePiDelegationTransport } from "../src/workflow/pi-delegation-transport.js";
 import { loadRegistry as defaultLoadRegistry } from "../src/workflow/registry.js";
 import { lookupExecutable, resolveWorkflowProjectsFile } from "../src/workflow/runtime-config.js";
@@ -510,7 +510,7 @@ async function inspectDelegationPid(pid, { runner, cwdFallback, readCwd = fsReal
   try {
     return await inspectExactProcessByPid(pid, {
       async runProcess(resolvedPid) {
-        return await runner.run("ps", ["-p", String(resolvedPid), "-o", "lstart=", "-o", "state="], { allowFailure: true });
+        return await runner.run("ps", psStatusArgv(resolvedPid), { allowFailure: true });
       },
       readCwd,
       cwdFallback,

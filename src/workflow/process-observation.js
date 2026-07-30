@@ -1,5 +1,18 @@
 const PS_STATUS_RE = /^(?<startedAt>[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(?<state>[A-Z]+)/u;
 
+// The one `ps` argv every own-ownership observation site must share, byte-for-byte:
+// ownership.js's spawnPsStatus (the write side, invoked from acquireLock/acquireGate before a
+// mutex is taken), bin/workflow.js's inspectDelegationPid (the read side `workflow unlock` uses
+// to observe an arbitrary owner), and workflow-hook-ownership.test.js's own unlock-path test
+// helper. classifyOwnership (ownership.js) compares startedAt for exact string equality: a
+// hook's own marker and unlock's later observation of it must come from the exact same `ps`
+// invocation and parse, or a live owner risks being misclassified as proven-dead and its lock
+// removed out from under it. This lives here, next to the parse (parsePsProcessStatus) that
+// reads what this argv produces, so the write shape and the read shape can never drift apart.
+export function psStatusArgv(pid) {
+  return ["-p", String(pid), "-o", "lstart=", "-o", "state="];
+}
+
 function fail(message) {
   throw new TypeError(message);
 }

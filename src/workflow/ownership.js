@@ -8,7 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
-import { inspectExactProcessByPid } from "./process-observation.js";
+import { inspectExactProcessByPid, psStatusArgv } from "./process-observation.js";
 
 // Exported so commands.js's observe-and-classify plumbing (observeOwner, ownerMarkerVersion)
 // shares this one guard instead of hand-rolling the same "plain object, not an array" check --
@@ -79,19 +79,20 @@ export function createOwnOwnershipReader({ inspectProcess, pid = String(process.
   };
 }
 
-// The one `ps` argv this module ever builds — byte-for-byte the same command and args
-// bin/workflow.js's inspectDelegationPid already runs (`ps -p <pid> -o lstart= -o state=`
-// through a process runner with allowFailure: true). Marker verdicts hinge on `startedAt`
-// string equality (classifyOwnership above), so a hook's own marker and unlock's later
-// observation of it must come from the exact same invocation and parse; a second, drifted
-// `ps` argv here would risk misclassifying a live owner as proven dead. Resolves rather than
-// rejects on a non-zero exit — inspectExactProcessByPid's runProcess contract needs that,
-// since a `ps` exit of 1 with empty stdout/stderr is how it proves a pid is gone.
+// The `ps` invocation this module runs — byte-for-byte the same command and args
+// bin/workflow.js's inspectDelegationPid already runs (through a process runner with
+// allowFailure: true), because both build on process-observation.js's shared psStatusArgv.
+// Marker verdicts hinge on `startedAt` string equality (classifyOwnership above), so a hook's
+// own marker and unlock's later observation of it must come from the exact same invocation and
+// parse; that is why the argv itself is a single exported function, not a literal repeated
+// here. Resolves rather than rejects on a non-zero exit — inspectExactProcessByPid's runProcess
+// contract needs that, since a `ps` exit of 1 with empty stdout/stderr is how it proves a pid
+// is gone.
 function spawnPsStatus(pid) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], { shell: false });
+      child = spawn("ps", psStatusArgv(pid), { shell: false });
     } catch (error) {
       reject(error);
       return;
