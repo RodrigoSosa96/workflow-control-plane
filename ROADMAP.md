@@ -1,6 +1,6 @@
 # Control Plane Hardening Roadmap
 
-**Creado:** 2026-07-29 · **Fuente:** review multi-agente profunda — evidencia completa con `archivo:línea` en [`docs/superpowers/reviews/2026-07-29-multi-agent-deep-review.md`](docs/superpowers/reviews/2026-07-29-multi-agent-deep-review.md). Los IDs `D1`–`D18` referencian los hallazgos de esa review.
+**Creado:** 2026-07-29 · **Fuente:** review multi-agente profunda — evidencia completa con `archivo:línea` en [`docs/superpowers/reviews/2026-07-29-multi-agent-deep-review.md`](docs/superpowers/reviews/2026-07-29-multi-agent-deep-review.md). Los IDs `D1`–`D18` referencian los hallazgos de esa review. Los patrones atribuidos a oh-my-pi salen del checkout read-only en `~/projects/references/oh-my-pi` (ver `AGENTS.md`, "Reference material").
 
 **Cómo usar este documento:** cada ítem es una unidad de trabajo pequeña (idealmente un commit/PR). Marcá el checkbox al completar y anotá el commit al lado (`- [x] 0.1 … (abc1234)`). Los ítems de Fase 0 son fixes directos: no necesitan diseño previo, sí tests. Los de Fases 1–4 no triviales siguen el flujo normal del repo (brainstorm → spec en `docs/superpowers/specs/` → plan en `docs/superpowers/plans/` → implementación). Dentro de cada batch el orden es el recomendado; entre batches no hay dependencia salvo que se indique.
 

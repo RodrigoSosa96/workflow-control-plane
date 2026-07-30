@@ -22,6 +22,18 @@ This repository coordinates Rodrigo's AI-assisted development workflows across p
 - Do not expose secrets from `.env`, credentials, auth stores, or project integrations.
 - Do not deploy, mutate production data, or run destructive migrations without explicit approval.
 - Follow the target repository's own `AGENTS.md`, `CLAUDE.md`, and local skills after entering it.
+- Never clone reference material into this repository. Read-only reference checkouts live in `~/projects/references/` (see below).
+
+## Reference material
+
+Third-party codebases consulted for design comparison are cloned, read-only, under `~/projects/references/` — never inside this repo, which must not contain copies of other projects' source. Current checkouts:
+
+| Path | What it is | Why it is here |
+|---|---|---|
+| `~/projects/references/oh-my-pi` | [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi), a Bun/TypeScript + Rust fork of Pi | Closest architectural sibling to this control plane; source for the ownership-marker, session-contract, and swarm-orchestration patterns cited in `docs/superpowers/reviews/` and `ROADMAP.md` |
+| `~/projects/references/terminal`, `dokploy`, `ui` | Unrelated reference checkouts | Pre-existing; not used by this control plane |
+
+Keep them current with `git -C ~/projects/references/<name> pull` when a design question depends on recent upstream behavior.
 
 ## Workflow stages
 
