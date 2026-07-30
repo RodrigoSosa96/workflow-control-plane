@@ -474,6 +474,13 @@ function createLiveDependencies(dependencies) {
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
     inspectProcessByPid,
+    // Exposed so commands.js's storeForCommand/reservationsForCommand can thread this SAME
+    // reader through when they build their own store/reservations lazily -- the normal path
+    // whenever WORKFLOW_STATE_ROOT is unset (the documented default; state_root then comes from
+    // the registry instead, see stateRootForCommand), since `store`/`reservations` below are only
+    // pre-built here when `stateRoot` is already known. Without this, that default-configuration
+    // path would silently fall back to each store's own `readOwnOwnership: async () => null`.
+    readOwnOwnership,
     store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot, onListProblem: reportListProblem, readOwnOwnership }) : undefined),
     // Real wiring for launch.js's best-effort Codex hook install (see isCodexInteractiveAgent
     // there): only assembled here, at the live-dependency boundary, so that unit tests of

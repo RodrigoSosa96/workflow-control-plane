@@ -2,14 +2,15 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import * as realFs from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { main, parseArgs } from "../bin/workflow.js";
-import { delegationRemediateCommand as defaultDelegationRemediateCommand } from "../src/workflow/commands.js";
+import { delegationGateClearCommand as defaultDelegationGateClearCommand, delegationRemediateCommand as defaultDelegationRemediateCommand } from "../src/workflow/commands.js";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
 import { createDelegationServices } from "../src/workflow/delegation-services.js";
 import { createDelegationStore } from "../src/workflow/delegation-store.js";
@@ -1495,12 +1496,15 @@ test("unlock propagates a non-zero exitCode (the refused/11 conflict case) from 
   assert.deepEqual(output.stdout, ["unlock:refused"]);
 });
 
-test("main wires unlock with the real run store and the shared ps-based process inspector, reused (not rebuilt) across store operations", async () => {
-  // Proves the two wiring jobs: (1) unlock's process inspector reuses the same `ps -p <pid> -o
-  // lstart= -o state=` invocation the delegation transport paths already use, and (2) that
-  // SAME inspector reaches the constructed run store as readOwnOwnership, memoized to exactly
-  // one `ps` call for the whole CLI invocation, no matter how many times the store acquires its
-  // own lock.
+test("main wires unlock with the real run store and the shared ps-based process inspector, reused (not rebuilt) across store operations, and the reader actually reaches the written lock marker", async () => {
+  // Proves three wiring jobs: (1) unlock's process inspector reuses the same `ps -p <pid> -o
+  // lstart= -o state=` invocation the delegation transport paths already use, (2) that SAME
+  // inspector reaches the constructed run store as readOwnOwnership, memoized to exactly one
+  // `ps` call for the whole CLI invocation no matter how many times the store acquires its own
+  // lock, and (3) -- the discriminating part a bare ps-call count cannot prove on its own, per
+  // Task 5 review round 2 -- that the reader's result actually lands in the marker acquireLock
+  // writes: the marker read WHILE the lock is held (inside store.update's own updater, the same
+  // hook workflow-run-store.test.js uses to observe it) carries this process's real pid.
   const dir = await mkdtemp(join(tmpdir(), "workflow-unlock-wiring-"));
   const stateRoot = join(dir, "state");
   const psCalls = [];
@@ -1511,6 +1515,7 @@ test("main wires unlock with the real run store and the shared ps-based process 
     },
   };
 
+  let observedMarker = null;
   const output = io();
   const code = await main(["unlock", RUN_ID], {
     ...output,
@@ -1527,8 +1532,16 @@ test("main wires unlock with the real run store and the shared ps-based process 
       assert.ok(unlockDeps.store);
       // Two independent lock acquisitions through the real, non-overridden store -- if
       // readOwnOwnership were not wired through, acquireLock would never call `ps` at all.
-      await unlockDeps.store.create({ runId: RUN_ID, projectAlias: "ocr", task: "ASANA-1" });
-      await unlockDeps.store.update(RUN_ID, () => ({}));
+      const run = await unlockDeps.store.create({ runId: RUN_ID, projectAlias: "ocr", task: "ASANA-1" });
+      const activePath = join(run.directory, "run.lock", "active");
+      await unlockDeps.store.update(RUN_ID, async () => {
+        // The lock is held for the duration of this updater -- read the live marker straight off
+        // disk, exactly as workflow-run-store.test.js's own "acquired lock marker ... carries
+        // pid, startedAt" test does, rather than inferring wiring from a call count alone.
+        const [markerName] = await realFs.readdir(activePath);
+        observedMarker = JSON.parse(await readFile(join(activePath, markerName), "utf8"));
+        return {};
+      });
       return { command: "unlock", runId: RUN_ID, action: "no-lock", exitCode: 0 };
     },
     formatWorkflowResult: (command, value) => `${command}:${value.action}`,
@@ -1544,6 +1557,12 @@ test("main wires unlock with the real run store and the shared ps-based process 
     argv: ["-p", String(process.pid), "-o", "lstart=", "-o", "state="],
     options: { allowFailure: true },
   }]);
+  // The stronger assertion: if readOwnOwnership were NOT threaded into the store (silently
+  // falling back to createRunStore's own `readOwnOwnership: async () => null` default), the
+  // marker would carry no pid/startedAt at all and this would fail outright rather than merely
+  // under-counting `ps` calls.
+  assert.equal(observedMarker.pid, String(process.pid));
+  assert.ok(observedMarker.startedAt);
 });
 
 test("workflow unlock end-to-end: classifies a proven-missing owner from a real crashed lock and removes it, using the reused ps wiring", async () => {
@@ -1641,9 +1660,15 @@ test("delegation gate-clear propagates a non-zero exitCode (the refused/11 confl
 test("main wires delegation gate-clear with the real reservation store, sharing (not rebuilding) the run store's own ps-based readOwnOwnership reader", async () => {
   // Proves the wiring the task brief calls out explicitly: bin/workflow.js must construct
   // exactly one readOwnOwnership reader per process and pass that SAME reader to both the run
-  // store and the reservation store -- never a second one for reservations. If a second reader
-  // were constructed, this test's two independent mutex acquisitions (one through each store)
-  // would spend two `ps` calls instead of one.
+  // store and the reservation store -- never a second one for reservations.
+  //
+  // Task 5 review round 2: the original version of this test called store.create() BEFORE
+  // reservations.reserve() and only checked the FINAL total (psCalls.length === 1). That does
+  // not discriminate the actual failure mode ("reservations silently built with the default
+  // null reader instead of the shared one"): a broken reservations reader contributes ZERO `ps`
+  // calls, same as a correctly-SHARED (already-memoized) one, so the final total is 1 either
+  // way. Reordering to call reservations.reserve() FIRST, alone, closes that gap: a null reader
+  // means the assertion right after it fires with 0, not 1.
   const dir = await mkdtemp(join(tmpdir(), "workflow-gate-clear-wiring-"));
   const stateRoot = join(dir, "state");
   const psCalls = [];
@@ -1668,7 +1693,10 @@ test("main wires delegation gate-clear with the real reservation store, sharing 
       assert.equal(gateDeps.inspectProcess, gateDeps.inspectProcessByPid);
       assert.ok(gateDeps.store);
       assert.ok(gateDeps.reservations);
-      await gateDeps.store.create({ runId: RUN_ID, projectAlias: FIXTURE_PROJECT_ALIAS, task: "ASANA-1" });
+
+      // Reservations acquires ALONE first: if its own reader were the default null stub instead
+      // of the shared one, this spends zero `ps` calls, and the assertion below catches it
+      // immediately -- rather than being masked by a `ps` call the run store spends later.
       await gateDeps.reservations.reserve({
         projectAlias: FIXTURE_PROJECT_ALIAS,
         delegationId: DELEGATION_ID,
@@ -1677,6 +1705,13 @@ test("main wires delegation gate-clear with the real reservation store, sharing 
         checkoutPath: FIXTURE_CWD,
         policy: FIXTURE_POLICY,
       });
+      assert.equal(psCalls.length, 1, "reservations.reserve alone must spend the one shared ps call");
+
+      // The run store's own acquisition must REUSE that same memoized call, not spend a second
+      // one (proving one reader per process, not two).
+      await gateDeps.store.create({ runId: RUN_ID, projectAlias: FIXTURE_PROJECT_ALIAS, task: "ASANA-1" });
+      assert.equal(psCalls.length, 1, "store.create must reuse the memoized reader, not spend a second ps call");
+
       return { command: "delegation-gate-clear", projectAlias: FIXTURE_PROJECT_ALIAS, action: "no-gate", exitCode: 0 };
     },
     formatWorkflowResult: (command, value) => `${command}:${value.action}`,
@@ -1685,6 +1720,111 @@ test("main wires delegation gate-clear with the real reservation store, sharing 
   assert.equal(code, 0);
   assert.deepEqual(output.stdout, ["delegation-gate-clear:no-gate"]);
   // Exactly one `ps` call for the whole invocation, shared across both mutex acquisitions.
+  assert.deepEqual(psCalls, [{
+    command: "ps",
+    argv: ["-p", String(process.pid), "-o", "lstart=", "-o", "state="],
+    options: { allowFailure: true },
+  }]);
+});
+
+// Wraps fs.readFile to capture the raw bytes of a single target path the first time it is read,
+// without altering what the caller sees. Mirrors workflow-delegation-reservations.test.js's own
+// fsCapturingRead: used to observe the gate owner marker's exact content while releaseGate reads
+// it (immediately before deleting it), since a successful reserve() releases the gate before
+// returning and leaves nothing on disk to inspect afterward.
+function fsCapturingReadForCliWiring(targetPath) {
+  const captured = { text: null };
+  const fs = {
+    ...realFs,
+    async readFile(path, encoding) {
+      const text = await realFs.readFile(path, encoding);
+      if (path === targetPath && captured.text === null) captured.text = text;
+      return text;
+    },
+  };
+  return { fs, captured };
+}
+
+test("main resolves the run store and reservation store from the registry's state_root (WORKFLOW_STATE_ROOT unset, the documented default) and still threads the single shared readOwnOwnership reader into both, producing provable owner markers", async () => {
+  // Task 5 review round 2, finding 1: bin/workflow.js only pre-builds `store`/`reservations`
+  // (with readOwnOwnership) when WORKFLOW_STATE_ROOT is set. That env var is normally UNSET --
+  // projects.yaml's launcher.state_root is the documented, normal source (see
+  // workflow-resume-close-commands.test.js's "registry-configured path" test for the run-store
+  // precedent) -- so in the default configuration, `store`/`reservations` arrive undefined here
+  // and commands.js's storeForCommand/reservationsForCommand must build them lazily instead. The
+  // two prior wiring tests above never exercise that fallback at all, since they both hand
+  // `stateRoot` directly to `main()`, which takes the pre-built branch. This test forces the
+  // fallback branch by leaving `stateRoot` out of `main()`'s dependencies entirely and supplying
+  // it only via a mocked registry, exactly as the real CLI does when the env var is unset.
+  const dir = await mkdtemp(join(tmpdir(), "workflow-gate-clear-registry-wiring-"));
+  const stateRoot = join(dir, "state");
+  const psCalls = [];
+  const runner = {
+    async run(command, argv, options) {
+      psCalls.push({ command, argv, options });
+      return { code: 0, stdout: "Wed Jan  1 00:10:00 2025 S\n" };
+    },
+  };
+
+  const output = io();
+  const code = await main(["delegation", "gate-clear", FIXTURE_PROJECT_ALIAS], {
+    ...output,
+    env: { WORKFLOW_PROJECTS_FILE: "/tmp/projects.yaml" }, // WORKFLOW_STATE_ROOT deliberately absent
+    runner,
+    loadRegistry: async () => ({ ...FIXTURE_REGISTRY, launcher: { ...FIXTURE_REGISTRY.launcher, state_root: stateRoot } }),
+    delegationGateClearCommand: async (options, gateDeps) => {
+      // Confirms this test actually reached the fallback branch, not the pre-built one: with
+      // WORKFLOW_STATE_ROOT unset and no dependencies.stateRoot, createLiveDependencies never
+      // constructs `store`/`reservations` itself.
+      assert.equal(gateDeps.store, undefined);
+      assert.equal(gateDeps.reservations, undefined);
+      // The fix's other half: bin/workflow.js must still expose the single per-process reader on
+      // the deps bag so storeForCommand/reservationsForCommand can thread it through when they
+      // build their own store/reservations, exactly the way the pre-built branch already did.
+      assert.equal(typeof gateDeps.readOwnOwnership, "function");
+
+      // Mirrors storeForCommand's/reservationsForCommand's own fallback construction call
+      // exactly (same two constructor arguments, same public factories) to observe what a
+      // marker acquired through THIS reader looks like -- gateDeps.reservations/.store cannot be
+      // used directly here since delegationGateClearCommand's real body only ever inspects/clears
+      // (never acquires), so there is no other way to observe an acquisition through this exact
+      // deps.readOwnOwnership without either invoking the private helpers directly (unexported)
+      // or reimplementing their one-line construction, which is what this does.
+      const probeStore = createRunStore({ stateRoot, readOwnOwnership: gateDeps.readOwnOwnership });
+      const probeRun = await probeStore.create({ runId: RUN_ID, projectAlias: FIXTURE_PROJECT_ALIAS, task: "ASANA-1" });
+      let lockMarker = null;
+      await probeStore.update(RUN_ID, async () => {
+        const activePath = join(probeRun.directory, "run.lock", "active");
+        const [markerName] = await realFs.readdir(activePath);
+        lockMarker = JSON.parse(await readFile(join(activePath, markerName), "utf8"));
+        return {};
+      });
+      assert.equal(lockMarker.pid, String(process.pid));
+      assert.ok(lockMarker.startedAt);
+
+      const { fs: capturingFs, captured } = fsCapturingReadForCliWiring(join(stateRoot, "delegation-reservations", "projects", createHash("sha256").update(FIXTURE_PROJECT_ALIAS, "utf8").digest("hex"), "gate", "active", "owner.json"));
+      const probeReservations = createDelegationReservationStore({ stateRoot, fs: capturingFs, readOwnOwnership: gateDeps.readOwnOwnership });
+      await probeReservations.reserve({
+        projectAlias: FIXTURE_PROJECT_ALIAS,
+        delegationId: DELEGATION_ID,
+        role: "code-reviewer",
+        mode: "background",
+        checkoutPath: FIXTURE_CWD,
+        policy: FIXTURE_POLICY,
+      });
+      assert.ok(captured.text, "expected releaseGate to have read the gate owner marker before deleting it");
+      const gateMarker = JSON.parse(captured.text);
+      assert.equal(gateMarker.pid, String(process.pid));
+      assert.ok(gateMarker.startedAt);
+
+      return await defaultDelegationGateClearCommand(options, gateDeps);
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(output.stdout, ["delegation-gate-clear:no-gate"]);
+  // The one real reader is shared: exactly one `ps` call across both probe acquisitions.
   assert.deepEqual(psCalls, [{
     command: "ps",
     argv: ["-p", String(process.pid), "-o", "lstart=", "-o", "state="],

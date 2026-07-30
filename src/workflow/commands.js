@@ -687,7 +687,13 @@ async function storeForCommand(options = {}, deps = {}) {
   if (deps.store) return deps.store;
   const stateRoot = await stateRootForCommand(options, deps);
   const factory = deps.createRunStore ?? createRunStore;
-  return factory({ stateRoot });
+  // deps.readOwnOwnership is bin/workflow.js's single per-process reader (see createLiveDependencies).
+  // Threading it through here matters specifically when deps.store was NOT pre-built there --
+  // i.e. WORKFLOW_STATE_ROOT is unset, the documented default, where stateRoot instead comes from
+  // the registry a few lines up. Without this, that (normal) path would silently fall back to
+  // createRunStore's own `readOwnOwnership: async () => null` default, and every lock marker this
+  // store's own acquireLock writes would carry no pid/startedAt for `workflow unlock` to prove.
+  return factory({ stateRoot, readOwnOwnership: deps.readOwnOwnership });
 }
 
 async function telemetryForCommand(options = {}, deps = {}) {
@@ -744,7 +750,12 @@ export async function workerWatchCommand(options = {}, deps = {}) {
 async function reservationsForCommand(options = {}, deps = {}) {
   if (deps.reservations) return deps.reservations;
   const stateRoot = await stateRootForCommand(options, deps);
-  return createDelegationReservationStore({ stateRoot });
+  const factory = deps.createDelegationReservationStore ?? createDelegationReservationStore;
+  // Same reasoning, and the same single reader, as storeForCommand's readOwnOwnership threading
+  // above -- this is the fallback path deps.reservations takes when bin/workflow.js did NOT
+  // pre-build it (WORKFLOW_STATE_ROOT unset), which is `delegation release`/`remediate`/`runtime`'s
+  // normal, documented configuration, not an edge case.
+  return factory({ stateRoot, readOwnOwnership: deps.readOwnOwnership });
 }
 
 async function delegationStoresForCommand(options = {}, deps = {}) {

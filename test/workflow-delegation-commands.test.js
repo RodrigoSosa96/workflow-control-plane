@@ -818,3 +818,37 @@ test("delegation gate-clear rejects an unknown project alias as a preflight fail
     (error) => /Unknown workflow project/i.test(error.message),
   );
 });
+
+test("delegation gate-clear threads deps.readOwnOwnership into reservationsForCommand's fallback store construction when deps.reservations is not pre-supplied", async () => {
+  // Task 5 review round 2, finding 1's other half (see the analogous unlock test in
+  // workflow-commands.test.js): whenever WORKFLOW_STATE_ROOT is unset (the CLI's documented
+  // default), bin/workflow.js does not pre-build `reservations`; reservationsForCommand must
+  // construct it lazily itself and must pass deps.readOwnOwnership into that construction, or
+  // every gate acquireGate ever writes through the resulting store carries no pid/startedAt --
+  // `workflow delegation gate-clear` would then classify it "unprovable" forever, refusing with
+  // exit 11 even when the owner is provably dead. deps.createDelegationReservationStore is a
+  // spy standing in for the real factory (the same injection-seam pattern storeForCommand
+  // already had, added to reservationsForCommand as part of this fix), so it directly observes
+  // what reservationsForCommand passed it, without needing a real gate acquisition.
+  const calls = [];
+  const fakeReadOwnOwnership = async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" });
+  const stubReservations = {
+    async inspectGate() {
+      return null;
+    },
+  };
+  const createDelegationReservationStoreSpy = (args) => {
+    calls.push(args);
+    return stubReservations;
+  };
+
+  const result = await delegationGateClearCommand(
+    { projectAlias: PROJECT_ALIAS, registryPath: "/tmp/projects.yaml", stateRoot: "/state/workflow" },
+    deps({ readOwnOwnership: fakeReadOwnOwnership, createDelegationReservationStore: createDelegationReservationStoreSpy }),
+  );
+
+  assert.equal(result.action, "no-gate");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].stateRoot, "/state/workflow");
+  assert.equal(calls[0].readOwnOwnership, fakeReadOwnOwnership);
+});

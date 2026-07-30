@@ -1000,3 +1000,37 @@ test("the unconfirmed path never calls removeLock, across no-lock, refused, and 
     assert.deepEqual(store.removeLockCalls, []);
   }
 });
+
+test("unlock threads deps.readOwnOwnership into storeForCommand's fallback store construction when deps.store is not pre-supplied", async () => {
+  // Task 5 review round 2, finding 1: whenever WORKFLOW_STATE_ROOT is unset (the CLI's
+  // documented default -- projects.yaml's launcher.state_root is the normal source), bin/
+  // workflow.js does not pre-build `store`; storeForCommand must construct it lazily itself and
+  // must pass deps.readOwnOwnership into that construction, or every lock acquireLock ever
+  // writes through the resulting store carries no pid/startedAt -- `workflow unlock` would then
+  // classify it "unprovable" forever. This is the precise, load-bearing regression test for that
+  // one line in storeForCommand: deps.createRunStore stands in for the real factory (an existing
+  // injection seam storeForCommand already had before this fix), so it directly observes what
+  // storeForCommand passed it, without needing a real lock acquisition, herdr mocks, or
+  // filesystem tricks.
+  const calls = [];
+  const fakeReadOwnOwnership = async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" });
+  const stubStore = {
+    async inspectLock() {
+      return null;
+    },
+  };
+  const createRunStoreSpy = (args) => {
+    calls.push(args);
+    return stubStore;
+  };
+
+  const result = await unlockCommand(
+    { runId: UNLOCK_RUN_ID },
+    { stateRoot: "/state/workflow", readOwnOwnership: fakeReadOwnOwnership, createRunStore: createRunStoreSpy },
+  );
+
+  assert.equal(result.action, "no-lock");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].stateRoot, "/state/workflow");
+  assert.equal(calls[0].readOwnOwnership, fakeReadOwnOwnership);
+});
