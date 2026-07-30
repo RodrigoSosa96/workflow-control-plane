@@ -25,11 +25,13 @@ import {
   resultCommand as defaultResultCommand,
   resumeCommand as defaultResumeCommand,
   statusCommand as defaultStatusCommand,
+  unlockCommand as defaultUnlockCommand,
   workerStatusCommand as defaultWorkerStatusCommand,
   workerWatchCommand as defaultWorkerWatchCommand,
 } from "../src/workflow/commands.js";
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { ensureCodexWorkerHooks as defaultEnsureCodexWorkerHooks } from "../src/workflow/codex-hooks.js";
+import { createOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
 import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
@@ -52,6 +54,7 @@ Commands:
   workflow reconcile [project] --run <run-id> [--format compact|json]
   workflow resume <run-id> [--yes] [--format compact|json]
   workflow close <run-id> [--format compact|json]
+  workflow unlock <run-id> [--yes] [--format compact|json]
   workflow worker status <run-id> [--format compact|json]
   workflow worker watch <run-id> [--format compact|json]
   workflow runtime <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--profile <name>] [--format compact|json] [--yes]
@@ -338,6 +341,17 @@ export function parseArgs(argv) {
     };
   }
 
+  if (command === "unlock") {
+    validateShape("unlock", positionals, options, { min: 1, max: 1, allowedOptions: ["yes"] });
+    assertPathSafeUuidSyntax(positionals[0], "unlock run ID");
+    return {
+      command,
+      runId: positionals[0],
+      ...(options.yes ? { yes: true } : {}),
+      format,
+    };
+  }
+
   const baseOptions = {
     command,
     projectAlias: positionals[0],
@@ -402,6 +416,18 @@ function createLiveDependencies(dependencies) {
   const reportListProblem = dependencies.onListProblem ?? ((problem) => {
     process.stderr.write(bound(`WARNING: skipped unreadable run ${problem?.runId ?? "unknown"} (${problem?.message ?? "unreadable"})\n`, 1024));
   });
+  // The generic `(pid) => observation|null` process inspector: reused as-is (same `ps -p <pid>
+  // -o lstart= -o state=` wiring as the delegation transport paths, see inspectDelegationPid
+  // below) both to give the run store's own lock-acquisition marker a provable pid/startedAt
+  // (via readOwnOwnership, memoized just below) and to let `workflow unlock` observe an
+  // arbitrary lock owner's pid. Constructed exactly once per process, here — never per store,
+  // per command, or per unlock invocation.
+  const inspectProcess = dependencies.inspectProcess ?? ((pid) => inspectDelegationPid(pid, { runner }));
+  // One reader per process, memoized to a single `ps` call for this process's own pid --
+  // createOwnOwnershipReader (not the store) owns that memoization; constructing a fresh reader
+  // per store/command would spend a `ps` call on every lock acquisition instead of one per CLI
+  // invocation.
+  const readOwnOwnership = dependencies.readOwnOwnership ?? createOwnOwnershipReader({ inspectProcess });
   return {
     env,
     runner,
@@ -424,7 +450,8 @@ function createLiveDependencies(dependencies) {
     }),
     git: dependencies.git ?? createGitAdapter({ runner }),
     herdr: dependencies.herdr ?? createHerdrAdapter({ runner }),
-    store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot, onListProblem: reportListProblem }) : undefined),
+    inspectProcess,
+    store: dependencies.store ?? (stateRoot ? createRunStore({ stateRoot, onListProblem: reportListProblem, readOwnOwnership }) : undefined),
     // Real wiring for launch.js's best-effort Codex hook install (see isCodexInteractiveAgent
     // there): only assembled here, at the live-dependency boundary, so that unit tests of
     // launch.js — which exercise the default codex-worker interactive profile pervasively —
@@ -651,6 +678,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const resumeCommand = dependencies.resumeCommand ?? defaultResumeCommand;
   const closeCommand = dependencies.closeCommand ?? defaultCloseCommand;
+  const unlockCommand = dependencies.unlockCommand ?? defaultUnlockCommand;
   const delegationResultCommand = dependencies.delegationResultCommand ?? defaultDelegationResultCommand;
   const delegationReconcileCommand = dependencies.delegationReconcileCommand ?? defaultDelegationReconcileCommand;
   const delegationRemediateCommand = dependencies.delegationRemediateCommand ?? defaultDelegationRemediateCommand;
@@ -786,6 +814,15 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const commandDependencies = await withLiveDelegationTransport(options, liveDependencies, dependencies);
       const result = await closeCommand(options, commandDependencies);
       emit(out, formatWorkflowResult("close", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "unlock") {
+      // No delegation transport is needed: unlock only inspects/removes a run lock, via
+      // liveDependencies' store and inspectProcess (the same generic ps-based inspector the
+      // store's own readOwnOwnership uses, wired once per process above).
+      const result = await unlockCommand({ ...options, confirmed: Boolean(options.yes) }, liveDependencies);
+      emit(out, formatWorkflowResult("unlock", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

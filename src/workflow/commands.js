@@ -10,6 +10,7 @@ import { createDelegationServices as defaultCreateDelegationServices } from "./d
 import { createDelegationStore } from "./delegation-store.js";
 import { buildClaudeWorkerSettings, CONTROL_PLANE_ROOT, PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
+import { classifyOwnership, OBSERVATION_FAILED } from "./ownership.js";
 import { createSessionTransport as buildSessionTransport } from "./session-transport.js";
 import { planWorkflow } from "./planner.js";
 import { resolveAgentProfile } from "./profiles.js";
@@ -1488,6 +1489,102 @@ export async function closeCommand(options = {}, deps = {}) {
     runId,
     ...outcome,
   };
+}
+
+// unlock's process-liveness probe. A marker missing `pid` (the version-1 shape
+// classifyOwnership already treats as unprovable on its own) has nothing to observe, so this
+// skips the inspector rather than spending a `ps` call on a verdict that is already decided.
+// When there IS a pid to check, a throwing inspector — an ambiguous observation — must become
+// OBSERVATION_FAILED rather than propagate: an ambiguous owner is a verdict the operator sees
+// ("unprovable"), never a command crash. Same fail-closed contract acquireLock's
+// readOwnOwnership gives a throwing inspectProcess.
+async function observeLockOwner(marker, inspectProcess) {
+  const pid = marker && typeof marker === "object" && !Array.isArray(marker) ? marker.pid : null;
+  if (pid === null || pid === undefined) return null;
+  if (typeof inspectProcess !== "function") return OBSERVATION_FAILED;
+  try {
+    return await inspectProcess(String(pid));
+  } catch {
+    return OBSERVATION_FAILED;
+  }
+}
+
+// version 2 is the only shape acquireLock ever writes with an explicit `version` field; a
+// marker object with no `version` predates that (a version-1 marker, in classifyOwnership's own
+// terms) rather than being unversioned nothing. Only a missing/unreadable marker (inspectLock's
+// marker: null, whether truly absent or ambiguous) reports markerVersion: null.
+function unlockMarkerVersion(marker) {
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return null;
+  return Number.isInteger(marker.version) ? marker.version : 1;
+}
+
+function unlockReport({ runId, lock, ownership, action, removed, reason = null, exitCode }) {
+  return {
+    command: "unlock",
+    runId,
+    lock,
+    ownership,
+    action,
+    removed,
+    reason,
+    // Removing a lock only unblocks future writes; it never touches run state, worktrees,
+    // Herdr tabs/panes, sessions, processes, or reservation leases.
+    cleanup: "none",
+    nextActions: action === "needs-confirmation" ? ["confirm-unlock"] : [],
+    exitCode,
+  };
+}
+
+// The blessed, confirmed exception to this repo's "crash residue is preserved and reported,
+// never removed automatically" policy: removes exactly one run lock, and only when the lock's
+// owner is PROVEN dead (classifyOwnership's `removable`), only with `confirmed: true`. A
+// non-removable verdict ("owner-alive" or "unprovable") refuses regardless of `confirmed` --
+// confirmation authorizes deleting proven-dead evidence, it can never override the proof itself.
+export async function unlockCommand(options = {}, deps = {}) {
+  const runId = assertPathSafeUuid(options.runId, "run ID");
+  const store = await storeForCommand(options, deps);
+  const inspectProcess = deps.inspectProcess;
+
+  const inspected = await store.inspectLock(runId);
+  if (!inspected) {
+    return unlockReport({ runId, lock: null, ownership: null, action: "no-lock", removed: null, exitCode: 0 });
+  }
+
+  const lock = { ageMs: inspected.ageMs, stale: inspected.stale, markerVersion: unlockMarkerVersion(inspected.marker) };
+
+  async function classify(marker) {
+    return classifyOwnership(marker, await observeLockOwner(marker, inspectProcess));
+  }
+
+  const ownership = await classify(inspected.marker);
+
+  if (!ownership.removable) {
+    return unlockReport({ runId, lock, ownership, action: "refused", removed: null, reason: ownership.reason, exitCode: 11 });
+  }
+
+  if (!options.confirmed) {
+    return unlockReport({ runId, lock, ownership, action: "needs-confirmation", removed: null, exitCode: 0 });
+  }
+
+  // removeLock re-reads the marker itself and hands THAT marker to `allow` -- it may differ
+  // from the one classified above (time passed waiting on confirmation), so the removal must be
+  // authorized against the freshly re-read marker, not the earlier snapshot.
+  const outcome = await store.removeLock(runId, {
+    allow: async (marker) => (await classify(marker)).removable,
+  });
+
+  if (!outcome.removed) {
+    return unlockReport({ runId, lock, ownership, action: "refused", removed: null, reason: outcome.reason, exitCode: 11 });
+  }
+
+  return unlockReport({
+    runId,
+    lock,
+    ownership,
+    action: "removed",
+    removed: { markerPath: outcome.markerPath, activePath: outcome.activePath },
+    exitCode: 0,
+  });
 }
 
 export async function launchCommand(options = {}, deps = {}) {

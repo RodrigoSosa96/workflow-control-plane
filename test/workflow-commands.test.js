@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { doctorCommand, planCommand, resultCommand, statusCommand } from "../src/workflow/commands.js";
+import { doctorCommand, planCommand, resultCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 
@@ -713,4 +713,218 @@ test("doctor reports an unpinned harness version as a telemetry warning without 
   assert.equal(unreadableCheck.status, "unknown");
   assert.match(unreadableCheck.reason, /could not be read/i);
   assert.equal(unreadable.ok, true);
+});
+
+// --- unlockCommand ------------------------------------------------------
+
+const UNLOCK_RUN_ID = "66666666-6666-4666-8666-666666666666";
+
+function lockMarker(overrides = {}) {
+  return { version: 2, token: "t1", runId: UNLOCK_RUN_ID, pid: "4242", startedAt: "2026-07-29T10:00:00.000Z", ...overrides };
+}
+
+function inspectedLock(overrides = {}) {
+  return {
+    activePath: `/state/workflow/${UNLOCK_RUN_ID}/run.lock/active`,
+    markerPath: `/state/workflow/${UNLOCK_RUN_ID}/run.lock/active/owner-t1.json`,
+    marker: lockMarker(),
+    ageMs: 120000,
+    stale: false,
+    ...overrides,
+  };
+}
+
+// A fake run store exposing only inspectLock/removeLock, call-recording so tests can prove the
+// unconfirmed path never reaches a mutating call. removeLock mirrors the real store's contract
+// (run-store.js): it calls `allow` with the marker it "re-read" (here, the same one inspectLock
+// already reported) and only removes when allow returns true; removeLockResult lets a test force
+// its own refusal to simulate a race the command itself cannot see (e.g. the marker changing
+// between the command's own classification and removeLock's internal re-read).
+function lockStoreFor({ inspected = null, removeLockResult } = {}) {
+  const inspectLockCalls = [];
+  const removeLockCalls = [];
+  return {
+    inspectLockCalls,
+    removeLockCalls,
+    async inspectLock(runId) {
+      inspectLockCalls.push(runId);
+      return inspected;
+    },
+    async removeLock(runId, { allow } = {}) {
+      removeLockCalls.push(runId);
+      const permitted = await allow(inspected?.marker ?? null);
+      if (!permitted) return { removed: false, reason: "removal was not permitted for the current owner marker" };
+      if (removeLockResult) return removeLockResult;
+      return { removed: true, markerPath: inspected.markerPath, activePath: inspected.activePath };
+    },
+  };
+}
+
+// deps.inspectProcess is `(pid) => Promise<observation|null>`, throwing on ambiguity -- the same
+// shape bin/workflow.js's inspectDelegationPid already gives delegation callers.
+function inspectProcessReturning(result) {
+  const calls = [];
+  return {
+    calls,
+    inspectProcess: async (pid) => {
+      calls.push(pid);
+      if (result instanceof Error) throw result;
+      return result;
+    },
+  };
+}
+
+test("unlock reports no-lock and exits 0 without inspecting any process when there is no active lock", async () => {
+  const store = lockStoreFor({ inspected: null });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID }, { store, inspectProcess });
+
+  assert.deepEqual(result, {
+    command: "unlock",
+    runId: UNLOCK_RUN_ID,
+    lock: null,
+    ownership: null,
+    action: "no-lock",
+    removed: null,
+    reason: null,
+    cleanup: "none",
+    nextActions: [],
+    exitCode: 0,
+  });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(store.removeLockCalls, []);
+});
+
+test("unlock refuses an alive owner with exit 11 even when confirmed, and never calls removeLock", async () => {
+  const marker = lockMarker();
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({ inspected });
+  const { inspectProcess } = inspectProcessReturning({ pid: marker.pid, startedAt: marker.startedAt, cwd: "/wt", active: true });
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "owner-alive");
+  assert.equal(result.ownership.removable, false);
+  assert.equal(result.removed, null);
+  assert.deepEqual(store.removeLockCalls, []);
+});
+
+test("unlock refuses a version-1 marker as unprovable, with a reason distinct from an alive owner", async () => {
+  const marker = { token: "t1", runId: UNLOCK_RUN_ID }; // no pid/startedAt: predates provable ownership
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({ inspected });
+  const { calls, inspectProcess } = inspectProcessReturning(null);
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+  assert.match(result.ownership.reason, /predates provable ownership/);
+  assert.equal(result.lock.markerVersion, 1);
+  // No pid on the marker means nothing to observe -- classifyOwnership already decides
+  // "unprovable" without it, so no `ps` call should be spent confirming a foregone conclusion.
+  assert.deepEqual(calls, []);
+  assert.deepEqual(store.removeLockCalls, []);
+});
+
+test("unlock treats a throwing (ambiguous) process inspection as unprovable, not a crash", async () => {
+  const marker = lockMarker();
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({ inspected });
+  const { inspectProcess } = inspectProcessReturning(new Error("ps: ambiguous match"));
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+  assert.match(result.ownership.reason, /liveness could not be verified/);
+  assert.deepEqual(store.removeLockCalls, []);
+});
+
+test("unlock treats a recycled pid (same pid, different start time) as owner-gone and removable", async () => {
+  const marker = lockMarker();
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({ inspected });
+  const { inspectProcess } = inspectProcessReturning({ pid: marker.pid, startedAt: "2026-07-29T12:00:00.000Z", cwd: "/wt", active: true });
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID }, { store, inspectProcess });
+
+  assert.equal(result.ownership.verdict, "owner-gone");
+  assert.match(result.ownership.reason, /recycled/);
+  assert.equal(result.ownership.removable, true);
+  assert.equal(result.action, "needs-confirmation");
+  assert.equal(result.exitCode, 0);
+});
+
+test("unlock reports needs-confirmation for a proven-missing owner, then removes it once confirmed", async () => {
+  const marker = lockMarker();
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({ inspected });
+  const { inspectProcess } = inspectProcessReturning(null); // proven gone: no matching process
+
+  const pending = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: false }, { store, inspectProcess });
+  assert.equal(pending.action, "needs-confirmation");
+  assert.equal(pending.exitCode, 0);
+  assert.equal(pending.removed, null);
+  assert.deepEqual(pending.nextActions, ["confirm-unlock"]);
+  assert.deepEqual(store.removeLockCalls, []);
+
+  const removed = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+  assert.equal(removed.action, "removed");
+  assert.equal(removed.exitCode, 0);
+  assert.deepEqual(removed.removed, { markerPath: inspected.markerPath, activePath: inspected.activePath });
+  assert.equal(removed.cleanup, "none");
+  assert.deepEqual(store.removeLockCalls, [UNLOCK_RUN_ID]);
+});
+
+test("a removeLock refusal (e.g. the marker changed underneath) surfaces as refused with its reason, not a crash", async () => {
+  const marker = lockMarker();
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({
+    inspected,
+    removeLockResult: { removed: false, reason: "the owner marker changed before removal" },
+  });
+  const { inspectProcess } = inspectProcessReturning(null);
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store, inspectProcess });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.removed, null);
+  assert.equal(result.reason, "the owner marker changed before removal");
+  // The ownership verdict computed before the removal attempt is still reported; only the
+  // removal itself failed underneath the command.
+  assert.equal(result.ownership.verdict, "owner-gone");
+});
+
+test("unlock without a wired inspectProcess degrades to unprovable rather than throwing", async () => {
+  const marker = lockMarker();
+  const inspected = inspectedLock({ marker });
+  const store = lockStoreFor({ inspected });
+
+  const result = await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: true }, { store });
+
+  assert.equal(result.action, "refused");
+  assert.equal(result.exitCode, 11);
+  assert.equal(result.ownership.verdict, "unprovable");
+});
+
+test("the unconfirmed path never calls removeLock, across no-lock, refused, and needs-confirmation outcomes", async () => {
+  const aliveMarker = lockMarker();
+  const cases = [
+    { inspected: null, observation: null }, // no-lock
+    { inspected: inspectedLock({ marker: aliveMarker }), observation: { pid: aliveMarker.pid, startedAt: aliveMarker.startedAt, cwd: "/wt", active: true } }, // alive -> refused
+    { inspected: inspectedLock({ marker: lockMarker() }), observation: null }, // proven-gone -> needs-confirmation
+  ];
+  for (const { inspected, observation } of cases) {
+    const store = lockStoreFor({ inspected });
+    const { inspectProcess } = inspectProcessReturning(observation);
+    await unlockCommand({ runId: UNLOCK_RUN_ID, confirmed: false }, { store, inspectProcess });
+    assert.deepEqual(store.removeLockCalls, []);
+  }
 });

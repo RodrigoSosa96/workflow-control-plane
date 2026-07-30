@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -306,6 +306,7 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow reconcile \[project\] --run <run-id>/);
   assert.match(result.stdout, /workflow resume <run-id>/);
   assert.match(result.stdout, /workflow close <run-id>/);
+  assert.match(result.stdout, /workflow unlock <run-id>/);
   assert.match(result.stdout, /workflow runtime <project> <task> .*--tickets <csv>/);
   assert.match(result.stdout, /workflow status <project> <task> .*--tickets <csv>/);
   assert.match(result.stdout, /workflow delegation result <run-id> <delegation-id>/);
@@ -408,6 +409,19 @@ test("parses documented workflow commands and options", () => {
     format: "json",
   });
 
+  assert.deepEqual(parseArgs(["unlock", RUN_ID]), {
+    command: "unlock",
+    runId: RUN_ID,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["unlock", RUN_ID, "--yes"]), {
+    command: "unlock",
+    runId: RUN_ID,
+    yes: true,
+    format: "compact",
+  });
+
   assert.deepEqual(parseArgs(["worker", "status", RUN_ID, "--format", "json"]), {
     command: "worker-status",
     runId: RUN_ID,
@@ -468,6 +482,10 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["resume", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["close", RUN_ID, "--yes"]), /close does not accept --yes/i);
   assert.throws(() => parseArgs(["close", "../not-a-run"]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["unlock"]), /requires an argument/i);
+  assert.throws(() => parseArgs(["unlock", RUN_ID, "extra"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["unlock", RUN_ID, "--tickets", "ASANA-150"]), /unlock does not accept --tickets/i);
+  assert.throws(() => parseArgs(["unlock", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["worker", "watch", RUN_ID, "--interval", "1"]), /Unknown option|does not accept/i);
   assert.throws(() => parseArgs(["worker", "status", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["launch", "ocr", "ASANA-123", "--prompt", "SECRET-DO-NOT-LEAK"]), /Unknown option: --prompt/i);
@@ -1411,6 +1429,143 @@ test("resume --yes passes confirmed: true through to resumeCommand; without it, 
   assert.equal(await main(["resume", RUN_ID, "--yes"], sharedDependencies), 0);
 
   assert.deepEqual(confirmedValues, [false, true]);
+});
+
+test("unlock --yes passes confirmed: true through to unlockCommand; without it, confirmed is false, and no delegation transport is built", async () => {
+  const output = io();
+  const confirmedValues = [];
+  const code1 = await main(["unlock", RUN_ID], {
+    ...output,
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async () => {
+      assert.fail("unlock must never resolve a delegation transport executable");
+    },
+    createPiDelegationTransport: () => {
+      assert.fail("unlock must never build a delegation transport");
+    },
+    unlockCommand: async (options) => {
+      confirmedValues.push(options.confirmed);
+      return { command: "unlock", runId: options.runId, action: "needs-confirmation", exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+  const code2 = await main(["unlock", RUN_ID, "--yes"], {
+    ...output,
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    unlockCommand: async (options) => {
+      confirmedValues.push(options.confirmed);
+      return { command: "unlock", runId: options.runId, action: "removed", exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+
+  assert.equal(code1, 0);
+  assert.equal(code2, 0);
+  assert.deepEqual(confirmedValues, [false, true]);
+  assert.deepEqual(output.stdout, ["unlock:needs-confirmation", "unlock:removed"]);
+});
+
+test("unlock propagates a non-zero exitCode (the refused/11 conflict case) from the command report", async () => {
+  const output = io();
+  const code = await main(["unlock", RUN_ID, "--yes"], {
+    ...output,
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    unlockCommand: async (options) => ({ command: "unlock", runId: options.runId, action: "refused", reason: "the owner process is still running", exitCode: 11 }),
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+  assert.equal(code, 11);
+  assert.deepEqual(output.stdout, ["unlock:refused"]);
+});
+
+test("main wires unlock with the real run store and the shared ps-based process inspector, reused (not rebuilt) across store operations", async () => {
+  // Proves the two wiring jobs: (1) unlock's process inspector reuses the same `ps -p <pid> -o
+  // lstart= -o state=` invocation the delegation transport paths already use, and (2) that
+  // SAME inspector reaches the constructed run store as readOwnOwnership, memoized to exactly
+  // one `ps` call for the whole CLI invocation, no matter how many times the store acquires its
+  // own lock.
+  const dir = await mkdtemp(join(tmpdir(), "workflow-unlock-wiring-"));
+  const stateRoot = join(dir, "state");
+  const psCalls = [];
+  const runner = {
+    async run(command, argv, options) {
+      psCalls.push({ command, argv, options });
+      return { code: 0, stdout: "Wed Jan  1 00:10:00 2025 S\n" };
+    },
+  };
+
+  const output = io();
+  const code = await main(["unlock", RUN_ID], {
+    ...output,
+    stateRoot,
+    runner,
+    unlockCommand: async (_options, liveDependencies) => {
+      assert.equal(typeof liveDependencies.inspectProcess, "function");
+      assert.ok(liveDependencies.store);
+      // Two independent lock acquisitions through the real, non-overridden store -- if
+      // readOwnOwnership were not wired through, acquireLock would never call `ps` at all.
+      await liveDependencies.store.create({ runId: RUN_ID, projectAlias: "ocr", task: "ASANA-1" });
+      await liveDependencies.store.update(RUN_ID, () => ({}));
+      return { command: "unlock", runId: RUN_ID, action: "no-lock", exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.action}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(output.stdout, ["unlock:no-lock"]);
+  // Exactly one `ps` call for the whole invocation (createOwnOwnershipReader's memoization),
+  // targeting this process's own real pid, using the exact argv inspectDelegationPid already
+  // builds for delegation inspection.
+  assert.deepEqual(psCalls, [{
+    command: "ps",
+    argv: ["-p", String(process.pid), "-o", "lstart=", "-o", "state="],
+    options: { allowFailure: true },
+  }]);
+});
+
+test("workflow unlock end-to-end: classifies a proven-missing owner from a real crashed lock and removes it, using the reused ps wiring", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-unlock-e2e-"));
+  const stateRoot = join(dir, "state");
+  const runDirectory = join(stateRoot, RUN_ID);
+  const lockContainer = join(runDirectory, "run.lock");
+  const activePath = join(lockContainer, "active");
+  const markerPath = join(activePath, "owner-crashed-token.json");
+  const deadPid = "999999";
+  const marker = { version: 2, token: "crashed-token", runId: RUN_ID, pid: deadPid, startedAt: "2024-12-31T00:00:00.000Z" };
+  // Simulate crash residue directly on disk, exactly as workflow-run-store.test.js does: no
+  // acquireLock/releaseLock cycle ever completes for a crashed run, so there is no store API
+  // that leaves a lock lingering -- only raw fs mirrors what a real crash leaves behind.
+  await mkdir(activePath, { recursive: true, mode: 0o700 });
+  await writeFile(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+
+  const psCalls = [];
+  const runner = {
+    async run(command, argv, options) {
+      psCalls.push({ command, argv, options });
+      // `ps -p <deadPid>` finds nothing: exit 1, no output -- proven gone.
+      return { code: 1, stdout: "", stderr: "" };
+    },
+  };
+
+  const output = io();
+  const code = await main(["unlock", RUN_ID, "--yes"], { ...output, stateRoot, runner });
+
+  assert.equal(code, 0);
+  // unlockCommand classifies the marker twice by design: once up front, and once more inside
+  // removeLock's `allow` against whatever marker removeLock itself re-reads (which may differ
+  // from the first read) -- so this is two `ps` calls, both against the same real pid here since
+  // nothing raced. Every call reuses the exact argv inspectDelegationPid already builds for
+  // delegation inspection.
+  const expectedPsCall = { command: "ps", argv: ["-p", deadPid, "-o", "lstart=", "-o", "state="], options: { allowFailure: true } };
+  assert.deepEqual(psCalls, [expectedPsCall, expectedPsCall]);
+  const report = JSON.parse(output.stdout[0]);
+  assert.equal(report.action, "removed");
+  assert.equal(report.ownership.verdict, "owner-gone");
+  assert.equal(report.removed.markerPath, markerPath);
+  assert.equal(report.cleanup, "none");
+  assert.deepEqual(output.stderr, []);
+
+  // The lock is actually gone from disk -- not just reported as gone.
+  await assert.rejects(() => readdir(activePath));
 });
 
 test("main prints compact and json output for read-only commands", async () => {
