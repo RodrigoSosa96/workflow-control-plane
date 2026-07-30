@@ -1164,6 +1164,64 @@ test("reconcile still reconciles, with no lock field, when the injected store pr
   assert.equal(result.command, "reconcile");
 });
 
+test("reconcile still reconciles, with no lock field, when inspectLock itself throws (an odd-filesystem-state anomaly, not a missing method)", async () => {
+  // Task 6 review: inspectLock can throw for reasons unrelated to "this store predates the
+  // method" -- an EACCES/EIO/EISDIR reaching throwFs inside the real store's inspectLockInternal.
+  // Those anomalies are most likely on exactly the wedged, crashed runs reconcile exists to
+  // diagnose, so a throwing inspectLock must degrade the same way a missing one does: the lock
+  // field is silently absent, never a thrown error that breaks reconcile entirely.
+  const run = reconcileRun();
+  const store = reconcileStoreFor({ run });
+  store.inspectLock = async () => {
+    throw new Error("Unable to stat active lock at /state/workflow/.../run.lock/active (EACCES)");
+  };
+
+  const result = await reconcileCommand({ runId: run.id }, { store });
+
+  assert.equal("lock" in result, false);
+  assert.deepEqual(result.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+  ]);
+  assert.equal(result.command, "reconcile");
+});
+
+test("reconcile reports a non-removable unprovable verdict and does not suggest unlock", async () => {
+  // Task 6 review: only owner-alive was covered for "does not suggest unlock" -- a regression
+  // that treated unprovable as removable would slip past that test alone (owner-alive was
+  // already false for a different reason: a live owner). Covers both an ambiguous (throwing)
+  // process inspection and, separately, a version-1 marker with no pid/startedAt to observe.
+  const run = reconcileRun();
+
+  const ambiguousInspected = reconcileInspectedLock();
+  const ambiguousStore = reconcileStoreFor({ run, inspected: ambiguousInspected });
+  const ambiguousInspectProcess = async () => {
+    throw new Error("ps: ambiguous match");
+  };
+  const ambiguousResult = await reconcileCommand({ runId: run.id }, { store: ambiguousStore, inspectProcess: ambiguousInspectProcess });
+  assert.equal(ambiguousResult.lock.ownership.verdict, "unprovable");
+  assert.equal(ambiguousResult.lock.ownership.removable, false);
+  assert.deepEqual(ambiguousResult.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+  ]);
+
+  const versionOneMarker = { token: "t1", runId: run.id }; // no pid/startedAt: predates provable ownership
+  const versionOneInspected = reconcileInspectedLock({ marker: versionOneMarker });
+  const versionOneStore = reconcileStoreFor({ run, inspected: versionOneInspected });
+  const { calls, inspectProcess: versionOneInspectProcess } = inspectProcessReturning(null);
+  const versionOneResult = await reconcileCommand({ runId: run.id }, { store: versionOneStore, inspectProcess: versionOneInspectProcess });
+  assert.equal(versionOneResult.lock.ownership.verdict, "unprovable");
+  assert.equal(versionOneResult.lock.ownership.removable, false);
+  assert.deepEqual(versionOneResult.nextActions, [
+    `workflow result ${run.id}`,
+    `workflow handoff ${run.id} --input /state/workflow/${run.id}/handoff-input.json`,
+  ]);
+  // No pid on the marker means nothing to observe -- classifyOwnership already decides
+  // "unprovable" without it, so no `ps` call should be spent confirming a foregone conclusion.
+  assert.deepEqual(calls, []);
+});
+
 test("reconcile performs no mutation even when the lock is removable", async () => {
   const run = reconcileRun();
   const inspected = reconcileInspectedLock(); // proven-missing owner below -> removable

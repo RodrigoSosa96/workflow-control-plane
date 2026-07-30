@@ -327,6 +327,14 @@ test("sameOwnerDirectory: falls back to ctimeMs/mtimeMs when dev/ino are not fin
 });
 
 test("sameOwnerDirectory: tolerates missing/undefined stats without throwing", () => {
+  // sameOwnerDirectory(undefined, undefined) is fail-OPEN (true), by construction of the
+  // ctimeMs/mtimeMs fallback: undefined === undefined on both sides. This is faithful to the
+  // original run-store.js/delegation-reservations.js implementations this was moved from
+  // verbatim, and is unreachable from either store's actual call sites -- every argument they
+  // pass is a `fs.Stats` object from a successful `fs.stat`, never undefined or null. Asserted
+  // here only to document the moved function's total behavior, not to sanction calling it with
+  // missing stats from new code: a caller with a genuinely missing/unknown stat must treat that
+  // as "not the same directory" itself, before ever reaching this comparison.
   assert.equal(sameOwnerDirectory(undefined, undefined), true);
   assert.doesNotThrow(() => sameOwnerDirectory(null, { dev: 1, ino: 1 }));
   assert.equal(typeof sameOwnerDirectory(null, { dev: 1, ino: 1 }), "boolean");

@@ -207,6 +207,10 @@ function formatResult(value) {
   return bound(lines.join("\n"));
 }
 
+function ageLabel(ageMs) {
+  return Number.isFinite(ageMs) ? `${ageMs}ms` : "unknown";
+}
+
 function formatReconcile(value) {
   const lines = [
     `Run: ${text(value.runId)}`,
@@ -215,6 +219,15 @@ function formatReconcile(value) {
   if (value.projectAlias) lines.push(`Project: ${value.projectLabel ? `${value.projectLabel} ` : ""}[${value.projectAlias}]`);
   if (value.state) lines.push(`State: ${value.state}`);
   if (value.fallbackWorkspace) lines.push(`Fallback workspace: ${value.fallbackWorkspace}`);
+  // Only present when the run's lock is currently held (reconcileCommand omits the field
+  // entirely otherwise) -- surfaces the same provable-ownership verdict `workflow unlock` itself
+  // classifies against, in the format an operator actually reads by default (compact), not just
+  // buried in --format json. Age is shown for context only; it is never grounds for removal.
+  if (value.lock) {
+    const { ageMs, stale, ownership } = value.lock;
+    const reason = ownership?.reason ? ` | ${ownership.reason}` : "";
+    lines.push(`Lock: ${text(ownership?.verdict)} | age ${ageLabel(ageMs)} | stale: ${stale ? "yes" : "no"}${reason}`);
+  }
   if (Array.isArray(value.nextActions) && value.nextActions.length > 0) {
     lines.push("Next actions:");
     for (const action of value.nextActions) lines.push(`- ${action}`);

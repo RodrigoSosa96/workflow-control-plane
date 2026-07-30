@@ -198,6 +198,80 @@ test("result and reconcile compact output are bounded and machine JSON stays det
   );
 });
 
+test("reconcile compact output has no Lock line when no lock field is present", () => {
+  const compact = formatWorkflowResult("reconcile", {
+    command: "reconcile",
+    runId: RUN_ID,
+    status: "pending",
+    nextActions: [`workflow result ${RUN_ID}`],
+  }, "compact");
+  assert.doesNotMatch(compact, /^Lock:/m);
+});
+
+test("reconcile compact output renders the lock's verdict, age, and staleness for each ownership verdict -- this is the operator's default view, not just --format json", () => {
+  const ownerGone = formatWorkflowResult("reconcile", {
+    command: "reconcile",
+    runId: RUN_ID,
+    status: "pending",
+    lock: {
+      ageMs: 999999,
+      stale: true,
+      ownership: {
+        verdict: "owner-gone",
+        reason: "the owner process is proven gone: no matching process exists",
+        pid: "9090",
+        startedAt: "2026-07-29T09:00:00.000Z",
+        removable: true,
+      },
+    },
+    nextActions: [`workflow result ${RUN_ID}`, `workflow unlock ${RUN_ID} --yes`],
+  }, "compact");
+  assert.match(ownerGone, /^Lock: owner-gone \| age 999999ms \| stale: yes \| the owner process is proven gone: no matching process exists$/m);
+
+  const ownerAlive = formatWorkflowResult("reconcile", {
+    command: "reconcile",
+    runId: RUN_ID,
+    status: "pending",
+    lock: {
+      ageMs: 1200,
+      stale: false,
+      ownership: {
+        verdict: "owner-alive",
+        reason: "the owner process is still running with a matching start time",
+        pid: "4242",
+        startedAt: "2026-07-29T10:00:00.000Z",
+        removable: false,
+      },
+    },
+    nextActions: [`workflow result ${RUN_ID}`],
+  }, "compact");
+  assert.match(ownerAlive, /^Lock: owner-alive \| age 1200ms \| stale: no \| the owner process is still running with a matching start time$/m);
+
+  const unprovable = formatWorkflowResult("reconcile", {
+    command: "reconcile",
+    runId: RUN_ID,
+    status: "pending",
+    lock: {
+      ageMs: 45000,
+      stale: false,
+      ownership: {
+        verdict: "unprovable",
+        reason: "owner liveness could not be verified because process inspection failed",
+        pid: "9090",
+        startedAt: "2026-07-29T09:00:00.000Z",
+        removable: false,
+      },
+    },
+    nextActions: [`workflow result ${RUN_ID}`],
+  }, "compact");
+  assert.match(unprovable, /^Lock: unprovable \| age 45000ms \| stale: no \| owner liveness could not be verified because process inspection failed$/m);
+
+  // The unlock suggestion only ever appears in nextActions (reconcileCommand's own job); the
+  // Lock line itself never renders a suggested command, only the verdict it was computed from.
+  assert.match(ownerGone, new RegExp(`workflow unlock ${RUN_ID} --yes`));
+  assert.doesNotMatch(ownerAlive, /workflow unlock/);
+});
+
 test("resume and close compact output render a short human line; JSON output is untouched", () => {
   const focusResume = formatWorkflowResult("resume", {
     command: "resume",

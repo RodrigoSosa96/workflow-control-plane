@@ -1291,15 +1291,21 @@ export async function resultCommand(options = {}, deps = {}) {
 // classifyMarkerOwnership -- the same observe-and-classify step mutexOwnerRecoveryFlow's
 // `classify` runs through below -- so an operator sees a recoverable lock's verdict exactly where
 // they already look, without reconcile gaining a mutation path of its own. Returns undefined
-// (the field must be ABSENT, not `lock: null`) both when no lock is held and when the injected
-// store predates inspectLock: a diagnostic must never break reconcile for a caller still on an
-// older store fake, so a missing method degrades silently rather than throwing.
+// (the field must be ABSENT, not `lock: null`) when no lock is held, when the injected store
+// predates inspectLock, AND when inspectLock itself throws: a diagnostic must never break
+// reconcile, and inspectLock throws for the same odd-filesystem-state anomalies (EACCES/EIO/
+// EISDIR reaching throwFs inside inspectLockInternal) that a genuinely wedged, crashed run is
+// most likely to have -- exactly the run an operator reaches for reconcile to diagnose.
 async function reconcileLockDiagnostic(store, runId, inspectProcess) {
   if (typeof store.inspectLock !== "function") return undefined;
-  const inspected = await store.inspectLock(runId);
-  if (!inspected) return undefined;
-  const ownership = await classifyMarkerOwnership(inspected.marker, inspectProcess);
-  return { ageMs: inspected.ageMs, stale: inspected.stale, ownership };
+  try {
+    const inspected = await store.inspectLock(runId);
+    if (!inspected) return undefined;
+    const ownership = await classifyMarkerOwnership(inspected.marker, inspectProcess);
+    return { ageMs: inspected.ageMs, stale: inspected.stale, ownership };
+  } catch {
+    return undefined;
+  }
 }
 
 export async function reconcileCommand(options = {}, deps = {}) {
