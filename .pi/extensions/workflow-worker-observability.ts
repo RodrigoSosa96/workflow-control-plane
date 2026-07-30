@@ -3,6 +3,14 @@ import { createRunStore } from "../../src/workflow/run-store.js";
 import { createTelemetryStore } from "../../src/workflow/telemetry-store.js";
 import { createTelemetryAdapter } from "../../src/workflow/telemetry-adapters.js";
 import { publicTelemetrySnapshot } from "../../src/workflow/telemetry.js";
+import { createSubprocessOwnOwnershipReader } from "../../src/workflow/ownership.js";
+
+// One reader per process, built at module scope -- see workflow-worker-lifecycle.ts's identical
+// comment. This extension also runs in-process for the whole Pi session, and it genuinely
+// acquires the run lock (updateWidget -> telemetry.record -> writePrivateFile -> withLock), so
+// the same one-`ps`-per-session accounting applies: the memoized reader pays for a single `ps`
+// spawn on the session's first telemetry write, not one per Pi event.
+const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 const REQUIRED_ENV = Object.freeze([
   "WORKFLOW_RUN_ID",
@@ -51,6 +59,9 @@ export function buildObservabilityLines(runId: string, snapshot: any): string[] 
 
 export function createWorkflowWorkerObservabilityExtension({
   env = process.env as Record<string, string | undefined>,
+  store: injectedStore,
+  createRunStore: createRunStoreImpl = createRunStore,
+  readOwnOwnership = defaultReadOwnOwnership,
 } = {}) {
   const boundEnv = readEnv(env);
   if (!boundEnv.WORKFLOW_RUN_ID || boundEnv.WORKFLOW_HARNESS !== "pi") {
@@ -63,7 +74,7 @@ export function createWorkflowWorkerObservabilityExtension({
   const runId = boundEnv.WORKFLOW_RUN_ID;
 
   return function workflowWorkerObservability(pi: ExtensionAPI) {
-    const store = createRunStore({ stateRoot });
+    const store = injectedStore ?? createRunStoreImpl({ stateRoot, readOwnOwnership });
     const telemetry = createTelemetryStore({ store });
     const adapter = createTelemetryAdapter({ harness: "pi", version: "0.81.1" });
 

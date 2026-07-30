@@ -13,8 +13,16 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { readFile as defaultReadFile } from "node:fs/promises";
+import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 
 const readPromptFile = defaultReadFile;
+
+// One reader per process, built at module scope -- same reasoning as the two Pi worker
+// extensions' identical comment, though this script is a one-shot CLI invocation rather than a
+// long-lived session: createLaunchDeps can be called more than once per run (launch, then each
+// poll iteration), so module scope still buys exactly one `ps` spawn total, on whichever call
+// first acquires the run lock, instead of one per createLaunchDeps call.
+const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 function parseArgs(argv) {
   const args = { fake: false, real: false, keep: false, agent: null };
@@ -168,7 +176,7 @@ function createLaunchDeps(fixture, env, overrides = {}) {
     lookupExecutable: overrides.lookupExecutable ?? ((name) => lookupExecutable(name, { env })),
     git: overrides.git ?? createGitAdapter({ runner }),
     herdr: overrides.herdr ?? createHerdrAdapter({ runner }),
-    store: overrides.store ?? createRunStore({ stateRoot }),
+    store: overrides.store ?? createRunStore({ stateRoot, readOwnOwnership: defaultReadOwnOwnership }),
   };
 }
 

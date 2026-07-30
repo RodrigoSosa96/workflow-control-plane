@@ -260,3 +260,67 @@ test("widget omits not-reported measurements", () => {
 test("widget shows starting when there is no snapshot", () => {
   assert.match(buildObservabilityLines("run12345abc", null).join("\n"), /starting \| pi/);
 });
+
+// --- Task 4: readOwnOwnership threaded into the fallback store construction ------------------
+//
+// Unlike the lifecycle extension, this one had no store-injection seam before this task; these
+// tests add the minimal one its sibling extension already uses (store: injectedStore plus a
+// fake-able createRunStore), rather than inventing a new pattern. A store stub must satisfy
+// createTelemetryStore's own contract (read/writePrivateFile/appendEvent), which
+// workflowWorkerObservability constructs synchronously the moment it runs.
+
+function stubTelemetryStore() {
+  return {
+    async read() { return null; },
+    async writePrivateFile() { return null; },
+    async appendEvent() { return null; },
+  };
+}
+
+// Load-bearing: verified by temporarily reverting the fallback's createRunStoreImpl call back to
+// `createRunStoreImpl({ stateRoot })` (dropping readOwnOwnership), re-running this test, and
+// observing it fail with `capturedArgs.readOwnOwnership` equal to `undefined` rather than a
+// function; then restoring the argument and confirming the suite is green again. See the task-4
+// report for the before/after run.
+test("the fallback store construction receives a readOwnOwnership function", () => {
+  let capturedArgs = null;
+  const fakeCreateRunStore = (args) => {
+    capturedArgs = args;
+    return stubTelemetryStore();
+  };
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: "/state",
+      WORKFLOW_CONTROL_PLANE_BIN: "/bin/workflow.js",
+    },
+    createRunStore: fakeCreateRunStore,
+  })(pi);
+  assert.ok(capturedArgs, "createRunStore should have been called");
+  assert.equal(typeof capturedArgs.readOwnOwnership, "function");
+});
+
+// This matters because every other test in this file drives the extension through a real,
+// temp-directory-backed run store; if wiring readOwnOwnership had made an injected store fall
+// through to createRunStoreImpl anyway, an injected store would no longer be a real bypass.
+test("an injected store bypasses the fallback entirely: no createRunStore call, no reader used", () => {
+  let fallbackCalled = false;
+  const fakeCreateRunStore = () => {
+    fallbackCalled = true;
+    return stubTelemetryStore();
+  };
+  const pi = createFakePi();
+  createWorkflowWorkerObservabilityExtension({
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "pi",
+      WORKFLOW_STATE_ROOT: "/state",
+      WORKFLOW_CONTROL_PLANE_BIN: "/bin/workflow.js",
+    },
+    store: stubTelemetryStore(),
+    createRunStore: fakeCreateRunStore,
+  })(pi);
+  assert.equal(fallbackCalled, false);
+});

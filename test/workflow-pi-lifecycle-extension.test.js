@@ -129,3 +129,51 @@ test("session_shutdown swallows a lifecycle throw instead of rejecting", async (
   makeExt({ life, run: { generation: 1, state: "running" } })(pi);
   await assert.doesNotReject(() => pi.handlers.session_shutdown({ reason: "quit" }, {}));
 });
+
+// --- Task 4: readOwnOwnership threaded into the fallback store construction ------------------
+//
+// This extension already had an injected-store seam (store: injectedStore); these tests add none
+// of their own -- they thread a fake createRunStore through it instead, mirroring the exact
+// pattern hooks/claude-lifecycle.mjs's "main constructs the run store with a readOwnOwnership
+// function" test uses, so the fallback construction becomes observable without spawning a real
+// `ps`.
+
+// Load-bearing: verified by temporarily reverting the fallback's createRunStoreImpl call back to
+// `createRunStoreImpl({ stateRoot: env.WORKFLOW_STATE_ROOT })` (dropping readOwnOwnership),
+// re-running this test, and observing it fail with `capturedArgs.readOwnOwnership` equal to
+// `undefined` rather than a function; then restoring the argument and confirming the suite is
+// green again. See the task-4 report for the before/after run.
+test("the fallback store construction receives a readOwnOwnership function", () => {
+  let capturedArgs = null;
+  const fakeCreateRunStore = (args) => {
+    capturedArgs = args;
+    return { async read() { return null; }, async update() { return null; } };
+  };
+  createWorkflowWorkerLifecycleExtension({
+    env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "pi", WORKFLOW_STATE_ROOT: "/x" },
+    createRunStore: fakeCreateRunStore,
+  });
+  assert.ok(capturedArgs, "createRunStore should have been called");
+  assert.equal(typeof capturedArgs.readOwnOwnership, "function");
+});
+
+// This matters because every other test in this file injects a store (via makeExt); if wiring
+// readOwnOwnership into the fallback had instead made an injected store go through
+// createRunStoreImpl too, the whole suite would start spawning a real `ps` per test.
+test("an injected store bypasses the fallback entirely: no createRunStore call, no reader used", () => {
+  let fallbackCalled = false;
+  const fakeCreateRunStore = () => {
+    fallbackCalled = true;
+    return { async read() { return null; }, async update() { return null; } };
+  };
+  const store = {
+    async read() { return { id: "r1", generation: 1, state: "running" }; },
+    async update() { return null; },
+  };
+  createWorkflowWorkerLifecycleExtension({
+    env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "pi", WORKFLOW_STATE_ROOT: "/x" },
+    store,
+    createRunStore: fakeCreateRunStore,
+  });
+  assert.equal(fallbackCalled, false);
+});

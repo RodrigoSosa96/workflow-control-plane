@@ -1,20 +1,31 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createRunStore } from "../../src/workflow/run-store.js";
 import { createLifecycle } from "../../src/workflow/lifecycle.js";
+import { createSubprocessOwnOwnershipReader } from "../../src/workflow/ownership.js";
 
 function continuationPrompt(runId: string, generation: number): string {
   return `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}.`;
 }
+
+// One reader per process, built at module scope -- like hooks/claude-lifecycle.mjs's identical
+// defaultReadOwnOwnership, but the cost model differs: this extension runs in-process for the
+// WHOLE Pi session (one module load, many agent_start/agent_settled events), not once per event
+// like the subprocess hooks. createSubprocessOwnOwnershipReader's memoization therefore buys one
+// `ps` spawn per session -- paid on the first lock this session acquires -- rather than one per
+// event. That is the only reason a `ps` spawn living inside an extension is acceptable here.
+const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 export function createWorkflowWorkerLifecycleExtension({
   env = process.env as Record<string, string | undefined>,
   lifecycle,
   hasValidHandoff,
   store: injectedStore,
+  createRunStore: createRunStoreImpl = createRunStore,
+  readOwnOwnership = defaultReadOwnOwnership,
 } = {} as any) {
   const runId = env.WORKFLOW_RUN_ID;
   if (!runId || env.WORKFLOW_HARNESS !== "pi") return (_pi: ExtensionAPI) => {};
-  const store = injectedStore ?? createRunStore({ stateRoot: env.WORKFLOW_STATE_ROOT });
+  const store = injectedStore ?? createRunStoreImpl({ stateRoot: env.WORKFLOW_STATE_ROOT, readOwnOwnership });
   const life = lifecycle ?? createLifecycle({ store });
   const validHandoff = hasValidHandoff ?? (async (gen: number) => await handoffExists(store, runId, gen));
 
