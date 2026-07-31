@@ -2,12 +2,12 @@ import * as defaultFs from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadDelegationRole as defaultLoadDelegationRole } from "./delegation-roles.js";
+import { TRANSPORT_IDENTITY_KEYS as IDENTITY_KEYS } from "./delegation-invariants.js";
 
 const RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_SHORT_TEXT = 4096;
 const MAX_TEXT_BYTES = 64 * 1024;
 const MODES = new Set(["foreground", "background"]);
-const IDENTITY_KEYS = new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]);
 const ASSIGNMENT_KEYS = new Set([
   "runId",
   "projectAlias",
@@ -78,18 +78,21 @@ function assertAbsolutePath(value, context) {
   return resolve(assertString(value, context, { absolute: true }));
 }
 
-// Not migrated to delegation-invariants.js's validateDelegationTransportIdentity,
-// even though the two check the same key set and kind. That shared definition
-// validates an untrusted `value` against a caller-known-good runId/delegationId;
-// here there is no such reference to cross-check against — this transport is
-// handed back its own previously-issued identity (to observe, resume, or close),
-// so identity IS the source of truth, not a claim to verify. It also
-// canonicalizes sessionPath/cwd with path.resolve() (assertAbsolutePath) rather
-// than only checking isAbsolute(), because sessionDirectoryFromIdentity() and
+// This validator itself is not migrated to delegation-invariants.js's
+// validateDelegationTransportIdentity, even though the two check the same
+// key set and kind. That shared definition validates an untrusted `value`
+// against a caller-known-good runId/delegationId; here there is no such
+// reference to cross-check against — this transport is handed back its own
+// previously-issued identity (to observe, resume, or close), so identity IS
+// the source of truth, not a claim to verify. It also canonicalizes
+// sessionPath/cwd with path.resolve() (assertAbsolutePath) rather than only
+// checking isAbsolute(), because sessionDirectoryFromIdentity() and
 // ensureContained() compare these paths for containment: this module's whole
-// security model depends on paths being resolved consistently, which the shared
-// definition intentionally does not do. Two different jobs, not a laxer copy of
-// one.
+// security model depends on paths being resolved consistently, which the
+// shared definition intentionally does not do. Two different jobs, not a
+// laxer copy of one. The key *set* itself (IDENTITY_KEYS, imported above as
+// TRANSPORT_IDENTITY_KEYS) has no such reason to diverge, so it is shared
+// rather than re-declared here.
 function assertTransportIdentity(value) {
   const identity = assertObject(value, "transport identity");
   assertExactKeys(identity, IDENTITY_KEYS, "transport identity");

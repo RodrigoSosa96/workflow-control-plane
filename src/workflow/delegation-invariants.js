@@ -8,10 +8,13 @@
 //
 // coordinator-policy.js's copy (reservationResources/reservationAllows) was
 // the weakest: it never compared the reservation's checkoutDigest against
-// the delegation's cwd, and it required a checkout:-prefixed resource to
-// merely exist rather than name the right checkout. Migrating it to this
-// predicate therefore changed that gate's authorization outcome, not just
-// its implementation — see coordinator-policy.js and its tests.
+// the delegation's cwd, it required a checkout:-prefixed resource to merely
+// exist rather than name the right checkout, and it never compared the
+// reservation's role/mode against the delegation's at all — a reservation
+// minted for a different role or mode passed as long as its resource list
+// happened to overlap. Migrating it to this predicate therefore changed that
+// gate's authorization outcome, not just its implementation — see
+// coordinator-policy.js and its tests.
 //
 // The transport identity shape below is the same story for a different
 // invariant. delegation-store.js (recording the identity a worker transport
@@ -43,7 +46,13 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { classifyDelegationRole } from "./delegation-policy.js";
 
-const TRANSPORT_IDENTITY_KEYS = new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]);
+// Exported (not just module-private) so pi-delegation-transport.js's own
+// assertTransportIdentity — which validates a different shape (see that
+// module's comment on why it is not migrated to
+// validateDelegationTransportIdentity below) — can still share this exact
+// key set rather than carrying a second byte-for-byte copy that could drift
+// if a field is ever added here.
+export const TRANSPORT_IDENTITY_KEYS = new Set(["kind", "runId", "delegationId", "sessionPath", "cwd", "pid", "processStartedAt"]);
 const MAX_SHORT_TEXT = 4096;
 
 function assertIdentityString(value, context, { limit = MAX_SHORT_TEXT, absolute = false } = {}, fail) {

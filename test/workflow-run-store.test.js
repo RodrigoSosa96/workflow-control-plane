@@ -967,6 +967,29 @@ test("removeLock refuses without throwing when there is no active lock to remove
   assert.match(result.reason, /no active lock/i);
 });
 
+test("removeLock's refusal is the public {removed:false, reason} shape, not mutex-removal.js's internal {refused} sentinel", async (t) => {
+  // removeLock translates removeOwnedMutex's `{refused: true, reason}` into this store's own
+  // `{removed: false, reason}` shape. mutex-removal.js's own tests only ever assert the internal
+  // sentinel (that is its contract); nothing previously asserted that removeLock actually
+  // performs the translation, so a caller that forgot it would go uncaught.
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  await store.create(plannedInput());
+
+  const result = await store.removeLock(RUN_ID_1, { allow: () => true });
+
+  assert.deepEqual(result, { removed: false, reason: "no active lock or the owner marker is unreadable" });
+});
+
+test("removeLock rejects a non-function allow before touching the filesystem", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
+  await store.create(plannedInput());
+
+  await assert.rejects(() => store.removeLock(RUN_ID_1, { allow: "not-a-function" }), /removeLock allow must be a function/);
+  await assert.rejects(() => store.removeLock(RUN_ID_1, {}), /removeLock allow must be a function/);
+});
+
 test("inspectLock reports stale: false for a freshly created lock", async (t) => {
   // Deliberately no injected clock: the real clock and the real mkdir mtime agree on "now",
   // so ageMs comes out small and deterministic without needing utimes(). This exists because

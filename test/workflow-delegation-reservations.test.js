@@ -585,6 +585,27 @@ test("clearGate refuses without throwing when there is no active gate to clear",
   assert.match(result.reason, /no active gate/i);
 });
 
+test("clearGate's refusal is the public {cleared:false, reason} shape, not mutex-removal.js's internal {refused} sentinel", async (t) => {
+  // clearGate translates removeOwnedMutex's `{refused: true, reason}` into this store's own
+  // `{cleared: false, reason}` shape. mutex-removal.js's own tests only ever assert the internal
+  // sentinel (that is its contract); nothing previously asserted that clearGate actually
+  // performs the translation, so a caller that forgot it would go uncaught.
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createStore(stateRoot);
+
+  const result = await reservations.clearGate({ projectAlias: "never-used", allow: () => true });
+
+  assert.deepEqual(result, { cleared: false, reason: "no active gate or the owner marker is unreadable" });
+});
+
+test("clearGate rejects a non-function allow before touching the filesystem", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const reservations = createStore(stateRoot);
+
+  await assert.rejects(() => reservations.clearGate({ projectAlias: "never-used", allow: "not-a-function" }), /clearGate allow must be a function/);
+  await assert.rejects(() => reservations.clearGate({ projectAlias: "never-used" }), /clearGate allow must be a function/);
+});
+
 test("clearGate's pre-unlink recheck refuses a same-content replacement gate via directory identity, not marker bytes", async (t) => {
   // If the identity check inside clearGate's pre-unlink recheck were deleted, this test would
   // fail: the fabricated identity below leaves the marker's path and byte content completely

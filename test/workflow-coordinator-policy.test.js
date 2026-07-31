@@ -129,6 +129,27 @@ test("requires writer reservations and keeps background writers disabled", () =>
     false,
   );
 
+  // The case above now rejects on role/mode (reservation() is code-reviewer/background) before
+  // ever reaching the resource check, so it no longer distinctly proves that a writer
+  // reservation must carry writersTotal and checkout:<digest>. Prove that separately here with a
+  // reservation whose role/mode match the writer request but whose resources are missing both
+  // writer-specific entries.
+  const missingWriterResources = validateSubagentRequestPolicy({
+    request: foreground,
+    prepared,
+    policy,
+    reservation: {
+      state: "active",
+      delegationId: DELEGATION_ID,
+      role: "sdd-implementer",
+      mode: "foreground",
+      checkoutDigest: writerCheckoutDigest,
+      resources: ["totalInternal", "foreground"],
+    },
+  });
+  assert.equal(missingWriterResources.allowed, false);
+  assert.match(missingWriterResources.reason, /reservation/i);
+
   assert.throws(
     () => createPreparedDelegationRequest({ delegation: delegation({ role: "sdd-implementer", mode: "background" }), policy }),
     /background writers/i,

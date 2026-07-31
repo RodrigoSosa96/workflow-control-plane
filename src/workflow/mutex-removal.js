@@ -36,7 +36,10 @@
 //       is already gone, so an anomaly here can no longer be resolved by silently declining —
 //       it must be reported. `onRmdirError` lets each store keep its own throw; the two differ
 //       deliberately (one uses a shared error constructor, the other its own fail()) and must
-//       still be called even if this function's own fallback throw never fires.
+//       still be called even if this function's own fallback throw never fires. It is invoked
+//       synchronously (not awaited) — both current callers throw synchronously, so this is not
+//       a live bug, but an async `onRmdirError` would have its rejection dropped and the
+//       fallback below would rethrow the raw rmdir error instead of that store's wrapped one.
 //   11. success.
 //
 // `fs.unlink`/`fs.stat`/`fs.rmdir` are called directly on the `fs` passed in. Steps 7 and 8's
@@ -112,7 +115,7 @@ export async function removeOwnedMutex({ inspect, allow, fs, noun, onRemoved, on
   try {
     await fs.rmdir(recheck.dirPath);
   } catch (error) {
-    onRmdirError(error, recheck);
+    onRmdirError(error, recheck); // called synchronously, not awaited -- see the step-10 note above.
     // onRmdirError is contracted to throw; this is only a safety net if it somehow doesn't.
     throw error;
   }

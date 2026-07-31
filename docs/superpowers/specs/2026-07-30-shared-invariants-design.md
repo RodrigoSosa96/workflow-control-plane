@@ -19,9 +19,9 @@ The review that created this roadmap phase found finding **D17**: the same predi
 
 **This item is drift prevention and correctness by construction — it does not close a live hole.** That distinction was verified, not assumed:
 
-The weaker reservation copy has two callers. `delegation-services.executeApproved` passes a reservation it *just created* with the authoritative `resourceList`, so the weak check validates something correct by construction. The other caller is the Pi coordinator extension's `tool_call` gate on the `subagent` tool, whose `getPreparedSubagentContext` is a no-op returning `undefined` by default — so `validateSubagentRequestPolicy` rejects at its first guard and the weak predicate is never reached.
+The weaker reservation copy has two callers, and only one of them is actually unreached. `delegation-services.executeApproved` genuinely reaches `validateSubagentRequestPolicy` on every approved delegation launch — it is not a dead path — but the reservation it passes was *just created* by that same call with the authoritative `resourceList`, so the weak check is validating something already correct by construction. The other caller, the Pi coordinator extension's `tool_call` gate on the `subagent` tool, is the one that is genuinely unreached: its `getPreparedSubagentContext` is a no-op returning `undefined` by default, so `validateSubagentRequestPolicy` rejects at its first guard before the weak predicate itself ever runs.
 
-So nothing here is exploitable today. What is true is that three hand-written copies of one rule **have already drifted**, and the drift landed in the copy that guards a model-facing boundary. The next person to wire that context provider inherits a check weaker than the one the handoff path enforces, with nothing marking it as such. That is the risk this item removes.
+So nothing here is exploitable today — not because the check goes unexercised, but because the one caller that does exercise it never hands it a reservation the strict version would have rejected. What is true is that three hand-written copies of one rule **have already drifted**, and the drift landed in the copy that guards a model-facing boundary. The next person to wire that context provider inherits a check weaker than the one the handoff path enforces, with nothing marking it as such. That is the risk this item removes.
 
 The removal choreography carries a sharper version of the same argument: it is not merely duplicated, it has already demanded a synchronized two-file fix once, on the code path that decides whether a mutex may be removed.
 
@@ -51,6 +51,10 @@ The four variants differ in strictness. The shared definition takes the strictes
 - Changing the two-lane governance model, the reservation policy values, or what any command does.
 - Consolidating `.pi/extensions/workflow-coordinator/index.ts`'s own store construction or its `ps` argv copy — that is the separate follow-up already recorded in `ROADMAP.md`'s "Pendientes conocidos".
 - Merging `ownership.js` and the two new modules into one grab-bag.
+
+## Known consequences
+
+- **A cwd whose canonical form differs from its raw string (a symlink, a trailing slash) now fails at launch instead of at handoff.** The lease mints its `checkoutDigest` from `canonicalPath(cwd)` (`delegation-reservations.js`'s `reserve`). The coordinator gate, via `reservationMatchesDelegation`, derives its own comparison digest from the *raw* `prepared.cwd` (`delegation-services.js`'s `executeApproved`, through `createPreparedDelegationRequest`) — it has no canonicalizing step of its own to apply. Before this task, `coordinator-policy.js`'s weak predicate never compared `checkoutDigest` at all, so a delegation in this situation passed `executeApproved`'s gate, started a real worker process, and only failed once that worker called handoff (`delegation-handoff.js` has compared digests this way all along). Now the same mismatch is caught at `executeApproved`, before the worker is ever spawned. This is fail-earlier, not a new failure mode, and it is inherent to giving the launch-time gate the same predicate the handoff path already enforced — not something this task's code papers over.
 
 ## Error Handling
 
