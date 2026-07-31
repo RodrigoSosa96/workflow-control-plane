@@ -430,6 +430,16 @@ function runInput(preview, { stateRoot, controlPlaneBin, originSession } = {}) {
     assignmentDigest: preview.assignmentDigest,
     approvalDigest: preview.approvalDigest,
     launchArgv: cloneData(preview.launchSpec?.argv ?? []),
+    // The exact profile object that produced the approved argv: previewHarnessProfile is the same
+    // normalization previewLaunchSpec fed to buildHarnessLaunch, applied to the same reconciliation,
+    // on a preview whose approvalDigest was just re-verified. Persisted whole rather than as the
+    // four security fields alone, so `workflow resume` can reproduce the argv instead of deciding
+    // field by field which parts of the envelope mattered.
+    //
+    // Deliberately NOT added to the approval digest payload: the profile's content is already
+    // covered through launchSpec.argv and selection, and a new digest field would invalidate every
+    // existing preview for no security gain.
+    agentProfile: cloneData(previewHarnessProfile(preview.reconciliation)),
     originSessionId: typeof originSession === "string" ? originSession : originSession?.sessionId ?? originSession?.id ?? null,
     originHarness: typeof originSession === "string" ? null : originSession?.harness ?? null,
   };

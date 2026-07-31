@@ -1658,3 +1658,90 @@ test("without an injected ensureCodexWorkerHooks dependency, an interactive code
 
   assert.equal(report.status, "running");
 });
+
+test("the created run record persists the resolved profile that produced the approved argv (pi)", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "pi-worker" });
+  const preview = await previewFor({ agentProfile: "pi-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+
+  await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [{ id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1" }],
+      notes: [],
+    }),
+  });
+
+  const created = calls.find((call) => call.kind === "store.create").input;
+  assert.deepEqual(created.agentProfile, {
+    harness: "pi",
+    command: "pi",
+    mode: "interactive",
+    model: null,
+    arguments: [],
+  });
+});
+
+test("the created run record persists the resolved profile that produced the approved argv (claude)", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls, { profileName: "claude-worker" });
+  const preview = await previewFor({ agentProfile: "claude-worker" }, { calls, planCommand });
+  const store = createStore(calls);
+
+  await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [{ id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1" }],
+      notes: [],
+    }),
+  });
+
+  const created = calls.find((call) => call.kind === "store.create").input;
+  assert.deepEqual(created.agentProfile, {
+    harness: "claude",
+    command: "claude",
+    mode: "interactive",
+    model: null,
+    arguments: [],
+    permission_mode: "manual",
+  });
+});
+
+test("the created run record persists the resolved profile that produced the approved argv (codex)", async () => {
+  const calls = [];
+  const planCommand = planCommandFactory(calls);
+  const preview = await previewFor({}, { calls, planCommand });
+  const store = createStore(calls);
+
+  await executeLaunch(preview, {
+    planCommand,
+    store,
+    stateRoot: STATE_ROOT,
+    controlPlaneBin: CONTROL_PLANE_BIN,
+    executeStart: async () => ({
+      status: "completed",
+      operations: [{ id: "agent", kind: "agent.session.start", status: "created", agentId: "agent-1" }],
+      notes: [],
+    }),
+  });
+
+  const created = calls.find((call) => call.kind === "store.create").input;
+  assert.deepEqual(created.agentProfile, {
+    harness: "codex",
+    command: "codex",
+    mode: "interactive",
+    model: "gpt-5-codex",
+    arguments: [],
+    sandbox: "workspace-write",
+    approval_policy: "on-request",
+  });
+});
