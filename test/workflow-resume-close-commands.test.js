@@ -20,6 +20,20 @@ function transportIdentity() {
   return { kind: "pi-session", sessionId: "s1" };
 }
 
+// Every value that follows `flag` in an argv. Returns [] when the flag is absent, so a missing
+// flag and a flag with a different value produce different failures. Mirrors the copy in
+// test/workflow-harnesses.test.js (each test file defines its own rather than sharing a util).
+function argvFlagValues(argv, flag) {
+  return argv.flatMap((entry, index) => (entry === flag && index + 1 < argv.length ? [argv[index + 1]] : []));
+}
+
+// The persisted run.agentProfile a relaunch reproduces (see harnesses.js/commands.js). A
+// relaunch resolves the executable itself, so `command` here is intentionally not the one that
+// ends up in argv[0] — relaunchSession overrides it with the resolved path.
+function agentProfile(overrides) {
+  return { harness: "pi", command: "pi", mode: "interactive", model: null, arguments: [], ...overrides };
+}
+
 // resume/close stay read-only except for one case: executeResume's confirmed-relaunch path
 // persists the relaunched pi-session's new pane/tab identity (a foreground write triggered by
 // the user's own `resume --yes`, not a background writer). updates[] lets tests assert that
@@ -136,7 +150,8 @@ test("claude relaunch builds claude --resume <exact> --settings, no bootstrap, v
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
   const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN,
-    profileName: "claude-worker", harness: "claude" };
+    profileName: "claude-worker", harness: "claude",
+    agentProfile: agentProfile({ harness: "claude", command: "claude", permission_mode: "manual" }) };
   const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/claude" });
   assert.equal(res.action, "relaunched");
   assert.equal(startCalls[0].kind, "claude");
@@ -159,7 +174,8 @@ test("codex relaunch builds `codex resume <exact>` subcommand, no bootstrap, val
     async splitPane() { return { paneId: "w3:p1" }; },
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
-  const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "codex-worker", harness: "codex" };
+  const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "codex-worker", harness: "codex",
+    agentProfile: agentProfile({ harness: "codex", command: "codex", sandbox: "workspace-write", approval_policy: "on-request" }) };
   const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/codex" });
   assert.equal(res.action, "relaunched");
   assert.equal(startCalls[0].kind, "codex");
@@ -175,6 +191,77 @@ test("codex relaunch builds `codex resume <exact>` subcommand, no bootstrap, val
   assert.ok(startCalls[0].argv.includes("--add-dir"), "codex relaunch must include --add-dir");
   assert.equal(startCalls[0].argv[startCalls[0].argv.indexOf("--add-dir") + 1], RUN_DIRECTORY);
   assert.equal(startCalls[0].argv.some((v) => /assignment\.md|handoff-input\.json/.test(v)), false);
+});
+
+// D6: the resumed codex worker auto-approved everything the approved profile would have asked
+// about. Presence of the correct flag is not enough — the old argv's hardcoded `-a never` must
+// be gone, or a future edit could emit both and the last one would win.
+test("a resumed codex worker runs under the approved approval policy and sandbox, never a hardcoded -a never", async () => {
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "codex-session", harness: "codex", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const startCalls = [];
+  const herdr = { async listAgents() { return { agents: [] }; },
+    async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane() { return { paneId: "w3:p1" }; },
+    async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent() {} };
+  const run = {
+    id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1,
+    stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "codex-worker",
+    agentProfile: agentProfile({ harness: "codex", command: "codex", sandbox: "workspace-write", approval_policy: "on-request" }),
+  };
+  const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/codex" });
+  assert.equal(res.action, "relaunched");
+  const argv = startCalls[0].argv;
+  assert.deepEqual(argvFlagValues(argv, "--ask-for-approval"), ["on-request"]);
+  assert.deepEqual(argvFlagValues(argv, "--sandbox"), ["workspace-write"]);
+  assert.equal(argv.includes("-a"), false, "the hardcoded -a never must be gone");
+  assert.equal(argv.includes("never"), false);
+});
+
+// The claude counterpart of the regression above: the old hand-built argv dropped
+// --permission-mode entirely, so a resumed claude worker ran without the approved permission
+// posture at all (not merely a substituted one, as codex's was).
+test("a resumed claude worker carries --permission-mode manual, the flag the old hand-built argv dropped", async () => {
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "claude-session", harness: "claude", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const startCalls = [];
+  const herdr = { async listAgents() { return { agents: [] }; },
+    async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane() { return { paneId: "w3:p1" }; },
+    async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent() {} };
+  const run = {
+    id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1,
+    stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "claude-worker",
+    agentProfile: agentProfile({ harness: "claude", command: "claude", permission_mode: "manual" }),
+  };
+  const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/claude" });
+  assert.equal(res.action, "relaunched");
+  assert.deepEqual(argvFlagValues(startCalls[0].argv, "--permission-mode"), ["manual"]);
+});
+
+// pi's divergence was latent, not visible: the hand-built argv never carried --model or
+// arguments at all, which happened to match the committed pi-worker profile's null/[] — this
+// pins the case where they are set, so a future profile with a real model would not go silently
+// unreproduced on resume.
+test("a resumed pi worker carries the profile's --model and arguments when set", async () => {
+  const identity = { kind: "pi-session", runId: RUN_ID, sessionId: "s1", paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const startCalls = [];
+  const herdr = { async listAgents() { return { agents: [] }; },
+    async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane() { return { paneId: "w3:p1" }; },
+    async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent() {} };
+  const run = {
+    id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1,
+    stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "pi-worker",
+    agentProfile: agentProfile({ model: "pi-latest", arguments: ["--plain-output"] }),
+  };
+  const res = await resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/pi" });
+  assert.equal(res.action, "relaunched");
+  assert.deepEqual(argvFlagValues(startCalls[0].argv, "--model"), ["pi-latest"]);
+  assert.ok(startCalls[0].argv.includes("--plain-output"), "resume argv must carry the profile's arguments");
 });
 
 test("resumeCommand reports needs-confirmation for a dead pi-session and relaunches only when confirmed", async () => {
@@ -232,6 +319,8 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
     generation: 2,
     stateRoot: RUN_STATE_ROOT,
     controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+    profileName: "pi-worker",
+    agentProfile: agentProfile(),
   };
   const expectedEnv = {
     WORKFLOW_RUN_ID: RUN_ID,
@@ -320,6 +409,8 @@ test("relaunch gives Herdr a valid agent name for a real UUID session id (<=32 c
     generation: 1,
     stateRoot: RUN_STATE_ROOT,
     controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+    profileName: "pi-worker",
+    agentProfile: agentProfile(),
   });
   const lookupExecutable = async () => "/usr/bin/pi";
 
@@ -356,6 +447,8 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
     generation: 2,
     stateRoot: RUN_STATE_ROOT,
     controlPlaneBin: RUN_CONTROL_PLANE_BIN,
+    profileName: "pi-worker",
+    agentProfile: agentProfile(),
   });
 
   const deadHerdr = {

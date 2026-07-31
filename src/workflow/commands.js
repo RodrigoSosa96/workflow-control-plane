@@ -10,9 +10,9 @@ import { createDelegationServices as defaultCreateDelegationServices } from "./d
 import { createDelegationStore } from "./delegation-store.js";
 import {
   buildClaudeWorkerSettings,
+  buildHarnessResume,
   CLAUDE_WORKER_SETTINGS_FILE,
   CONTROL_PLANE_ROOT,
-  PI_WORKER_EXTENSIONS,
   runEnv,
 } from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
@@ -1389,8 +1389,9 @@ function transportForRun(run, deps, command) {
 // pane from herdr.createTab carries no env on its own, so skipping the split-with-env step
 // here would resume the native history with the widget/telemetry/lifecycle wiring silently
 // dead. session-transport.js deliberately does not implement this itself (its start/
-// deliverFollowUp are stubs) — relaunch is owned by resume, branching on `identity.harness`
-// for the parts that differ per harness (Pi's --extension flags vs Claude's --settings file).
+// deliverFollowUp are stubs) — relaunch is owned by resume. The per-harness argv itself comes
+// from buildHarnessResume (harnesses.js), shared with `workflow launch`; the one thing that
+// still branches on `identity.harness` here is regenerating Claude's --settings file.
 async function relaunchSession(identity, deps) {
   const herdr = deps.herdr;
   if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.splitPane !== "function" || typeof herdr.startAgent !== "function") {
@@ -1436,7 +1437,7 @@ async function relaunchSession(identity, deps) {
     focus: true,
   });
 
-  let argv;
+  let settingsPath;
   if (harness === "claude") {
     // Regenerate claude-worker-settings.json (the dead session left no live process to have
     // kept it current) so the resumed pane reloads the same lifecycle/statusLine hooks the
@@ -1448,34 +1449,24 @@ async function relaunchSession(identity, deps) {
       text: `${JSON.stringify(settings, null, 2)}\n`,
       updater: () => ({}),
     });
-    const settingsPath = join(run.directory, CLAUDE_WORKER_SETTINGS_FILE);
-    // Claude resumes an EXISTING session with `--resume <id>`; `--session-id <id>` CREATES a
-    // session and errors ("Session ID already in use") if it exists — the opposite of Pi, whose
-    // `--session-id` resumes-or-creates. So the relaunch must use `--resume` to reattach to the
-    // dead session's native history. No bootstrap prompt (a resume continues, it does not restart
-    // the assignment). No --permission-mode/--model either — those live on the registry profile,
-    // which the transportIdentity does not carry (known follow-up).
-    argv = [command, "--resume", identity.sessionId, "--add-dir", run.directory, "--settings", settingsPath];
-  } else if (harness === "codex") {
-    // Codex resumes via the `codex resume <id>` SUBCOMMAND, not a flag — the subcommand and
-    // exact session id must be argv[0]/argv[1]/argv[2] (after the executable), unlike Pi/Claude
-    // which resume through flags on the base command. Run in the session's original cwd
-    // (`-C`), grant write access to the run directory (`--add-dir`, same as codexArgv's initial
-    // launch and the claude relaunch above — needed so the resumed worker can write the
-    // handoff), never prompt on approval (`-a never`), and bypass the interactive worker's
-    // lifecycle-hook trust prompt exactly like the initial interactive launch does (Codex hooks
-    // are global, so no settings/hook regeneration is needed here). Sandbox/approval-policy
-    // aren't carried on the transportIdentity, so they're omitted for now (documented
-    // follow-up, mirroring how the claude relaunch omits --permission-mode/--model). No
-    // bootstrap prompt: a resume continues the existing session instead of starting a fresh
-    // assignment.
-    argv = [command, "resume", identity.sessionId, "-C", identity.cwd, "--add-dir", run.directory, "-a", "never", "--dangerously-bypass-hook-trust"];
-  } else {
-    argv = [command, "--name", sessionName, "--session-id", identity.sessionId];
-    for (const extension of PI_WORKER_EXTENSIONS) argv.push("--extension", extension);
-    // No bootstrap prompt: a resume continues the existing session instead of starting a fresh
-    // assignment.
+    settingsPath = join(run.directory, CLAUDE_WORKER_SETTINGS_FILE);
   }
+
+  // The argv that reattaches to the exact native session, under the same security envelope the
+  // original launch's approval covered — one builder shared with `workflow launch` (see
+  // harnesses.js), so a flag added to a launch cannot be forgotten here. run.agentProfile is the
+  // profile that produced the approved launch argv, persisted on the run at launch time; it is
+  // never re-resolved from the registry, which may have changed since the approval. The resolved
+  // executable replaces the persisted profile's (launch-time) command string.
+  const { argv } = buildHarnessResume({
+    profileName: run.profileName,
+    profile: { ...run.agentProfile, command },
+    sessionName,
+    cwd: identity.cwd,
+    run,
+    sessionId: identity.sessionId,
+    settingsPath,
+  });
 
   const started = await herdr.startAgent({
     name: sessionName,
