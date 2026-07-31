@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { classifyDelegationRole, validateDelegationPolicy } from "./delegation-policy.js";
 import { checkoutDigestFor, reservationResourceList } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
-import { sameOwnerDirectory as sameGateDirectory } from "./ownership.js";
+import { removeOwnedMutex } from "./mutex-removal.js";
 
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -300,80 +300,71 @@ export function createDelegationReservationStore({
   // bytes immediately before deleting anything — and again, identity only, immediately before
   // rmdir. A change in either window (a fresh acquisition, a different marker) refuses instead
   // of deleting unknown state. Refuses by returning a reason; it only throws for anomalies
-  // discovered after the rmdir itself has already begun.
+  // discovered after the rmdir itself has already begun. The choreography itself lives in
+  // mutex-removal.js's removeOwnedMutex, shared with run-store.js's removeLock; this function
+  // supplies the gate-specific inspect/error-wrapping/success-shape and the "active gate" noun.
   async function clearGate({ projectAlias, allow } = {}) {
     if (typeof allow !== "function") fail("clearGate allow must be a function");
     const alias = assertString(projectAlias, "reservation project alias", 512);
     const projectDigest = digestKey(alias);
     const paths = projectPaths(projectDigest);
 
-    const initial = await inspectGateInternal(paths);
-    if (!initial || !initial.marker) {
-      return { cleared: false, reason: "no active gate or the owner marker is unreadable" };
+    async function inspect() {
+      const internal = await inspectGateInternal(paths);
+      if (!internal) return null;
+      return {
+        dirPath: internal.activeGate,
+        dirStat: internal.activeStat,
+        markerPath: internal.markerPath,
+        markerText: internal.markerText,
+        marker: internal.marker,
+        entries: internal.entries,
+      };
     }
 
-    const permitted = await allow(initial.marker);
-    if (!permitted) {
-      return { cleared: false, reason: "removal was not permitted for the current owner marker" };
-    }
+    // The shared choreography only knows "refuse on ENOENT/ENOTDIR, otherwise throw" for the
+    // unlink and post-unlink stat steps; it deliberately does not know this store's own error
+    // wrapping convention. Wrap fs.unlink/fs.stat here so an unexpected error still comes out
+    // exactly as it did before this call moved into mutex-removal.js. fs.rmdir stays unwrapped:
+    // its full anomaly handling is delegated to onRmdirError instead.
+    const removalFs = {
+      unlink: async (path) => {
+        try {
+          await fs.unlink(path);
+        } catch (error) {
+          if (error?.code === "ENOENT" || error?.code === "ENOTDIR") throw error;
+          fail(`Unable to remove reservation gate owner marker (${error?.code ?? "FS_ERROR"})`);
+        }
+      },
+      stat: async (path) => {
+        try {
+          return await fs.stat(path);
+        } catch (error) {
+          if (error?.code === "ENOENT" || error?.code === "ENOTDIR") throw error;
+          fail(`Unable to inspect reservation project gate (${error?.code ?? "FS_ERROR"})`);
+        }
+      },
+      rmdir: (path) => fs.rmdir(path),
+    };
 
-    const recheck = await inspectGateInternal(paths);
-    if (!recheck || !recheck.marker) {
-      return { cleared: false, reason: "the active gate or its owner marker disappeared before removal" };
-    }
-    if (!sameGateDirectory(recheck.activeStat, initial.activeStat)) {
-      return { cleared: false, reason: "the active gate directory was replaced before removal" };
-    }
-    if (recheck.markerPath !== initial.markerPath || recheck.markerText !== initial.markerText) {
-      return { cleared: false, reason: "the owner marker changed before removal" };
-    }
-    // A directory holding anything besides the marker (a stray .DS_Store, an editor temp —
-    // exactly what inspectGate already tolerates when identifying the marker) would make the
-    // rmdir below fail with ENOTEMPTY *after* the marker is already gone: the gate stays
-    // wedged, but now with no marker to recover from, destroying the pid/startedAt evidence
-    // this whole mechanism exists to preserve. Refuse before unlinking anything instead.
-    if (recheck.entries.length !== 1) {
-      return { cleared: false, reason: "the active gate directory holds entries besides the owner marker; refusing before deleting anything to avoid destroying ownership evidence" };
-    }
+    const result = await removeOwnedMutex({
+      inspect,
+      allow,
+      fs: removalFs,
+      noun: "active gate",
+      onRemoved: (recheck) => ({ cleared: true, activeGate: recheck.dirPath }),
+      onRmdirError: (error) => {
+        // At this point the owner marker is already unlinked -- only the directory removal
+        // itself failed. Say both facts: what removal already committed (the marker, the
+        // ownership evidence) and what it could not finish (the directory), matching this
+        // spec's "reports exactly what was removed and what remains" requirement instead of
+        // leaving an operator to guess whether the marker survived.
+        fail(`The reservation gate owner marker was already removed, but the active gate directory could not be removed (${error?.code ?? "FS_ERROR"}); manual inspection required`);
+      },
+    });
 
-    try {
-      await fs.unlink(recheck.markerPath);
-    } catch (error) {
-      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
-        return { cleared: false, reason: "the owner marker disappeared before removal" };
-      }
-      fail(`Unable to remove reservation gate owner marker (${error?.code ?? "FS_ERROR"})`);
-    }
-
-    // The marker is gone; re-verify the directory itself one more time before rmdir-ing it.
-    // Nothing should legitimately replace an active-gate directory this fast, but if it
-    // happened (a fresh acquisition landing in the window between the unlink above and here),
-    // rmdir-ing it unverified would destroy a live acquisition we never inspected.
-    let postUnlinkStat;
-    try {
-      postUnlinkStat = await fs.stat(recheck.activeGate);
-    } catch (error) {
-      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
-        return { cleared: false, reason: "the active gate directory disappeared before removal" };
-      }
-      fail(`Unable to inspect reservation project gate (${error?.code ?? "FS_ERROR"})`);
-    }
-    if (!postUnlinkStat.isDirectory() || !sameGateDirectory(postUnlinkStat, recheck.activeStat)) {
-      return { cleared: false, reason: "the active gate directory was replaced before removal" };
-    }
-
-    try {
-      await fs.rmdir(recheck.activeGate);
-    } catch (error) {
-      // At this point the owner marker is already unlinked (above) -- only the directory removal
-      // itself failed. Say both facts: what removal already committed (the marker, the ownership
-      // evidence) and what it could not finish (the directory), matching this spec's "reports
-      // exactly what was removed and what remains" requirement instead of leaving an operator to
-      // guess whether the marker survived.
-      fail(`The reservation gate owner marker was already removed, but the active gate directory could not be removed (${error?.code ?? "FS_ERROR"}); manual inspection required`);
-    }
-
-    return { cleared: true, activeGate: recheck.activeGate };
+    if (result.refused) return { cleared: false, reason: result.reason };
+    return result;
   }
 
   async function withProjectGate(projectDigest, callback) {
