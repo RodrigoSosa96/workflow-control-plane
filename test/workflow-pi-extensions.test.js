@@ -228,6 +228,47 @@ test("coordinator live runtime resolves an absolute Pi binary and honors a valid
   );
 });
 
+test("the coordinator runtime builds both mutex-taking stores with one shared readOwnOwnership reader", async () => {
+  const runStoreArgs = [];
+  const reservationArgs = [];
+  const injectedReader = async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" });
+
+  await createWorkflowCoordinatorRuntime({
+    env: { WORKFLOW_STATE_ROOT: "/state/override" },
+    readOwnOwnership: injectedReader,
+    lookupExecutableImpl: async () => "/opt/pi/bin/pi",
+    loadRegistryImpl: async () => ({ launcher: { state_root: "/state/override" }, projects: {} }),
+    createRunStoreImpl: (args) => { runStoreArgs.push(args); return { async read() { return { id: RUN_ID, projectAlias: "fixture" }; } }; },
+    createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
+    createReservationStoreImpl: (args) => { reservationArgs.push(args); return {}; },
+    createDelegationServicesImpl: () => ({}),
+    createTransportImpl: () => ({ async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {} }),
+    loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
+  });
+
+  assert.equal(runStoreArgs[0].readOwnOwnership, injectedReader);
+  assert.equal(reservationArgs[0].readOwnOwnership, injectedReader);
+});
+
+// The default must be lazy: building a runtime happens on every Pi session start, and the reader
+// is memoized per process, so construction itself must spawn nothing.
+test("building a coordinator runtime never invokes the ownership reader", async () => {
+  let readerCalls = 0;
+  await createWorkflowCoordinatorRuntime({
+    env: { WORKFLOW_STATE_ROOT: "/state/override" },
+    readOwnOwnership: async () => { readerCalls += 1; return null; },
+    lookupExecutableImpl: async () => "/opt/pi/bin/pi",
+    loadRegistryImpl: async () => ({ launcher: { state_root: "/state/override" }, projects: {} }),
+    createRunStoreImpl: () => ({ async read() { return { id: RUN_ID, projectAlias: "fixture" }; } }),
+    createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
+    createReservationStoreImpl: () => ({}),
+    createDelegationServicesImpl: () => ({}),
+    createTransportImpl: () => ({ async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {} }),
+    loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
+  });
+  assert.equal(readerCalls, 0);
+});
+
 // The coordinator's own inspector must keep reporting exactly the startedAt string the rest of
 // the repo's pid observation produces: the transport records it at spawn (pi-delegation-transport
 // launchIdentity) and compares it in observeExact, and a drift there degrades live children to an

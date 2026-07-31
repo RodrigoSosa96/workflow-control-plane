@@ -15,7 +15,7 @@ import { createDelegationServices } from "../../../src/workflow/delegation-servi
 import { createPiDelegationTransport } from "../../../src/workflow/pi-delegation-transport.js";
 import { loadDelegationRole } from "../../../src/workflow/delegation-roles.js";
 import { inspectExactProcessByPid } from "../../../src/workflow/process-observation.js";
-import { spawnPsStatus } from "../../../src/workflow/ownership.js";
+import { spawnPsStatus, createSubprocessOwnOwnershipReader } from "../../../src/workflow/ownership.js";
 import { validateSubagentRequestPolicy } from "../../../src/workflow/coordinator-policy.js";
 import { createDelegationWatcher } from "../../../src/workflow/delegation-watcher.js";
 import { createWorkerWatcher } from "../../../src/workflow/worker-watcher.js";
@@ -28,6 +28,16 @@ const CONTROL_PLANE_BIN = fileURLToPath(new URL("../../../bin/workflow.js", impo
 const AGENT_DIRECTORY = fileURLToPath(new URL("../../agents", import.meta.url));
 const CHILD_EXTENSION_PATH = fileURLToPath(new URL("../workflow-delegation-child.ts", import.meta.url));
 const PREVIEW_LIMIT = 16 * 1024;
+
+// One reader per process, built at module scope -- same shape as workflow-worker-lifecycle.ts's
+// and workflow-worker-observability.ts's identical defaults. Constructing it spawns nothing; the
+// first mutex this session takes pays one `ps`, and createOwnOwnershipReader's memoization (which
+// caches a null outcome too) means every later lock and gate in the session is free. That ratio
+// is the reason a `ps` spawn inside a long-lived extension is acceptable: this coordinator holds
+// the run lock across worktree creation, the Herdr calls and agent startup, the longest hold in
+// the system, and residue from an interrupted launch is exactly what `workflow unlock` exists to
+// recover.
+const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 function StringEnum(values, options = {}) {
   return { type: "string", enum: [...values], ...options };
@@ -458,6 +468,7 @@ export async function createWorkflowCoordinatorRuntime({
   controlPlaneBin = CONTROL_PLANE_BIN,
   agentDirectory = AGENT_DIRECTORY,
   childExtensionPath = CHILD_EXTENSION_PATH,
+  readOwnOwnership = defaultReadOwnOwnership,
 } = {}) {
   const registry = await loadRegistryImpl(projectsFile);
   const stateRoot = env.WORKFLOW_STATE_ROOT ?? registry?.launcher?.state_root;
@@ -478,6 +489,7 @@ export async function createWorkflowCoordinatorRuntime({
     onListProblem: (problem: { runId?: string; message?: string }) => {
       noteDiagnostic("run-store.list", `skipped ${problem?.runId ?? "unknown"}: ${problem?.message ?? "unreadable"}`);
     },
+    readOwnOwnership,
   });
   const runner = createProcessRunnerImpl();
   const git = createGitAdapterImpl({ runner });
@@ -486,6 +498,7 @@ export async function createWorkflowCoordinatorRuntime({
   const reservations = createReservationStoreImpl({
     stateRoot,
     canonicalPath,
+    readOwnOwnership,
   });
   const roles = {
     async loadDelegationRole({ name }) {
