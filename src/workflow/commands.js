@@ -1411,31 +1411,29 @@ async function relaunchSession(identity, deps) {
   }
 
   const run = await deps.store.read(identity.runId);
+  // run.agentProfile.harness is the authoritative record of what was approved (it drives the
+  // argv builder below); `harness` above is derived from the transport identity instead, for the
+  // env/settings-regeneration/startAgent kind decisions that happen before the profile is even
+  // read. The two must agree — a disagreement means a hand-edited or corrupted run.json, not
+  // something to reconcile silently: left unchecked, it would start one harness's argv under
+  // another harness's executable with no error (e.g. a codex argv run under the claude binary).
+  if (run.agentProfile && run.agentProfile.harness !== harness) {
+    delegationError(
+      "PREFLIGHT",
+      `Resume identity harness "${harness}" disagrees with the approved profile's harness "${run.agentProfile.harness}"`,
+      10,
+    );
+  }
   const env = runEnv(run, harness);
   // Herdr agent names are limited to 1-32 chars ([a-z][a-z0-9_-]*). A full session UUID makes
   // `resume-<uuid>` 43 chars, which `herdr agent start` rejects — so the relaunch would create
   // the tab + split pane but never start the agent, and the user sees an empty panel on reopen.
-  // Use the session id's first block (matching the tab label). The resume is driven by the
-  // exact `--session-id` below, not by this display name, so shortening it is safe.
+  // Use the session id's first block (matching the tab label). The resume is driven by the exact
+  // session id buildHarnessResume encodes into the argv below (each harness's own resume form —
+  // `--session-id` for pi, `--resume` for claude, the `resume` subcommand for codex), not by this
+  // display name, so shortening it is safe.
   const shortSessionId = String(identity.sessionId ?? "").slice(0, 8) || "session";
   const sessionName = `resume-${shortSessionId}`;
-
-  // A fresh tab (no env — Herdr's createTab has no env parameter) gives us a root pane to
-  // split from, exactly like the interactive launch's bootstrap pane.
-  const tab = await herdr.createTab({
-    workspaceId: identity.workspaceId,
-    cwd: identity.cwd,
-    label: sessionName,
-    focus: true,
-  });
-  // The WORKFLOW_* env goes on the split pane, exactly as the interactive launch's agent pane.
-  const agentPane = await herdr.splitPane({
-    paneId: tab.paneId,
-    direction: "down",
-    cwd: identity.cwd,
-    env,
-    focus: true,
-  });
 
   let settingsPath;
   if (harness === "claude") {
@@ -1457,7 +1455,10 @@ async function relaunchSession(identity, deps) {
   // harnesses.js), so a flag added to a launch cannot be forgotten here. run.agentProfile is the
   // profile that produced the approved launch argv, persisted on the run at launch time; it is
   // never re-resolved from the registry, which may have changed since the approval. The resolved
-  // executable replaces the persisted profile's (launch-time) command string.
+  // executable replaces the persisted profile's (launch-time) command string. Called before any
+  // Herdr mutation below (createTab/splitPane): planResume's gate (assertProfile) checks less
+  // than this builder demands (e.g. settingsPath for an interactive claude resume), so a profile
+  // that clears the gate can still fail here — and must fail before a tab/pane exists, not after.
   const { argv } = buildHarnessResume({
     profileName: run.profileName,
     profile: { ...run.agentProfile, command },
@@ -1466,6 +1467,25 @@ async function relaunchSession(identity, deps) {
     run,
     sessionId: identity.sessionId,
     settingsPath,
+  });
+  // buildHarnessResume also returns `env`, discarded here: splitPane below needs the WORKFLOW_*
+  // env before this argv exists, so it already took it from runEnv(run, harness) above instead.
+
+  // A fresh tab (no env — Herdr's createTab has no env parameter) gives us a root pane to
+  // split from, exactly like the interactive launch's bootstrap pane.
+  const tab = await herdr.createTab({
+    workspaceId: identity.workspaceId,
+    cwd: identity.cwd,
+    label: sessionName,
+    focus: true,
+  });
+  // The WORKFLOW_* env goes on the split pane, exactly as the interactive launch's agent pane.
+  const agentPane = await herdr.splitPane({
+    paneId: tab.paneId,
+    direction: "down",
+    cwd: identity.cwd,
+    env,
+    focus: true,
   });
 
   const started = await herdr.startAgent({

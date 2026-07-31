@@ -109,13 +109,27 @@ bypass shortcuts"`, and the dedicated `never.launcher.agent_profiles
 throws on exactly this, alongside the same treatment given to
 `--dangerously-skip-permissions` (Claude) and `danger-full-access` sandbox
 (Codex) — a checked-in registry profile can never grant full-autonomy
-approval. The `"never"` value **does** appear elsewhere in this codebase, but
-only hardcoded directly into argv by code that bypasses profile validation
-entirely: `relaunchSession`'s codex branch (`src/workflow/commands.js`) always
-resumes with `-a never` (a dead session being reattached should not stop to
-ask for approval), and several unit tests construct raw (non-registry)
-profile objects with `approval_policy: "never"` to exercise `codexArgv`'s
-plumbing in isolation. None of that goes through `validateRegistry`.
+approval. At the time this section was written, the `"never"` value appeared
+elsewhere in this codebase only hardcoded directly into argv by code that
+bypassed profile validation entirely: `relaunchSession`'s codex branch
+(`src/workflow/commands.js`) always resumed with `-a never` regardless of what
+the approved profile said (reasoned then as "a dead session being reattached
+should not stop to ask for approval"), and several unit tests construct raw
+(non-registry) profile objects with `approval_policy: "never"` to exercise
+`codexArgv`'s plumbing in isolation. None of that went through
+`validateRegistry`.
+
+**Superseded by roadmap item 1.3**
+(`docs/superpowers/specs/2026-07-31-resume-approved-envelope-design.md`): that
+hardcoded `-a never` was exactly the escalation 1.3 exists to remove — a
+resumed codex worker auto-approved everything the approved profile would have
+asked about. `relaunchSession` no longer hand-assembles argv itself; it calls
+`buildHarnessResume` (`src/workflow/harnesses.js`), the same per-harness argv
+builder `workflow launch` uses, so a resumed codex worker now runs under
+`--ask-for-approval <run.agentProfile.approval_policy>` and
+`--sandbox <run.agentProfile.sandbox>` — the approved envelope from the run
+record, never a hardcoded bypass. The raw-profile unit tests referenced above
+are unaffected by this change.
 
 So the correct patch for this fixture is **`mode` only** — leave
 `approval_policy` at the fixture's own default (`on-request`, already a
@@ -370,10 +384,15 @@ fine to fold this probe into that session instead of starting a second one.
 
 - [ ] **(c) `codex resume <id>` resumes the native session in the original
   cwd, with the workflow hook still active.** With a dead session's exact
-  UUID (see §4 step 4 — this is exactly the `relaunchSession` argv in
-  `src/workflow/commands.js`):
+  UUID (see §4 step 4 — this is now `buildHarnessResume`'s codex argv
+  (`src/workflow/harnesses.js`), run by `relaunchSession`
+  (`src/workflow/commands.js`); see the "Superseded by roadmap item 1.3" note
+  in §1 above — it is no longer the hardcoded `-a never` command this item
+  originally showed):
   ```bash
-  codex resume <exact-uuid> -C <run-directory> -a never --dangerously-bypass-hook-trust
+  codex resume <exact-uuid> -C <run-directory> --add-dir <run-directory> \
+    --sandbox workspace-write --ask-for-approval on-request \
+    --dangerously-bypass-hook-trust
   ```
   Inside the resumed session, confirm (1) the prior turn's greeting is in
   scrollback/history (not a fresh empty session), and (2) a new prompt

@@ -436,9 +436,23 @@ function runInput(preview, { stateRoot, controlPlaneBin, originSession } = {}) {
     // four security fields alone, so `workflow resume` can reproduce the argv instead of deciding
     // field by field which parts of the envelope mattered.
     //
+    // True of the *approved* argv, not the *executed* one: the argv that actually runs comes from
+    // a third normalization, hydrateAgentProfile (execute.js), with different defaults —
+    // hydrateAgentProfile defaults permission_mode/sandbox/approval_policy ("manual",
+    // "workspace-write", "on-request") where previewHarnessProfile omits an unset field outright.
+    // The two cannot diverge today only because previewLaunchSpec's buildHarnessLaunch call would
+    // already have thrown on a profile missing a field claudeArgv/codexArgv demand (assertString),
+    // so no persisted agentProfile ever reaches hydrateAgentProfile's defaults with a genuinely
+    // different value to apply. Reproducing what was *approved* is the right choice regardless —
+    // that is what the digest covers — but "plan.agent -> profile" now has three separate
+    // definitions (previewHarnessProfile here, hydrateAgentProfile in execute.js, selectedProfile
+    // just above), which is a real duplication and a follow-up worth collapsing.
+    //
     // Deliberately NOT added to the approval digest payload: the profile's content is already
-    // covered through launchSpec.argv and selection, and a new digest field would invalidate every
-    // existing preview for no security gain.
+    // covered through launchSpec.argv, selection, and reconciliation (digestPayload includes it
+    // whole, and it is the only one of the three that covers `mode` itself rather than only its
+    // effect on which flags appear), and a new digest field would invalidate every existing
+    // preview for no security gain.
     agentProfile: cloneData(previewHarnessProfile(preview.reconciliation)),
     originSessionId: typeof originSession === "string" ? originSession : originSession?.sessionId ?? originSession?.id ?? null,
     originHarness: typeof originSession === "string" ? null : originSession?.harness ?? null,

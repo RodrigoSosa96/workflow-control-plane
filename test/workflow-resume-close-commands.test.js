@@ -264,6 +264,68 @@ test("a resumed pi worker carries the profile's --model and arguments when set",
   assert.ok(startCalls[0].argv.includes("--plain-output"), "resume argv must carry the profile's arguments");
 });
 
+// Finding 2 (final review, roadmap 1.3): assertProfile — planResume's reproducibility gate — is
+// less strict than the argv builder. A profile can pass assertProfile (harness/command/arguments
+// well-shaped) and still lack a field claudeArgv demands (permission_mode), so the builder
+// throws. That must happen before any Herdr mutation, or a run this code creates would leave an
+// orphan tab/pane behind a thrown error.
+test("a builder-level failure (assertProfile passes, the argv builder demands more) creates no Herdr state", async () => {
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "claude-session", harness: "claude", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const herdrCalls = [];
+  const herdr = {
+    async listAgents() { return { agents: [] }; },
+    async createTab(args) { herdrCalls.push({ method: "createTab", args }); return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane(args) { herdrCalls.push({ method: "splitPane", args }); return { paneId: "w3:p1" }; },
+    async startAgent(args) { herdrCalls.push({ method: "startAgent", args }); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent(args) { herdrCalls.push({ method: "focusAgent", args }); },
+  };
+  const run = {
+    id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1,
+    stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "claude-worker",
+    // Passes assertProfile (non-empty harness/command, arguments is an array of strings) but has
+    // no permission_mode, which claudeArgv (harnesses.js) requires via assertString.
+    agentProfile: { harness: "claude", command: "claude", mode: "interactive", arguments: [] },
+  };
+  await assert.rejects(
+    () => resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/claude" }),
+    /permission_mode/,
+  );
+  assert.deepEqual(herdrCalls, [], "no createTab/splitPane/startAgent/focusAgent call may happen before the builder validates the profile");
+});
+
+// Finding 3 (final review, roadmap 1.3): identity.harness drives env/settings/startAgent's kind;
+// run.agentProfile.harness drives the argv builder. A hand-edited or corrupted run.json could
+// make the two disagree, which used to run silently (e.g. a codex argv under the claude binary,
+// with no error). run.agentProfile.harness is the authoritative approved record now, so a
+// disagreement must refuse loudly instead.
+test("a resume whose identity harness disagrees with the approved profile's harness is refused", async () => {
+  const sessionId = "d263185e-7ef5-4521-857d-8818074a826e";
+  const identity = { kind: "claude-session", harness: "claude", runId: RUN_ID, sessionId, paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
+  const herdrCalls = [];
+  const herdr = {
+    async listAgents() { return { agents: [] }; },
+    async createTab(args) { herdrCalls.push({ method: "createTab", args }); return { tabId: "w3:t1", paneId: "w3:p0" }; },
+    async splitPane(args) { herdrCalls.push({ method: "splitPane", args }); return { paneId: "w3:p1" }; },
+    async startAgent(args) { herdrCalls.push({ method: "startAgent", args }); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
+    async focusAgent(args) { herdrCalls.push({ method: "focusAgent", args }); },
+  };
+  const run = {
+    id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1,
+    stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "codex-worker",
+    agentProfile: agentProfile({ harness: "codex", command: "codex", sandbox: "workspace-write", approval_policy: "on-request" }),
+  };
+  await assert.rejects(
+    () => resumeCommand({ runId: RUN_ID, confirmed: true }, { store: storeFor(run), herdr, lookupExecutable: async () => "/usr/bin/claude" }),
+    (error) => error instanceof WorkflowError
+      && error.category === "PREFLIGHT"
+      && error.exitCode === 10
+      && /"claude"/.test(error.message)
+      && /"codex"/.test(error.message),
+  );
+  assert.deepEqual(herdrCalls, [], "a disagreeing identity/profile harness must be caught before any Herdr call");
+});
+
 test("resumeCommand reports needs-confirmation for a dead pi-session and relaunches only when confirmed", async () => {
   const identity = { kind: "pi-session", runId: RUN_ID, sessionId: "s1", paneId: "w2:p9", tabId: "w2:t1", workspaceId: "w2", cwd: "/wt" };
   const deadHerdr = {
