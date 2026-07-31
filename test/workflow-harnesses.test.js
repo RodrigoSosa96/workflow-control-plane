@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   buildClaudeWorkerSettings,
   buildHarnessLaunch,
+  buildHarnessResume,
   CLAUDE_WORKER_SETTINGS_FILE,
 } from "../src/workflow/harnesses.js";
 
@@ -298,4 +299,169 @@ test("interactive codexArgv adds --dangerously-bypass-hook-trust; stream-json do
 // kept in sync by a comment; this pins the single one.
 test("CLAUDE_WORKER_SETTINGS_FILE is exported from harnesses.js and is the file claudeArgv points --settings at", () => {
   assert.equal(CLAUDE_WORKER_SETTINGS_FILE, "claude-worker-settings.json");
+});
+
+const SESSION_ID = "22222222-2222-4222-8222-222222222222";
+const SETTINGS_PATH = `${RUN.directory}/${CLAUDE_WORKER_SETTINGS_FILE}`;
+
+// Every value that follows `flag` in an argv. Returns [] when the flag is absent, so a missing
+// flag and a flag with a different value produce different failures.
+function argvFlagValues(argv, flag) {
+  return argv.flatMap((entry, index) => (entry === flag && index + 1 < argv.length ? [argv[index + 1]] : []));
+}
+
+// Drops the first occurrence of a contiguous span (a harness's session form) from an argv, so the
+// rest can be compared verbatim.
+function withoutSpan(argv, span) {
+  if (span.length === 0) return [...argv];
+  const at = argv.findIndex((_, index) => span.every((value, offset) => argv[index + offset] === value));
+  assert.notEqual(at, -1, `argv must contain the session form "${span.join(" ")}": ${argv.join(" ")}`);
+  return [...argv.slice(0, at), ...argv.slice(at + span.length)];
+}
+
+// The three interactive harnesses `workflow resume` can relaunch. Each profile sets BOTH a model
+// and a non-empty `arguments` so the parity assertions below exercise them instead of passing
+// vacuously against null/[]. `sessionForm` is the ONLY thing a resume argv may change (plus the
+// launch-only bootstrap prompt) — see the resume-form table in the plan.
+const PROFILE_FLAG_CASES = [
+  {
+    harness: "claude",
+    profileName: "claude-worker",
+    profile: profile({
+      harness: "claude",
+      command: "claude",
+      model: "claude-3-5-sonnet-latest",
+      arguments: ["--verbose"],
+      permission_mode: "manual",
+    }),
+    settingsPath: SETTINGS_PATH,
+    flags: ["--permission-mode", "--model", "--add-dir", "--settings"],
+    sessionForm: { launch: ["--session-id", SESSION_ID], resume: ["--resume", SESSION_ID] },
+  },
+  {
+    harness: "codex",
+    profileName: "codex-worker",
+    profile: profile({
+      harness: "codex",
+      command: "codex",
+      model: "gpt-5-codex",
+      arguments: ["--config", "ui=false"],
+      sandbox: "workspace-write",
+      approval_policy: "on-request",
+    }),
+    flags: ["--sandbox", "--ask-for-approval", "--model", "--add-dir"],
+    sessionForm: { launch: [], resume: ["resume", SESSION_ID] },
+  },
+  {
+    harness: "pi",
+    profileName: "pi-worker",
+    profile: profile({ model: "pi-latest", arguments: ["--plain-output"] }),
+    flags: ["--model", "--extension"],
+    sessionForm: { launch: ["--session-id", SESSION_ID], resume: ["--session-id", SESSION_ID] },
+  },
+];
+
+function launchAndResume({ profileName, profile: harnessProfile, settingsPath }) {
+  const common = { profileName, profile: harnessProfile, sessionName: SESSION_NAME, cwd: CWD, run: RUN, settingsPath };
+  return {
+    launched: buildHarnessLaunch({ ...common, nativeSessionId: SESSION_ID }),
+    resumed: buildHarnessResume({ ...common, sessionId: SESSION_ID }),
+  };
+}
+
+// The defect this whole item exists for: launch and resume derived the same profile into flags
+// twice, and drifted (claude resume dropped --permission-mode; codex resume dropped
+// --sandbox and answered -a never instead of the approved --ask-for-approval on-request). This
+// asserts they cannot drift again — every flag the profile contributes to a launch must appear
+// identically in the resume argv. Compared as a filtered list rather than whole argvs, because
+// the session form and the bootstrap prompt legitimately differ.
+for (const testCase of PROFILE_FLAG_CASES) {
+  test(`launch and resume emit identical profile-derived flags for ${testCase.harness}`, () => {
+    const { launched, resumed } = launchAndResume(testCase);
+    for (const flag of testCase.flags) {
+      const launchValues = argvFlagValues(launched.argv, flag);
+      assert.notDeepEqual(launchValues, [], `${flag} must be present in the launch argv, else this case asserts nothing`);
+      assert.deepEqual(argvFlagValues(resumed.argv, flag), launchValues, flag);
+    }
+    // profile.arguments are part of the approved envelope too, and carry no flag of their own.
+    for (const argument of testCase.profile.arguments) {
+      assert.ok(resumed.argv.includes(argument), `resume argv must carry profile argument ${argument}`);
+    }
+    assert.deepEqual(resumed.env, launched.env);
+  });
+}
+
+// The stronger form of the same guarantee, and the one that catches a flag added to only one
+// path in the FUTURE (the flag list above can only catch drift in flags someone remembered to
+// list). A resume argv may differ from its launch argv in exactly two ways: the session form and
+// the launch-only bootstrap prompt. Anything else added to one side must be added to the other.
+for (const testCase of PROFILE_FLAG_CASES) {
+  test(`resume argv differs from launch argv only in the session form and bootstrap prompt for ${testCase.harness}`, () => {
+    const { launched, resumed } = launchAndResume(testCase);
+    assert.match(launched.argv.at(-1), /assignment\.md/, "launch argv must end with the bootstrap prompt");
+    const launchCore = withoutSpan(launched.argv.slice(0, -1), testCase.sessionForm.launch);
+    const resumeCore = withoutSpan(resumed.argv, testCase.sessionForm.resume);
+    assert.deepEqual(resumeCore, launchCore);
+  });
+}
+
+test("claude resumes with --resume and never --session-id, which would create a session instead", () => {
+  const { resumed } = launchAndResume(PROFILE_FLAG_CASES[0]);
+  assert.equal(resumed.argv[0], "claude");
+  assert.equal(resumed.argv[1], "--resume");
+  assert.equal(resumed.argv[2], SESSION_ID);
+  assert.equal(resumed.argv.includes("--session-id"), false);
+});
+
+test("codex resumes through the positional `resume <id>` subcommand, before -C and every flag", () => {
+  const { resumed } = launchAndResume(PROFILE_FLAG_CASES[1]);
+  assert.deepEqual(resumed.argv.slice(0, 5), ["codex", "resume", SESSION_ID, "-C", CWD]);
+  // The subcommand and its id are positional: any flag ahead of them changes what codex runs.
+  assert.equal(resumed.argv.findIndex((entry) => entry.startsWith("-")) > 2, true);
+});
+
+test("pi resumes with the same --session-id form it launched with", () => {
+  const { resumed } = launchAndResume(PROFILE_FLAG_CASES[2]);
+  assert.deepEqual(resumed.argv.slice(0, 5), ["pi", "--name", SESSION_NAME, "--session-id", SESSION_ID]);
+});
+
+test("no resume argv carries a bootstrap prompt: a resume continues, it does not restart the assignment", () => {
+  for (const testCase of PROFILE_FLAG_CASES) {
+    const { resumed } = launchAndResume(testCase);
+    for (const entry of resumed.argv) {
+      assert.doesNotMatch(entry, /assignment\.md|handoff-input\.json/, `${testCase.harness} resume argv must not restart the assignment`);
+    }
+  }
+});
+
+test("buildHarnessResume rejects an opencode profile instead of inventing a resume argv", () => {
+  // `workflow resume` only ever relaunches pi/claude/codex; opencode has no resume form, and
+  // guessing one would run an unapproved argv.
+  assert.throws(
+    () => buildHarnessResume({
+      profileName: "opencode-worker",
+      profile: profile({ harness: "opencode", command: "opencode", model: "provider/model" }),
+      sessionName: SESSION_NAME,
+      cwd: CWD,
+      run: RUN,
+      sessionId: SESSION_ID,
+    }),
+    /opencode/,
+  );
+});
+
+test("buildHarnessResume requires the session id and the run whose envelope it reproduces", () => {
+  const base = {
+    profileName: "pi-worker",
+    profile: profile({ model: "pi-latest", arguments: ["--plain-output"] }),
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+    sessionId: SESSION_ID,
+  };
+  assert.doesNotThrow(() => buildHarnessResume(base));
+  assert.throws(() => buildHarnessResume({ ...base, sessionId: "" }), /sessionId/);
+  assert.throws(() => buildHarnessResume({ ...base, sessionId: undefined }), /sessionId/);
+  assert.throws(() => buildHarnessResume({ ...base, run: null }), /run/);
+  assert.throws(() => buildHarnessResume({ ...base, profile: { ...base.profile, harness: "nope" } }), /harness/i);
 });
