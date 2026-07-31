@@ -261,10 +261,16 @@ builds its own.)
   `Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]` /
   `[SESSION_ID] — Session id (UUID) or session name ... If omitted, use
   --last to pick the most recent recorded session`. This is the subcommand
-  `relaunchSession`'s codex branch (`src/workflow/commands.js`) builds:
+  the codex resume argv is built around — a subcommand, not a flag (unlike
+  Pi's `--session-id` or Claude's `--resume`), which is why its session id
+  must sit at argv positions 1-2, ahead of every flag.
+  **Superseded by roadmap item 1.3:** this used to read
   `[codex, "resume", <exact sessionId>, "-C", <cwd>, "-a", "never",
-  "--dangerously-bypass-hook-trust"]` — a subcommand, not a flag (unlike
-  Pi's `--session-id` or Claude's `--resume`).
+  "--dangerously-bypass-hook-trust"]`, hand-assembled by `relaunchSession`'s
+  codex branch. That branch is gone; `buildHarnessResume`
+  (`src/workflow/harnesses.js`) now builds the argv from the profile
+  persisted at launch, so the sandbox and approval policy are the approved
+  ones rather than a hardcoded `-a never`.
 - **Sessions live under `~/.codex/sessions/`, cwd-scoped, one file per
   session** — live directory listing from this environment (codex-cli
   0.145.0) shows the real layout is **`~/.codex/sessions/<YYYY>/<MM>/<DD>/
@@ -338,8 +344,11 @@ builds its own.)
   `--ask-for-approval <profile.approval_policy>`. Because the registry
   forbids `approval_policy: "never"` (see §1), a real interactive launch
   built from a registry profile can only ever carry `untrusted` or
-  `on-request` here — `"never"` is reachable only via the hardcoded
-  `relaunchSession` resume path, never via a fresh `launch`.
+  `on-request` here. **Updated by roadmap item 1.3:** this used to add that
+  `"never"` was still reachable through `relaunchSession`'s hardcoded resume
+  path. It no longer is — resume builds its argv from the same profile
+  through `buildHarnessResume`, so neither path can reach `"never"` while
+  the registry forbids it.
 
 ## 3. Probe section — runtime unknowns (human/TTY, real Codex, real tokens)
 
