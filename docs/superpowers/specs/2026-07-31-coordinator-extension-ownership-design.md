@@ -52,6 +52,8 @@ This is the same cost note `workflow-worker-lifecycle.ts:9-15` already records f
 
 The coordinator passes both `store` and `readOwnOwnership` into the launch deps, mirroring `bin/workflow.js:483-484`. Passing the reader alone would fix today's defect; passing the store as well means the reader cannot be lost again by a future change to `launchCommand`'s internal fallback, and it hands launch the store whose `onListProblem` is already wired to the coordinator's bounded `noteDiagnostic` — so a launch that trips over crash residue while listing reports it instead of dropping it.
 
+**Correction (recorded during the final-review fix, same pass as the one above):** the `onListProblem` half of that sentence is inert. Nothing on the launch path calls `store.list()` — `launch.js` never does (its `list(...)` at `:475`/`:511` is a local array helper), and `planCommand` (`commands.js:438-470`) does not touch the store at all. The first half stands on its own and is the real reason to pass the store; the comment in `.pi/extensions/workflow-coordinator/index.ts` was trimmed accordingly.
+
 ### Sharing the `ps` spawn, not just its argv
 
 `spawnPsStatus` becomes an export of `ownership.js` and `runPsForPid` is deleted; `inspectCoordinatorPid` passes the shared helper as `runProcess`. This closes the argv copy the roadmap names and the stderr divergence found above, and leaves one definition of how this repo asks the OS about a pid.
