@@ -534,6 +534,16 @@ export async function createWorkflowCoordinatorRuntime({
         controlPlaneBin,
         git,
         herdr,
+        // Both, mirroring bin/workflow.js's live dependencies. launchCommand (commands.js:1778)
+        // deliberately does NOT route through storeForCommand -- that bypass was item 1.1's
+        // final-review finding 1 -- so without `store` it builds its own, and without
+        // `readOwnOwnership` that fallback lands on createRunStore's `async () => null` default.
+        // Passing the store means the reader cannot be lost again by a future change to
+        // launchCommand's internals, and it hands launch the store whose onListProblem is already
+        // wired to this file's bounded noteDiagnostic, so crash residue hit while listing gets
+        // reported instead of dropped.
+        store,
+        readOwnOwnership,
         ensureCodexWorkerHooks: ensureCodexWorkerHooksImpl,
       });
     },

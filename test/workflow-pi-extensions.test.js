@@ -250,6 +250,34 @@ test("the coordinator runtime builds both mutex-taking stores with one shared re
   assert.equal(reservationArgs[0].readOwnOwnership, injectedReader);
 });
 
+test("the coordinator hands launch the same run store and the same ownership reader it built, not launchCommand's null-default fallback", async () => {
+  const launchCalls = [];
+  const injectedReader = async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" });
+  const runStore = { async read() { return { id: RUN_ID, projectAlias: "fixture" }; } };
+
+  const runtime = await createWorkflowCoordinatorRuntime({
+    env: { WORKFLOW_STATE_ROOT: "/state/override" },
+    readOwnOwnership: injectedReader,
+    lookupExecutableImpl: async () => "/opt/pi/bin/pi",
+    loadRegistryImpl: async () => ({ launcher: { state_root: "/state/override" }, projects: {} }),
+    createRunStoreImpl: () => runStore,
+    createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
+    createReservationStoreImpl: () => ({}),
+    createDelegationServicesImpl: () => ({}),
+    createTransportImpl: () => ({ async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {} }),
+    loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
+    createLaunchCommandImpl: async (options, dependencies) => {
+      launchCalls.push({ options, dependencies });
+      return { preview: { approvalDigest: `sha256:${"d".repeat(64)}` } };
+    },
+  });
+
+  await runtime.createLaunchCommand({ projectAlias: "fixture", task: "ASANA-123", request: "Review launch wiring." });
+
+  assert.equal(launchCalls[0].dependencies.store, runStore);
+  assert.equal(launchCalls[0].dependencies.readOwnOwnership, injectedReader);
+});
+
 // The default must be lazy: building a runtime happens on every Pi session start, and the reader
 // is memoized per process, so construction itself must spawn nothing.
 test("building a coordinator runtime never invokes the ownership reader", async () => {
