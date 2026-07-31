@@ -15,6 +15,7 @@ import { createDelegationServices } from "../../../src/workflow/delegation-servi
 import { createPiDelegationTransport } from "../../../src/workflow/pi-delegation-transport.js";
 import { loadDelegationRole } from "../../../src/workflow/delegation-roles.js";
 import { inspectExactProcessByPid } from "../../../src/workflow/process-observation.js";
+import { spawnPsStatus } from "../../../src/workflow/ownership.js";
 import { validateSubagentRequestPolicy } from "../../../src/workflow/coordinator-policy.js";
 import { createDelegationWatcher } from "../../../src/workflow/delegation-watcher.js";
 import { createWorkerWatcher } from "../../../src/workflow/worker-watcher.js";
@@ -383,36 +384,10 @@ function summarizeExecution(result) {
   return bound(`Workflow delegation state: ${result.state}; generation ${result.generation}.`);
 }
 
-async function runPsForPid(pid) {
-  return await new Promise<{ code: number | null; stdout: string }>((resolvePromise, reject) => {
-    let child;
-    try {
-      child = spawn("ps", ["-p", String(pid), "-o", "lstart=", "-o", "state="], {
-        shell: false,
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-    } catch (error) {
-      reject(error);
-      return;
-    }
-
-    let stdout = "";
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      resolvePromise({ code, stdout });
-    });
-  });
-}
-
-async function inspectCoordinatorPid(pid, cwdFallback) {
+async function inspectCoordinatorPid(pid) {
   return await inspectExactProcessByPid(pid, {
-    runProcess: runPsForPid,
+    runProcess: spawnPsStatus,
     readCwd: async (path) => await fs.readlink(path),
-    cwdFallback,
   });
 }
 
@@ -436,7 +411,7 @@ async function spawnChildProcess({ command, argv, cwd, env }) {
     child.once("spawn", async () => {
       child.unref();
       try {
-        const inspection = await inspectCoordinatorPid(child.pid, cwd);
+        const inspection = await inspectCoordinatorPid(child.pid);
         if (!inspection) {
           resolvePromise({ outcome: "spawned-but-unverified" });
           return;
@@ -450,7 +425,7 @@ async function spawnChildProcess({ command, argv, cwd, env }) {
 }
 
 async function inspectChildProcess(identity) {
-  return await inspectCoordinatorPid(identity.pid, identity.cwd);
+  return await inspectCoordinatorPid(identity.pid);
 }
 
 async function resolveCanonicalPath(value) {

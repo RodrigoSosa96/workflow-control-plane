@@ -5,6 +5,7 @@ import { createPreparedDelegationRequest } from "../src/workflow/coordinator-pol
 import { checkoutDigestFor } from "../src/workflow/delegation-invariants.js";
 import { createWorkflowDelegationChildExtension } from "../.pi/extensions/workflow-delegation-child.ts";
 import { createWorkflowCoordinatorExtension, createWorkflowCoordinatorRuntime } from "../.pi/extensions/workflow-coordinator/index.ts";
+import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -225,6 +226,40 @@ test("coordinator live runtime resolves an absolute Pi binary and honors a valid
     }),
     /WORKFLOW_PROJECTS_FILE|absolute|registry/i,
   );
+});
+
+// The coordinator's own inspector must keep reporting exactly the startedAt string the rest of
+// the repo's pid observation produces: the transport records it at spawn (pi-delegation-transport
+// launchIdentity) and compares it in observeExact, and a drift there degrades live children to an
+// identity mismatch. Swapping runPsForPid for the shared spawnPsStatus must not move that string.
+test("the coordinator's default process inspector reports the same startedAt as the shared subprocess ownership reader, for this live process", async (t) => {
+  let capturedInspectProcess;
+  await createWorkflowCoordinatorRuntime({
+    env: { WORKFLOW_STATE_ROOT: "/state/override" },
+    lookupExecutableImpl: async () => "/opt/pi/bin/pi",
+    loadRegistryImpl: async () => ({ launcher: { state_root: "/state/override" }, projects: {} }),
+    createRunStoreImpl: () => ({ async read() { return { id: RUN_ID, projectAlias: "fixture" }; } }),
+    createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
+    createReservationStoreImpl: () => ({}),
+    createDelegationServicesImpl: () => ({}),
+    loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
+    createTransportImpl: (options) => {
+      capturedInspectProcess = options.inspectProcess;
+      return { async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {} };
+    },
+  });
+
+  // Degrade, don't silently pass: on a host without a usable `ps` the reader resolves null
+  // (ownership.js swallows it by design). Skip with a named reason rather than asserting on nulls.
+  const written = await createSubprocessOwnOwnershipReader()();
+  if (!written) {
+    t.skip("this host cannot report its own process start time via `ps`");
+    return;
+  }
+
+  const observed = await capturedInspectProcess({ pid: String(process.pid), cwd: process.cwd() });
+  assert.equal(observed.pid, String(process.pid));
+  assert.equal(observed.startedAt, written.startedAt);
 });
 
 test("child extension stays inert until valid session env, records bounded lifecycle facts, and terminates only after a successful handoff", async () => {

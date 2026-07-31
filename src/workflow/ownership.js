@@ -88,7 +88,13 @@ export function createOwnOwnershipReader({ inspectProcess, pid = String(process.
 // here. Resolves rather than rejects on a non-zero exit — inspectExactProcessByPid's runProcess
 // contract needs that, since a `ps` exit of 1 with empty stdout/stderr is how it proves a pid
 // is gone.
-function spawnPsStatus(pid) {
+//
+// Exported so the Pi coordinator extension's process inspector runs this exact spawn too: the
+// delegation transport's child identity comparison (launchIdentity vs. observeExact) hinges on
+// the same startedAt string equality classifyOwnership does, so both sides of that comparison
+// route through this one parse and can never drift apart the way two independently written
+// `ps` spawns could.
+export function spawnPsStatus(pid) {
   return new Promise((resolve, reject) => {
     let child;
     try {
