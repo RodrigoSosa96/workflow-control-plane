@@ -8,7 +8,13 @@ import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./del
 import { createDelegationReservationStore } from "./delegation-reservations.js";
 import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
-import { buildClaudeWorkerSettings, CONTROL_PLANE_ROOT, PI_WORKER_EXTENSIONS, runEnv } from "./harnesses.js";
+import {
+  buildClaudeWorkerSettings,
+  CLAUDE_WORKER_SETTINGS_FILE,
+  CONTROL_PLANE_ROOT,
+  PI_WORKER_EXTENSIONS,
+  runEnv,
+} from "./harnesses.js";
 import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { classifyOwnership, isPlainMarker, OBSERVATION_FAILED } from "./ownership.js";
 import { createSessionTransport as buildSessionTransport } from "./session-transport.js";
@@ -1372,10 +1378,9 @@ function transportForRun(run, deps, command) {
   return assertWorkerTransportDependency(deps, command);
 }
 
-// Filename must match launch.js's CLAUDE_WORKER_SETTINGS_FILE — this is the same file the
-// interactive launch generates into the run directory, regenerated here so a relaunch reloads
-// working hooks/statusLine (the settings file itself is not carried across the dead session).
-const CLAUDE_WORKER_SETTINGS_FILE = "claude-worker-settings.json";
+// This is the same file the interactive launch generates into the run directory, regenerated
+// here so a relaunch reloads working hooks/statusLine (the settings file itself is not carried
+// across the dead session).
 
 // Relaunch a dead *-session so it comes back exactly as the interactive launch left it: same
 // native session (`--session-id <exact>`, never `--last`/`--continue`) AND the same

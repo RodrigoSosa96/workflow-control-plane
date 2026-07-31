@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildClaudeWorkerSettings, buildHarnessLaunch } from "../src/workflow/harnesses.js";
+import {
+  buildClaudeWorkerSettings,
+  buildHarnessLaunch,
+  CLAUDE_WORKER_SETTINGS_FILE,
+} from "../src/workflow/harnesses.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -287,4 +291,11 @@ test("interactive codexArgv adds --dangerously-bypass-hook-trust; stream-json do
   assert.ok(interactive.argv.includes("--dangerously-bypass-hook-trust"));
   const streamed = buildHarnessLaunch({ profileName: "codex-worker", profile: { ...base, mode: "stream-json" }, sessionName: "s", cwd: "/wt", run });
   assert.ok(!streamed.argv.includes("--dangerously-bypass-hook-trust"));
+});
+
+// The filename is a contract between three modules: launch.js writes the file, commands.js
+// regenerates it on relaunch, and claudeArgv points --settings at it. It had two definitions
+// kept in sync by a comment; this pins the single one.
+test("CLAUDE_WORKER_SETTINGS_FILE is exported from harnesses.js and is the file claudeArgv points --settings at", () => {
+  assert.equal(CLAUDE_WORKER_SETTINGS_FILE, "claude-worker-settings.json");
 });

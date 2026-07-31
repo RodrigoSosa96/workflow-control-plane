@@ -5,10 +5,13 @@ import { HARNESS_TELEMETRY_VERSIONS } from "./telemetry-adapters.js";
 import { buildAssignmentTemplate } from "./assignment.js";
 import { WorkflowError } from "./errors.js";
 import { executeStart as defaultExecuteStart } from "./execute.js";
-import { buildClaudeWorkerSettings, buildHarnessLaunch, CONTROL_PLANE_ROOT } from "./harnesses.js";
+import {
+  buildClaudeWorkerSettings,
+  buildHarnessLaunch,
+  CLAUDE_WORKER_SETTINGS_FILE,
+  CONTROL_PLANE_ROOT,
+} from "./harnesses.js";
 import { RUN_STATES } from "./run-state.js";
-
-const CLAUDE_WORKER_SETTINGS_FILE = "claude-worker-settings.json";
 
 function fail(category, message, details, exitCode = 10) {
   throw new WorkflowError(category, message, { details, exitCode });

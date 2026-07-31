@@ -91,6 +91,11 @@ export function runEnv(run, harness) {
   return Object.fromEntries(WORKFLOW_ENV_KEYS.map((key) => [key, env[key]]));
 }
 
+// The filename an interactive Claude worker's `--settings` payload (built below) is written to
+// in the run directory. launch.js writes it, commands.js regenerates it on relaunch, and
+// claudeArgv points --settings at it — one definition shared by all three.
+export const CLAUDE_WORKER_SETTINGS_FILE = "claude-worker-settings.json";
+
 // Builds the Claude `--settings` payload that wires the control plane's lifecycle/telemetry
 // hooks and statusLine into an interactive Claude worker. The commands embed an absolute
 // control-plane path that differs per machine/worktree, so this must be computed at launch
