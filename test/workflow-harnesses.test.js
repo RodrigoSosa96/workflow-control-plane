@@ -450,6 +450,39 @@ test("buildHarnessResume rejects an opencode profile instead of inventing a resu
   );
 });
 
+test("an interactive claude resume without a settingsPath fails loudly instead of dropping --settings", () => {
+  // --settings is the one flag claudeArgv gates on a caller-supplied argument rather than on the
+  // profile, so it is the one the parity tests above cannot protect: they always pass
+  // SETTINGS_PATH. A caller that omits it would resume the pane with its lifecycle/statusLine
+  // hooks silently dead — a regression against the hand-built resume this builder replaces, which
+  // did pass the path. The resume knows the harness and the mode, so it must refuse.
+  const { profileName, profile: claudeProfile } = PROFILE_FLAG_CASES[0];
+  const resume = (settingsPath) => buildHarnessResume({
+    profileName,
+    profile: claudeProfile,
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+    sessionId: SESSION_ID,
+    settingsPath,
+  });
+  assert.throws(() => resume(undefined), /settingsPath/);
+  assert.throws(() => resume(""), /settingsPath/);
+  assert.ok(resume(SETTINGS_PATH).argv.includes("--settings"));
+
+  // Only the case where claudeArgv would emit the flag is demanded: a supervised profile wires no
+  // hooks at launch either, so requiring the path there would refuse a resume for no gain.
+  const streamed = buildHarnessResume({
+    profileName,
+    profile: { ...claudeProfile, mode: "stream-json" },
+    sessionName: SESSION_NAME,
+    cwd: CWD,
+    run: RUN,
+    sessionId: SESSION_ID,
+  });
+  assert.equal(streamed.argv.includes("--settings"), false);
+});
+
 test("buildHarnessResume requires the session id and the run whose envelope it reproduces", () => {
   const base = {
     profileName: "pi-worker",

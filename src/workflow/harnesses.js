@@ -145,6 +145,14 @@ function expectedLaunch({ profileName, profile, sessionName, cwd, nativeSessionI
 // claude resume dropped `--permission-mode`, the codex resume dropped `--sandbox` and answered
 // `-a never` in place of the approved `--ask-for-approval`. Adding a flag to a launch without
 // adding it to the resume is now structurally impossible rather than merely discouraged.
+//
+// With one honest exception, which is why buildHarnessResume carries an extra assertion: Claude's
+// `--settings` is gated on the caller-supplied `settingsPath`, not on the profile, so a caller
+// that omits it gets an argv with the flag silently missing. Both entry points therefore have to
+// guarantee the argument for an interactive Claude run — launch.js passes it (see
+// isClaudeInteractiveAgent in launch.js), and buildHarnessResume demands it instead of trusting
+// its caller. Any future flag gated on an argument rather than on the profile needs the same
+// treatment; a flag derived from the profile alone needs none.
 
 function piArgv({ profile, sessionName, run, sessionForm }) {
   const argv = [profile.command, "--name", sessionName, ...sessionForm];
@@ -278,6 +286,14 @@ export function buildHarnessResume({ profileName, profile, sessionName, cwd, run
   const resumeForm = RESUME_SESSION_FORM[profile.harness];
   if (!resumeForm) {
     throw new TypeError(`Harness ${profile.harness} (profile ${profileName}) has no resume form; only ${Object.keys(RESUME_SESSION_FORM).join(", ")} can be resumed`);
+  }
+  // --settings is the one flag claudeArgv gates on a caller-supplied argument rather than on the
+  // profile, so it is the one flag a resume could silently drop: omit settingsPath and the pane
+  // comes back with its lifecycle/statusLine hooks dead, no error, no failing assertion. A resume
+  // always has a run and knows the mode, so the condition is decidable here — demand the argument
+  // in exactly the case where claudeArgv would emit the flag.
+  if (profile.harness === "claude" && profile.mode === "interactive") {
+    assertString(settingsPath, "settingsPath");
   }
 
   // No bootstrap prompt, unlike buildHarnessLaunch: a resume continues an existing session rather
