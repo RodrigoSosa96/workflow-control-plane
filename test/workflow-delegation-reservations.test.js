@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import * as realFs from "node:fs/promises";
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
+import { classifyOwnership, createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
+import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
+import { createProcessRunner } from "../src/workflow/process.js";
 
 const FIRST_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_ID = "22222222-2222-4222-8222-222222222222";
@@ -84,11 +87,17 @@ function activeGatePathFor(stateRoot, projectAlias) {
 }
 
 // Wraps fs.readFile to capture the raw bytes of a single target path the first time it is
-// read, without altering what the caller sees. Used to observe the gate owner marker's exact
-// content while releaseGate reads it (immediately before deleting it), since a successful
-// reserve() releases the gate before returning and leaves nothing on disk to inspect afterward.
+// read, and fs.chmod to record every mode applied to that same path, without altering what the
+// caller sees. Used to observe the gate owner marker's exact content and file mode while
+// releaseGate reads it (immediately before deleting it), since a successful reserve() releases
+// the gate before returning and leaves nothing on disk to inspect afterward -- writeAtomicJson's
+// chmodFile(path) call (the one that applies PRIVATE_FILE_MODE to the final marker path, after
+// the temp file is opened with that same mode and renamed into place) is the honest observation
+// point for the mode, since the file itself is gone by the time reserve() resolves. chmodModes
+// is additive: existing callers that only destructure { fs, captured } are unaffected.
 function fsCapturingRead(targetPath) {
   const captured = { text: null };
+  const chmodModes = [];
   const fs = {
     ...realFs,
     async readFile(path, encoding) {
@@ -96,8 +105,12 @@ function fsCapturingRead(targetPath) {
       if (path === targetPath && captured.text === null) captured.text = text;
       return text;
     },
+    async chmod(path, mode) {
+      if (path === targetPath) chmodModes.push(mode);
+      return realFs.chmod(path, mode);
+    },
   };
-  return { fs, captured };
+  return { fs, captured, chmodModes };
 }
 
 // Fabricates a different `ino` for the Nth fs.stat(path) call, deterministically simulating
@@ -712,4 +725,128 @@ test("clearGate refuses to unlink the marker when a stray entry would make rmdir
   // The stray file and the gate directory itself must also survive: nothing was touched.
   assert.equal(await readFile(join(activeGate, ".DS_Store"), "utf8"), "not a marker");
   await assert.doesNotReject(() => stat(activeGate));
+});
+
+// --- ownership: the gate's read-before-mutex order and its produced marker --------------------
+//
+// The run lock got exactly this treatment in 1.1b (test/workflow-hook-ownership.test.js:109);
+// the reservation gate never did. Now that the Pi coordinator extension wires a real
+// readOwnOwnership into this store (see .pi/extensions/workflow-coordinator/index.ts), both
+// properties below are reachable from a real, non-CLI caller and are worth pinning as facts a
+// future edit cannot silently break, rather than merely true by inspection of acquireGate.
+
+async function pathExists(path) {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
+// Duplicated (not imported) from test/workflow-hook-ownership.test.js:38-46 deliberately: that
+// file's header states it exists to prove exactly one property (write/read startedAt equality)
+// and must not be diluted with wiring assertions, and every other fixture this test needs
+// already lives in this file. Four lines here is far less duplication than threading this
+// file's ~25 lines of reservation fixtures the other way. Kept byte-for-byte equivalent: the
+// real createProcessRunner, `ps` invoked with allowFailure so a non-zero exit resolves instead
+// of rejecting, and the real node:fs/promises realpath for reading /proc/<pid>/cwd -- the exact
+// wiring bin/workflow.js's inspectDelegationPid gives `workflow delegation gate-clear`, which is
+// the command whose verdict the marker test below is really about.
+const runner = createProcessRunner();
+async function observeViaUnlockPath(pid) {
+  return inspectExactProcessByPid(pid, {
+    async runProcess(resolvedPid) {
+      return runner.run("ps", psStatusArgv(resolvedPid), { allowFailure: true });
+    },
+    readCwd: realpath,
+  });
+}
+
+// 1.1's task-2 review deliberately moved the own-ownership read out of acquireGate's critical
+// section: a slow `ps` spawn must never run while the mkdir-based gate is held, both to protect
+// the bounded retry budget at :191-199 and to avoid widening the window where the active gate
+// directory exists with no marker yet. Until the coordinator was wired, no non-CLI caller reached
+// this gate with a real reader at all, so the ordering was only ever true by inspection. This
+// makes it a fact a future edit cannot silently break.
+test("readOwnOwnership is invoked before the active gate directory exists (the gate's read precedes acquisition, never runs while the mutex is held)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+
+  let activeGateExistedDuringRead;
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    randomUUID: uuidSequence(FIRST_ID, SECOND_ID, THIRD_ID),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    canonicalPath: async (value) => value,
+    async readOwnOwnership() {
+      activeGateExistedDuringRead = await pathExists(activeGate);
+      return { pid: "1", startedAt: "2025-01-01T00:00:00.000Z" };
+    },
+  });
+
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+
+  assert.equal(reservation.state, "active");
+  assert.equal(
+    activeGateExistedDuringRead,
+    false,
+    "readOwnOwnership ran while the active gate directory already existed -- the ownership read "
+    + "must complete before the gate mutex is acquired, not during or after",
+  );
+});
+
+// The coordinator now builds its reservation store with exactly this reader
+// (createSubprocessOwnOwnershipReader), so this is the marker a real coordinator writes. The
+// verdict assertion is the point: "not unprovable" alone would not distinguish a classifiable
+// marker from a broken observation. This process is alive and its start time matches, so the one
+// correct verdict is owner-alive.
+test("a reservation gate acquired with the real subprocess ownership reader yields a marker classifyOwnership can rule on", async (t) => {
+  // Degrade, don't silently pass: the reader swallows a missing/unusable `ps` and resolves null.
+  const written = await createSubprocessOwnOwnershipReader()();
+  if (!written) {
+    t.skip("this host cannot report its own process start time via `ps`");
+    return;
+  }
+
+  const stateRoot = await tempStateRoot(t);
+  const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
+  const { fs, captured, chmodModes } = fsCapturingRead(markerPath);
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    fs,
+    randomUUID: uuidSequence(FIRST_ID, SECOND_ID, THIRD_ID),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    canonicalPath: async (value) => value,
+    readOwnOwnership: createSubprocessOwnOwnershipReader(),
+  });
+
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+
+  assert.equal(reservation.state, "active");
+  assert.ok(captured.text, "expected releaseGate to have read the gate owner marker");
+  const marker = JSON.parse(captured.text);
+  assert.equal(marker.version, 2);
+  assert.equal(marker.pid, String(process.pid));
+  assert.equal(marker.startedAt, written.startedAt);
+  assert.deepEqual(chmodModes, [0o600]);
+
+  const verdict = classifyOwnership(marker, await observeViaUnlockPath(marker.pid));
+  assert.equal(verdict.verdict, "owner-alive");
+  assert.equal(verdict.removable, false);
 });
