@@ -1,4 +1,9 @@
-// Shared twelve-step choreography for removing a mutex whose owner is proven dead.
+// Shared choreography for removing a mutex whose owner is proven dead.
+//
+// The eleven steps enumerated below are the shared ones. The plan's twelfth — rejecting a
+// non-function `allow` — deliberately stays in each caller, because its message names the
+// caller's own function and its error category differs per store. A new caller must add that
+// guard itself; nothing here enforces it.
 //
 // run-store.js's removeLock and delegation-reservations.js's clearGate are the only code in
 // this repository that removes crash residue: the standing policy everywhere else is that
