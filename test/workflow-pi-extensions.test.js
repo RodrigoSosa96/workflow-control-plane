@@ -246,12 +246,19 @@ test("the coordinator runtime builds both mutex-taking stores with one shared re
     loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
   });
 
+  // Call counts, not just args[0] identity: a regression that builds a SECOND run store (or
+  // reservation store) still passes an args[0] equality check as long as the first construction
+  // happened to be wired correctly, so the count is what actually proves "one store, built once"
+  // rather than "a store that happens to match on its first call."
+  assert.equal(runStoreArgs.length, 1);
+  assert.equal(reservationArgs.length, 1);
   assert.equal(runStoreArgs[0].readOwnOwnership, injectedReader);
   assert.equal(reservationArgs[0].readOwnOwnership, injectedReader);
 });
 
 test("the coordinator hands launch the same run store and the same ownership reader it built, not launchCommand's null-default fallback", async () => {
   const launchCalls = [];
+  const runStoreArgs = [];
   const injectedReader = async () => ({ pid: "4242", startedAt: "2024-12-31T00:00:00.000Z" });
   const runStore = { async read() { return { id: RUN_ID, projectAlias: "fixture" }; } };
 
@@ -260,7 +267,7 @@ test("the coordinator hands launch the same run store and the same ownership rea
     readOwnOwnership: injectedReader,
     lookupExecutableImpl: async () => "/opt/pi/bin/pi",
     loadRegistryImpl: async () => ({ launcher: { state_root: "/state/override" }, projects: {} }),
-    createRunStoreImpl: () => runStore,
+    createRunStoreImpl: (args) => { runStoreArgs.push(args); return runStore; },
     createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
     createReservationStoreImpl: () => ({}),
     createDelegationServicesImpl: () => ({}),
@@ -274,13 +281,60 @@ test("the coordinator hands launch the same run store and the same ownership rea
 
   await runtime.createLaunchCommand({ projectAlias: "fixture", task: "ASANA-123", request: "Review launch wiring." });
 
+  // createRunStoreImpl must run exactly once. Without this count check, a regression where
+  // launchCommandForSession builds its OWN store (e.g. `store: createRunStoreImpl({ stateRoot,
+  // readOwnOwnership })` instead of reusing the runtime's `store`) still satisfies the identity
+  // asserts below whenever that second store happens to be wired with the same readOwnOwnership --
+  // confirmed by probe: exactly that mutation left both this test and the previous one green.
+  assert.equal(runStoreArgs.length, 1);
   assert.equal(launchCalls[0].dependencies.store, runStore);
   assert.equal(launchCalls[0].dependencies.readOwnOwnership, injectedReader);
 });
 
+// Spec verification item 4: the run store, the reservation store, and the launch deps all receive
+// the SAME reader object -- one reader per process, not three. The two tests above only pin that
+// per-site with an INJECTED reader; this exercises index.ts's real default,
+// defaultReadOwnOwnership, by deliberately not passing readOwnOwnership at all. That is safe to do
+// here: createSubprocessOwnOwnershipReader() only runs `ps` when the returned function is CALLED
+// (ownership.js:145-149), and none of the fakes below ever call it.
+test("with no readOwnOwnership injected, the run store, the reservation store, and the launch deps all receive the same default reader", async () => {
+  const runStoreArgs = [];
+  const reservationArgs = [];
+  const launchCalls = [];
+  const runStore = { async read() { return { id: RUN_ID, projectAlias: "fixture" }; } };
+
+  const runtime = await createWorkflowCoordinatorRuntime({
+    env: { WORKFLOW_STATE_ROOT: "/state/override" },
+    lookupExecutableImpl: async () => "/opt/pi/bin/pi",
+    loadRegistryImpl: async () => ({ launcher: { state_root: "/state/override" }, projects: {} }),
+    createRunStoreImpl: (args) => { runStoreArgs.push(args); return runStore; },
+    createDelegationStoreImpl: () => ({ async list() { return []; }, async adoptResult() { throw new Error("not used"); } }),
+    createReservationStoreImpl: (args) => { reservationArgs.push(args); return {}; },
+    createDelegationServicesImpl: () => ({}),
+    createTransportImpl: () => ({ async start() {}, async observeExact() {}, async deliverFollowUp() {}, async requestGracefulClose() {} }),
+    loadDelegationRoleImpl: async ({ name }) => ({ name, tools: ["read"], systemPrompt: "x" }),
+    createLaunchCommandImpl: async (options, dependencies) => {
+      launchCalls.push({ options, dependencies });
+      return { preview: { approvalDigest: `sha256:${"d".repeat(64)}` } };
+    },
+  });
+
+  await runtime.createLaunchCommand({ projectAlias: "fixture", task: "ASANA-123", request: "Review launch wiring." });
+
+  assert.equal(runStoreArgs.length, 1);
+  assert.equal(reservationArgs.length, 1);
+  assert.equal(typeof runStoreArgs[0].readOwnOwnership, "function");
+  assert.equal(runStoreArgs[0].readOwnOwnership, reservationArgs[0].readOwnOwnership);
+  assert.equal(runStoreArgs[0].readOwnOwnership, launchCalls[0].dependencies.readOwnOwnership);
+});
+
 // The default must be lazy: building a runtime happens on every Pi session start, and the reader
-// is memoized per process, so construction itself must spawn nothing.
-test("building a coordinator runtime never invokes the ownership reader", async () => {
+// is memoized per process, so construction itself must spawn nothing. This only proves the
+// runtime FACTORY makes no eager call to the reader it was given -- the injected fake stores below
+// never call it either, so it says nothing about the real reader's own laziness or memoization.
+// Those are pinned separately, at store level, in test/workflow-ownership.test.js (around :405 and
+// :422).
+test("runtime construction never invokes the injected ownership reader", async () => {
   let readerCalls = 0;
   await createWorkflowCoordinatorRuntime({
     env: { WORKFLOW_STATE_ROOT: "/state/override" },

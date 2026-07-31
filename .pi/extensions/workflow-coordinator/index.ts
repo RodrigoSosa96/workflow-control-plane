@@ -33,10 +33,11 @@ const PREVIEW_LIMIT = 16 * 1024;
 // and workflow-worker-observability.ts's identical defaults. Constructing it spawns nothing; the
 // first mutex this session takes pays one `ps`, and createOwnOwnershipReader's memoization (which
 // caches a null outcome too) means every later lock and gate in the session is free. That ratio
-// is the reason a `ps` spawn inside a long-lived extension is acceptable: this coordinator holds
-// the run lock across worktree creation, the Herdr calls and agent startup, the longest hold in
-// the system, and residue from an interrupted launch is exactly what `workflow unlock` exists to
-// recover.
+// is the reason a `ps` spawn inside a long-lived extension is acceptable: launch is the command
+// that acquires the run lock the most times across the longest wall-clock window, and it is the
+// only path that acquires it on a brand-new run directory -- so it has the most opportunities to
+// be killed between the mkdir that takes the lock and the rmdir that releases it. Residue from an
+// interrupted launch is exactly what `workflow unlock` exists to recover.
 const defaultReadOwnOwnership = createSubprocessOwnOwnershipReader();
 
 function StringEnum(values, options = {}) {
@@ -539,9 +540,10 @@ export async function createWorkflowCoordinatorRuntime({
         // final-review finding 1 -- so without `store` it builds its own, and without
         // `readOwnOwnership` that fallback lands on createRunStore's `async () => null` default.
         // Passing the store means the reader cannot be lost again by a future change to
-        // launchCommand's internals, and it hands launch the store whose onListProblem is already
-        // wired to this file's bounded noteDiagnostic, so crash residue hit while listing gets
-        // reported instead of dropped.
+        // launchCommand's internals. (Passing the store does NOT currently also route launch's
+        // crash residue through this file's onListProblem/noteDiagnostic: nothing on the launch
+        // path calls store.list() -- launch.js's own `list()` at :475/:511 is a local array
+        // helper, and planCommand, commands.js:438-470, never touches the store.)
         store,
         readOwnOwnership,
         ensureCodexWorkerHooks: ensureCodexWorkerHooksImpl,
