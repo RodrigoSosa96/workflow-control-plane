@@ -57,7 +57,7 @@ function assertString(value, context) {
   return value;
 }
 
-function assertProfile(profile) {
+export function assertProfile(profile) {
   if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
     throw new TypeError("profile must be an object");
   }

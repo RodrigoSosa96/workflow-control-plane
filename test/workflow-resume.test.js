@@ -3,12 +3,17 @@ import { test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { planResume, executeResume } from "../src/workflow/resume.js";
+import { planResume, executeResume, UNREPRODUCIBLE_ENVELOPE_REASON } from "../src/workflow/resume.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 
 const REAL_RUN_ID = "11111111-1111-4111-8111-111111111111";
+// A reproducible envelope: fixtures below that exercise the "missing" -> relaunch path for
+// concerns other than the agentProfile check itself (claim mechanics, identity persistence,
+// focus/needs-confirmation semantics) carry this so they keep reaching "relaunch" rather than
+// tripping the new refusal this file adds.
+const VALID_AGENT_PROFILE = { harness: "pi", command: "pi", arguments: [] };
 const MISSING_RUN_ID = "22222222-2222-4222-8222-222222222222";
 // A structurally-valid worker transport; these integration tests exercise the real store's read
 // path, so observeExact only runs when a real identity is present.
@@ -35,10 +40,74 @@ function deps({ observation, run }) {
 
 test("a live session is resumed by focus; a dead one relaunches; a mismatch refuses", async () => {
   const identity = { kind: "pi-session", sessionId: "s1" };
-  const run = { id: "r1", harness: "pi", transportIdentity: identity };
+  const run = { id: "r1", harness: "pi", transportIdentity: identity, agentProfile: VALID_AGENT_PROFILE };
   assert.equal((await planResume({ ...deps({ observation: { state: "idle", identity }, run }), runId: "r1" })).action, "focus");
   assert.equal((await planResume({ ...deps({ observation: { state: "missing", identity }, run }), runId: "r1" })).action, "relaunch");
   assert.equal((await planResume({ ...deps({ observation: { state: "mismatch", identity }, run }), runId: "r1" })).action, "refuse");
+});
+
+test("a run with no agentProfile refuses a relaunch, but a live session still resumes by focus", async () => {
+  const identity = { kind: "pi-session", sessionId: "s1" };
+  const run = { id: "r1", harness: "pi", transportIdentity: identity };
+
+  const relaunchPlan = await planResume({ ...deps({ observation: { state: "missing", identity }, run }), runId: "r1" });
+  assert.equal(relaunchPlan.action, "refuse");
+  assert.equal(relaunchPlan.reason, UNREPRODUCIBLE_ENVELOPE_REASON);
+
+  // The refusal must not leak into the live path: a run with no agentProfile at all still
+  // focuses (never builds an argv) when its session is observed alive.
+  const focusPlan = await planResume({ ...deps({ observation: { state: "active", identity }, run }), runId: "r1" });
+  assert.equal(focusPlan.action, "focus");
+});
+
+test("a run with a malformed agentProfile refuses a relaunch the same way a missing one does", async () => {
+  const identity = { kind: "pi-session", sessionId: "s1" };
+  // No `command`: assertProfile rejects this shape, so it is not a reproducible envelope.
+  const run = { id: "r1", harness: "claude", transportIdentity: identity, agentProfile: { harness: "claude" } };
+  const plan = await planResume({ ...deps({ observation: { state: "missing", identity }, run }), runId: "r1" });
+  assert.equal(plan.action, "refuse");
+  assert.equal(plan.reason, UNREPRODUCIBLE_ENVELOPE_REASON);
+});
+
+test("a run with a valid agentProfile still relaunches when its session is missing", async () => {
+  const identity = { kind: "pi-session", sessionId: "s1" };
+  const run = {
+    id: "r1",
+    harness: "claude",
+    transportIdentity: identity,
+    agentProfile: { harness: "claude", command: "claude", arguments: [] },
+  };
+  const plan = await planResume({ ...deps({ observation: { state: "missing", identity }, run }), runId: "r1" });
+  assert.equal(plan.action, "relaunch");
+});
+
+test("executeResume never creates Herdr state when the plan refuses an unreproducible envelope", async () => {
+  const calls = [];
+  // Mirrors relaunchSession's real Herdr surface (commands.js): if executeResume ever routed a
+  // refused plan into relaunch, this relaunch stub would call createTab, and the test would
+  // catch it. Refusing at plan time means this must never happen.
+  const herdr = {
+    async createTab(...args) { calls.push({ method: "createTab", args }); return { tabId: "t1" }; },
+    async focusAgent(...args) { calls.push({ method: "focusAgent", args }); },
+    async focusTab(...args) { calls.push({ method: "focusTab", args }); },
+  };
+  const identity = { kind: "pi-session", sessionId: "s1" };
+  const run = { id: "r1", harness: "pi", transportIdentity: identity };
+  const store = { async read() { return run; } };
+  const transport = {
+    start() {}, deliverFollowUp() {}, requestGracefulClose() {},
+    async observeExact() { return { state: "missing", identity }; },
+  };
+  const relaunch = async () => {
+    await herdr.createTab({});
+    return { identity };
+  };
+
+  await assert.rejects(
+    () => executeResume({ store, transport, herdr, runId: "r1", confirmed: true, relaunch }),
+    (error) => error instanceof WorkflowError && error.message.includes(UNREPRODUCIBLE_ENVELOPE_REASON),
+  );
+  assert.equal(calls.filter((call) => call.method === "createTab").length, 0);
 });
 
 test("a run with no transportIdentity is refused with a resume-category WorkflowError", async () => {
@@ -53,7 +122,7 @@ test("executeResume focuses the live agent pane and gates relaunch on confirmati
   // bootstrap shell pane above Pi, so `tab focus` lands the cursor on the empty shell.
   const herdr = { async focusAgent(a) { focus.push(a); } };
   const liveTransport = { start(){}, deliverFollowUp(){}, requestGracefulClose(){}, async observeExact() { return { state: "idle", identity: { paneId: "w2:p9" } }; } };
-  const store = { async read() { return { id: "r1", transportIdentity: { kind: "pi-session", tabId: "w2:t1", paneId: "w2:p9", sessionId: "s1" } }; } };
+  const store = { async read() { return { id: "r1", transportIdentity: { kind: "pi-session", tabId: "w2:t1", paneId: "w2:p9", sessionId: "s1" }, agentProfile: VALID_AGENT_PROFILE }; } };
   let relaunchCalls = 0;
   const relaunch = async () => { relaunchCalls += 1; return { identity: { sessionId: "s1" } }; };
 
@@ -76,9 +145,9 @@ test("executeResume persists the new identity after a confirmed relaunch, but ne
   const oldIdentity = { kind: "pi-session", sessionId: "s1", paneId: "w2:p9", tabId: "w2:t1" };
   const newIdentity = { kind: "pi-session", sessionId: "s1", paneId: "w3:p1", tabId: "w3:t1" };
   const store = {
-    async read() { return { id: "r1", transportIdentity: oldIdentity }; },
+    async read() { return { id: "r1", transportIdentity: oldIdentity, agentProfile: VALID_AGENT_PROFILE }; },
     async update(runId, updater) {
-      updateCalls.push({ runId, patch: await updater({ id: "r1", transportIdentity: oldIdentity }) });
+      updateCalls.push({ runId, patch: await updater({ id: "r1", transportIdentity: oldIdentity, agentProfile: VALID_AGENT_PROFILE }) });
     },
   };
   const herdr = { async focusAgent() {} };
@@ -109,8 +178,8 @@ test("executeResume persists the new identity after a confirmed relaunch, but ne
   assert.notEqual(updateCalls[1].patch.transportIdentity.paneId, oldIdentity.paneId);
 });
 
-function claimStore({ identity, resumeClaim = null }) {
-  const state = { id: "r1", transportIdentity: identity, resumeClaim };
+function claimStore({ identity, resumeClaim = null, agentProfile = VALID_AGENT_PROFILE }) {
+  const state = { id: "r1", transportIdentity: identity, resumeClaim, agentProfile };
   const updateCalls = [];
   return {
     updateCalls,
@@ -152,7 +221,7 @@ test("a resume whose identity moved since planning is refused before relaunching
   // The store's current identity changed (another resume relaunched) between
   // this resume's planning read and its claim.
   const store = claimStore({ identity: moved });
-  store.read = async () => ({ id: "r1", transportIdentity: planned });
+  store.read = async () => ({ id: "r1", transportIdentity: planned, agentProfile: VALID_AGENT_PROFILE });
   let relaunchCalls = 0;
   await assert.rejects(
     () => executeResume({ store, transport: deadTransport, runId: "r1", confirmed: true, relaunch: async () => { relaunchCalls += 1; } }),

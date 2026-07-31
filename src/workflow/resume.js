@@ -1,13 +1,32 @@
 import { assertWorkerTransport } from "./worker-transport.js";
 import { WorkflowError } from "./errors.js";
+import { assertProfile } from "./harnesses.js";
 
 // A crashed resume leaves its claim behind (no-cleanup); claims older than
 // this window are treated as residue and may be reclaimed by a new confirmed
 // resume instead of blocking it forever.
 const RESUME_CLAIM_FRESH_MS = 10 * 60 * 1000;
 
+// Rendered verbatim in the CLI's error line (`fail` below folds plan.reason straight into the
+// thrown message, and bin/workflow.js prints that message as-is) — a sentence, not a slug, so
+// the operator sees what happened and what to do next without cross-referencing a code.
+export const UNREPRODUCIBLE_ENVELOPE_REASON =
+  "This run's approved envelope cannot be reproduced (it predates agent-profile tracking); " +
+  "start a fresh, freshly-approved launch instead of resuming.";
+
 function fail(message, details) {
   throw new WorkflowError("resume", message, { details });
+}
+
+// True only when run.agentProfile is present and passes assertProfile: the argv builder's own
+// judgment of a reproducible envelope, not a hand-rolled shape check duplicating it here.
+function resumableProfile(run) {
+  try {
+    assertProfile(run?.agentProfile);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function identityKey(identity) {
@@ -40,7 +59,15 @@ export async function planResume({ store, transport, runId }) {
     case "idle":
       return { action: "focus", identity };
     case "missing":
-      return { action: "relaunch", identity };
+      // A relaunch has to reproduce the argv the approval digest covered, and run.agentProfile is
+      // the only record of it (the registry may have changed since launch; transportIdentity does
+      // not carry it). Runs created before that field existed cannot be reproduced, so they are
+      // refused here rather than relaunched under an envelope nobody approved — the escalation
+      // this item removed. Refusing in planResume, not in the relaunch itself, means the operator
+      // sees it in the read-only preview instead of after a Herdr tab already exists.
+      return resumableProfile(run)
+        ? { action: "relaunch", identity }
+        : { action: "refuse", identity, reason: UNREPRODUCIBLE_ENVELOPE_REASON };
     default:
       return { action: "refuse", identity, reason: observation.state };
   }

@@ -275,7 +275,7 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
     },
   };
 
-  const pendingStore = storeFor({ id: RUN_ID, transportIdentity: identity });
+  const pendingStore = storeFor({ id: RUN_ID, transportIdentity: identity, agentProfile: agentProfile() });
   const pending = await resumeCommand(
     { runId: RUN_ID, confirmed: false },
     { store: pendingStore, herdr: deadHerdr },
