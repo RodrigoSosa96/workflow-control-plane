@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { runClaudeLifecycleHook, main } from "../hooks/claude-lifecycle.mjs";
+import { handoffExists } from "../hooks/lib/lifecycle-hook-core.mjs";
 import { renderClaudeStatusLine } from "../hooks/claude-statusline.mjs";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { createLifecycle } from "../src/workflow/lifecycle.js";
@@ -90,6 +91,31 @@ test("no-op when WORKFLOW_RUN_ID / harness is absent", async () => {
   const rec = [];
   await runClaudeLifecycleHook({ event: "UserPromptSubmit", stdinJson: {}, env: {}, store: fakeStore({}), lifecycle: fakeLifecycle(rec) });
   assert.equal(rec.length, 0);
+});
+
+// Moved from test/workflow-pi-lifecycle-extension.test.js (single-lifecycle-core, Task 2): the
+// Pi extension's own handoffExists was removed once it became a thin adapter over this shared
+// core, leaving hooks/lib/lifecycle-hook-core.mjs's handoffExists as the only definition. No
+// other test in this file calls it directly -- every Stop-event test above overrides
+// hasValidHandoff instead -- so these four cases had no coverage left here. Moved, not dropped.
+test("handoffExists is true when the run is completed at the given generation", async () => {
+  const store = { async read() { return { state: "completed", generation: 1 }; } };
+  assert.equal(await handoffExists(store, "r1", 1), true);
+});
+
+test("handoffExists is false when the run is not completed", async () => {
+  const store = { async read() { return { state: "running", generation: 1 }; } };
+  assert.equal(await handoffExists(store, "r1", 1), false);
+});
+
+test("handoffExists is false when the generation does not match", async () => {
+  const store = { async read() { return { state: "completed", generation: 2 }; } };
+  assert.equal(await handoffExists(store, "r1", 1), false);
+});
+
+test("handoffExists is false when the store returns no run", async () => {
+  const store = { async read() { return null; } };
+  assert.equal(await handoffExists(store, "r1", 1), false);
 });
 
 // FINDING 1: against the real lifecycle + store, the sequence must be

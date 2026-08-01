@@ -148,9 +148,9 @@ export async function runLifecycleHook({
         }
       }
       if (action === "continue") {
-        // Mark the continuation BEFORE returning the block decision, so the UserPromptSubmit it
-        // may trigger is recognized as a continuation (reuses the generation) rather than a
-        // user follow-up (which would bump it).
+        // Mark the continuation BEFORE returning the harness-neutral decision, so the
+        // UserPromptSubmit it may trigger is recognized as a continuation (reuses the
+        // generation) rather than a user follow-up (which would bump it).
         await persistMarker(store, runId, { [pendingContinuationField]: true }, debug);
         return { continuation: { prompt: continuationPrompt(runId, current.generation) } };
       }

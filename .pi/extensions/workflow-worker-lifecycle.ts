@@ -2,10 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createRunStore } from "../../src/workflow/run-store.js";
 import { createLifecycle } from "../../src/workflow/lifecycle.js";
 import { createSubprocessOwnOwnershipReader } from "../../src/workflow/ownership.js";
-
-function continuationPrompt(runId: string, generation: number): string {
-  return `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}.`;
-}
+import { runLifecycleHook } from "../../hooks/lib/lifecycle-hook-core.mjs";
 
 // One reader per process, built at module scope -- like hooks/claude-lifecycle.mjs's identical
 // defaultReadOwnOwnership, but the cost model differs: this extension runs in-process for the
@@ -27,24 +24,24 @@ export function createWorkflowWorkerLifecycleExtension({
   if (!runId || env.WORKFLOW_HARNESS !== "pi") return (_pi: ExtensionAPI) => {};
   const store = injectedStore ?? createRunStoreImpl({ stateRoot: env.WORKFLOW_STATE_ROOT, readOwnOwnership });
   const life = lifecycle ?? createLifecycle({ store });
-  const validHandoff = hasValidHandoff ?? (async (gen: number) => await handoffExists(store, runId, gen));
 
-  // Pi 0.81.1 emits no field distinguishing a user follow-up from our own queued
-  // continuation (both are just agent_start), so we track it locally.
-  let pendingContinuation = false;
-  let startedOnce = false;
+  // This extension is now a thin adapter over the harness-agnostic core
+  // (hooks/lib/lifecycle-hook-core.mjs, shared with Claude/Codex's stateless subprocess hooks).
+  // It holds no lifecycle condition of its own -- generation/source discrimination, marker
+  // persistence, telemetry-phase recording, and stop notifications all live in the core, keyed
+  // off `piStartedOnce` / `piPendingContinuation` on the run record. This file only maps Pi's
+  // events onto the core's event vocabulary and renders the core's harness-neutral decision
+  // ({ continuation: { prompt } } | undefined) into Pi's own protocol. Pi's events carry no
+  // payload the core reads, so stdinJson is always {}; env is threaded through so the core's
+  // recordDebug can write to the run's hook debug log via env.WORKFLOW_RUN_DIR -- strictly
+  // better than the silent `catch {}` blocks this extension used to have.
+  const runCore = (event: string) =>
+    runLifecycleHook({ harness: "pi", event, stdinJson: {}, env, store, lifecycle: life, hasValidHandoff });
 
   return function workflowWorkerLifecycle(pi: ExtensionAPI) {
     pi.on("agent_start", async () => {
       try {
-        const current = await store.read(runId);
-        const source = pendingContinuation ? "continuation" : "user";
-        pendingContinuation = false;
-        // The first start confirms the launch generation; a later user start is a
-        // follow-up that increments it. A continuation reuses the current generation.
-        const generation = source === "user" && startedOnce ? current.generation + 1 : current.generation;
-        startedOnce = true;
-        await life.onPrompt({ runId, generation, source });
+        await runCore("UserPromptSubmit");
       } catch {
         // Swallow: a lifecycle bookkeeping error must never crash the worker. This
         // handler runs inside Pi's fire-and-forget pi.on(...) dispatch, so a throw
@@ -54,25 +51,12 @@ export function createWorkflowWorkerLifecycleExtension({
 
     pi.on("agent_settled", async () => {
       try {
-        const current = await store.read(runId);
-        const { action } = await life.onStop({
-          runId,
-          generation: current.generation,
-          hasValidHandoff: await validHandoff(current.generation),
-        });
-        // Best-effort notification for non-continuation stop states (settled / manual).
-        if (action !== "continue" && action !== "none") {
-          try {
-            const { notifyStop } = await import("../../src/workflow/notifier.js");
-            await notifyStop({ run: current, store, runId, action });
-          } catch {
-            // swallow: a notifier must never break the lifecycle hook
-          }
-        }
-        if (action === "continue") {
-          // Set the flag BEFORE sending, so the agent_start this triggers is tagged.
-          pendingContinuation = true;
-          await pi.sendUserMessage(continuationPrompt(runId, current.generation), {
+        const decision = await runCore("Stop");
+        // Rendering the decision belongs here, in the file that speaks Pi's protocol -- Pi has
+        // no wire format comparable to Claude/Codex's {"decision":"block",...} stdout contract,
+        // so a continuation is simply delivered as a queued follow-up turn.
+        if (decision?.continuation) {
+          await pi.sendUserMessage(decision.continuation.prompt, {
             deliverAs: "followUp",
             triggerTurn: true,
           });
@@ -84,24 +68,12 @@ export function createWorkflowWorkerLifecycleExtension({
 
     pi.on("session_shutdown", async () => {
       try {
-        await life.onSessionEnd({ runId });
-        // Best-effort notification when the session ends without a handoff.
-        try {
-          const { notifyRun } = await import("../../src/workflow/notifier.js");
-          await notifyRun({ store, runId });
-        } catch {
-          // swallow: a notifier must never break the lifecycle hook
-        }
+        await runCore("SessionEnd");
       } catch {
         // Swallow: a lifecycle bookkeeping error must never crash the worker.
       }
     });
   };
-}
-
-export async function handoffExists(store: any, runId: string, generation: number): Promise<boolean> {
-  const run = await store.read(runId);
-  return Boolean(run && run.state === "completed" && run.generation === generation);
 }
 
 export default createWorkflowWorkerLifecycleExtension();

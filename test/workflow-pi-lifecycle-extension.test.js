@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createWorkflowWorkerLifecycleExtension, handoffExists } from "../.pi/extensions/workflow-worker-lifecycle.ts";
+import { createWorkflowWorkerLifecycleExtension } from "../.pi/extensions/workflow-worker-lifecycle.ts";
+import { continuationPrompt } from "../hooks/lib/lifecycle-hook-core.mjs";
 
 function fakePi() {
   return {
@@ -11,12 +12,35 @@ function fakePi() {
   };
 }
 
+// A stateful fake store: unlike a flat `{ ...run }` literal, `update` actually merges its patch
+// back into the held state, so a marker written by one call (piStartedOnce,
+// piPendingContinuation) is visible to `read()` on the NEXT call -- mirroring the real store's
+// patch-merge update() (src/workflow/run-store.js's updatedRun). This is now load-bearing: the
+// shared core (hooks/lib/lifecycle-hook-core.mjs) discriminates first-start / continuation /
+// follow-up from markers persisted ON THE RUN RECORD, not from closure variables the way the old
+// extension did -- a store that silently dropped updates would make every call look like the
+// first one.
+function makeStatefulStore(run) {
+  let state = { id: "r1", ...run };
+  return {
+    async read() { return { ...state }; },
+    async update(_id, fn) {
+      const patch = await fn(state);
+      state = { ...state, ...patch };
+      return { ...state };
+    },
+  };
+}
+
 function makeExt({ life, run, hasValidHandoff = async () => false }) {
-  const store = { async read() { return { id: "r1", ...run }; } };
-  return createWorkflowWorkerLifecycleExtension({
+  const store = makeStatefulStore(run);
+  const ext = createWorkflowWorkerLifecycleExtension({
     env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "pi", WORKFLOW_STATE_ROOT: "/x" },
     lifecycle: life, store, hasValidHandoff,
   });
+  // Exposed so tests can assert on persisted markers directly (see the piStartedOnce test
+  // below) without threading a second store through every call site.
+  return Object.assign(ext, { store });
 }
 
 test("extension stays inert without required Pi env", () => {
@@ -31,6 +55,18 @@ test("extension stays inert when harness is not pi", () => {
     env: { WORKFLOW_RUN_ID: "r1", WORKFLOW_HARNESS: "claude", WORKFLOW_STATE_ROOT: "/x" },
   })(pi);
   assert.deepEqual(Object.keys(pi.handlers), []);
+});
+
+// The marker, not a closure variable, is now the discriminator (see
+// hooks/lib/lifecycle-hook-core.mjs's UserPromptSubmit branch: `current[startedOnceField]`).
+test("the first agent_start persists piStartedOnce on the run record", async () => {
+  const life = { onPrompt: async () => {}, onStop: async () => ({ action: "none" }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  const ext = makeExt({ life, run: { generation: 1, state: "running" } });
+  ext(pi);
+  assert.equal((await ext.store.read()).piStartedOnce, undefined);
+  await pi.handlers.agent_start({}, {});
+  assert.equal((await ext.store.read()).piStartedOnce, true);
 });
 
 test("agent_settled without a handoff queues at most two continuations then falls back", async () => {
@@ -68,6 +104,21 @@ test("a user follow-up after the first cycle increments the generation", async (
   assert.deepEqual(calls.at(-1), { runId: "r1", generation: 2, source: "user" });
 });
 
+// The continuation is rendered via pi.sendUserMessage carrying the core's own prompt text --
+// never JSON. Task 1 made the core return a harness-neutral { continuation: { prompt } };
+// Claude/Codex render that into their own {"decision":"block",...} wire format in their own hook
+// files, but Pi has no such wire format, so its adapter just delivers the prompt as a follow-up.
+test("agent_settled renders the continuation via pi.sendUserMessage with the core's prompt, not JSON", async () => {
+  const life = { onPrompt: async () => {}, onStop: async () => ({ action: "continue" }), onSessionEnd: async () => {} };
+  const pi = fakePi();
+  makeExt({ life, run: { generation: 3, state: "running" } })(pi);
+  await pi.handlers.agent_settled({}, {});
+  assert.equal(pi.sent.length, 1);
+  assert.equal(pi.sent[0].msg, continuationPrompt("r1", 3));
+  assert.deepEqual(pi.sent[0].opts, { deliverAs: "followUp", triggerTurn: true });
+  assert.throws(() => JSON.parse(pi.sent[0].msg), /Unexpected token|not valid JSON/i);
+});
+
 test("session_shutdown ends the session (no generation, per the real onSessionEnd contract)", async () => {
   const ended = [];
   const life = { onPrompt: async () => {}, onStop: async () => ({ action: "none" }), onSessionEnd: async (a) => ended.push(a) };
@@ -75,26 +126,6 @@ test("session_shutdown ends the session (no generation, per the real onSessionEn
   makeExt({ life, run: { generation: 2, state: "running" } })(pi);
   await pi.handlers.session_shutdown({ reason: "quit" }, {});
   assert.deepEqual(ended.at(-1), { runId: "r1" });
-});
-
-test("handoffExists is true when the run is completed at the given generation", async () => {
-  const store = { async read() { return { state: "completed", generation: 1 }; } };
-  assert.equal(await handoffExists(store, "r1", 1), true);
-});
-
-test("handoffExists is false when the run is not completed", async () => {
-  const store = { async read() { return { state: "running", generation: 1 }; } };
-  assert.equal(await handoffExists(store, "r1", 1), false);
-});
-
-test("handoffExists is false when the generation does not match", async () => {
-  const store = { async read() { return { state: "completed", generation: 2 }; } };
-  assert.equal(await handoffExists(store, "r1", 1), false);
-});
-
-test("handoffExists is false when the store returns no run", async () => {
-  const store = { async read() { return null; } };
-  assert.equal(await handoffExists(store, "r1", 1), false);
 });
 
 // Fix 2 (whole-branch review): each pi.on(...) handler runs fire-and-forget inside
