@@ -571,10 +571,14 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
 
   // The env rebuilt for the relaunch pane must come from the run this resolved store read --
   // proof relaunchPiSession actually received a working store rather than failing preflight.
+  // Seeded generation was 2; a confirmed resume now explicitly opens a new generation (roadmap
+  // 1.2 / resume.js) before relaunch() is called, so the pane env carries 3, not the stale seed
+  // value -- this test uses the real store (unlike storeFor's fakes elsewhere in this file), so
+  // it is the one place in this file where that ordering is actually observable end to end.
   const expectedEnv = {
     WORKFLOW_RUN_ID: RUN_ID,
     WORKFLOW_RUN_DIR: join(stateRoot, RUN_ID),
-    WORKFLOW_GENERATION: "2",
+    WORKFLOW_GENERATION: "3",
     WORKFLOW_HARNESS: "pi",
     WORKFLOW_STATE_ROOT: RUN_STATE_ROOT,
     WORKFLOW_CONTROL_PLANE_BIN: RUN_CONTROL_PLANE_BIN,
@@ -588,6 +592,8 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
   const verifyStore = createRunStore({ stateRoot });
   const persisted = await verifyStore.read(RUN_ID);
   assert.deepEqual(persisted.transportIdentity, newIdentity);
+  assert.equal(persisted.generation, 3);
+  assert.equal(persisted.stopAttempts, 0);
 });
 
 test("resumeCommand surfaces the resume-category error for a run with no transport identity", async () => {

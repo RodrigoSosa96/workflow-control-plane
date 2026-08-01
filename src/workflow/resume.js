@@ -29,6 +29,15 @@ function resumableProfile(run) {
   }
 }
 
+// Mirrors relaunchSession's own normalization (commands.js) exactly: anything other than
+// "claude"/"codex" is treated as Pi. The marker field names the lifecycle core reads
+// (`${harness}StartedOnce` / `${harness}PendingContinuation`) must agree with the harness
+// relaunchSession derives from the same identity, or this clears the wrong run fields and the
+// bug this item exists to close survives silently.
+function normalizeHarness(identityHarness) {
+  return identityHarness === "claude" ? "claude" : identityHarness === "codex" ? "codex" : "pi";
+}
+
 function identityKey(identity) {
   if (!identity || typeof identity !== "object") return null;
   return JSON.stringify({
@@ -96,6 +105,12 @@ export async function executeResume({ store, transport, herdr, runId, confirmed 
     // or the identity moved since this resume planned.
     const canPersist = typeof store.update === "function";
     const claimedAt = new Date().toISOString();
+    // Same normalization relaunchSession applies to this same identity (commands.js) — the
+    // marker fields cleared below must be the ones the core will actually read for this harness.
+    const harness = normalizeHarness(plan.identity?.harness);
+    // Captured from `current` inside the updater below, before the generation bump, so a failed
+    // relaunch can restore exactly what was there rather than guessing at a rollback value.
+    let priorLifecycleState = null;
     if (canPersist) {
       await store.update(runId, (current) => {
         if (identityKey(current.transportIdentity) !== identityKey(plan.identity)) {
@@ -109,7 +124,30 @@ export async function executeResume({ store, transport, herdr, runId, confirmed 
             claimedAt: current.resumeClaim.claimedAt,
           });
         }
-        return { resumeClaim: { claimedAt } };
+        priorLifecycleState = {
+          generation: current.generation,
+          previousGeneration: current.previousGeneration,
+          stopAttempts: current.stopAttempts,
+          [`${harness}StartedOnce`]: current[`${harness}StartedOnce`],
+          [`${harness}PendingContinuation`]: current[`${harness}PendingContinuation`],
+        };
+        // A confirmed relaunch explicitly opens a new generation with a fresh stop budget,
+        // before relaunch() is called: relaunchSession stamps WORKFLOW_GENERATION into the
+        // pane env from this same record (runEnv(run, harness)), so the bump must land first
+        // or the resumed worker's env disagrees with what the record now claims. Clearing the
+        // markers is what makes the first prompt after the relaunch take the first-prompt
+        // branch in every harness and confirm the generation just opened here, instead of
+        // bumping it a second time. lifecycle.onPrompt's follow-up branch is the only thing
+        // that resets stopAttempts, so without this a worker that already exhausted its two
+        // stop attempts would relaunch straight back into manual-handoff-required.
+        return {
+          resumeClaim: { claimedAt },
+          generation: current.generation + 1,
+          previousGeneration: current.generation,
+          stopAttempts: 0,
+          [`${harness}StartedOnce`]: false,
+          [`${harness}PendingContinuation`]: false,
+        };
       });
     }
     let result;
@@ -118,7 +156,7 @@ export async function executeResume({ store, transport, herdr, runId, confirmed 
     } catch (error) {
       if (canPersist) {
         try {
-          await store.update(runId, () => ({ resumeClaim: null }));
+          await store.update(runId, () => ({ resumeClaim: null, ...(priorLifecycleState ?? {}) }));
         } catch {
           // Best-effort: a stale claim expires on its own after the freshness window.
         }
