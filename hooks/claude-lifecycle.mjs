@@ -28,9 +28,20 @@ import { runLifecycleHook, continuationPrompt, handoffExists } from "./lib/lifec
 
 export { continuationPrompt, handoffExists };
 
-// Thin wrapper: the exact behavior of runClaudeLifecycleHook now lives in the shared core.
+// Thin wrapper: the lifecycle bookkeeping now lives in the shared core, which returns a
+// harness-neutral decision ({ continuation: { prompt } } | undefined). Rendering that decision
+// into Claude's own wire format ({"decision":"block","reason":...}) belongs here, in the file
+// that speaks Claude's protocol, not in the module Pi shares (see hooks/lib/lifecycle-hook-core.mjs).
 export async function runClaudeLifecycleHook(args = {}) {
-  return runLifecycleHook({ ...args, harness: "claude" });
+  const decision = await runLifecycleHook({ ...args, harness: "claude" });
+  try {
+    if (decision?.continuation) {
+      return JSON.stringify({ decision: "block", reason: decision.continuation.prompt });
+    }
+  } catch {
+    // Swallow: a malformed decision must never break the worker's turn.
+  }
+  return undefined;
 }
 
 // One reader per process: acquireLock calls readOwnOwnership() on every lock it takes (every

@@ -152,7 +152,7 @@ export async function runLifecycleHook({
         // may trigger is recognized as a continuation (reuses the generation) rather than a
         // user follow-up (which would bump it).
         await persistMarker(store, runId, { [pendingContinuationField]: true }, debug);
-        return JSON.stringify({ decision: "block", reason: continuationPrompt(runId, current.generation) });
+        return { continuation: { prompt: continuationPrompt(runId, current.generation) } };
       }
       return undefined;
     }

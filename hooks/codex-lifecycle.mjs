@@ -23,9 +23,22 @@ import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
 import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { runLifecycleHook } from "./lib/lifecycle-hook-core.mjs";
 
-// Thin wrapper: the actual behavior lives in the shared core, parameterized harness="codex".
+// Thin wrapper: the lifecycle bookkeeping lives in the shared core, parameterized
+// harness="codex", which returns a harness-neutral decision ({ continuation: { prompt } } |
+// undefined). Rendering that decision into Codex's own wire format
+// ({"decision":"block","reason":...}) belongs here, in the file that speaks Codex's protocol,
+// not in the module Pi shares (see hooks/lib/lifecycle-hook-core.mjs). Identical to Claude's
+// rendering in hooks/claude-lifecycle.mjs since both harnesses share the same wire format.
 export async function runCodexLifecycleHook(args = {}) {
-  return runLifecycleHook({ ...args, harness: "codex" });
+  const decision = await runLifecycleHook({ ...args, harness: "codex" });
+  try {
+    if (decision?.continuation) {
+      return JSON.stringify({ decision: "block", reason: decision.continuation.prompt });
+    }
+  } catch {
+    // Swallow: a malformed decision must never break the worker's turn.
+  }
+  return undefined;
 }
 
 // One reader per process: see hooks/claude-lifecycle.mjs's identical comment. Module scope so
