@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -238,10 +238,9 @@ test("the merged Codex hooks.json UserPromptSubmit entry, run as the harness run
   const hooksPath = join(stateRoot, "codex-home", "hooks.json");
   // hooksPath must live under this test's own temp root -- never the real ~/.codex/hooks.json.
   assert.ok(hooksPath.startsWith(stateRoot), `fixture bug: hooksPath ${hooksPath} escaped the temp root ${stateRoot}`);
-  // ensureCodexWorkerHooks writes hooksPath's temp-file-and-rename directly into its parent
-  // directory; unlike the real ~/.codex/ (created by Codex itself), a fresh temp root has no
-  // codex-home/ subdirectory yet.
-  await mkdir(join(stateRoot, "codex-home"), { recursive: true });
+  // Deliberately NOT pre-creating codex-home/: ensureCodexWorkerHooks must create hooksPath's
+  // parent directory itself (this is what proves it's self-sufficient on a fresh machine, or
+  // with CODEX_HOME pointed at a directory that was never created).
   const realHooksPath = join(homedir(), ".codex", "hooks.json");
   const realBefore = await statOrNull(realHooksPath);
 
@@ -295,7 +294,8 @@ test("the merged Codex hooks.json UserPromptSubmit entry, pointed at a control-p
 
   const hooksPath = join(stateRoot, "codex-home", "hooks.json");
   assert.ok(hooksPath.startsWith(stateRoot), `fixture bug: hooksPath ${hooksPath} escaped the temp root ${stateRoot}`);
-  await mkdir(join(stateRoot, "codex-home"), { recursive: true });
+  // Deliberately NOT pre-creating codex-home/ -- see the identical comment on the positive
+  // Codex test above.
   const realHooksPath = join(homedir(), ".codex", "hooks.json");
   const realBefore = await statOrNull(realHooksPath);
 

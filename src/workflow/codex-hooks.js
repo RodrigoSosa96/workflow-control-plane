@@ -1,5 +1,5 @@
-import { readFile as defaultReadFile, rename as defaultRename, writeFile as defaultWriteFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir as defaultMkdir, readFile as defaultReadFile, rename as defaultRename, writeFile as defaultWriteFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 // The Codex analog of buildClaudeWorkerSettings (see harnesses.js), but merged into Codex's
 // GLOBAL ~/.codex/hooks.json rather than written into a fresh per-run settings file: Codex has
@@ -73,14 +73,18 @@ export function mergeCodexWorkerHooks(current, controlPlaneRoot) {
 // an empty {hooks:{}} (a fresh machine simply won't have ~/.codex/hooks.json yet), but a file
 // that exists and does not parse is never overwritten: it is a shared file, so replacing
 // content this merge cannot read would destroy other tools' entries. The write goes through a
-// temp file plus rename so a crash mid-write cannot truncate the shared file. readFile/writeFile
-// and rename are injectable so callers (and tests) never touch the real ~/.codex/hooks.json.
+// temp file plus rename so a crash mid-write cannot truncate the shared file. A fresh machine
+// equally won't have hooksPath's parent directory (~/.codex/ itself, or whatever CODEX_HOME
+// points at) -- nothing else in this codebase creates it, so it is created here, idempotently,
+// right before the write. readFile/writeFile/rename/mkdir are all injectable so callers (and
+// tests) never touch the real ~/.codex/hooks.json.
 export async function ensureCodexWorkerHooks({
   hooksPath,
   controlPlaneRoot,
   readFile = defaultReadFile,
   writeFile = defaultWriteFile,
   rename = defaultRename,
+  mkdir = defaultMkdir,
 } = {}) {
   assertString(hooksPath, "hooksPath");
   assertString(controlPlaneRoot, "controlPlaneRoot");
@@ -117,6 +121,9 @@ export async function ensureCodexWorkerHooks({
   // path would interleave into a corrupt blob and rename it over the shared file.
   tempCounter += 1;
   const tempPath = `${hooksPath}.workflow-${process.pid}-${tempCounter}.tmp`;
+  // Idempotent: recursive tolerates the directory already existing, so this is safe on every
+  // host, not only the fresh one this exists for.
+  await mkdir(dirname(hooksPath), { recursive: true });
   await writeFile(tempPath, text, { mode: 0o600 });
   await rename(tempPath, hooksPath);
   return merged;

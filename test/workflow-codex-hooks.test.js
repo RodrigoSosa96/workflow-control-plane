@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ensureCodexWorkerHooks, mergeCodexWorkerHooks } from "../src/workflow/codex-hooks.js";
 
 test("adds the workflow lifecycle hooks beside an existing Herdr SessionStart hook, without clobbering it", () => {
@@ -51,6 +54,7 @@ test("ensureCodexWorkerHooks reads, merges, and writes the shared file through t
       assert.equal(path, "/home/user/.codex/hooks.json");
       return JSON.stringify(existing);
     },
+    mkdir: async () => {},
     writeFile: async (path, text) => {
       writtenPath = path;
       writtenText = text;
@@ -78,6 +82,7 @@ test("ensureCodexWorkerHooks falls back to an empty hooks object when the file i
       error.code = "ENOENT";
       throw error;
     },
+    mkdir: async () => {},
     writeFile: async () => {},
     rename: async () => {},
   });
@@ -121,8 +126,9 @@ test("ensureCodexWorkerHooks run twice via injected fs is idempotent end to end"
     files.set(to, files.get(from));
     files.delete(from);
   };
-  await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile, rename });
-  const second = await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile, rename });
+  const mkdir = async () => {};
+  await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile, rename, mkdir });
+  const second = await ensureCodexWorkerHooks({ hooksPath: "/x/.codex/hooks.json", controlPlaneRoot: "/cp", readFile, writeFile, rename, mkdir });
   for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
     const cmds = second.hooks[ev].flatMap((g) => g.hooks.map((h) => h.command)).filter((c) => c.includes("codex-lifecycle.mjs"));
     assert.equal(cmds.length, 1);
@@ -173,6 +179,63 @@ test("ensureCodexWorkerHooks refuses to write when an existing hooks file cannot
   assert.equal(touched, false);
 });
 
+test("ensureCodexWorkerHooks creates hooksPath's parent directory when it does not exist yet (real fs, nested temp path)", async (t) => {
+  // On a fresh machine (or with CODEX_HOME pointed at a directory that was never created),
+  // hooksPath's parent does not exist. readFile tolerates that as ENOENT-means-empty, but
+  // writeFile/rename below both throw ENOENT with no directory to write into -- this is the
+  // production defect: a launch on such a host silently never installs the Codex hooks. Uses
+  // the real (non-injected) fs functions against a mkdtemp root so the fix is proven end to end,
+  // not just that an injected mkdir was called.
+  const tempRoot = await mkdtemp(join(tmpdir(), "workflow-codex-hooks-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true }));
+  const hooksPath = join(tempRoot, "not-created-yet", "nested", "hooks.json");
+
+  const result = await ensureCodexWorkerHooks({ hooksPath, controlPlaneRoot: "/cp" });
+
+  const written = JSON.parse(await readFile(hooksPath, "utf8"));
+  for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    assert.equal(written.hooks[ev][0].hooks[0].command, `node "/cp/hooks/codex-lifecycle.mjs" ${ev}`);
+  }
+  assert.deepEqual(result, written);
+});
+
+test("ensureCodexWorkerHooks still writes correctly when hooksPath's parent directory already exists (real fs)", async (t) => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "workflow-codex-hooks-"));
+  t.after(() => rm(tempRoot, { recursive: true, force: true }));
+  const dir = join(tempRoot, "already-there");
+  await mkdir(dir, { recursive: true });
+  const hooksPath = join(dir, "hooks.json");
+
+  const result = await ensureCodexWorkerHooks({ hooksPath, controlPlaneRoot: "/cp" });
+
+  const written = JSON.parse(await readFile(hooksPath, "utf8"));
+  for (const ev of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+    assert.equal(written.hooks[ev][0].hooks[0].command, `node "/cp/hooks/codex-lifecycle.mjs" ${ev}`);
+  }
+  assert.deepEqual(result, written);
+});
+
+test("ensureCodexWorkerHooks accepts an injected mkdir and calls it with the parent directory, recursively, before writing", async () => {
+  // Mirrors the readFile/writeFile/rename injection already in this function's signature, so
+  // this (like every other test in this file) never has to touch a real home directory.
+  const calls = [];
+  await ensureCodexWorkerHooks({
+    hooksPath: "/home/user/.codex/nested/hooks.json",
+    controlPlaneRoot: "/cp",
+    readFile: async () => {
+      const error = new Error("ENOENT");
+      error.code = "ENOENT";
+      throw error;
+    },
+    mkdir: async (path, options) => { calls.push({ path, options }); },
+    writeFile: async () => {
+      assert.equal(calls.length, 1, "mkdir must run before writeFile");
+    },
+    rename: async () => {},
+  });
+  assert.deepEqual(calls, [{ path: "/home/user/.codex/nested", options: { recursive: true } }]);
+});
+
 test("ensureCodexWorkerHooks writes the temp file with private permissions", async () => {
   const writes = [];
   await ensureCodexWorkerHooks({
@@ -183,6 +246,7 @@ test("ensureCodexWorkerHooks writes the temp file with private permissions", asy
       error.code = "ENOENT";
       throw error;
     },
+    mkdir: async () => {},
     writeFile: async (path, text, options) => writes.push({ path, options }),
     rename: async () => {},
   });
