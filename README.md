@@ -304,6 +304,8 @@ npm run smoke:fixture -- --real --agent pi --keep
 
 Before starting, the script prints the fixture root, registry, tickets, exact assignment, and a token-cost warning. Real canaries require a TTY, `--keep`, and typed confirmation. Type the exact harness name (`pi`) to confirm. On failure or timeout the fixture root and run directory are preserved for inspection.
 
+This is also the only place Herdr workspace/tab/pane orchestration is verified live: `--real --agent <harness> --keep` behind the same TTY and typed-confirmation gates, deliberately with no automated equivalent.
+
 Inspection commands for a preserved canary:
 
 ```bash

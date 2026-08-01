@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
   buildClaudeWorkerSettings,
   buildHarnessLaunch,
   buildHarnessResume,
   CLAUDE_WORKER_SETTINGS_FILE,
+  PI_WORKER_EXTENSIONS,
 } from "../src/workflow/harnesses.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -217,6 +220,19 @@ test("pi stream-json argv does not load the interactive-only workflow worker ext
     run: RUN,
   });
   assert.equal(spec.argv.includes("--extension"), false);
+});
+
+// Pi loads these in-process via --extension, so their ingestion cannot be exercised without
+// running Pi (that stays with the --real canary). What IS testable is Pi's share of the same
+// broken-path failure class the Claude and Codex ingestion tests cover: an extension file moved
+// or renamed leaves PI_WORKER_EXTENSIONS pointing at nothing, and every launch wires a flag at
+// a path that does not exist.
+test("every PI_WORKER_EXTENSIONS path exists and can be imported", async () => {
+  assert.ok(PI_WORKER_EXTENSIONS.length > 0);
+  for (const path of PI_WORKER_EXTENSIONS) {
+    assert.equal(existsSync(path), true, `PI_WORKER_EXTENSIONS points at a missing file: ${path}`);
+    await import(pathToFileURL(path).href);
+  }
 });
 
 test("preserves legacy no-prompt Pi starts when no run is supplied", () => {
