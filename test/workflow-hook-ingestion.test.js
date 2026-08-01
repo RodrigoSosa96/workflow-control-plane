@@ -39,33 +39,45 @@ async function runHookCommand(command, { env, payload, timeoutMs = 20_000 }) {
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => { clearTimeout(timer); reject(error); });
-    child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, timedOut }); });
+    // A child that has already exited (e.g. "sh: node: not found") before this write reaches its
+    // stdin raises EPIPE on child.stdin; with no listener, that is an uncaughtException that
+    // tears down the whole test file rather than failing one test. The run-record assertion below
+    // is the same either way -- a dead child never gets to advance it -- so swallow it here.
+    child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(payload ?? {}));
   });
 }
 
-// Degrade, don't lie: a sandboxed or minimal host might have no /bin/sh, or process.execPath
-// (the node binary these tests themselves run under) might not resolve as an executable. Either
-// one means the shell-invoked hook subprocess this whole file exists to exercise cannot run at
-// all here, so every test below skips with a named reason rather than failing -- mirrors the
-// t.skip degrade convention in test/workflow-hook-ownership.test.js.
+// Degrade, don't lie: a sandboxed or minimal host might have no /bin/sh, or no `node` resolvable
+// on PATH. Either one means the shell-invoked hook subprocess this whole file exists to exercise
+// cannot run at all here, so every test below skips with a named reason rather than failing --
+// mirrors the t.skip degrade convention in test/workflow-hook-ownership.test.js.
+//
+// The load-bearing dependency is the literal `node` token the generated commands look up on PATH
+// (see workflowHookCommand in codex-hooks.js and buildClaudeWorkerSettings in harnesses.js), not
+// process.execPath -- nothing in this file ever invokes process.execPath, so checking it here
+// checked the wrong thing: on a host where `node` is not on PATH but this suite is somehow still
+// running (e.g. `node --test` invoked with an absolute path outside PATH), the generated command
+// would fail with "sh: node: not found" in under ~1ms, fast enough to hit the child.stdin EPIPE
+// window runHookCommand's stdin error listener now guards against, instead of skipping cleanly.
+// Resolve the token the same way the shell will: `command -v node` under /bin/sh -c.
 async function canRunShellInvokedHook() {
   try {
     await access("/bin/sh", constants.X_OK);
   } catch {
     return false;
   }
-  if (typeof process.execPath !== "string" || process.execPath.length === 0) return false;
-  try {
-    await access(process.execPath, constants.X_OK);
-  } catch {
-    return false;
-  }
-  return true;
+  return await new Promise((resolve) => {
+    const child = spawn("/bin/sh", ["-c", "command -v node"], { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("close", (code) => resolve(code === 0));
+  });
 }
 
 const SKIP_REASON = "this host cannot run a shell-invoked hook subprocess";
@@ -83,6 +95,20 @@ async function statOrNull(path) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
+}
+
+// Mirrors codexHooksPath in src/workflow/launch.js:494-498 exactly (env.CODEX_HOME falling back
+// to ~/.codex) so the runtime "never touched" probe below watches the same file production would
+// actually write to. Duplicated rather than imported: that helper is private to launch.js and not
+// worth exporting for a test-only concern. The guarantee this probe backs up is belt-and-braces
+// anyway -- the real one is static (every ensureCodexWorkerHooks call in this file passes an
+// explicit hooksPath under a mkdtemp root, never the default), so on a machine with CODEX_HOME set
+// differently from this function's own reading of it, or where a live `codex` session writes to
+// this exact path mid-run, this probe could still watch the wrong file or flake. It is not the
+// thing that makes "never touched" true.
+function productionCodexHooksPath() {
+  const codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  return join(codexHome, "hooks.json");
 }
 
 // Proves this suite never mutates the operator's real ~/.codex/hooks.json: if it existed before
@@ -126,7 +152,7 @@ test("the generated Claude settings' UserPromptSubmit hook, run as the harness r
   assert.equal(
     after.state,
     RUN_STATES.RUNNING,
-    `the generated settings' hook did not advance the run. command: ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    `the generated settings' hook did not advance the run. command: ${command}\ntimedOut: ${result.timedOut}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
   );
   assert.equal(after.generation, 1);
 });
@@ -167,7 +193,7 @@ test("the generated Claude settings' UserPromptSubmit hook, pointed at a control
   assert.equal(
     after.state,
     RUN_STATES.LAUNCHING,
-    `expected a hook pointed at a control-plane root with no hooks/ directory to leave the run untouched. command: ${command}\ncode: ${result.code}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    `expected a hook pointed at a control-plane root with no hooks/ directory to leave the run untouched. command: ${command}\ncode: ${result.code}\ntimedOut: ${result.timedOut}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
   );
   assert.equal(after.generation, 1);
 });
@@ -210,7 +236,7 @@ test("a control-plane root path containing a space does not break the generated 
   assert.equal(
     after.state,
     RUN_STATES.RUNNING,
-    `a control-plane root path containing a space broke the quoted hook command. command: ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    `a control-plane root path containing a space broke the quoted hook command. command: ${command}\ntimedOut: ${result.timedOut}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
   );
   assert.equal(after.generation, 1);
 });
@@ -241,7 +267,7 @@ test("the merged Codex hooks.json UserPromptSubmit entry, run as the harness run
   // Deliberately NOT pre-creating codex-home/: ensureCodexWorkerHooks must create hooksPath's
   // parent directory itself (this is what proves it's self-sufficient on a fresh machine, or
   // with CODEX_HOME pointed at a directory that was never created).
-  const realHooksPath = join(homedir(), ".codex", "hooks.json");
+  const realHooksPath = productionCodexHooksPath();
   const realBefore = await statOrNull(realHooksPath);
 
   await ensureCodexWorkerHooks({ hooksPath, controlPlaneRoot: CONTROL_PLANE_ROOT });
@@ -265,7 +291,7 @@ test("the merged Codex hooks.json UserPromptSubmit entry, run as the harness run
   assert.equal(
     after.state,
     RUN_STATES.RUNNING,
-    `the merged hooks.json entry did not advance the run. command: ${command}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    `the merged hooks.json entry did not advance the run. command: ${command}\ntimedOut: ${result.timedOut}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
   );
   assert.equal(after.generation, 1);
 
@@ -296,7 +322,7 @@ test("the merged Codex hooks.json UserPromptSubmit entry, pointed at a control-p
   assert.ok(hooksPath.startsWith(stateRoot), `fixture bug: hooksPath ${hooksPath} escaped the temp root ${stateRoot}`);
   // Deliberately NOT pre-creating codex-home/ -- see the identical comment on the positive
   // Codex test above.
-  const realHooksPath = join(homedir(), ".codex", "hooks.json");
+  const realHooksPath = productionCodexHooksPath();
   const realBefore = await statOrNull(realHooksPath);
 
   await ensureCodexWorkerHooks({ hooksPath, controlPlaneRoot: missingHooksRoot });
@@ -320,7 +346,7 @@ test("the merged Codex hooks.json UserPromptSubmit entry, pointed at a control-p
   assert.equal(
     after.state,
     RUN_STATES.LAUNCHING,
-    `expected a hook pointed at a control-plane root with no hooks/ directory to leave the run untouched. command: ${command}\ncode: ${result.code}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    `expected a hook pointed at a control-plane root with no hooks/ directory to leave the run untouched. command: ${command}\ncode: ${result.code}\ntimedOut: ${result.timedOut}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
   );
   assert.equal(after.generation, 1);
 

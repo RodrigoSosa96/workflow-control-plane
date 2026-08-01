@@ -233,7 +233,7 @@ test("ensureCodexWorkerHooks accepts an injected mkdir and calls it with the par
     },
     rename: async () => {},
   });
-  assert.deepEqual(calls, [{ path: "/home/user/.codex/nested", options: { recursive: true } }]);
+  assert.deepEqual(calls, [{ path: "/home/user/.codex/nested", options: { recursive: true, mode: 0o700 } }]);
 });
 
 test("ensureCodexWorkerHooks writes the temp file with private permissions", async () => {

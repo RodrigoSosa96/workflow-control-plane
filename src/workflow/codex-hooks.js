@@ -122,8 +122,13 @@ export async function ensureCodexWorkerHooks({
   tempCounter += 1;
   const tempPath = `${hooksPath}.workflow-${process.pid}-${tempCounter}.tmp`;
   // Idempotent: recursive tolerates the directory already existing, so this is safe on every
-  // host, not only the fresh one this exists for.
-  await mkdir(dirname(hooksPath), { recursive: true });
+  // host, not only the fresh one this exists for. mode: 0o700 rather than leaving it to the
+  // umask, matching every other directory this repo creates (run-store.js, handoff.js,
+  // delegation-reservations.js, events-bus.js) -- the file written into it is deliberately
+  // 0o600 and holds command strings the harness executes, so a group/world-writable parent
+  // (e.g. under umask 000) would let another local account replace them. Only applies when we
+  // are the one creating the directory; an already-existing ~/.codex/ is left exactly as it is.
+  await mkdir(dirname(hooksPath), { recursive: true, mode: 0o700 });
   await writeFile(tempPath, text, { mode: 0o600 });
   await rename(tempPath, hooksPath);
   return merged;
