@@ -83,6 +83,7 @@ test("package metadata exposes the workflow bin and packaged control-plane files
   assert.match(pkg.description, /workflow/i);
   assert.ok(pkg.files.includes("bin"));
   assert.ok(pkg.files.includes("src"));
+  assert.ok(pkg.files.includes("hooks"));
   assert.ok(pkg.files.includes("README.md"));
   assert.ok(pkg.files.includes(".pi/agents"));
   assert.ok(pkg.files.includes(".pi/extensions"));

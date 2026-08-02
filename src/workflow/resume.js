@@ -158,7 +158,11 @@ export async function executeResume({ store, transport, herdr, runId, confirmed 
         try {
           await store.update(runId, () => ({ resumeClaim: null, ...(priorLifecycleState ?? {}) }));
         } catch {
-          // Best-effort: a stale claim expires on its own after the freshness window.
+          // Best-effort: resumeClaim itself expires on its own after the freshness window, but
+          // generation/previousGeneration/stopAttempts and both markers have no such window --
+          // a failed restore here leaves them at the new-generation values this same claim update
+          // set above, ahead of a worker that never actually started. That is visible in the run
+          // record (an operator running `workflow status` would see it) and does not self-heal.
         }
       }
       throw error;

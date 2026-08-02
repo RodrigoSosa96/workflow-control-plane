@@ -59,10 +59,13 @@ const STEP_LABELS = [
 // records would therefore fail this test for a reason that is not a lifecycle divergence: Claude
 // and Codex would carry `telemetry` entries Pi does not. That asymmetry is a controller decision,
 // not an oversight -- recorded here so a reader can see exactly what is excluded and why, and can
-// confirm nothing lifecycle-relevant is hidden behind it. Also excluded for the same "not
-// lifecycle arithmetic" reason: resumeClaim, transportIdentity, agentProfile, createdAt/updatedAt,
-// stateHistory, and harness/profileName -- none of them is a field lifecycle.js or
-// lifecycle-hook-core.mjs ever writes.
+// confirm nothing lifecycle-relevant is hidden behind it. Also excluded, but not because they're
+// unwritten -- resume.js does write resumeClaim and transportIdentity on the very "resume" step
+// this test drives: resumeClaim, transportIdentity, agentProfile, createdAt/updatedAt,
+// stateHistory, and harness/profileName. They're excluded because each is harness-variant by
+// construction (agentProfile, harness/profileName) or carries a timestamp/opaque identity with no
+// fixed expected value (resumeClaim, transportIdentity, createdAt/updatedAt, stateHistory) -- not
+// arithmetic a shared lifecycle expectation can pin.
 function lifecycleProjection(run, harness) {
   return {
     state: run.state,

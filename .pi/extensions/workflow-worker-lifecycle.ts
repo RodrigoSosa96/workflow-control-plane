@@ -29,7 +29,10 @@ export function createWorkflowWorkerLifecycleExtension({
   // (hooks/lib/lifecycle-hook-core.mjs, shared with Claude/Codex's stateless subprocess hooks).
   // It holds no lifecycle condition of its own -- generation/source discrimination, marker
   // persistence, telemetry-phase recording, and stop notifications all live in the core, keyed
-  // off `piStartedOnce` / `piPendingContinuation` on the run record. This file only maps Pi's
+  // off `piStartedOnce` / `piPendingContinuation` on the run record. (Telemetry-phase recording
+  // is true of the core in general, not of this call site: runCore below passes no `telemetry`,
+  // so the core's recordPhase() returns immediately for every Pi event. Pi's own phases come
+  // from .pi/extensions/workflow-worker-observability.ts instead.) This file only maps Pi's
   // events onto the core's event vocabulary and renders the core's harness-neutral decision
   // ({ continuation: { prompt } } | undefined) into Pi's own protocol. Pi's events carry no
   // payload the core reads, so stdinJson is always {}; env is threaded through so the core's
