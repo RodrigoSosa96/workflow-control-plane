@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
+    "test:ci-like": "bash scripts/test-ci-like.sh",
     "fixture:create": "node scripts/workflow-fixture.js create --keep",
     "fixture:inspect": "node scripts/workflow-fixture.js inspect",
     "smoke:fixture": "node scripts/smoke-workflow-fixture.js"

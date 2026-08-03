@@ -295,7 +295,7 @@ handoff.
 
 ## Real harness canaries (interactive only)
 
-Real canaries start an actual harness session and may consume API tokens. They are never run in CI or by `npm test`.
+Real canaries start an actual harness session and may consume API tokens. They are never run in CI or by `npm test`. To check what CI will say before pushing, `npm run test:ci-like` runs the same suite with the harness binaries stripped from `PATH` and the CI environment variables set, cleaning up after itself.
 
 ```bash
 # Pi real canary — requires TTY, --keep, and typed confirmation
