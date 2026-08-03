@@ -295,11 +295,18 @@ test("--real rejects wrong typed harness confirmation", async () => {
 });
 
 test("--real rejects CI environment before ever prompting for confirmation", async () => {
-  // Nothing else pins this: the guard sits between the --agent check and the typed
-  // confirmation prompt in assertRealModeAllowed. Deliberately don't pass `stdin` -- if
-  // the guard were ever removed or reordered, this would hang on the confirmation prompt
-  // instead of failing fast, which is its own signal.
+  // The guard sits between the --agent check and the typed confirmation prompt in
+  // assertRealModeAllowed. We still pass stdin, but with a deliberately WRONG
+  // confirmation ("\n", which trims to "" and never equals "pi"): if the guard were ever
+  // removed or reordered, promptExactHarness awaits stdin.once("data") with no EOF path,
+  // so a no-stdin version of this test would hang the runner to its timeout instead of
+  // failing fast -- in CI that is a job stuck until the 6-hour cap, not a red X in
+  // seconds. With stdin supplied, a regressed guard still fails fast (wrong confirmation
+  // -> "not confirmed"), and a live guard fails fast too (CI rejection before the prompt
+  // is ever reached) -- so this test observes the CI guard specifically either way,
+  // without ever being able to hang.
   const { code, stderr, stdout } = await runSmoke(["--real", "--agent", "pi", "--keep"], {
+    stdin: "\n",
     env: { WORKFLOW_SMOKE_TEST_TTY: "1", CI: "true" },
   });
   assert.equal(code, 1);

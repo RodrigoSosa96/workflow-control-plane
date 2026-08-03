@@ -28,6 +28,16 @@ pnpm add --global /home/you/projects/personal/workflows
 
 This installs both `workflow` and `asana-workflow`. For a full fresh-machine setup, see [`INSTALL.md`](INSTALL.md).
 
+## Development
+
+Run the test suite with:
+
+```bash
+npm test
+```
+
+To check what CI will say before pushing, `npm run test:ci-like` runs the same suite with the harness binaries stripped from `PATH`, the CI environment variables set, and this project's own `WORKFLOW_*`/harness-related environment variables cleared for the child process — so a developer's shell profile (`WORKFLOW_STATE_ROOT`, `CODEX_HOME`, and similar) can't leak state CI would never have. It cleans up after itself and exits with the suite's own exit code.
+
 ## Quick start
 
 After the design and implementation plan are approved:
@@ -295,7 +305,7 @@ handoff.
 
 ## Real harness canaries (interactive only)
 
-Real canaries start an actual harness session and may consume API tokens. They are never run in CI or by `npm test`. To check what CI will say before pushing, `npm run test:ci-like` runs the same suite with the harness binaries stripped from `PATH` and the CI environment variables set, cleaning up after itself.
+Real canaries start an actual harness session and may consume API tokens. They are never run in CI, by `npm test`, or by `npm run test:ci-like` (see "Development" above).
 
 ```bash
 # Pi real canary — requires TTY, --keep, and typed confirmation
