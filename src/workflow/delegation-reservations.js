@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { classifyDelegationRole, validateDelegationPolicy } from "./delegation-policy.js";
 import { checkoutDigestFor, reservationResourceList } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
+import { MUTEX_RETRY_BUDGET_MS, retryWithinBudget } from "./bounded-retry.js";
 import { removeOwnedMutex } from "./mutex-removal.js";
 
 const PRIVATE_DIR_MODE = 0o700;
@@ -88,11 +89,13 @@ export function createDelegationReservationStore({
   randomUUID = defaultRandomUUID,
   canonicalPath = defaultCanonicalPath,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  retryNow = () => Date.now(),
   readOwnOwnership = async () => null,
 } = {}) {
   const root = resolve(assertString(stateRoot, "reservation state root"));
   if (typeof randomUUID !== "function" || typeof canonicalPath !== "function") fail("reservation store requires randomUUID and canonicalPath functions");
   if (typeof sleep !== "function") fail("reservation store requires a sleep function");
+  if (typeof retryNow !== "function") fail("reservation store requires a retryNow function");
   if (typeof readOwnOwnership !== "function") fail("reservation store requires a readOwnOwnership function");
   let tempCounter = 0;
 
@@ -187,21 +190,19 @@ export function createDelegationReservationStore({
     // The gate is a mkdir mutex held for a single read-modify-write. Concurrent
     // holders are millisecond-scale, so a bounded retry absorbs a live collision
     // instead of telling the operator to inspect a gate that is about to clear.
-    // Crash residue still ends in the manual-inspection error, unchanged.
-    const maxAttempts = 3;
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        await fs.mkdir(paths.activeGate, { mode: PRIVATE_DIR_MODE });
-        break;
-      } catch (error) {
-        if (error?.code !== "EEXIST") {
-          fail(`Unable to acquire reservation project gate (${error?.code ?? "FS_ERROR"})`);
-        }
-        if (attempt >= maxAttempts) {
-          fail("Reservation project gate is active; manual inspection required");
-        }
-        await sleep(25 + Math.floor(Math.random() * 75));
+    // Crash residue still ends in the manual-inspection error, unchanged. The
+    // retry itself is shared with run-store.js's acquireLockWithRetry -- see
+    // bounded-retry.js for why it budgets wall time instead of attempt count.
+    try {
+      await retryWithinBudget(
+        () => fs.mkdir(paths.activeGate, { mode: PRIVATE_DIR_MODE }),
+        { shouldRetry: (error) => error?.code === "EEXIST", budgetMs: MUTEX_RETRY_BUDGET_MS, now: retryNow, sleep },
+      );
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        fail(`Unable to acquire reservation project gate (${error?.code ?? "FS_ERROR"})`);
       }
+      fail("Reservation project gate is active; manual inspection required");
     }
     await chmodDirectory(paths.activeGate);
     const ownerToken = uuid(randomUUID, "reservation gate owner token");

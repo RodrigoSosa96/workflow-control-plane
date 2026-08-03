@@ -2,6 +2,7 @@ import { randomUUID as defaultRandomUUID } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
+import { MUTEX_RETRY_BUDGET_MS, retryWithinBudget } from "./bounded-retry.js";
 import { removeOwnedMutex } from "./mutex-removal.js";
 import { sameOwnerDirectory as sameActiveDirectory } from "./ownership.js";
 import { RUN_STATES, isRunState, transitionRun } from "./run-state.js";
@@ -148,6 +149,7 @@ export function createRunStore({
   randomUUID = defaultRandomUUID,
   onListProblem = () => {},
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  retryNow = () => Date.now(),
   readOwnOwnership = async () => null,
 } = {}) {
   const root = resolveStateRoot(stateRoot);
@@ -157,6 +159,9 @@ export function createRunStore({
   }
   if (typeof sleep !== "function") {
     failStore("sleep must be a function");
+  }
+  if (typeof retryNow !== "function") {
+    failStore("retryNow must be a function");
   }
   if (typeof readOwnOwnership !== "function") {
     failStore("readOwnOwnership must be a function");
@@ -574,20 +579,18 @@ export function createRunStore({
 
   // Millisecond-scale lock collisions (launcher final write vs a worker's
   // fire-and-forget lifecycle hook) previously dropped the losing transition
-  // silently, because hook callers swallow errors by design. A short bounded
-  // retry makes those collisions survivable while staying fail-fast for stale
-  // locks (crash residue), which are never waited on.
+  // silently, because hook callers swallow errors by design. A bounded retry
+  // makes those collisions survivable while staying fail-fast for stale locks
+  // (crash residue), which are never waited on. The retry itself is shared
+  // with delegation-reservations.js's acquireGate -- see bounded-retry.js for
+  // why it budgets wall time instead of attempt count.
   async function acquireLockWithRetry(directory, runId) {
-    const maxAttempts = 3;
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        return await acquireLock(directory, runId);
-      } catch (error) {
-        const freshContention = error?.details?.stale === false;
-        if (!freshContention || attempt >= maxAttempts) throw error;
-        await sleep(25 + Math.floor(Math.random() * 75));
-      }
-    }
+    return retryWithinBudget(() => acquireLock(directory, runId), {
+      shouldRetry: (error) => error?.details?.stale === false,
+      budgetMs: MUTEX_RETRY_BUDGET_MS,
+      now: retryNow,
+      sleep,
+    });
   }
 
   async function withLock(directory, runId, callback) {

@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { MUTEX_RETRY_BUDGET_MS } from "../src/workflow/bounded-retry.js";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
 import { classifyOwnership, createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
@@ -297,6 +298,55 @@ test("does not remove an active foreign reservation gate", async (t) => {
   );
   assert.equal((await stat(activeGate)).isDirectory(), true);
   assert.equal(await fileMode(activeGate), 0o755);
+});
+
+// The property that motivated bounded-retry.js: a *live* gate holder (not crash residue) can
+// take longer than the old ~50-200ms attempt-count tolerance to release on a slow or loaded
+// host, and acquireGate must still absorb that instead of reporting "manual inspection
+// required". Drives a fake wall clock through the same injected `sleep` seam acquireGate already
+// used before this fix (never waits in real time): the gate stays held past the old tolerance,
+// then clears, and reserve() must still succeed within the new budget.
+test("reserve() absorbs a live gate holder that clears only after longer than the old ~200ms retry tolerance", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const activeGate = activeGatePathFor(stateRoot, "fixture-single");
+  const sleeps = [];
+  let elapsedMs = 0;
+  const reservations = createDelegationReservationStore({
+    stateRoot,
+    randomUUID: distinctUuidSequence(),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    canonicalPath: async (value) => value,
+    retryNow: () => elapsedMs,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      elapsedMs += ms;
+      // The live holder (another process finishing its own read-modify-write) releases the
+      // gate only once simulated elapsed time has passed the old tolerance -- well within the
+      // new MUTEX_RETRY_BUDGET_MS budget.
+      if (elapsedMs >= 250) {
+        await realFs.rm(activeGate, { recursive: true, force: true });
+      }
+    },
+  });
+
+  // Pre-seed a held gate with no marker at all -- a live acquireGate mid-mkdir, not crash
+  // residue (crash residue always leaves a marker once acquireGate's mkdir succeeds).
+  await mkdir(activeGate, { recursive: true, mode: 0o700 });
+
+  const reservation = await reservations.reserve({
+    projectAlias: "fixture-single",
+    delegationId: FIRST_ID,
+    role: "code-reviewer",
+    mode: "background",
+    checkoutPath: "/fixture/source",
+    policy,
+  });
+
+  assert.equal(reservation.state, "active");
+  const totalSleptMs = sleeps.reduce((sum, ms) => sum + ms, 0);
+  assert.ok(totalSleptMs > 200, `expected the absorbed collision to span more than the old ~200ms tolerance, got ${totalSleptMs}ms`);
+  assert.ok(sleeps.length > 2, `expected more retries than the old fixed two backoffs, got ${sleeps.length}`);
+  assert.ok(totalSleptMs < MUTEX_RETRY_BUDGET_MS, "expected the fix to land comfortably within the 2s budget");
 });
 
 test("releaseForDelegation frees a lease without its owner token and restores writer capacity", async (t) => {

@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
+import { MUTEX_RETRY_BUDGET_MS } from "../src/workflow/bounded-retry.js";
 import { RUN_STATES, transitionRun } from "../src/workflow/run-state.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 
@@ -818,13 +819,26 @@ test("update retries a fresh lock collision briefly and succeeds once it clears"
 });
 
 test("update stays fail-fast when the lock collision persists past the bounded retries", async (t) => {
+  // NOTE: this test's shape changed from the pre-fix version. It used to assert `sleeps.length
+  // === 2` because the retry was bounded by a fixed attempt count (3 tries). That count-based
+  // guarantee is exactly what this fix (bounded-retry.js) replaces with a wall-time budget, so
+  // asserting a fixed attempt count no longer describes the contract under test. This version
+  // drives a fake wall clock through the same injected `sleep` seam (advancing it by each
+  // jittered backoff, never waiting in real time) and asserts the budget-based property instead:
+  // retries continue until MUTEX_RETRY_BUDGET_MS of simulated time has elapsed, then the
+  // contention error still surfaces.
   const stateRoot = await tempStateRoot(t);
   const sleeps = [];
+  let elapsedMs = 0;
   const store = createRunStore({
     stateRoot,
     randomUUID: uuidSequence(RUN_ID_1),
     clock: clockSequence("2025-01-01T00:00:00.000Z"),
-    sleep: async (ms) => sleeps.push(ms),
+    retryNow: () => elapsedMs,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      elapsedMs += ms;
+    },
   });
   await store.create(plannedInput({ primaryTicket: "A-1" }));
   await mkdir(join(stateRoot, RUN_ID_1, "run.lock", "active"), { recursive: true, mode: 0o700 });
@@ -833,8 +847,13 @@ test("update stays fail-fast when the lock collision persists past the bounded r
     () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
     (error) => error.category === "run-lock" && error.details?.stale === false,
   );
-  // Bounded: exactly two backoffs for three attempts, then the contention error.
-  assert.equal(sleeps.length, 2);
+  // Bounded by wall time, not attempt count: more than the old fixed two backoffs, and the
+  // simulated elapsed time spent retrying reaches the full budget before giving up.
+  assert.ok(sleeps.length > 2, `expected more than the old fixed two backoffs, got ${sleeps.length}`);
+  for (const ms of sleeps) {
+    assert.ok(ms >= 25 && ms < 100, `backoff must be jittered 25-100ms, got ${ms}`);
+  }
+  assert.ok(elapsedMs >= MUTEX_RETRY_BUDGET_MS, `expected the retry to spend the full ${MUTEX_RETRY_BUDGET_MS}ms budget, got ${elapsedMs}ms`);
 });
 
 test("inspectLock returns null with no lock, and returns the marker with a stale flag without mutating anything", async (t) => {
