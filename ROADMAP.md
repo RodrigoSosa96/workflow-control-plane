@@ -112,6 +112,7 @@ Referencia: artículo "The new rules of context engineering" — Anthropic borr�
 | 2026-08-01 | 1.6 | `fa5b958..6281496` | Los settings generados de Claude y el `hooks.json` mergeado de Codex se ejecutan ahora por shell tal como los corre el harness: el comando se lee de la salida del propio generador, corre como subprocess con el `WORKFLOW_*` env del worker, y la aserción es sobre el run record (`LAUNCHING → RUNNING`), nunca sobre el exit code. Cada harness tiene además un caso negativo permanente contra una raíz de control plane sin `hooks/`. Los paths de `PI_WORKER_EXTENSIONS` quedan pinneados; el placeholder de Herdr fue eliminado. De paso encontró y corrigió un defecto de producción: `ensureCodexWorkerHooks` nunca creaba el directorio padre de `hooksPath` (`eb3b12e`). Suite: 929 tests, 929 pass, 0 skips (venía de 921 tests, 920 pass, 1 skip). |
 | 2026-08-02 | 1.2 | `5b263ea..8449096` | Lifecycle core único: `hooks/lib/lifecycle-hook-core.mjs` pasa a ser el único dueño de `continuationPrompt`, `handoffExists`, discriminación de generación y condiciones de stop/notify. Devuelve una decisión harness-neutral (`{continuation:{prompt}}`) en vez del wire format de Claude; cada uno de los tres archivos de harness renderiza su propio protocolo (Claude y Codex a `{"decision":"block",...}` por stdout, Pi a `pi.sendUserMessage`). `.pi/extensions/workflow-worker-lifecycle.ts` queda como adapter delgado sobre markers persistidos (`piStartedOnce`/`piPendingContinuation`), sin closures en memoria. `executeResume` abre generación nueva explícitamente, bajo el lock que ya toma antes de relanzar. Suite: 939 tests, 939 pass, 0 skips. |
 | 2026-08-03 | CI roja en el primer push (4 tests entorno-dependientes) | `3fe8d44..47cd3b2` | Ver "CI roja en el primer push a `origin/main`" abajo. No fue regresión, ninguna causa fue defecto de producción. `npm run test:ci-like` reproduce la CI localmente desde ahora. Suite: 940 tests, 940 pass, 0 skips. |
+| 2026-08-03 | CI roja en el segundo push (retry de mutex por tiempo, no por intentos) | `980a1e1` | Ver "CI roja en el segundo push a `origin/main`" abajo. A diferencia de la primera corrida roja, esta sí fue un defecto real de producción. Nuevo módulo compartido `src/workflow/bounded-retry.js`. Suite: 947 tests, 947 pass, 0 skips. |
 
 **Fase 0 completa y revisada.** Rama `hardening/fase-0`, 699 tests (698 pass, 1 skip — el smoke de Herdr vivo, ítem 1.6; ese skip fue eliminado en 1.6 — ver la fila 2026-08-01 arriba, 929/929/0).
 
@@ -187,7 +188,7 @@ Ver el Registro de progreso arriba para el rango de commits.
 **Corregido en la revisión final de rama.** El `files` de `package.json` empaquetaba `.pi/extensions` pero no `hooks/`, y la extensión de Pi ahora importa `hooks/lib/` en duro — preexistente para Claude y Codex (`buildClaudeWorkerSettings` y `ensureCodexWorkerHooks` apuntan igual a `hooks/`), pero Pi antes no tenía esa dependencia, así que este ítem escaló el hueco de degradado a no-carga: un `hooks/` faltante en una instalación global (`npm install --global`, el path que documenta `INSTALL.md:17`) es ahora un módulo sin resolver al cargar la extensión de Pi, no un no-op silencioso. Corregido agregando `"hooks"` a `files`, con la aserción correspondiente en `test/workflow-docs.test.js` — arregla los tres harnesses, no solo Pi.
 
 **Conocido, registrado, no corregido** — se incluye con honestidad, es el lado del costo:
-- El adapter toma como máximo dos adquisiciones del run lock por evento (la escritura del marker más el propio update del lifecycle) donde la closure tomaba una — la rama de follow-up de `UserPromptSubmit` y los stops que no continúan toman solo una. La escritura más disputada no es la más benigna: es `${harness}PendingContinuation: true`, persistida en el mismo evento de stop en el que la extensión de observabilidad de Pi también toma el run lock (`telemetry.record → writePrivateFile → withLock`). Si esa escritura se pierde, el arranque de la propia continuación cae en la rama de follow-up, y el reset de `stopAttempts` a 0 que `lifecycle.js` hace en esa rama anula el presupuesto de dos intentos — bajo contención sostenida, un loop de continuación sin cota. (Perder `${harness}StartedOnce` en cambio es el caso benigno: solo salta en silencio un incremento de generación.) El riesgo en sí es aceptable — `acquireLockWithRetry` da 3 intentos con jitter de 25–100 ms contra la escritura de un archivo chico, y la lectura de ownership queda deliberadamente fuera de la sección crítica — pero al menos la escritura perdida queda logueada en el hook debug log del run ahora, algo que el `catch {}` silencioso viejo no hacía.
+- El adapter toma como máximo dos adquisiciones del run lock por evento (la escritura del marker más el propio update del lifecycle) donde la closure tomaba una — la rama de follow-up de `UserPromptSubmit` y los stops que no continúan toman solo una. La escritura más disputada no es la más benigna: es `${harness}PendingContinuation: true`, persistida en el mismo evento de stop en el que la extensión de observabilidad de Pi también toma el run lock (`telemetry.record → writePrivateFile → withLock`). Si esa escritura se pierde, el arranque de la propia continuación cae en la rama de follow-up, y el reset de `stopAttempts` a 0 que `lifecycle.js` hace en esa rama anula el presupuesto de dos intentos — bajo contención sostenida, un loop de continuación sin cota. (Perder `${harness}StartedOnce` en cambio es el caso benigno: solo salta en silencio un incremento de generación.) El riesgo en sí es aceptable — `acquireLockWithRetry` reintenta contra la escritura de un archivo chico, y la lectura de ownership queda deliberadamente fuera de la sección crítica — pero al menos la escritura perdida queda logueada en el hook debug log del run ahora, algo que el `catch {}` silencioso viejo no hacía. **Actualización (2026-08-03):** ese reintento pasó de 3 intentos con jitter de 25–100 ms a un presupuesto de tiempo compartido de 2000 ms (`bounded-retry.js`, ver "CI roja en el segundo push a `origin/main`" abajo) — la ventana en la que esta pérdida puede ocurrir se redujo, no se cerró.
 - Que el propio extension loader de Pi resuelva el import `.mjs` desde una extensión `.ts` **no está verificado acá** — el type stripping de Node sí lo hace, y los tests importan el `.ts` directo, pero no hay Pi instalado en este entorno. El canario `--real` (`scripts/smoke-workflow-fixture.js`) es lo que lo detectaría.
 
 Ver el Registro de progreso arriba para el rango de commits.
@@ -210,6 +211,33 @@ Un sweep completo bajo una reproducción fiel de CI (binarios de harness fuera d
 Suite tras el fix: 940 tests, 940 pass, 0 skips.
 
 Ver el Registro de progreso arriba para el rango de commits.
+
+### CI roja en el segundo push a `origin/main`
+
+La segunda corrida de CI (`b146e3d`) falló un test — `beginRemediation races claim atomically so only one follow-up child launches` — que había pasado en la primera corrida (`ok 309`) contra código de producción idéntico: la rama anterior a esta era test-only. **No fue flakiness.** La propia aserción del test nombra la propiedad que se rompió:
+
+```js
+  // The loser is refused by the claim guard (or by the record having already
+  // moved past a remediable state once the winner finished) — never by gate or
+  // lock contention, which bounded retries absorb.
+  assert.match(rejected.reason.message, /already claimed|allowed state/i);
+```
+
+En CI el loser recibió `Reservation project gate is active; manual inspection required` — contención de gate, no el claim guard. El propio comentario de `acquireGate` promete lo mismo que rompió la aserción: los holders concurrentes son de escala de milisegundos, así que un retry acotado debería absorber una colisión viva en vez de mandar al operador a inspeccionar un gate que está por liberarse.
+
+**La falla estaba en la unidad.** Los dos mutex presupuestaban sus reintentos en **intentos** (`maxAttempts = 3` con `sleep(25 + random*75)` — dos sleeps, tolerancia de entre ~50 y 200 ms) mientras la garantía que prometen es sobre **tiempo**. Un presupuesto de intentos depende de la velocidad de la máquina. Medido localmente antes del fix: 15/15 pasa sin carga y 12/12 con 36 workers quemando CPU — y aun así falló en un runner de dos núcleos.
+
+**El fix:** un único retry acotado por tiempo, compartido (`src/workflow/bounded-retry.js`), consumido por `acquireLockWithRetry` de `run-store.js` y por `acquireGate` de `delegation-reservations.js`. Es además la **quinta** copia de la misma lógica en este repo, después del argv de `ps` (1.1b, 1.1c), los invariantes de delegación y la coreografía de remoción de mutex (1.4), y el protocolo de lifecycle (1.2).
+
+**Lo que no cambió:** el residuo genuino de un crash sigue terminando en el mismo error de inspección manual — solo se alargó la espera antes de declararlo. Un lock de run **stale** sigue fallando rápido hacia el flujo de recuperación de `workflow unlock`, en vez de esperar el presupuesto.
+
+**Esto reduce, no cierra, la exposición que anotó 1.2.** Esa entrada registró que, bajo contención del lock, perder la escritura del marker puede saltear en silencio un incremento de generación (ver el bullet de `acquireLockWithRetry` en "1.2 completa" arriba) — anotado ahí como riesgo aceptado, no corregido. Un presupuesto de reintento más ancho reduce la ventana en la que esa pérdida puede ocurrir; no la elimina.
+
+**Costo honesto:** dos tests existentes que ejercitan residuo genuino ahora tardan el presupuesto completo (~2s cada uno) antes de llegar al error de inspección manual, porque eso es exactamente lo que significa el presupuesto — antes tardaban ~200ms. Y un test existente tuvo que cambiar: pinneaba el contrato viejo de conteo de intentos asertando el número de sleeps (`sleeps.length === 2`), así que ahora conduce un reloj falso a través del mismo seam de `sleep` inyectado en vez de eso.
+
+Suite: 947 tests, 947 pass, 0 skips, bajo `npm test` y `npm run test:ci-like`.
+
+Ver el Registro de progreso arriba para el commit.
 
 Orden sugerido para el resto de la Fase 1, por dependencia:
 
