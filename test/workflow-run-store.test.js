@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { MUTEX_RETRY_BUDGET_MS } from "../src/workflow/bounded-retry.js";
 import { RUN_STATES, transitionRun } from "../src/workflow/run-state.js";
-import { createRunStore } from "../src/workflow/run-store.js";
+import { createRunStore, SUPPORTED_RUN_VERSION } from "../src/workflow/run-store.js";
 
 const RUN_ID_1 = "11111111-1111-4111-8111-111111111111";
 const RUN_ID_2 = "22222222-2222-4222-8222-222222222222";
@@ -86,6 +86,29 @@ function plannedInput(overrides = {}) {
     state: RUN_STATES.PLANNED,
     ...overrides,
   };
+}
+
+// The store never produces a bad version itself (initialRun/updatedRun strip a caller-supplied
+// one), so version-check fixtures must bypass the store and write run.json directly.
+function rawRunRecord(overrides = {}) {
+  return {
+    version: SUPPORTED_RUN_VERSION,
+    id: RUN_ID_1,
+    state: RUN_STATES.PLANNED,
+    stateHistory: [{ from: null, to: RUN_STATES.PLANNED, at: "2025-01-01T00:00:00.000Z" }],
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-01T00:00:00.000Z",
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    ...overrides,
+  };
+}
+
+async function writeRawRun(stateRoot, runId, record) {
+  const directory = join(stateRoot, runId);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(directory, "run.json"), JSON.stringify(record), { mode: 0o600 });
+  return directory;
 }
 
 test("creates private run directories and files", async (t) => {
@@ -173,6 +196,114 @@ test("rejects malformed run JSON without leaking the raw payload", async (t) => 
       return true;
     },
   );
+});
+
+test("read accepts a run record at the supported version", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot });
+  await writeRawRun(stateRoot, RUN_ID_1, rawRunRecord());
+
+  const run = await store.read(RUN_ID_1);
+
+  assert.equal(run.version, SUPPORTED_RUN_VERSION);
+});
+
+test("read refuses a run record from a newer version, naming both the version found and the version supported", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot });
+  await writeRawRun(stateRoot, RUN_ID_1, rawRunRecord({ version: 2 }));
+
+  await assert.rejects(
+    () => store.read(RUN_ID_1),
+    (error) => {
+      assert.match(error.message, /version/i);
+      assert.match(error.message, new RegExp(String(SUPPORTED_RUN_VERSION)));
+      assert.match(error.message, /2/);
+      return true;
+    },
+  );
+});
+
+test("read refuses a run record with an absent, non-integer, or zero version", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot });
+
+  const absent = rawRunRecord();
+  delete absent.version;
+
+  const cases = [
+    ["absent version", absent],
+    ["non-integer version", rawRunRecord({ version: 1.5 })],
+    ["version 0", rawRunRecord({ version: 0 })],
+  ];
+
+  for (const [label, record] of cases) {
+    await writeRawRun(stateRoot, RUN_ID_1, record);
+    await assert.rejects(() => store.read(RUN_ID_1), /version/i, label);
+  }
+});
+
+test("update refuses a run record whose version this control plane does not support, same as read", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot });
+
+  const absent = rawRunRecord();
+  delete absent.version;
+
+  const cases = [
+    ["a newer version", rawRunRecord({ version: 2 })],
+    ["an absent version", absent],
+    ["a non-integer version", rawRunRecord({ version: 1.5 })],
+    ["version 0", rawRunRecord({ version: 0 })],
+  ];
+
+  for (const [label, record] of cases) {
+    await writeRawRun(stateRoot, RUN_ID_1, record);
+    await assert.rejects(
+      () => store.update(RUN_ID_1, () => ({ state: RUN_STATES.LAUNCHING })),
+      /version/i,
+      label,
+    );
+  }
+});
+
+test("list skips a future-version run record, reports it through onListProblem, and returns the supported ones", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const problems = [];
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: uuidSequence(RUN_ID_1, RUN_ID_3),
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+    onListProblem: (problem) => problems.push(problem),
+  });
+  const first = await store.create(plannedInput({ primaryTicket: "A-1" }));
+  const third = await store.create(plannedInput({ primaryTicket: "A-3" }));
+  await writeRawRun(stateRoot, RUN_ID_2, rawRunRecord({ id: RUN_ID_2, version: 2 }));
+
+  const listed = await store.list({});
+
+  assert.deepEqual(listed.map((run) => run.id).sort(), [first.id, third.id].sort());
+  assert.equal(problems.length, 1);
+  assert.equal(problems[0].runId, RUN_ID_2);
+  assert.match(problems[0].message, /version/i);
+
+  // Strict reads keep refusing loudly for the future-version record.
+  await assert.rejects(() => store.read(RUN_ID_2), /version/i);
+});
+
+test("the run version cannot be forged: create() ignores a caller-supplied version, and update() cannot move it off 1", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({
+    stateRoot,
+    randomUUID: () => RUN_ID_1,
+    clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:01:00.000Z"),
+  });
+
+  const created = await store.create(plannedInput({ version: 99 }));
+  assert.equal(created.version, SUPPORTED_RUN_VERSION);
+
+  const updated = await store.update(RUN_ID_1, () => ({ version: 99, state: RUN_STATES.LAUNCHING }));
+  assert.equal(updated.version, SUPPORTED_RUN_VERSION);
 });
 
 test("transitionRun enforces the closed state machine and records timestamped history", () => {

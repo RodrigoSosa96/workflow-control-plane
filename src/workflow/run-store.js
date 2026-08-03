@@ -7,6 +7,10 @@ import { removeOwnedMutex } from "./mutex-removal.js";
 import { sameOwnerDirectory as sameActiveDirectory } from "./ownership.js";
 import { RUN_STATES, isRunState, transitionRun } from "./run-state.js";
 
+// One exported constant, so a future bump has exactly one place to change and callers can
+// assert against it rather than a literal.
+export const SUPPORTED_RUN_VERSION = 1;
+
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const RUN_FILE = "run.json";
@@ -132,6 +136,21 @@ function validateRunRecord(record, expectedRunId, path) {
   return record;
 }
 
+// Runs before shape validation: a record from the future must be refused on its version, not on
+// whatever shape mismatch its new fields happen to trigger in validateRunRecord, which would
+// send an operator chasing the wrong problem. `?.` guards a non-object `parsed` (e.g. `null`)
+// so this never crashes ahead of validateRunRecord's own object check.
+// When a version 2 exists, this is the dispatch point for a migrator, mirroring
+// registry.js:565-568's explicit per-version handling; there is nothing to migrate yet.
+function assertSupportedRunVersion(record, path) {
+  const found = record?.version;
+  if (found === SUPPORTED_RUN_VERSION) return;
+  failStore(
+    `Run record at ${path} must use version ${SUPPORTED_RUN_VERSION} (received ${found ?? "unknown"}); ` +
+      "upgrade the control plane reading this state root, or point it at one built for this record's version.",
+  );
+}
+
 function parseRunJson(text, path, expectedRunId) {
   let parsed;
   try {
@@ -139,6 +158,7 @@ function parseRunJson(text, path, expectedRunId) {
   } catch (_error) {
     failStore(`Malformed run JSON at ${path}; parse failed`);
   }
+  assertSupportedRunVersion(parsed, path);
   return validateRunRecord(parsed, expectedRunId, path);
 }
 
