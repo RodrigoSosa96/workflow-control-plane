@@ -23,7 +23,7 @@ Son las fallas *silenciosas* en el camino crítico de estado y notificaciones. P
 ### Batch B — Correctitud de la máquina de estados (D4, D6, D7)
 
 - [x] **0.8** Write final del launcher consciente del estado: en el updater, transicionar a RUNNING solo desde PLANNED/LAUNCHING y estampar FAILED solo desde LAUNCHING; devolver `{}` si el worker ya avanzó (`launch.js:734-743`, `:549-551`). Hoy puede regresar COMPLETED→RUNNING o marcar FAILED a un worker vivo. *(ffc6929)*
-- [x] **0.9** Retry acotado (3 intentos, backoff 25–100ms con jitter) en `acquireLock` solo para contención (`run-store.js:446-460`). Hoy una colisión de milisegundos entre el launcher y el hook `onStop` del worker pierde la transición COMPLETED sin diagnóstico. *(ffc6929)*
+- [x] **0.9** Retry acotado (3 intentos, backoff 25–100ms con jitter) en `acquireLock` solo para contención (`run-store.js:446-460`). Hoy una colisión de milisegundos entre el launcher y el hook `onStop` del worker pierde la transición COMPLETED sin diagnóstico. *(ffc6929)* **Actualización (2026-08-03):** ese retry de 3 intentos fue reemplazado por un presupuesto de tiempo compartido de 2000 ms (`bounded-retry.js`), consumido también por `acquireGate` de `delegation-reservations.js` — ver "CI roja en el segundo push a `origin/main`" más abajo para el porqué (un presupuesto de intentos depende de la velocidad de la máquina) y la evidencia medida.
 - [x] **0.10** Lock alrededor de observe→relaunch en `executeResume` (`resume.js:25-50`): re-leer el run bajo el lock, verificar que `transportIdentity` no cambió desde `planResume`, rehusar con conflicto si se movió. Hoy dos `resume --yes` concurrentes doble-relanzan al mismo worktree. *(ffc6929)*
 
 ### Batch C — Assignment, config y delegación (D1, D8, D10, D11, D13, D14)
