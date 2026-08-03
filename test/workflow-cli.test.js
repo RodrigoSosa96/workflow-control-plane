@@ -199,6 +199,24 @@ const FIXTURE_ROLE_LOADER = Object.freeze({
     });
   },
 });
+// Satisfies withLiveDelegationTransport's `if (liveDependencies.transport) return liveDependencies;`
+// short-circuit so tests don't resolve `pi` from the real PATH. Every method throws because these
+// tests' injected commands resolve or throw before ever touching the transport; a call here means
+// the test stopped exercising what it claims to.
+const UNUSED_DELEGATION_TRANSPORT = Object.freeze({
+  async start() {
+    throw new Error("delegation transport must not run: this test's command resolves before touching it");
+  },
+  async observeExact() {
+    throw new Error("delegation transport must not run: this test's command resolves before touching it");
+  },
+  async deliverFollowUp() {
+    throw new Error("delegation transport must not run: this test's command resolves before touching it");
+  },
+  async requestGracefulClose() {
+    throw new Error("delegation transport must not run: this test's command resolves before touching it");
+  },
+});
 
 function uuidSequence(...values) {
   let index = 0;
@@ -719,6 +737,7 @@ test("main prints stable exits for delegation result and keeps delegation reconc
   const reconcileCalls = [];
   const reconcileCode = await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID, "--format", "json"], {
     ...reconcileOutput,
+    transport: UNUSED_DELEGATION_TRANSPORT,
     delegationReconcileCommand: async (options) => {
       reconcileCalls.push(options);
       return {
@@ -798,6 +817,7 @@ test("delegation remediate dry-run reads only --prompt-file, and execution requi
   const executeCode = await main(["delegation", "remediate", RUN_ID, DELEGATION_ID, "--prompt-file", promptFile, "--yes", "--approval-digest", APPROVAL_DIGEST], {
     ...executeOutput,
     isInteractive: () => false,
+    transport: UNUSED_DELEGATION_TRANSPORT,
     delegationRemediateCommand: async () => ({
       preview: delegationRemediationPreview(),
       async execute(executeOptions) {
@@ -2195,6 +2215,7 @@ test("maps conflict and preflight workflow errors to stable categories", async (
   const delegationService = io();
   assert.equal(await main(["delegation", "reconcile", RUN_ID, DELEGATION_ID], {
     ...delegationService,
+    transport: UNUSED_DELEGATION_TRANSPORT,
     delegationReconcileCommand: async () => {
       throw new WorkflowError("delegation-service", "exact worker must be idle");
     },
@@ -2204,6 +2225,7 @@ test("maps conflict and preflight workflow errors to stable categories", async (
   const resume = io();
   assert.equal(await main(["resume", RUN_ID], {
     ...resume,
+    transport: UNUSED_DELEGATION_TRANSPORT,
     resumeCommand: async () => {
       throw new WorkflowError("resume", "Run has no exact session identity to resume");
     },
@@ -2213,6 +2235,7 @@ test("maps conflict and preflight workflow errors to stable categories", async (
   const close = io();
   assert.equal(await main(["close", RUN_ID], {
     ...close,
+    transport: UNUSED_DELEGATION_TRANSPORT,
     closeCommand: async () => {
       throw new WorkflowError("close", "close requires a worker transport");
     },
