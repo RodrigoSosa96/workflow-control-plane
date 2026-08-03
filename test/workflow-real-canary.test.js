@@ -282,9 +282,30 @@ test("completed canary validates telemetry snapshot is bounded", async () => {
 });
 
 test("--real rejects wrong typed harness confirmation", async () => {
-  const { code, stderr } = await runSmoke(["--real", "--agent", "pi", "--keep"], { stdin: "claude\n", env: { WORKFLOW_SMOKE_TEST_TTY: "1" } });
+  // Neutralise the CI signals `isCiEnv` reads: runSmoke spreads process.env under the
+  // passed env, so a parent CI run (this test's own CI!) would otherwise leak CI=true
+  // through and trip the interactive-only guard before the typed confirmation is ever
+  // checked. Force them falsy here so this test exercises the confirmation path itself.
+  const { code, stderr } = await runSmoke(["--real", "--agent", "pi", "--keep"], {
+    stdin: "claude\n",
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1", CI: "", GITHUB_ACTIONS: "", GITLAB_CI: "", BUILDKITE: "" },
+  });
   assert.equal(code, 1);
   assert.match(stderr, /not confirmed/);
+});
+
+test("--real rejects CI environment before ever prompting for confirmation", async () => {
+  // Nothing else pins this: the guard sits between the --agent check and the typed
+  // confirmation prompt in assertRealModeAllowed. Deliberately don't pass `stdin` -- if
+  // the guard were ever removed or reordered, this would hang on the confirmation prompt
+  // instead of failing fast, which is its own signal.
+  const { code, stderr, stdout } = await runSmoke(["--real", "--agent", "pi", "--keep"], {
+    env: { WORKFLOW_SMOKE_TEST_TTY: "1", CI: "true" },
+  });
+  assert.equal(code, 1);
+  assert.match(stderr, /interactive-only/);
+  assert.doesNotMatch(stdout, /REAL canary/);
+  assert.doesNotMatch(stdout, /Type the exact harness name/);
 });
 
 test("--fake creates a fixture and cleans up without --keep", async () => {
