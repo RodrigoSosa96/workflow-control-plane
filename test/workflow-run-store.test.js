@@ -390,10 +390,23 @@ test("a readOwnOwnership that throws still permits acquisition and yields a mark
 
 test("reports bounded active lock contention with injected clock without deleting it", async (t) => {
   const stateRoot = await tempStateRoot(t);
+  // A stale lock (crash residue) must fail fast into `workflow unlock` recovery rather than
+  // waiting out acquireLockWithRetry's bounded retry budget -- that discrimination lives in
+  // shouldRetry: (error) => error?.details?.stale === false. Inject a fake wall clock (sleep
+  // advances retryNow, per bounded-retry.js's doc comment) so a regression that retries a stale
+  // lock anyway shows up as a non-empty `sleeps` instead of hanging the test until a real
+  // 2-second budget elapses.
+  const sleeps = [];
+  let elapsedMs = 0;
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
     clock: clockSequence("2025-01-01T00:00:00.000Z", "2025-01-01T00:10:00.000Z"),
+    retryNow: () => elapsedMs,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      elapsedMs += ms;
+    },
   });
   const run = await store.create(plannedInput());
   const lockContainer = join(run.directory, "run.lock");
@@ -425,6 +438,7 @@ test("reports bounded active lock contention with injected clock without deletin
   assert.equal(await readFile(markerPath, "utf8"), markerContent);
   assert.equal(await fileMode(lockContainer), 0o700);
   assert.equal(await fileMode(activePath), 0o700);
+  assert.equal(sleeps.length, 0, "a stale lock must never be retried -- it must fail fast, not wait out the bounded retry budget");
 });
 
 test("treats a legacy fixed-file lock as a manual-recovery conflict", async (t) => {
@@ -854,6 +868,11 @@ test("update stays fail-fast when the lock collision persists past the bounded r
     assert.ok(ms >= 25 && ms < 100, `backoff must be jittered 25-100ms, got ${ms}`);
   }
   assert.ok(elapsedMs >= MUTEX_RETRY_BUDGET_MS, `expected the retry to spend the full ${MUTEX_RETRY_BUDGET_MS}ms budget, got ${elapsedMs}ms`);
+  // The old fixed count also proved an upper bound ("and no more than that"). node --test's
+  // default timeout is Infinity, so a genuinely unbounded loop would hang this run rather than
+  // fail it -- restore that bound here, sized to the worst case of every backoff landing at the
+  // jitter floor (25ms).
+  assert.ok(sleeps.length <= Math.ceil(MUTEX_RETRY_BUDGET_MS / 25) + 1, `expected a bounded number of retries, got ${sleeps.length}`);
 });
 
 test("inspectLock returns null with no lock, and returns the marker with a stale flag without mutating anything", async (t) => {

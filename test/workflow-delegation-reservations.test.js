@@ -66,7 +66,7 @@ async function fileMode(path) {
   return (await stat(path)).mode & 0o777;
 }
 
-function createStore(stateRoot, ids = [FIRST_ID, SECOND_ID, THIRD_ID]) {
+function createStore(stateRoot, ids = [FIRST_ID, SECOND_ID, THIRD_ID], overrides = {}) {
   return createDelegationReservationStore({
     stateRoot,
     randomUUID: uuidSequence(...ids),
@@ -79,7 +79,23 @@ function createStore(stateRoot, ids = [FIRST_ID, SECOND_ID, THIRD_ID]) {
       "2025-01-01T00:05:00.000Z",
     ),
     canonicalPath: async (value) => value,
+    ...overrides,
   });
+}
+
+// A retryNow/sleep pair that advances a simulated clock instead of waiting in real time, the
+// same seam the "absorbs a live gate holder" test below drives directly. For a test whose gate
+// collision never clears, acquireGate's bounded retry still runs out its full simulated
+// MUTEX_RETRY_BUDGET_MS before giving up -- this just removes the real ~2s of idle wall-clock
+// wait around it. No assertion in those tests is about duration, so nothing is lost.
+function fastRetryClock() {
+  let elapsedMs = 0;
+  return {
+    retryNow: () => elapsedMs,
+    sleep: async (ms) => {
+      elapsedMs += ms;
+    },
+  };
 }
 
 function activeGatePathFor(stateRoot, projectAlias) {
@@ -279,7 +295,10 @@ test("serializes concurrent writers and retains released reservation history", a
 
 test("does not remove an active foreign reservation gate", async (t) => {
   const stateRoot = await tempStateRoot(t);
-  const reservations = createStore(stateRoot);
+  // The gate never clears here (genuine crash residue), so acquireGate's bounded retry runs out
+  // its full budget before reporting -- drive a simulated clock instead of spending ~2s of real
+  // idle wall-clock time waiting it out.
+  const reservations = createStore(stateRoot, undefined, fastRetryClock());
   const projectDigest = createHash("sha256").update("fixture-single", "utf8").digest("hex");
   const activeGate = join(stateRoot, "delegation-reservations", "projects", projectDigest, "gate", "active");
   await mkdir(activeGate, { recursive: true, mode: 0o700 });
@@ -294,7 +313,13 @@ test("does not remove an active foreign reservation gate", async (t) => {
       checkoutPath: "/fixture/source",
       policy,
     }),
-    /gate|manual/i,
+    // Exact operator-facing message, not the looser /gate|manual/i also matched by "Unable to
+    // acquire reservation project gate (EEXIST)" -- that looser pattern would not catch a
+    // degradation of this specific message, and acquireGate's fail() moved from inside the
+    // retry loop into a catch, so this is exactly the path worth pinning precisely. (assert.rejects
+    // matches a RegExp against String(error), i.e. "WorkflowError: <message>" -- anchor only the
+    // tail so the exact operator-facing message is still pinned.)
+    /: Reservation project gate is active; manual inspection required$/,
   );
   assert.equal((await stat(activeGate)).isDirectory(), true);
   assert.equal(await fileMode(activeGate), 0o755);
@@ -569,7 +594,9 @@ test("inspectGate ignores a stray non-owner file and still finds the real marker
 test("clearGate clears only when allow returns true, refuses without throwing when the marker changes first, and unblocks reserve", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const ids = [FIRST_ID, SECOND_ID, THIRD_ID, "44444444-4444-4444-8444-444444444444"];
-  const reservations = createStore(stateRoot, ids);
+  // The initial reserve() below hits a gate that never clears (crash residue) -- drive a
+  // simulated clock instead of spending ~2s of real idle wall-clock time waiting out the budget.
+  const reservations = createStore(stateRoot, ids, fastRetryClock());
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
   const markerPath = join(activeGate, "owner.json");
   const marker = { version: 2, ownerToken: "crashed-token", pid: "9999", startedAt: "2024-12-31T00:00:00.000Z" };

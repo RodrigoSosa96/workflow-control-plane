@@ -89,7 +89,7 @@ export function createDelegationReservationStore({
   randomUUID = defaultRandomUUID,
   canonicalPath = defaultCanonicalPath,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  retryNow = () => Date.now(),
+  retryNow = () => performance.now(),
   readOwnOwnership = async () => null,
 } = {}) {
   const root = resolve(assertString(stateRoot, "reservation state root"));

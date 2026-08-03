@@ -27,7 +27,13 @@ function jitteredBackoffMs() {
 
 // Retries `attempt` while `shouldRetry(error)` holds, until `budgetMs` of wall time has
 // elapsed since the first try. Sleeps with jitter between tries. Rethrows the last error
-// when the budget is spent. `now` and `sleep` are injectable so tests never wait in real time.
+// when the budget is spent. `now` and `sleep` are injectable so tests never wait in real time --
+// but an injected `sleep` must advance the same time base `now` reads, or `now() - startedAt`
+// never reaches `budgetMs` and a persistent collision spins forever instead of failing fast.
+// Production callers should default `now` to `performance.now()`, not `Date.now()`: `Date.now()`
+// can step backwards (an NTP correction, a VM suspend/resume) mid-retry, which would make
+// `now() - startedAt` negative and -- with no absolute iteration cap as a backstop -- keep this
+// loop retrying until the clock catches up. `performance.now()` is monotonic, so it cannot regress.
 export async function retryWithinBudget(attempt, { shouldRetry, budgetMs, now, sleep }) {
   const startedAt = now();
   for (;;) {

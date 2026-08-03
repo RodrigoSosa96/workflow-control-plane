@@ -149,7 +149,7 @@ export function createRunStore({
   randomUUID = defaultRandomUUID,
   onListProblem = () => {},
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  retryNow = () => Date.now(),
+  retryNow = () => performance.now(),
   readOwnOwnership = async () => null,
 } = {}) {
   const root = resolveStateRoot(stateRoot);
