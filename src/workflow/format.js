@@ -387,15 +387,18 @@ function runRow(run, nowMs) {
 // column for this render. It cannot misalign, truncate, or bleed into a neighbour, and it cannot
 // affect any other call's output. The trailing `.trimEnd()` only ever removes padding after the
 // last column, so it never touches alignment of the columns before it.
-function renderRunsTable(rows) {
-  const widths = RUNS_COLUMNS.map((column) => (
+//
+// Shared by formatRuns (RUNS_COLUMNS) and formatInbox (INBOX_COLUMNS below) -- one table
+// implementation, not two copies of the same width/pad/join logic for two different column sets.
+function renderTable(columns, rows) {
+  const widths = columns.map((column) => (
     Math.max(column.label.length, ...rows.map((row) => row[column.key].length))
   ));
-  const renderRow = (values) => RUNS_COLUMNS
+  const renderRow = (values) => columns
     .map((column, index) => values[column.key].padEnd(widths[index]))
     .join(" | ")
     .trimEnd();
-  const header = renderRow(Object.fromEntries(RUNS_COLUMNS.map((column) => [column.key, column.label])));
+  const header = renderRow(Object.fromEntries(columns.map((column) => [column.key, column.label])));
   return [header, ...rows.map((row) => renderRow(row))];
 }
 
@@ -408,10 +411,79 @@ export function formatRuns(value = {}, deps = {}) {
   // explicitly rather than printing nothing.
   const lines = runs.length === 0
     ? ["Runs: none"]
-    : renderRunsTable(runs.map((run) => runRow(run, nowMs)));
+    : renderTable(RUNS_COLUMNS, runs.map((run) => runRow(run, nowMs)));
 
   // Crash residue item 0.3's list() skips rather than swallows: named here as a count and the
   // ids, following this file's no-blank-line-between-sections idiom (formatDoctor, formatPlanLike).
+  if (skipped.length > 0) {
+    const ids = skipped.map((problem) => text(problem.runId)).join(", ");
+    lines.push(`Skipped: ${skipped.length} (${ids})`);
+  }
+
+  return bound(lines.join("\n"));
+}
+
+// --- formatInbox: the compact view for `workflow inbox` (roadmap item 2.2) ---------------------
+//
+// Deliberately reuses formatRuns's shape rather than inventing a second board style (see that
+// function's own comment): a table for the actionable entries -- here, blocked runs instead of
+// every run -- an explicit line when there is nothing to report, and residue named underneath
+// rather than folded into the table or dropped. `inboxCommand`'s entries (`{runId, projectAlias,
+// primaryTicket, harness, paneId[, reason]}`, commands.js's `inboxEntry`) are already as small as
+// `runs --format json`'s own projection, so there is no separate projection step here the way
+// runProjection exists for `runs` -- `--format json` below carries them unchanged.
+
+const INBOX_COLUMNS = [
+  { key: "run", label: "RUN" },
+  { key: "project", label: "PROJECT" },
+  { key: "ticket", label: "TICKET" },
+  { key: "harness", label: "HARNESS" },
+  { key: "pane", label: "PANE" },
+];
+
+function inboxRow(entry) {
+  return {
+    run: shortRunId(entry.runId),
+    project: text(entry.projectAlias),
+    ticket: text(entry.primaryTicket),
+    harness: text(entry.harness),
+    pane: text(entry.paneId),
+  };
+}
+
+// The reason string itself already names the pane where one is relevant (e.g. "No live Herdr
+// agent found for pane w1:p1", "Herdr is unavailable") -- see inboxEntry's/agentsByPaneFromHerdr's
+// own comments in commands.js -- so this line does not repeat a separate pane column; project,
+// ticket, and harness are enough to place the run, and the reason carries the rest.
+function unresolvedLine(entry) {
+  return `${shortRunId(entry.runId)} | ${text(entry.projectAlias)}/${text(entry.primaryTicket)} | ${text(entry.harness)} | ${text(entry.reason)}`;
+}
+
+export function formatInbox(value = {}) {
+  const blocked = list(value.blocked);
+  const unresolved = list(value.unresolved);
+  const skipped = list(value.skipped);
+
+  // "Nothing waiting on you" is only honest when nothing is blocked AND nothing is uncertain --
+  // an unresolved run's status is unknown, not confirmed clear, so it might in fact be blocked.
+  // Reassuring the operator in that case would be exactly the false negative this whole command
+  // exists to avoid (see the design spec's "reported, not dropped" section). A board with nothing
+  // blocked but something unresolved instead says "Blocked: none" and lets the Unresolved section
+  // underneath speak for itself -- never silence, following formatRuns's own "a blank response is
+  // indistinguishable from a broken command" reasoning.
+  const lines = blocked.length === 0 && unresolved.length === 0
+    ? ["Nothing waiting on you"]
+    : blocked.length === 0
+      ? ["Blocked: none"]
+      : renderTable(INBOX_COLUMNS, blocked.map(inboxRow));
+
+  if (unresolved.length > 0) {
+    lines.push("Unresolved:");
+    for (const entry of unresolved) lines.push(unresolvedLine(entry));
+  }
+
+  // Crash residue, reported the same way formatRuns reports it -- a count and the ids, never
+  // swallowed.
   if (skipped.length > 0) {
     const ids = skipped.map((problem) => text(problem.runId)).join(", ");
     lines.push(`Skipped: ${skipped.length} (${ids})`);
@@ -528,6 +600,38 @@ function runsOverflowFallback(command, source, limit) {
   };
 }
 
+// `inbox` entries are far smaller than a full run record (see formatInbox's own comment), but
+// they are not immune to the same collapse `runs` measured: at a realistic-looking combination of
+// long project aliases, tickets, and pane ids, ~45 combined blocked+unresolved entries alone
+// exceed OUTPUT_LIMIT (measured directly against this file's own JSON.stringify, the same way the
+// `runs` numbers above were measured), and both fields inbox accumulates from -- non-terminal
+// runs, and the `no cleanup until item 2.5` growth `runs`'s own comment names -- only grow while an
+// operator lets runs sit open. `inbox` also has neither `runId` nor `status`, so the general
+// fallback below would degrade exactly the way it did for `runs` before that fix: a bare
+// `{command, truncated, truncationMarker}` with the blocked/unresolved data gone and no way to
+// tell "quiet" from "overflowed" apart. Same fix, same shape: `blocked`/`unresolved` stay present
+// as `[]`, counts and ids survive so a consumer can still act one run at a time, `skippedCount`
+// preserves 0.3's crash-residue visibility, and the marker names this command's actual affordance
+// (`--project`, not a `--limit` or `--state` this command does not have).
+function inboxOverflowFallback(command, source, limit) {
+  const droppedBlocked = list(source.blocked);
+  const droppedUnresolved = list(source.unresolved);
+  const idsOf = (entries) => entries.map((entry) => entry?.runId).filter((id) => typeof id === "string" && id.length > 0);
+  return {
+    command: source.command ?? command,
+    blocked: [],
+    unresolved: [],
+    blockedCount: droppedBlocked.length,
+    blockedRunIds: idsOf(droppedBlocked),
+    unresolvedCount: droppedUnresolved.length,
+    unresolvedRunIds: idsOf(droppedUnresolved),
+    herdrAvailable: Boolean(source.herdrAvailable),
+    skippedCount: list(source.skipped).length,
+    truncated: true,
+    truncationMarker: `JSON output truncated at ${limit} characters; ${droppedBlocked.length + droppedUnresolved.length} inbox entries did not fit and were dropped from this response (their ids are in blockedRunIds/unresolvedRunIds). There is no --limit flag for this command; --project narrows if more than one project has live runs, and \`workflow result <run-id>\` inspects one run at a time.`,
+  };
+}
+
 function boundedJson(command, value) {
   const text = JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
   const limit = command === "launch" ? ASSIGNMENT_OUTPUT_LIMIT + OUTPUT_LIMIT : OUTPUT_LIMIT;
@@ -536,6 +640,9 @@ function boundedJson(command, value) {
   const source = value && typeof value === "object" ? value : {};
   if (command === "runs") {
     return JSON.stringify(normalizeJson(runsOverflowFallback(command, source, limit)), null, 2);
+  }
+  if (command === "inbox") {
+    return JSON.stringify(normalizeJson(inboxOverflowFallback(command, source, limit)), null, 2);
   }
   return JSON.stringify(normalizeJson({
     command: source.command ?? command,
@@ -569,6 +676,8 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatClose(value);
     case "runs":
       return formatRuns(value);
+    case "inbox":
+      return formatInbox(value);
     case "worker-status":
     case "worker-watch":
       return bound(formatWorkers(value));

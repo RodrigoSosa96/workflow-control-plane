@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatRuns, formatWorkflowResult } from "../src/workflow/format.js";
+import { formatInbox, formatRuns, formatWorkflowResult } from "../src/workflow/format.js";
 
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -638,5 +638,247 @@ test("--format json for runs names the overflow instead of silently dropping run
   assert.doesNotMatch(parsed.truncationMarker, /rerun with a narrower result query/, "the single-record fallback's advice does not apply to a command with no --limit");
   assert.match(parsed.truncationMarker, /--limit/);
   assert.match(parsed.truncationMarker, /--state/);
+  assert.match(parsed.truncationMarker, /workflow result/);
+});
+
+// --- formatInbox (roadmap item 2.2's compact view) ------------------------------------------
+//
+// inboxCommand's own entry shape (commands.js's inboxEntry): {runId, projectAlias, primaryTicket,
+// harness, paneId}, plus a `reason` string on unresolved entries. Built directly here rather than
+// through a shared fixture helper -- the two lists differ by exactly the `reason` field, and both
+// are small enough that spelling them out is clearer than a builder with a `withReason` flag.
+
+function blockedEntry(overrides = {}) {
+  return {
+    runId: "11111111-1111-4111-8111-111111111111",
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "pi",
+    paneId: "w1:p1",
+    ...overrides,
+  };
+}
+
+function unresolvedEntry(overrides = {}) {
+  return {
+    ...blockedEntry(),
+    reason: "No live Herdr agent found for pane w1:p1",
+    ...overrides,
+  };
+}
+
+test("formatInbox renders a populated inbox with one line per blocked run, its columns, and no leaked reason text", () => {
+  const value = {
+    command: "inbox",
+    blocked: [
+      blockedEntry(),
+      blockedEntry({
+        runId: "22222222-2222-4222-8222-222222222222",
+        projectAlias: "acme",
+        primaryTicket: "B-2",
+        harness: "codex",
+        paneId: "w2:p9",
+      }),
+    ],
+    unresolved: [],
+    herdrAvailable: true,
+    skipped: [],
+    exitCode: 0,
+  };
+
+  const compact = formatInbox(value);
+  const lines = compact.split("\n");
+
+  assert.equal(lines.length, 3, "one header line plus one line per blocked run, nothing else");
+  assert.match(lines[0], /^RUN\s+\|\s+PROJECT\s+\|\s+TICKET\s+\|\s+HARNESS\s+\|\s+PANE$/);
+  assert.match(lines[1], /^11111111\s+\|\s+ocr\s+\|\s+A-1\s+\|\s+pi\s+\|\s+w1:p1$/);
+  assert.match(lines[2], /^22222222\s+\|\s+acme\s+\|\s+B-2\s+\|\s+codex\s+\|\s+w2:p9$/);
+});
+
+test("an empty inbox says nothing is waiting rather than printing nothing", () => {
+  const value = { command: "inbox", blocked: [], unresolved: [], herdrAvailable: true, skipped: [], exitCode: 0 };
+  assert.equal(formatInbox(value), "Nothing waiting on you");
+  assert.equal(formatWorkflowResult("inbox", value, "compact"), "Nothing waiting on you");
+});
+
+test("unresolved entries are named underneath with their reasons, and an all-unresolved inbox does not falsely claim nothing is waiting", () => {
+  const value = {
+    command: "inbox",
+    blocked: [],
+    unresolved: [
+      unresolvedEntry(),
+      unresolvedEntry({
+        runId: "33333333-3333-4333-8333-333333333333",
+        projectAlias: "acme",
+        primaryTicket: "B-3",
+        harness: "claude",
+        paneId: null,
+        reason: "Run has no pane id recorded",
+      }),
+    ],
+    herdrAvailable: true,
+    skipped: [],
+    exitCode: 0,
+  };
+
+  const compact = formatInbox(value);
+  assert.equal(compact, [
+    "Blocked: none",
+    "Unresolved:",
+    "11111111 | ocr/A-1 | pi | No live Herdr agent found for pane w1:p1",
+    "33333333 | acme/B-3 | claude | Run has no pane id recorded",
+  ].join("\n"));
+  assert.doesNotMatch(compact, /Nothing waiting on you/, "some runs' status is unknown, not confirmed clear -- reassurance here would be a lie");
+});
+
+test("unresolved entries appear underneath a populated blocked table, not instead of it", () => {
+  const value = {
+    command: "inbox",
+    blocked: [blockedEntry()],
+    unresolved: [unresolvedEntry({
+      runId: "44444444-4444-4444-8444-444444444444",
+      primaryTicket: "A-4",
+      reason: "Herdr is unavailable",
+    })],
+    herdrAvailable: false,
+    skipped: [],
+    exitCode: 0,
+  };
+
+  const compact = formatInbox(value);
+  assert.match(compact, /^RUN\s+\|\s+PROJECT/m);
+  assert.match(compact, /^11111111\s+\|\s+ocr\s+\|\s+A-1/m);
+  assert.match(compact, /^Unresolved:$/m);
+  assert.match(compact, /^44444444 \| ocr\/A-4 \| pi \| Herdr is unavailable$/m);
+});
+
+test("skipped records are named under the inbox the same way runs reports them", () => {
+  const skipped = [
+    { runId: "99999999-9999-4999-8999-999999999999", directory: "/state/workflow/99999999-9999-4999-8999-999999999999", message: "malformed run.json" },
+  ];
+
+  const emptyInbox = formatInbox({ command: "inbox", blocked: [], unresolved: [], skipped, exitCode: 0 });
+  assert.equal(emptyInbox, [
+    "Nothing waiting on you",
+    "Skipped: 1 (99999999-9999-4999-8999-999999999999)",
+  ].join("\n"));
+
+  const populatedInbox = formatInbox({ command: "inbox", blocked: [blockedEntry()], unresolved: [], skipped, exitCode: 0 });
+  assert.match(populatedInbox, /Skipped: 1 \(99999999-9999-4999-8999-999999999999\)$/);
+  assert.match(populatedInbox, /^11111111\s+\|\s+ocr/m);
+});
+
+test("formatWorkflowResult dispatches \"inbox\" to the compact view", () => {
+  const value = { command: "inbox", blocked: [blockedEntry()], unresolved: [], herdrAvailable: true, skipped: [], exitCode: 0 };
+  const compact = formatWorkflowResult("inbox", value, "compact");
+  assert.match(compact, /^RUN\s+\|\s+PROJECT\s+\|\s+TICKET\s+\|\s+HARNESS\s+\|\s+PANE$/m);
+  assert.match(compact, /^11111111\s+\|\s+ocr\s+\|\s+A-1\s+\|\s+pi\s+\|\s+w1:p1$/m);
+});
+
+test("--format json for inbox carries blocked, unresolved, herdrAvailable, and skipped unchanged", () => {
+  const value = {
+    command: "inbox",
+    blocked: [blockedEntry()],
+    unresolved: [unresolvedEntry({ runId: "55555555-5555-4555-8555-555555555555", reason: "Herdr is unavailable" })],
+    herdrAvailable: false,
+    skipped: [{ runId: "99999999-9999-4999-8999-999999999999", directory: "/x", message: "malformed run.json" }],
+    exitCode: 0,
+  };
+
+  const parsed = JSON.parse(formatWorkflowResult("inbox", value, "json"));
+  assert.equal(parsed.command, "inbox");
+  assert.equal(parsed.herdrAvailable, false);
+  assert.deepEqual(parsed.blocked, value.blocked);
+  assert.deepEqual(parsed.unresolved, value.unresolved);
+  assert.equal(parsed.skipped[0].runId, "99999999-9999-4999-8999-999999999999");
+});
+
+// This command's entries carry only {runId, projectAlias, primaryTicket, harness, paneId[,
+// reason]} -- no repositories, no telemetry, none of the ~44 fields runProjection's own comment
+// names -- so there is no separate projection step to prove correct. What still needs proving,
+// the same way runProjection's own headroom test proved it for `runs`: this stays comfortably
+// under OUTPUT_LIMIT at a scale an operator could plausibly reach (several projects each with a
+// handful of concurrently open runs), not just at the 1-2 entry scale a hand-written test would
+// otherwise exercise -- a test asserting only "it is valid JSON" would have passed against a
+// truncation fallback carrying zero entries too (see the overflow test below for that failure
+// mode measured directly).
+test("--format json for inbox stays well under OUTPUT_LIMIT at a realistic combined count and still carries every entry's data", () => {
+  function realisticEntry(index, extra = {}) {
+    return {
+      runId: `${String(index).padStart(8, "0")}-0000-4000-8000-000000000000`,
+      projectAlias: "workflows-control-plane", // realistic long alias, matches runs' own headroom fixture
+      primaryTicket: `CTRLPLANE-${45000 + index}`,
+      harness: "opencode", // longest real harness
+      paneId: `w${index}:pane-${index}-abcdefgh`,
+      ...extra,
+    };
+  }
+
+  // 20 combined entries: several projects each with several concurrently open runs -- generous
+  // for a single operator's live workload, well short of the ~44-entry point measured (via this
+  // same JSON.stringify) to first cross OUTPUT_LIMIT at this fixture's field lengths.
+  const ENTRY_COUNT = 20;
+  const blocked = Array.from({ length: ENTRY_COUNT / 2 }, (_, index) => realisticEntry(index));
+  const unresolved = Array.from({ length: ENTRY_COUNT / 2 }, (_, index) => realisticEntry(index + 1000, {
+    reason: `No live Herdr agent found for pane w${index + 1000}:pane-${index + 1000}-abcdefgh`,
+  }));
+  const value = { command: "inbox", blocked, unresolved, herdrAvailable: true, skipped: [], exitCode: 0 };
+
+  const json = formatWorkflowResult("inbox", value, "json");
+  assert.ok(json.length < 12000 * 0.75, `realistic-scale inbox JSON was ${json.length} characters, expected comfortably under 75% of OUTPUT_LIMIT`);
+
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, undefined, "realistic scale must not engage the truncation fallback");
+  assert.equal(parsed.blocked.length, ENTRY_COUNT / 2);
+  assert.equal(parsed.unresolved.length, ENTRY_COUNT / 2);
+  assert.deepEqual(parsed.blocked.map((entry) => entry.runId).sort(), blocked.map((entry) => entry.runId).sort());
+  assert.deepEqual(parsed.unresolved.map((entry) => entry.runId).sort(), unresolved.map((entry) => entry.runId).sort());
+});
+
+// The regression this guards against is the same one `runs` shipped and then fixed: the general
+// boundedJson fallback (`{command, runId?, status?, truncated, truncationMarker}`) was built for
+// single-record commands and `inbox` has neither `runId` nor `status`, so without a dedicated
+// fallback this collapses to `{command, truncated, truncationMarker}` -- `blocked`/`unresolved`
+// absent, not empty, and a consumer reading `result.blocked?.length ?? 0` silently reports "no
+// blocked workers" on the one command whose entire job is to not miss that. Forces the collapse
+// directly (well past the ~44-entry point measured above) and asserts the corrected shape.
+test("--format json for inbox names the overflow instead of silently dropping blocked/unresolved data", () => {
+  function overflowEntry(index, extra = {}) {
+    return {
+      runId: `${String(index).padStart(8, "0")}-0000-4000-8000-000000000000`,
+      projectAlias: "workflows-control-plane",
+      primaryTicket: `CTRLPLANE-${45000 + index}`,
+      harness: "opencode",
+      paneId: `w${index}:pane-${index}-abcdefgh`,
+      ...extra,
+    };
+  }
+
+  const ENTRY_COUNT = 80; // well past the ~44-entry realistic-scale boundary measured above
+  const blocked = Array.from({ length: ENTRY_COUNT / 2 }, (_, index) => overflowEntry(index));
+  const unresolved = Array.from({ length: ENTRY_COUNT / 2 }, (_, index) => overflowEntry(index + 1000, {
+    reason: `No live Herdr agent found for pane w${index + 1000}:pane-${index + 1000}-abcdefgh`,
+  }));
+  const skipped = [{ runId: "99999999-9999-4999-8999-999999999999", directory: "/state/workflow/broken", message: "malformed run.json" }];
+  const value = { command: "inbox", blocked, unresolved, herdrAvailable: true, skipped, exitCode: 0 };
+
+  // Sanity check on the fixture itself, the same discipline runs's own overflow test applies.
+  const unboundedLength = JSON.stringify(value, null, 2).length;
+  assert.ok(unboundedLength > 12000, `fixture is too small to prove anything: ${ENTRY_COUNT} entries were only ${unboundedLength} characters, not over OUTPUT_LIMIT`);
+
+  const json = formatWorkflowResult("inbox", value, "json");
+  const parsed = JSON.parse(json);
+
+  assert.equal(parsed.command, "inbox");
+  assert.equal(parsed.truncated, true);
+  assert.deepEqual(parsed.blocked, [], "blocked stays a present empty array, never absent -- absent is indistinguishable from a genuinely empty inbox");
+  assert.deepEqual(parsed.unresolved, [], "unresolved stays present too, for the same reason");
+  assert.equal(parsed.blockedCount, ENTRY_COUNT / 2);
+  assert.equal(parsed.unresolvedCount, ENTRY_COUNT / 2);
+  assert.equal(parsed.skippedCount, 1, "collapsing must not also erase 0.3's crash-residue visibility");
+  assert.deepEqual(parsed.blockedRunIds.slice().sort(), blocked.map((entry) => entry.runId).sort());
+  assert.deepEqual(parsed.unresolvedRunIds.slice().sort(), unresolved.map((entry) => entry.runId).sort());
+  assert.doesNotMatch(parsed.truncationMarker, /rerun with a narrower result query/, "the single-record fallback's advice does not apply to a command with no --limit");
+  assert.match(parsed.truncationMarker, /--project/);
   assert.match(parsed.truncationMarker, /workflow result/);
 });

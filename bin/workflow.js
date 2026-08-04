@@ -20,6 +20,7 @@ import {
   delegationResultCommand as defaultDelegationResultCommand,
   doctorCommand as defaultDoctorCommand,
   handoffCommand as defaultHandoffCommand,
+  inboxCommand as defaultInboxCommand,
   launchCommand as defaultLaunchCommand,
   planCommand as defaultPlanCommand,
   reconcileCommand as defaultReconcileCommand,
@@ -56,6 +57,7 @@ Commands:
   workflow result <run-id> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
   workflow runs [project] [--state <state>] [--all] [--format compact|json]
+  workflow inbox [project] [--format compact|json]
   workflow resume <run-id> [--yes] [--format compact|json]
   workflow close <run-id> [--format compact|json]
   workflow unlock <run-id> [--yes] [--format compact|json]
@@ -341,6 +343,15 @@ export function parseArgs(argv) {
       ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
       ...(options.state ? { state: options.state } : {}),
       ...(options.all ? { all: true } : {}),
+      format,
+    };
+  }
+
+  if (command === "inbox") {
+    validateShape("inbox", positionals, options, { min: 0, max: 1, allowedOptions: [] });
+    return {
+      command,
+      ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
       format,
     };
   }
@@ -724,6 +735,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const runsCommand = dependencies.runsCommand ?? defaultRunsCommand;
+  const inboxCommand = dependencies.inboxCommand ?? defaultInboxCommand;
   const resumeCommand = dependencies.resumeCommand ?? defaultResumeCommand;
   const closeCommand = dependencies.closeCommand ?? defaultCloseCommand;
   const unlockCommand = dependencies.unlockCommand ?? defaultUnlockCommand;
@@ -863,6 +875,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (args.command === "runs") {
       const result = await runsCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("runs", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "inbox") {
+      const result = await inboxCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("inbox", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

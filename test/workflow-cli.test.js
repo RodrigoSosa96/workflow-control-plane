@@ -325,6 +325,7 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow result <run-id>/);
   assert.match(result.stdout, /workflow reconcile \[project\] --run <run-id>/);
   assert.match(result.stdout, /workflow runs \[project\] \[--state <state>\] \[--all\]/);
+  assert.match(result.stdout, /workflow inbox \[project\]/);
   assert.match(result.stdout, /workflow resume <run-id>/);
   assert.match(result.stdout, /workflow close <run-id>/);
   assert.match(result.stdout, /workflow unlock <run-id>/);
@@ -422,6 +423,17 @@ test("parses documented workflow commands and options", () => {
     projectAlias: "acme",
     state: "running",
     all: true,
+    format: "json",
+  });
+
+  assert.deepEqual(parseArgs(["inbox"]), {
+    command: "inbox",
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["inbox", "acme", "--format", "json"]), {
+    command: "inbox",
+    projectAlias: "acme",
     format: "json",
   });
 
@@ -530,6 +542,10 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["runs", "acme", "extra"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["runs", "--yes"]), /runs does not accept --yes/i);
   assert.throws(() => parseArgs(["runs", "--bogus"]), /Unknown option: --bogus/i);
+  assert.throws(() => parseArgs(["inbox", "acme", "extra"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["inbox", "--all"]), /inbox does not accept --all/i);
+  assert.throws(() => parseArgs(["inbox", "--state", "running"]), /inbox does not accept --state/i);
+  assert.throws(() => parseArgs(["inbox", "--bogus"]), /Unknown option: --bogus/i);
   assert.throws(() => parseArgs(["resume", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["close", RUN_ID, "--yes"]), /close does not accept --yes/i);
   assert.throws(() => parseArgs(["close", "../not-a-run"]), /path-safe|UUID/i);
@@ -1473,6 +1489,52 @@ test("runs --all reaches the command with no project narrowing", async () => {
   assert.deepEqual(output.stdout, ["runs:0"]);
 });
 
+test("inbox is read-only, exits 0, and passes the positional project through to the command", async () => {
+  const output = io();
+  const calls = [];
+  const code = await main(["inbox", "acme", "--format", "json"], {
+    ...output,
+    inboxCommand: async (options) => {
+      calls.push(options);
+      return { command: "inbox", blocked: [], unresolved: [], herdrAvailable: true, skipped: [], exitCode: 0 };
+    },
+    executeStart: async () => {
+      throw new Error("inbox must not launch or repair");
+    },
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{
+    command: "inbox",
+    projectAlias: "acme",
+    format: "json",
+    registryPath: join(packageRoot, "projects.yaml"),
+  }]);
+  assert.deepEqual(JSON.parse(output.stdout[0]), { command: "inbox", blocked: [], unresolved: [], herdrAvailable: true, skipped: [], exitCode: 0 });
+  assert.deepEqual(output.stderr, []);
+});
+
+test("inbox with no project narrows nothing, and dispatches to the compact formatter by default", async () => {
+  const output = io();
+  const calls = [];
+  const code = await main(["inbox"], {
+    ...output,
+    inboxCommand: async (options) => {
+      calls.push(options);
+      return { command: "inbox", blocked: [], unresolved: [], herdrAvailable: true, skipped: [], exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.blocked.length}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{
+    command: "inbox",
+    format: "compact",
+    registryPath: join(packageRoot, "projects.yaml"),
+  }]);
+  assert.deepEqual(output.stdout, ["inbox:0"]);
+});
+
 test("workflow runs end-to-end against a real store: renders the board, an empty board, skipped residue, JSON with repositories, and refuses an unknown --state", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "workflow-runs-cli-e2e-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -1522,6 +1584,68 @@ test("workflow runs end-to-end against a real store: renders the board, an empty
   for (const state of Object.values(RUN_STATES)) {
     assert.ok(bogus.stderr[0].includes(state), `expected the usage error to name valid state "${state}": ${bogus.stderr[0]}`);
   }
+});
+
+test("workflow inbox end-to-end against a real store: an empty inbox, a blocked run, an unresolved run, and skipped residue", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-inbox-cli-e2e-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateRoot = join(dir, "state");
+  const store = createRunStore({ stateRoot });
+
+  const empty = io();
+  assert.equal(await main(["inbox"], { ...empty, stateRoot, herdr: { async listAgents() { return { agents: [] }; } } }), 0);
+  assert.deepEqual(empty.stdout, ["Nothing waiting on you"]);
+  assert.deepEqual(empty.stderr, []);
+
+  const blockedRun = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    state: RUN_STATES.PLANNED,
+    repositories: [{ id: "repository", path: "/tmp/ocr", branch: "main" }],
+  });
+  await store.update(blockedRun.id, () => ({ state: RUN_STATES.LAUNCHING }));
+  await store.update(blockedRun.id, () => ({ state: RUN_STATES.RUNNING, paneId: "w1:p1" }));
+
+  const populated = io();
+  const herdrWithBlocked = { async listAgents() { return { agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "blocked", cwd: "/wt" }] }; } };
+  assert.equal(await main(["inbox"], { ...populated, stateRoot, herdr: herdrWithBlocked }), 0);
+  assert.match(populated.stdout[0], /^RUN\s+\|\s+PROJECT/);
+  assert.match(populated.stdout[0], /ocr/);
+  assert.match(populated.stdout[0], /A-1/);
+  assert.deepEqual(populated.stderr, []);
+
+  const json = io();
+  assert.equal(await main(["inbox", "--format", "json"], { ...json, stateRoot, herdr: herdrWithBlocked }), 0);
+  const parsed = JSON.parse(json.stdout[0]);
+  assert.equal(parsed.blocked.length, 1);
+  assert.equal(parsed.blocked[0].runId, blockedRun.id);
+  assert.equal(parsed.blocked[0].paneId, "w1:p1");
+
+  const scoped = io();
+  assert.equal(await main(["inbox", "acme"], { ...scoped, stateRoot, herdr: herdrWithBlocked }), 0);
+  assert.deepEqual(scoped.stdout, ["Nothing waiting on you"], "--project narrows away the ocr run entirely");
+
+  const unresolvedCreate = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-2",
+    state: RUN_STATES.PLANNED,
+  });
+  await store.update(unresolvedCreate.id, () => ({ state: RUN_STATES.LAUNCHING }));
+  const unresolvedRun = await store.update(unresolvedCreate.id, () => ({ state: RUN_STATES.RUNNING }));
+  const unresolved = io();
+  assert.equal(await main(["inbox"], { ...unresolved, stateRoot, herdr: { async listAgents() { throw new Error("herdr unreachable"); } } }), 0);
+  assert.match(unresolved.stdout[0], /^Blocked: none$/m);
+  assert.match(unresolved.stdout[0], /^Unresolved:$/m);
+  assert.match(unresolved.stdout[0], new RegExp(`${blockedRun.id.slice(0, 8)} \\| ocr/A-1 \\| .* \\| Herdr is unavailable`));
+  assert.match(unresolved.stdout[0], new RegExp(`${unresolvedRun.id.slice(0, 8)} \\| ocr/A-2 \\| .* \\| Herdr is unavailable`));
+
+  const brokenRunId = "99999999-9999-4999-8999-999999999999";
+  await mkdir(join(stateRoot, brokenRunId), { recursive: true, mode: 0o700 });
+  await writeFile(join(stateRoot, brokenRunId, "run.json"), "not json", { mode: 0o600 });
+
+  const skipped = io();
+  assert.equal(await main(["inbox"], { ...skipped, stateRoot, herdr: herdrWithBlocked }), 0);
+  assert.match(skipped.stdout[0], new RegExp(`Skipped: 1 \\(${brokenRunId}\\)`));
 });
 
 test("resume and close subcommands dispatch to their commands read-only until confirmed, wired with the live Pi delegation transport", async () => {
