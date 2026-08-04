@@ -49,7 +49,7 @@ Son las fallas *silenciosas* en el camino crítico de estado y notificaciones. P
 - [x] **1.2** Lifecycle core único: convertir `.pi/extensions/workflow-worker-lifecycle.ts` en adapter delgado sobre `hooks/lib/lifecycle-hook-core.mjs` (markers persistidos; también corrige la divergencia de generaciones post-resume entre Pi y Claude/Codex). Un solo módulo dueño de `continuationPrompt`, `handoffExists`, discriminación de generación y condiciones de notify. *(D5)* *(5b263ea..8449096)*
 - [x] **1.3** Persistir el profile resuelto (permission_mode, sandbox, approval_policy, model) en el run record al launch, agregar variante resume a `buildHarnessLaunch`, y que `relaunchSession` (`commands.js:1281-1320`) la use en vez de armar argv a mano. Exportar `CLAUDE_WORKER_SETTINGS_FILE` de un solo lugar. Hoy un resume corre con permisos distintos a los aprobados. *(D6)* *(8183e9a..b9e6cbc)*
 - [x] **1.4** Módulo `delegation-invariants` compartido (lista de recursos de reserva, reservation-matches, shape de transport identity) consumido por services/handoff/reservations/coordinator-policy. Hoy hay 3–5 copias que ya divergen — `coordinator-policy.js:26-45` es la más débil (no compara checkoutDigest). *(D17)* — **completo:** ver "1.4 completa" en Próximo paso sugerido y el Registro de progreso para el rango de commits.
-- [ ] **1.5** Chequear `version` de `run.json` al leer (fail-closed o migrar, como ya hace el registry v2→v3) y documentar el inventario de campos del run record en un solo lugar. Hoy `version: 1` es write-only y cada lane agrega markers ad-hoc. *(D18)*
+- [x] **1.5** Chequear `version` de `run.json` al leer (fail-closed o migrar, como ya hace el registry v2→v3) y documentar el inventario de campos del run record en un solo lugar. Hoy `version: 1` es write-only y cada lane agrega markers ad-hoc. *(D18)* — **completo, y último ítem de Fase 1:** ver "1.5 completa" en Próximo paso sugerido y el Registro de progreso para el rango de commits. **Fase 1 completa.**
 - [x] **1.6** E2E por harness contra fakes: fixture que ejercite la ingesta real de hooks (settings generado de Claude disparando `claude-lifecycle.mjs`, hooks.json mergeado de Codex) en vez de bypassearla con el fake agent Pi-style. Hoy un settings generado roto pasa toda la suite. Además: implementar o eliminar el smoke de Herdr placeholder (`workflow-herdr-smoke.test.js:9-12`) — se eliminó, no se implementó; ver "1.6 completa" abajo. *(D18)* *(fa5b958..6281496)*
 
 ---
@@ -113,6 +113,7 @@ Referencia: artículo "The new rules of context engineering" — Anthropic borr�
 | 2026-08-02 | 1.2 | `5b263ea..8449096` | Lifecycle core único: `hooks/lib/lifecycle-hook-core.mjs` pasa a ser el único dueño de `continuationPrompt`, `handoffExists`, discriminación de generación y condiciones de stop/notify. Devuelve una decisión harness-neutral (`{continuation:{prompt}}`) en vez del wire format de Claude; cada uno de los tres archivos de harness renderiza su propio protocolo (Claude y Codex a `{"decision":"block",...}` por stdout, Pi a `pi.sendUserMessage`). `.pi/extensions/workflow-worker-lifecycle.ts` queda como adapter delgado sobre markers persistidos (`piStartedOnce`/`piPendingContinuation`), sin closures en memoria. `executeResume` abre generación nueva explícitamente, bajo el lock que ya toma antes de relanzar. Suite: 939 tests, 939 pass, 0 skips. |
 | 2026-08-03 | CI roja en el primer push (4 tests entorno-dependientes) | `3fe8d44..47cd3b2` | Ver "CI roja en el primer push a `origin/main`" abajo. No fue regresión, ninguna causa fue defecto de producción. `npm run test:ci-like` reproduce la CI localmente desde ahora. Suite: 940 tests, 940 pass, 0 skips. |
 | 2026-08-03 | CI roja en el segundo push (retry de mutex por tiempo, no por intentos) | `980a1e1` | Ver "CI roja en el segundo push a `origin/main`" abajo. A diferencia de la primera corrida roja, esta sí fue un defecto real de producción. Nuevo módulo compartido `src/workflow/bounded-retry.js`. Suite: 947 tests, 947 pass, 0 skips. |
+| 2026-08-04 | 1.5 (último ítem de Fase 1) | `b871289..b2a5cba` | `run.json` chequea `version` al leer, con el split de estrictez de 0.3 preservado (`read()`/`update()` rehúsan, `list()` skipea con warning acotado); e inventario de campos del run record en `docs/run-record-fields.md`, verificado por test contra registros reales. Suite: 956 tests, 956 pass, 0 skips, bajo `npm test` y `npm run test:ci-like`. **Fase 1 completa.** |
 
 **Fase 0 completa y revisada.** Rama `hardening/fase-0`, 699 tests (698 pass, 1 skip — el smoke de Herdr vivo, ítem 1.6; ese skip fue eliminado en 1.6 — ver la fila 2026-08-01 arriba, 929/929/0).
 
@@ -239,6 +240,22 @@ Suite: 947 tests, 947 pass, 0 skips, bajo `npm test` y `npm run test:ci-like`.
 
 Ver el Registro de progreso arriba para el commit.
 
+**1.5 completa, y con esto Fase 1 completa — es su último ítem.** `run.json`'s `version` ahora se lee, no solo se estampa: `read()` y `update()` rehúsan un registro cuya versión este control plane no soporta, nombrando tanto la versión encontrada como la soportada; `list()` lo skipea con un warning acotado a través del canal `onListProblem` ya existente, preservando el split de estrictez que estableció el ítem 0.3 — así que un registro malo no puede brickear un listado, lo cual importa porque el board cross-proyecto del ítem **2.1** se va a construir sobre `list()`. Aparte, `docs/run-record-fields.md` documenta cada campo con el módulo que lo escribe, y un test chequea el documento contra registros reales, así que un campo agregado sin documentar hace fallar la suite.
+
+**Por qué importa el chequeo, en concreto, no en abstracto:** `INSTALL.md` documenta una instalación global y el launcher corre workers desde worktrees de git, así que un desarrollador puede tener un control plane instalado globalmente y un worktree checkout apuntando al mismo `state_root`. Versiones distintas, y la más vieja lee mal en silencio los registros de la más nueva. Eso es exactamente lo que el campo existía para prevenir, y no podía.
+
+**Por qué el inventario se chequea en vez de escribirse una sola vez.** La queja de D18 es que cada lane agrega markers ad-hoc, y es medible: un registro carga ~45 keys y esta misma sesión agregó tres más — `agentProfile` (ítem 1.3), `piStartedOnce`/`piPendingContinuation` (ítem 1.2) — cada uno desde un módulo distinto, ninguno documentado. Un documento en prosa habría respondido la pregunta una vez y se habría podrido, porque nada frenaba al próximo lane de agregar un marker sin tocarlo. El test convierte "documentá tu campo" en algo que la suite exige.
+
+**Honestidad sobre el alcance del chequeo:** no puede ver un campo que solo se escribe en un lane que el test no ejercita. El documento marca esos casos con su writer y lo dice explícitamente.
+
+**Omisiones deliberadas, las dos registradas:**
+- Sin migrador, porque no hay nada que migrar — existe exactamente una versión. Dónde va un futuro migrador queda nombrado en un comentario junto a la aserción, espejando `registry.js:565-568`.
+- Los registros de **evento** cargan su propio `version: 1` (`run-store.js`) con el mismo problema latente, deliberadamente no incluido acá. Es el follow-up natural.
+
+**Un hallazgo que trajo el inventario, más acotado de lo que parece a primera vista.** `list({unconsumed: true})` filtra sobre un `run.consumedAt` de nivel superior. El filtro **funciona y está bien testeado** — el test siembra el campo directamente. Pero **ningún código de producción escribe `consumedAt`, y ningún código de producción llama al filtro** — su único caller es ese mismo test. No es código muerto ni un bug: es una capacidad implementada y testeada sin writer ni usuario de producción. Un campo homónimo pero distinto, anidado — `run.delegations[id].result.consumedAt` — es el que sí se escribe. Vale la pena saberlo antes de que **2.1** construya un board sobre `list()`: puede ser exactamente lo que 2.1 necesita, o debería irse.
+
+Ver el Registro de progreso arriba para el rango de commits.
+
 Orden sugerido para el resto de la Fase 1, por dependencia:
 
 1. ~~**1.1b** (ownership en los locks que toman los hooks)~~ — **completo**, ver "1.1b completa" arriba y el Registro de progreso para el rango de commits.
@@ -247,4 +264,8 @@ Orden sugerido para el resto de la Fase 1, por dependencia:
 4. ~~**1.3** (profile persistido + argv de resume por `harnesses.js`)~~ — **completo**, ver "1.3 completa" arriba y el Registro de progreso para el rango de commits.
 5. ~~**1.6** (e2e por harness contra fakes)~~ — **completo**, ver "1.6 completa" arriba y el Registro de progreso para el rango de commits. La suite queda en cero skips.
 6. ~~**1.2** (lifecycle core único)~~ — **completo**, ver "1.2 completa" arriba y el Registro de progreso para el rango de commits.
-7. **1.5** (chequeo de `version` en `run.json`) → chico e independiente, y el último ítem que queda de Fase 1.
+7. ~~**1.5** (chequeo de `version` en `run.json` + inventario de campos)~~ — **completo**, ver "1.5 completa" arriba y el Registro de progreso para el rango de commits.
+
+**Fase 1 completa.** Sus ocho ítems — 1.1, 1.1b, 1.1c, 1.2, 1.3, 1.4, 1.5, 1.6 — están mergeados y pusheados, CI verde.
+
+**Próximo paso: Fase 2**, el lado de salida (superficie de operador) — el propio roadmap sostiene que es donde todo el ecosistema es más débil (ver la introducción de Fase 2 arriba). Su primer ítem es **2.1** (`workflow runs`), que depende de **0.3** — ya hecho.
