@@ -317,24 +317,27 @@ test("resume and close compact output render a short human line; JSON output is 
 
 // --- formatRuns (roadmap item 2.1's compact board) -------------------------------------------
 //
-// Real records only ever carry projectAlias/primaryTicket/harness/id/state/updatedAt (see
+// Real records only ever carry projectAlias/primaryTicket/harness/id/state/updatedAt/directory
+// (`directory` is attached by run-store.js's own `attachDirectory`, not persisted -- see
 // docs/run-record-fields.md) -- no `worktree` field exists, so every fixture below that stands
-// in for "leaks a path" carries `repositories`/`runDirectory` deliberately, the way a real record
-// does, and every test asserting no leak checks against those exact values.
+// in for "leaks a path" carries `repositories`/`directory`/`runDirectory` deliberately, the way a
+// real record does, and every test asserting no leak checks against those exact values.
 
 const NOW = "2026-08-04T12:00:00.000Z";
 const fixedNow = () => Date.parse(NOW);
 
 function runRecord(overrides = {}) {
+  const id = overrides.id ?? "11111111-1111-4111-8111-111111111111";
   return {
-    id: "11111111-1111-4111-8111-111111111111",
+    id,
     state: "running",
     projectAlias: "ocr",
     primaryTicket: "A-1",
     harness: "pi",
     updatedAt: "2026-08-04T10:00:00.000Z", // exactly 2h before NOW
     repositories: [{ id: "backend", path: "/worktrees/ocr/A-1/backend", branch: "feature/A-1" }],
-    runDirectory: "/state/workflow/11111111-1111-4111-8111-111111111111",
+    directory: `/state/workflow/${id}`,
+    runDirectory: `/state/workflow/${id}`,
     ...overrides,
   };
 }
@@ -460,17 +463,101 @@ test("formatWorkflowResult dispatches \"runs\" to the compact board", () => {
   assert.doesNotMatch(compact, /\/worktrees\//);
 });
 
-test("--format json for runs carries the full records, including repositories, untouched by the compact renderer", () => {
+test("--format json for runs projects each run to its documented field list, including repositories, and drops the rest", () => {
   const value = {
     command: "runs",
-    runs: [runRecord()],
+    runs: [runRecord({
+      // Fields a real record carries that the projection must NOT emit -- see runProjection's
+      // own comment in format.js for why "machines get complete records" was the wrong call.
+      stateHistory: [{ from: null, to: "running", at: "2026-08-04T09:00:00.000Z" }],
+      request: { task: "A-1" },
+      launchArgv: ["--foo", "bar"],
+      telemetry: { workers: [] },
+    })],
     skipped: [{ runId: "99999999-9999-4999-8999-999999999999", directory: "/x", message: "malformed run.json" }],
     exitCode: 0,
   };
   const json = formatWorkflowResult("runs", value, "json");
   const parsed = JSON.parse(json);
+
+  assert.deepEqual(Object.keys(parsed.runs[0]).sort(), [
+    "directory", "harness", "id", "primaryTicket", "projectAlias", "repositories", "state", "updatedAt",
+  ]);
   assert.equal(parsed.runs[0].repositories[0].path, "/worktrees/ocr/A-1/backend");
   assert.equal(parsed.runs[0].id, "11111111-1111-4111-8111-111111111111");
+  assert.equal(parsed.runs[0].directory, "/state/workflow/11111111-1111-4111-8111-111111111111");
+  assert.equal(parsed.runs[0].state, "running");
+  assert.equal(parsed.runs[0].projectAlias, "ocr");
+  assert.equal(parsed.runs[0].primaryTicket, "A-1");
+  assert.equal(parsed.runs[0].harness, "pi");
+  assert.equal(parsed.runs[0].updatedAt, "2026-08-04T10:00:00.000Z");
+  assert.equal(parsed.runs[0].stateHistory, undefined);
+  assert.equal(parsed.runs[0].request, undefined);
+  assert.equal(parsed.runs[0].launchArgv, undefined);
+  assert.equal(parsed.runs[0].telemetry, undefined);
+
   assert.equal(parsed.skipped[0].runId, "99999999-9999-4999-8999-999999999999");
   assert.equal(parsed.command, "runs");
+});
+
+// The regression this projection exists to fix: a board-scale `--format json` call must not just
+// be *valid JSON* -- a truncated `{command, truncated, truncationMarker}` fallback is valid JSON
+// too, and was exactly what shipped before this fix (see runProjection's comment in format.js for
+// the measured numbers: 53,791 characters for 8 real runs against a 12,000-character shared
+// OUTPUT_LIMIT). So this asserts both halves: the output stays comfortably under the limit AND
+// every run's identifying data actually made it through -- a test asserting only "it parses as
+// JSON" would have passed against the broken version too (the truncation fallback is valid JSON).
+test("--format json for runs stays well under OUTPUT_LIMIT and still carries every run's data at realistic board scale", () => {
+  // Mirrors what a real run record actually weighs (measured against this developer's real
+  // records: ~5.3 KB/record, 44 fields -- stateHistory, telemetry, launchOperations, launchArgv,
+  // request, digests, delegations, ...). Every one of these extra fields must be dropped by the
+  // projection for this test to be meaningful; a fixture built only from the projected fields
+  // would pass even with no fix at all.
+  function heavyRunRecord(index) {
+    return {
+      ...runRecord({
+        id: `${String(index).padStart(8, "0")}-0000-4000-8000-000000000000`,
+        primaryTicket: `TICKET-${index}`,
+        updatedAt: "2026-08-04T09:00:00.000Z",
+      }),
+      stateHistory: Array.from({ length: 12 }, (_, i) => ({ from: `state-${i}`, to: `state-${i + 1}`, at: "2026-08-01T00:00:00.000Z" })),
+      telemetry: { workers: Array.from({ length: 6 }, (_, i) => ({ id: `worker-${i}`, status: "idle", detail: "x".repeat(120) })) },
+      launchOperations: Array.from({ length: 8 }, (_, i) => ({ step: `op-${i}`, status: "completed", detail: "y".repeat(120) })),
+      launchArgv: Array.from({ length: 40 }, (_, i) => `--flag-${i}=value-${i}`),
+      request: { body: "z".repeat(2000) },
+      delegations: Object.fromEntries(Array.from({ length: 4 }, (_, i) => (
+        [`delegation-${i}`, { status: "completed", evidence: "w".repeat(300) }]
+      ))),
+      assignmentDigest: `sha256:${"a".repeat(64)}`,
+      approvalDigest: `sha256:${"b".repeat(64)}`,
+    };
+  }
+
+  // 16: double the 8 real runs that broke this in production. Runs accumulate forever (no
+  // cleanup until item 2.5), so the fix has to hold up past today's exact count, not just at it.
+  const RUN_COUNT = 16;
+  const runs = Array.from({ length: RUN_COUNT }, (_, index) => heavyRunRecord(index));
+  const value = { command: "runs", runs, skipped: [], exitCode: 0 };
+
+  // Sanity check on the fixture itself: without the projection, this many full heavy records
+  // must actually exceed OUTPUT_LIMIT -- otherwise this test wouldn't be exercising the failure
+  // mode at all, the same trap a "just assert valid JSON" test would fall into.
+  const unprojectedLength = JSON.stringify(value, null, 2).length;
+  assert.ok(unprojectedLength > 12000, `fixture is too small to prove anything: ${RUN_COUNT} unprojected heavy runs were only ${unprojectedLength} characters, not over OUTPUT_LIMIT`);
+
+  const json = formatWorkflowResult("runs", value, "json");
+  assert.ok(json.length < 12000 * 0.75, `projected JSON for ${RUN_COUNT} heavy runs was ${json.length} characters, expected comfortably under 75% of OUTPUT_LIMIT`);
+
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, undefined, "the projection must fit without ever engaging the truncation fallback");
+  assert.equal(parsed.runs.length, RUN_COUNT);
+  assert.deepEqual(parsed.runs.map((run) => run.primaryTicket).sort(), runs.map((run) => run.primaryTicket).sort());
+  for (const run of parsed.runs) {
+    assert.equal(run.stateHistory, undefined);
+    assert.equal(run.telemetry, undefined);
+    assert.equal(run.launchOperations, undefined);
+    assert.equal(run.launchArgv, undefined);
+    assert.equal(run.request, undefined);
+    assert.equal(run.delegations, undefined);
+  }
 });

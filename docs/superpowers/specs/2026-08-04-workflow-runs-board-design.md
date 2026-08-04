@@ -18,6 +18,8 @@ The roadmap names the three questions this should answer: **what is running, wha
 
 A read-only `workflow runs` command over `store.list()`, with a compact table for humans and full records for machines.
 
+**Correction:** "full records for machines" did not hold up at board scale — see the correction paragraph under "The compact view drops the worktree" below for the measurement and the fix (a documented projection, not full records).
+
 ```
 workflow runs [--project <alias>] [--state <state>] [--all] [--format compact|json]
 ```
@@ -38,6 +40,12 @@ The roadmap lists "worktree" as a column. **There is no worktree field.** Verifi
 
 A table column cannot honestly render that. The compact view therefore carries short id, state, project, ticket, harness and a relative `updatedAt`; `--format json` carries the whole record including `repositories`, which is what a tool consuming this actually wants. An operator who needs the paths runs `workflow result <run-id>`.
 
+**Correction (recorded after running this command against the developer's real 8 runs, item 2.1's own implementation task 3):** "`--format json` carries the whole record" is wrong, and was found wrong by measurement, not inspection. A run record is large — `stateHistory`, `telemetry`, `launchOperations`, `launchArgv`, `request`, digests, `delegations` — and runs accumulate forever (there is no cleanup until item 2.5). Against the real state root: `runs --all` (8 records) serialized to **53,791 characters** against `formatWorkflowResult`'s one shared `OUTPUT_LIMIT` (12,000 characters, `src/workflow/format.js`). Worse, `boundedJson`'s overflow fallback — designed for single-record commands — keeps only `{command, runId?, status?, truncated, truncationMarker}`; a `runs` result has neither `runId` nor `status`, so the fallback degraded to **zero run data**, not a truncated subset. The default (live-set) view fared little better: 2 records serialized to 11,895 characters, 105 bytes under the same limit — one more live run away from the identical failure.
+
+"Machines get complete records" was the wrong call at board scale: a board is a summary, and every field of every run was never the right shape for "what is running". The fix is a **documented projection**, not a bigger budget or a pagination/limit flag: `valueForJson` (`src/workflow/format.js`) maps each run through `runProjection` before serializing, keeping exactly `id`, `directory`, `state`, `projectAlias`, `primaryTicket`, `harness`, `updatedAt`, and `repositories` — the two fields that make a run addressable (`id` for `workflow result <id>`; `directory`, which the compact table also never renders), the board's own five compact columns unabbreviated, and `repositories`, which is precisely the field this section's own reasoning says the table cannot honestly render and JSON exists to carry. Everything else — the ~44-field full record documented in `docs/run-record-fields.md` — stays out; `workflow result <run-id>` is the tool already sized for that.
+
+Measured after the fix, against the same real state root: `runs --all` (8 records) → **7,593 characters** (63% of the 12,000-character budget); the default view (2 records) → **1,344 characters**. Both projections completed with zero truncation and full run data present. This is not unlimited headroom — each projected run costs roughly 600–950 characters depending on repository-list length and path depth, so a sustained run count in the high teens to twenties would revisit the same all-or-nothing collapse without item 2.5's cleanup (or a further, separate fix) — but it is a measured, substantial improvement over "zero run data at 8 records," and comfortable for the counts this board is used against today.
+
 ### Skipped records are named, not swallowed
 
 Item 0.3 made `list()` skip an unreadable run directory and report it through `onListProblem` rather than poisoning the listing. The board is the first thing that will meet those in the wild, and the whole point of 0.3 was that they stay visible.
@@ -56,7 +64,7 @@ It is a report, not a check. Skipped records are information, not failure. Nothi
 
 - One command answers what is running and what needs input, across every project, without knowing any run id.
 - Crash residue is visible and cannot empty the board.
-- Machines get complete records; humans get a table that fits a terminal.
+- Machines get complete records; humans get a table that fits a terminal. **Correction:** not complete records — a documented projection; see the correction under "The compact view drops the worktree" above.
 - `store.list()` is unchanged.
 
 ## Non-goals
@@ -83,6 +91,8 @@ workflow runs ──> runsCommand(options, deps)
    formatRuns(table + footer)   full records
 ```
 
+**Correction:** the `json` branch does not emit full records — it emits `runProjection`'s documented projection of each run. See the correction under "The compact view drops the worktree" above.
+
 The live set is every state except `completed`, `failed` and `interrupted`. It is defined in one place next to `RUN_STATES` so a new state has to be classified deliberately rather than defaulting into or out of the board.
 
 `--state` is validated against the known states and refuses an unknown one with a usage error naming the valid values — the same courtesy every other argument in this CLI gets.
@@ -105,7 +115,7 @@ The live set is every state except `completed`, `failed` and `interrupted`. It i
 7. Runs are ordered by `updatedAt`, most recent first, and `list()`'s own order is untouched.
 8. An unreadable run directory appears in the skipped list, is named in the compact footer and in the JSON, and does not prevent the readable runs from being listed.
 9. The compact table stays within a sensible terminal width for realistic ids, tickets and project names, and carries no worktree path.
-10. `--format json` carries the full records, including `repositories`.
+10. `--format json` carries the full records, including `repositories`. **Correction:** superseded — `--format json` carries `runProjection`'s documented projection, which does still include `repositories` (that part of the criterion holds); see the correction under "The compact view drops the worktree" above.
 11. Exit code is 0 with runs, with no runs, and with skipped records.
 12. `npm test` and `npm run test:ci-like` green, zero skips.
 

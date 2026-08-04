@@ -327,10 +327,12 @@ function formatDelegation(value) {
 // No worktree column: verified against a real record, the paths live inside `repositories[]` as
 // `{id, path, branch}`, one entry per repository, and a multi-repo run carries several under one
 // shared worktree root. A table column cannot honestly render that -- `--format json` carries
-// `repositories` whole (boundedJson, untouched by this file); an operator who needs the paths
-// runs `workflow result <run-id>`. So this renderer only ever reads `id`/`state`/`projectAlias`/
-// `primaryTicket`/`harness`/`updatedAt` off a run record -- never `repositories`, `runDirectory`,
-// `stateRoot`, or anything else that could carry a filesystem path.
+// `repositories` in its own documented projection instead (see `runProjection` below -- not the
+// raw record; a board-scale JSON dump of every field turned out not to fit the shared output
+// budget, see that function's own comment); an operator who needs the paths runs `workflow result
+// <run-id>`. So this renderer only ever reads `id`/`state`/`projectAlias`/`primaryTicket`/
+// `harness`/`updatedAt` off a run record -- never `repositories`, `runDirectory`, `stateRoot`, or
+// anything else that could carry a filesystem path.
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -414,8 +416,57 @@ export function formatRuns(value = {}, deps = {}) {
   return bound(lines.join("\n"));
 }
 
+// The projection roadmap item 2.1's design spec promised ("machines get complete records") was
+// wrong at board scale, and the wrongness is measured, not theoretical: against the 8 real runs
+// on the machine that first ran this command, whole records serialize to 53,791 characters for
+// `--all` and 11,895 for the (2-record) default view -- both against the one shared
+// OUTPUT_LIMIT (12000 characters, this file's top). `--all` already lost: boundedJson's overflow
+// fallback keeps only `{command, runId?, status?, truncated, truncationMarker}`, and a `runs`
+// result has neither `runId` nor `status` for it to preserve, so the fallback degrades to zero
+// run data. The default view was 105 bytes from the same fate. Runs accumulate forever -- there
+// is no cleanup until item 2.5 -- so both numbers only grow.
+//
+// A board is a summary; emitting every field of a run record (~44 of them --
+// docs/run-record-fields.md -- stateHistory, telemetry, launchOperations, launchArgv, request,
+// digests, delegations, ...) was never the right shape for "what is running". This projects each
+// run down to what a board's consumer needs, and nothing else. See this spec's correction
+// paragraph: docs/superpowers/specs/2026-08-04-workflow-runs-board-design.md.
+//
+// Field-by-field:
+//   - id, directory: what makes a run addressable. `id` is what `workflow result <id>` and every
+//     other run-scoped command take; `directory` is the run's own location on disk -- neither the
+//     compact table renders it (runRow's own comment says why), so JSON is the only place a
+//     consumer gets it.
+//   - state, projectAlias, primaryTicket, harness, updatedAt: the board's own compact columns
+//     (RUNS_COLUMNS above), carried unabbreviated -- e.g. the full id rather than shortRunId's
+//     8-character display slice.
+//   - repositories: the one field the compact table CANNOT honestly render at all -- a multi-repo
+//     run has one `{id, path, branch}` entry per repository, not a single "worktree" column could
+//     hold (see formatRuns's own comment on why the table drops it) -- and therefore the specific
+//     reason the design spec promised `--format json` would carry more than the table. This is
+//     the field a tool consuming the board actually wants.
+// Everything else stays out on purpose. An operator or script that needs the rest already has the
+// tool sized for exactly that: `workflow result <run-id>` returns one run's full record.
+function runProjection(run) {
+  if (!run || typeof run !== "object") return run;
+  return {
+    id: run.id,
+    directory: run.directory,
+    state: run.state,
+    projectAlias: run.projectAlias,
+    primaryTicket: run.primaryTicket,
+    harness: run.harness,
+    updatedAt: run.updatedAt,
+    repositories: run.repositories,
+  };
+}
+
 function valueForJson(command, value) {
   if (command === "worker-status" || command === "worker-watch") return publicWorkerResult(value);
+  if (command === "runs") {
+    if (!value || typeof value !== "object") return value;
+    return { ...value, runs: list(value.runs).map(runProjection) };
+  }
   if (command !== "launch" || !value || typeof value !== "object" || !Object.hasOwn(value, "assignment")) {
     return value;
   }
