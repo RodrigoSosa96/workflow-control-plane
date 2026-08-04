@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import { agentStatus, paneId } from "./agent-status.js";
 import { closeWorker as defaultCloseWorker } from "./close.js";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
@@ -773,6 +774,117 @@ export async function runsCommand(options = {}, deps = {}) {
   return {
     command: "runs",
     runs: sortRunsForBoard(selectRunsForBoard(runs, { state: options.state, all: Boolean(options.all) })),
+    skipped,
+    exitCode: 0,
+  };
+}
+
+// Herdr's listAgents() wire shape is `{agents: [...]}`, but some call sites (and test doubles)
+// hand back a bare array -- the same normalization reconcile.js and execute.js already carry as
+// private three-line helpers each; a third private copy here follows that precedent rather than
+// promoting three lines to a shared module.
+function listValue(value, key) {
+  if (Array.isArray(value)) return value;
+  return Array.isArray(value?.[key]) ? value[key] : [];
+}
+
+// herdr.listAgents() is called exactly once here and the result indexed by pane id -- see this
+// function's only caller, inboxCommand, for why (the board can hold dozens of runs and Herdr is a
+// subprocess, so one call amortized over every run beats one call per run). A missing/malformed
+// adapter and a thrown/rejected listAgents() are both reported the same way -- herdrAvailable:
+// false -- rather than thrown onward, because inboxCommand's whole contract is read-only, exit 0
+// always, report what could not be determined rather than pretend the inbox is empty.
+async function agentsByPaneFromHerdr(herdr) {
+  if (!herdr || typeof herdr.listAgents !== "function") {
+    return { agentsByPane: null, herdrAvailable: false };
+  }
+  try {
+    const agents = listValue(await herdr.listAgents(), "agents");
+    const agentsByPane = new Map();
+    for (const agent of agents) {
+      const key = paneId(agent);
+      if (key) agentsByPane.set(key, agent);
+    }
+    return { agentsByPane, herdrAvailable: true };
+  } catch {
+    return { agentsByPane: null, herdrAvailable: false };
+  }
+}
+
+// THE correlation `workflow inbox` exists around -- see
+// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md's "Correlation uses
+// transportIdentity.paneId" section. `run.paneId` is written once, only "when the launch created
+// the selected agent" (docs/run-record-fields.md), and never again. `executeResume`'s
+// confirmed-relaunch path persists only `{transportIdentity, resumeClaim}` (resume.js:177), and
+// the identity it persists carries the NEW pane `relaunchSession` (this file) creates -- so for
+// every resumed run, the top-level `run.paneId` still names the pane Herdr closed when the
+// original session died, while `run.transportIdentity.paneId` is the one actually alive. Reading
+// `run.paneId` first silently loses every resumed run's blocked status: this command would report
+// nothing for it, and "nothing" from an inbox reads as "nothing needs you" -- the one lie this
+// command must not tell. Do NOT "simplify" this to `run.paneId ?? run.transportIdentity?.paneId`;
+// that ordering is the bug this command exists to work around, not a style preference.
+function correlationPaneId(run) {
+  return run.transportIdentity?.paneId ?? run.paneId ?? null;
+}
+
+// Shared shape for every blocked/unresolved entry, so the two lists never drift apart on which
+// fields identify a run: enough for an operator to act on (attach or `herdr agent send-keys` by
+// pane, or `workflow result <runId>` for the rest) without exposing the whole run record --
+// deliberately as small as `runs --format json`'s own projection (see runProjection's comment in
+// format.js for why a board-scale JSON dump of full records is the wrong shape).
+function inboxEntry(run, resolvedPaneId) {
+  return {
+    runId: run.id,
+    projectAlias: run.projectAlias,
+    primaryTicket: run.primaryTicket,
+    harness: run.harness,
+    paneId: resolvedPaneId,
+  };
+}
+
+// `workflow inbox` (roadmap item 2.2): which of my workers are sitting at a permission prompt
+// waiting on me, across every project, without looking at panes. Anchored on store.list() exactly
+// like runsCommand -- `herdr agent list` returns every agent on the machine, including
+// interactive sessions this control plane never launched, and a blocked agent with no run behind
+// it is not this command's business (see the design spec's "anchored on runs, not agents"
+// section). Read-only, exit 0 always: a blocked worker is information, not a failure, and an
+// unreachable Herdr is reported via herdrAvailable/unresolved rather than thrown.
+export async function inboxCommand(options = {}, deps = {}) {
+  const { store, skipped } = await runsStoreForCommand(options, deps);
+  const filters = options.projectAlias !== undefined ? { projectAlias: options.projectAlias } : {};
+  // Only non-terminal runs have anything to wait on -- the same LIVE_RUN_STATES set runsCommand's
+  // default view uses, and for the same reason (its own comment in run-state.js).
+  const runs = (await store.list(filters)).filter((run) => LIVE_RUN_STATES.has(run.state));
+
+  const { agentsByPane, herdrAvailable } = await agentsByPaneFromHerdr(deps.herdr);
+
+  const blocked = [];
+  const unresolved = [];
+  for (const run of runs) {
+    const pane = correlationPaneId(run);
+    if (!herdrAvailable) {
+      unresolved.push({ ...inboxEntry(run, pane), reason: "Herdr is unavailable" });
+      continue;
+    }
+    if (!pane) {
+      unresolved.push({ ...inboxEntry(run, pane), reason: "Run has no pane id recorded" });
+      continue;
+    }
+    const agent = agentsByPane.get(pane);
+    if (!agent) {
+      unresolved.push({ ...inboxEntry(run, pane), reason: `No live Herdr agent found for pane ${pane}` });
+      continue;
+    }
+    if (agentStatus(agent) === "blocked") {
+      blocked.push(inboxEntry(run, pane));
+    }
+  }
+
+  return {
+    command: "inbox",
+    blocked,
+    unresolved,
+    herdrAvailable,
     skipped,
     exitCode: 0,
   };

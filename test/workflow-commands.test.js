@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { doctorCommand, launchCommand, planCommand, reconcileCommand, resultCommand, runsCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
+import { doctorCommand, inboxCommand, launchCommand, planCommand, reconcileCommand, resultCommand, runsCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 import { createRunStore } from "../src/workflow/run-store.js";
@@ -1491,5 +1491,229 @@ test("runsCommand surfaces a skipped record as data while the readable runs stil
   assert.equal(result.skipped.length, 1);
   assert.equal(result.skipped[0].runId, brokenRunId);
   assert.match(result.skipped[0].message, /malformed/i);
+  assert.equal(result.exitCode, 0);
+});
+
+// --- inboxCommand -----------------------------------------------------------
+//
+// Roadmap item 2.2. Same real-store discipline as runsCommand's tests above -- runs are driven
+// through real store.create()/update() calls, never raw run.json -- plus the file's own
+// createHerdr() stub (it already models listAgents()'s `{agents: [...]}` wire shape and records
+// call order, which the "called exactly once" test below depends on).
+
+test("inboxCommand correlates through transportIdentity.paneId, not the stale top-level paneId, for a resumed run (load-bearing case)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "pi",
+    paneId: "w1:dead-pane",
+  });
+  // Mirrors executeResume's own confirmed-relaunch patch exactly (resume.js:177): only
+  // transportIdentity changes; the top-level paneId is never touched and keeps naming the
+  // pane Herdr closed when the original session died.
+  const resumed = await store.update(run.id, () => ({
+    transportIdentity: { kind: "pi-session", paneId: "w1:live-pane", tabId: "t1", harness: "pi" },
+  }));
+  assert.equal(resumed.paneId, "w1:dead-pane", "fixture assumption: resume never touches the top-level paneId");
+
+  // Herdr only knows about the LIVE pane -- the dead one is gone, not merely idle.
+  const herdr = createHerdr({
+    agents: [{ agent: "pi", pane_id: "w1:live-pane", agent_status: "blocked", cwd: "/wt" }],
+  });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked.map((entry) => entry.runId), [run.id]);
+  assert.equal(result.blocked[0].paneId, "w1:live-pane");
+  assert.deepEqual(result.unresolved, []);
+});
+
+test("inboxCommand reports a run whose live agent is blocked", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "pi",
+    paneId: "w1:p1",
+  });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "blocked", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, [{
+    runId: run.id,
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "pi",
+    paneId: "w1:p1",
+  }]);
+  assert.equal(result.herdrAvailable, true);
+  assert.equal(result.exitCode, 0);
+});
+
+test("inboxCommand omits runs whose live agent is working or idle", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2", paneId: "w1:p2" });
+  const herdr = createHerdr({
+    agents: [
+      { agent: "pi", pane_id: "w1:p1", agent_status: "working", cwd: "/wt" },
+      { agent: "pi", pane_id: "w1:p2", agent_status: "idle", cwd: "/wt" },
+    ],
+  });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.unresolved, []);
+});
+
+test("inboxCommand never reports a blocked agent that has no run behind it", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const herdr = createHerdr({
+    agents: [
+      { agent: "pi", pane_id: "w1:p1", agent_status: "working", cwd: "/wt" },
+      // An interactive session Herdr knows about that this control plane never launched --
+      // herdr agent list returns every agent on the machine (the design spec's own finding).
+      { agent: "shell", pane_id: "w9:interactive", agent_status: "blocked", cwd: "/elsewhere" },
+    ],
+  });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.unresolved, []);
+});
+
+test("inboxCommand reports a non-terminal run with no pane id as unresolved, with a reason", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.PLANNED, { projectAlias: "ocr", primaryTicket: "A-1" });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.equal(result.blocked.length, 0);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+  assert.equal(result.unresolved[0].paneId, null);
+  assert.match(result.unresolved[0].reason, /pane/i);
+  assert.equal(result.exitCode, 0);
+});
+
+test("inboxCommand reports a run whose pane id matches no live Herdr agent as unresolved, with a reason", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:gone" });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+  assert.equal(result.unresolved[0].paneId, "w1:gone");
+  assert.match(result.unresolved[0].reason, /no live|not found|no agent/i);
+});
+
+test("inboxCommand puts every non-terminal run in unresolved with herdrAvailable false when Herdr is unreachable, and still exits 0", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const withPane = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const withoutPane = await createRunInState(store, RUN_STATES.PLANNED, { projectAlias: "ocr", primaryTicket: "A-2" });
+  const herdr = { async listAgents() { throw new Error("herdr unreachable"); } };
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.equal(result.herdrAvailable, false);
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.unresolved.map((entry) => entry.runId).sort(), [withPane.id, withoutPane.id].sort());
+  for (const entry of result.unresolved) {
+    assert.match(entry.reason, /herdr/i);
+  }
+  assert.equal(result.exitCode, 0);
+});
+
+test("inboxCommand treats a missing herdr adapter as unavailable rather than throwing", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+
+  const result = await inboxCommand({}, { stateRoot });
+
+  assert.equal(result.herdrAvailable, false);
+  assert.deepEqual(result.unresolved.map((entry) => entry.runId), [run.id]);
+  assert.equal(result.exitCode, 0);
+});
+
+test("inboxCommand never reports a terminal run, blocked or not", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  await createRunInState(store, RUN_STATES.FAILED, { projectAlias: "ocr", primaryTicket: "A-2", paneId: "w1:p2" });
+  await createRunInState(store, RUN_STATES.INTERRUPTED, { projectAlias: "ocr", primaryTicket: "A-3", paneId: "w1:p3" });
+  const herdr = createHerdr({
+    agents: [
+      { agent: "pi", pane_id: "w1:p1", agent_status: "blocked", cwd: "/wt" },
+      { agent: "pi", pane_id: "w1:p2", agent_status: "blocked", cwd: "/wt" },
+      { agent: "pi", pane_id: "w1:p3", agent_status: "blocked", cwd: "/wt" },
+    ],
+  });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.unresolved, []);
+});
+
+test("inboxCommand narrows to --project", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const ocrRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "acme", primaryTicket: "B-1", paneId: "w1:p2" });
+  const herdr = createHerdr({
+    agents: [
+      { agent: "pi", pane_id: "w1:p1", agent_status: "blocked", cwd: "/wt" },
+      { agent: "pi", pane_id: "w1:p2", agent_status: "blocked", cwd: "/wt" },
+    ],
+  });
+
+  const result = await inboxCommand({ projectAlias: "ocr" }, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked.map((entry) => entry.runId), [ocrRun.id]);
+});
+
+test("inboxCommand calls herdr.listAgents exactly once regardless of run count", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  for (let index = 0; index < 5; index += 1) {
+    await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: `A-${index}`, paneId: `w1:p${index}` });
+  }
+  const herdr = createHerdr({ agents: [] });
+
+  await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(herdr.calls.map((call) => call.kind), ["listAgents"]);
+});
+
+test("inboxCommand surfaces a skipped record as data the same way runsCommand does", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+
+  const brokenRunId = "88888888-8888-4888-8888-888888888888";
+  await realFs.mkdir(join(stateRoot, brokenRunId), { recursive: true, mode: 0o700 });
+  await realFs.writeFile(join(stateRoot, brokenRunId, "run.json"), "not json", { mode: 0o600 });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "idle", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].runId, brokenRunId);
   assert.equal(result.exitCode, 0);
 });
