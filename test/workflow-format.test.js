@@ -915,8 +915,10 @@ test("--format json for inbox stays well under OUTPUT_LIMIT at a realistic combi
   }
 
   // 21 combined entries, 7 per bucket: several projects each with several concurrently open runs
-  // -- generous for a single operator's live workload, well short of the ~44-entry point measured
-  // (via this same JSON.stringify) to first cross OUTPUT_LIMIT at this fixture's field lengths.
+  // -- generous for a single operator's live workload, well short of the n=37 point measured (via
+  // this same formatWorkflowResult call, see format.js's inboxOverflowFallback comment for the
+  // full re-measurement) to first cross OUTPUT_LIMIT for this three-way-split composition at this
+  // fixture's field lengths.
   const PER_BUCKET = 7;
   const blocked = Array.from({ length: PER_BUCKET }, (_, index) => realisticEntry(index));
   const waiting = Array.from({ length: PER_BUCKET }, (_, index) => realisticEntry(index + 2000, {
@@ -947,7 +949,8 @@ test("--format json for inbox stays well under OUTPUT_LIMIT at a realistic combi
 // fallback this collapses to `{command, truncated, truncationMarker}` -- `blocked`/`unresolved`
 // absent, not empty, and a consumer reading `result.blocked?.length ?? 0` silently reports "no
 // blocked workers" on the one command whose entire job is to not miss that. Forces the collapse
-// directly (well past the ~44-entry point measured above) and asserts the corrected shape.
+// directly (well past the n=37 three-way-split crossing point measured above) and asserts the
+// corrected shape.
 test("--format json for inbox names the overflow instead of silently dropping blocked/waiting/unresolved data", () => {
   function overflowEntry(index, extra = {}) {
     return {
@@ -961,7 +964,7 @@ test("--format json for inbox names the overflow instead of silently dropping bl
     };
   }
 
-  const ENTRY_COUNT = 81; // well past the ~44-entry realistic-scale boundary measured above, 27 per bucket
+  const ENTRY_COUNT = 81; // well past the n=37 three-way-split boundary measured above, 27 per bucket
   const PER_BUCKET = ENTRY_COUNT / 3;
   const blocked = Array.from({ length: PER_BUCKET }, (_, index) => overflowEntry(index));
   const waiting = Array.from({ length: PER_BUCKET }, (_, index) => overflowEntry(index + 2000, {

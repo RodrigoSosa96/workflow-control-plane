@@ -1689,6 +1689,166 @@ test("inboxCommand keeps an active run (idle-awaiting-handoff) with no live agen
   assert.match(result.unresolved[0].reason, /no live|not found|no agent/i);
 });
 
+// --- inboxCommand: a live, resolved agent must not silently drop a waiting run (C1) -----------
+//
+// Found by branch review: the pre-fix loop only ever pushed into `waiting` from inside the
+// "agent could not be confirmed" branches. A manual-handoff-required/needs-input/blocked run
+// whose agent WAS found -- the ordinary shape right after a "manual" hook action, which lets the
+// harness Stop proceed and leaves the session open and idle in its pane
+// (hooks/lib/lifecycle-hook-core.mjs:133-157) -- fell through every branch and vanished with no
+// entry in any list. This is the fresh, typical case, not a corner case.
+
+test("inboxCommand still reports a manual-handoff-required run as waiting when its agent resolves alive and idle (C1)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.MANUAL_HANDOFF_REQUIRED, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "claude",
+    paneId: "w1:p1",
+  });
+  const herdr = createHerdr({ agents: [{ agent: "claude", pane_id: "w1:p1", agent_status: "idle", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.unresolved, []);
+  assert.equal(result.waiting.length, 1);
+  assert.equal(result.waiting[0].runId, run.id);
+  assert.match(result.waiting[0].reason, /manual-handoff-required/);
+});
+
+test("inboxCommand still reports a needs-input run as waiting when its agent resolves alive with status done (C1)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.NEEDS_INPUT, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    paneId: "w1:p1",
+  });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "done", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.unresolved, []);
+  assert.equal(result.waiting.length, 1);
+  assert.equal(result.waiting[0].runId, run.id);
+});
+
+// --- inboxCommand: self-reported blocked belongs in waiting, not the vanished-pane diagnostic (I3) --
+//
+// RUN_STATES.BLOCKED is written from a worker's own self-reported "I am blocked" (handoff.js:16).
+// That run is waiting on the operator exactly as unambiguously as manual-handoff-required is --
+// its pane being gone is the expected shape, not an infrastructure complaint.
+
+test("inboxCommand puts a self-reported blocked run with no live agent in waiting, not unresolved (I3)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.BLOCKED, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    paneId: "w1:dead",
+  });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.unresolved, []);
+  assert.equal(result.waiting.length, 1);
+  assert.equal(result.waiting[0].runId, run.id);
+  assert.equal(result.waiting[0].state, RUN_STATES.BLOCKED);
+  assert.match(result.waiting[0].reason, /blocked/);
+  assert.doesNotMatch(result.waiting[0].reason, /no live|pane/i, "the vanished-pane detail is exactly the misleading framing this bucket exists to avoid");
+});
+
+// `result-stale` is the deliberate counter-example: it stays in `unresolved` when its agent
+// cannot be confirmed, because unlike manual-handoff-required/needs-input/blocked it is not a
+// worker self-reporting "I need a human" -- see AWAITS_OPERATOR_STATES's comment in commands.js.
+test("inboxCommand keeps a result-stale run with no live agent in unresolved, not waiting (documented decision)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RESULT_STALE, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    paneId: "w1:gone",
+  });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.waiting, []);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+  assert.equal(result.unresolved[0].state, RUN_STATES.RESULT_STALE);
+  assert.match(result.unresolved[0].reason, /no live|not found|no agent/i);
+});
+
+// --- inboxCommand: an agent status outside Herdr's documented vocabulary is reported, not dropped (C2) --
+//
+// HERDR_AGENT_STATUSES (agent-status.js) is Herdr's documented vocabulary: idle, working,
+// blocked, done, unknown. The pre-fix code compared `agentStatus(agent) === "blocked"` and did
+// nothing on any other outcome -- so `unknown` (Herdr's own "could not determine" value), an
+// absent agent_status, and any status outside the vocabulary entirely (e.g. a future Herdr rename
+// of "blocked") all silently dropped the run with no entry in any list.
+
+test("inboxCommand reports a running run as unresolved, not silently dropped, when its agent status is unknown (C2)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "unknown", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.waiting, []);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+  assert.match(result.unresolved[0].reason, /unknown/i);
+});
+
+test("inboxCommand reports a running run as unresolved, not silently dropped, when its agent has no agent_status field at all (C2)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.waiting, []);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+});
+
+test("inboxCommand reports a running run as unresolved, not silently dropped, when its agent status is outside Herdr's documented vocabulary (C2)", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "awaiting-permission", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.waiting, []);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+  assert.match(result.unresolved[0].reason, /awaiting-permission/);
+});
+
+test("inboxCommand still reports a run whose agent status is done as neither blocked nor waiting nor unresolved", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "done", cwd: "/wt" }] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.waiting, []);
+  assert.deepEqual(result.unresolved, []);
+});
+
 test("inboxCommand classifies a manual-handoff-required run as waiting even when Herdr itself is unreachable", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });

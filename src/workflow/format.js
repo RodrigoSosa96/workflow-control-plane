@@ -402,6 +402,17 @@ function renderTable(columns, rows) {
   return [header, ...rows.map((row) => renderRow(row))];
 }
 
+// Crash residue item 0.3's list() skips rather than swallows: named as a count and the ids,
+// following this file's no-blank-line-between-sections idiom (formatDoctor, formatPlanLike).
+// Shared by formatRuns and formatInbox below -- both boards report the same skip shape
+// (`{runId, ...}`) the same way, and this repo is sensitive to letting that drift into two
+// copies (see renderTable's own comment for the same reasoning applied to the table itself).
+function appendSkippedLine(lines, skipped) {
+  if (skipped.length === 0) return;
+  const ids = skipped.map((problem) => text(problem.runId)).join(", ");
+  lines.push(`Skipped: ${skipped.length} (${ids})`);
+}
+
 export function formatRuns(value = {}, deps = {}) {
   const nowMs = typeof deps.now === "function" ? deps.now() : Date.now();
   const runs = list(value.runs);
@@ -413,12 +424,7 @@ export function formatRuns(value = {}, deps = {}) {
     ? ["Runs: none"]
     : renderTable(RUNS_COLUMNS, runs.map((run) => runRow(run, nowMs)));
 
-  // Crash residue item 0.3's list() skips rather than swallows: named here as a count and the
-  // ids, following this file's no-blank-line-between-sections idiom (formatDoctor, formatPlanLike).
-  if (skipped.length > 0) {
-    const ids = skipped.map((problem) => text(problem.runId)).join(", ");
-    lines.push(`Skipped: ${skipped.length} (${ids})`);
-  }
+  appendSkippedLine(lines, skipped);
 
   return bound(lines.join("\n"));
 }
@@ -436,14 +442,27 @@ export function formatRuns(value = {}, deps = {}) {
 //
 // Three lists, not two -- **correction, recorded after running this command against the
 // developer's real state root** (see the correction paragraph in
-// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md): a run in `manual-handoff-required`
-// or `needs-input` whose worker already exited is not a diagnostic, it is the run doing exactly
-// what that state means. `blocked` (a live pane, sitting at a prompt right now) and `waiting`
-// (the run's own state already means it needs the operator) are both actionable "this needs you"
-// sections; `unresolved` stays a genuine diagnostic, reserved for an *active* run
-// (running/launching/idle-awaiting-handoff) whose agent could not be confirmed -- that one really
-// is surprising, because an active run's worker is supposed to still be there.
+// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md): a run in `manual-handoff-required`,
+// `needs-input`, or self-reported `blocked` (`RUN_STATES.BLOCKED`, added by the branch-review I3
+// fix -- a worker's own "I am stuck" is exactly as unambiguous as the other two) whose worker
+// already exited is not a diagnostic, it is the run doing exactly what that state means. `blocked`
+// (a live pane, sitting at a prompt right now, per Herdr's `agent_status`) and `waiting` (the
+// run's own state already means it needs the operator, decided by `AWAITS_OPERATOR_STATES` in
+// commands.js independent of whether the agent even resolved -- see the C1 fix) are both
+// actionable "this needs you" sections; `unresolved` stays a genuine diagnostic, covering an
+// *active* run (running/launching/idle-awaiting-handoff/result-stale) whose agent could not be
+// confirmed live or classified into a recognized status -- that one really is surprising, because
+// an active run's worker is supposed to still be there.
 
+// No STATE column here, unlike RUNS_COLUMNS -- a deliberate call, made explicit during the branch
+// review (M10 finding). Every entry the compact `blocked` table renders shares one identical
+// actionable meaning regardless of the run's underlying `state`: a live agent is confirmed sitting
+// at a permission prompt right now, and the operator's move is the same either way -- attach, or
+// `herdr agent send-keys` by pane. The `waiting`/`unresolved` sections below already surface state
+// where it changes what to do (their `reason` text literally names the state, e.g. "Waiting on you
+// (manual-handoff-required)"), and `--format json` carries `state` on every entry unconditionally
+// (inboxEntry, commands.js) for a consumer that wants it. Revisit if a future bucket ever needs the
+// distinction to decide an action, not just to satisfy curiosity the JSON already answers.
 const INBOX_COLUMNS = [
   { key: "run", label: "RUN" },
   { key: "project", label: "PROJECT" },
@@ -506,12 +525,9 @@ export function formatInbox(value = {}) {
     for (const entry of unresolved) lines.push(reasonLine(entry));
   }
 
-  // Crash residue, reported the same way formatRuns reports it -- a count and the ids, never
-  // swallowed.
-  if (skipped.length > 0) {
-    const ids = skipped.map((problem) => text(problem.runId)).join(", ");
-    lines.push(`Skipped: ${skipped.length} (${ids})`);
-  }
+  // Crash residue, reported the same way formatRuns reports it -- appendSkippedLine, not a second
+  // copy of the count-and-ids logic.
+  appendSkippedLine(lines, skipped);
 
   return bound(lines.join("\n"));
 }
@@ -625,12 +641,23 @@ function runsOverflowFallback(command, source, limit) {
 }
 
 // `inbox` entries are far smaller than a full run record (see formatInbox's own comment), but
-// they are not immune to the same collapse `runs` measured: at a realistic-looking combination of
-// long project aliases, tickets, and pane ids, ~45 combined blocked+waiting+unresolved entries
-// alone exceed OUTPUT_LIMIT (measured directly against this file's own JSON.stringify, the same
-// way the `runs` numbers above were measured), and all three lists inbox accumulates from --
-// non-terminal runs, and the `no cleanup until item 2.5` growth `runs`'s own comment names -- only
-// grow while an operator lets runs sit open. `inbox` also has neither `runId` nor `status`, so the
+// they are not immune to the same collapse `runs` measured. Measured directly against this file's
+// own `formatWorkflowResult("inbox", ..., "json")`, the same way the `runs` numbers above were
+// measured, at this fixture's field lengths (a realistic-looking combination of long project
+// aliases, tickets, and pane ids -- see test/workflow-format.test.js's `realisticEntry`):
+// **correction, re-measured during branch review** (the original comment here said "~45 combined
+// ... entries", stated as measured but off by about 20% for the composition it actually
+// described) -- an even three-way split across blocked/waiting/unresolved (`waiting` and
+// `unresolved` entries also carry a `reason` string the `blocked` ones do not) first exceeds
+// OUTPUT_LIMIT at **n=37** (n=36 = 11,908 characters, 99.2% of budget; n=37 collapses to the
+// overflow fallback below); a blocked-only inbox (no `reason` field on any entry, so each entry
+// costs less) does not cross until **n=47** (n=46 = 11,758 characters). "~45" was only ever right
+// for the blocked-heavy case; a mixed inbox -- the composition this comment actually described --
+// overflows about 20% earlier. Both numbers only ever shrink further as the fixture's field
+// lengths shrink, so they are upper bounds on how much headroom an operator actually has, not
+// promises of at least this many. All three lists inbox accumulates from -- non-terminal runs, and
+// the `no cleanup until item 2.5` growth `runs`'s own comment names -- only grow while an operator
+// lets runs sit open. `inbox` also has neither `runId` nor `status`, so the
 // general fallback below would degrade exactly the way it did for `runs` before that fix: a bare
 // `{command, truncated, truncationMarker}` with the blocked/waiting/unresolved data gone and no
 // way to tell "quiet" from "overflowed" apart. Same fix, same shape: `blocked`/`waiting`/

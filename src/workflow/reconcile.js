@@ -1,7 +1,7 @@
 import { realpath as defaultRealpath } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { herdrAgentName } from "./naming.js";
-import { agentStatus, paneId, WRITER_HARNESSES, STOPPED_AGENT_STATUSES } from "./agent-status.js";
+import { agentStatus, listValue, paneId, WRITER_HARNESSES, STOPPED_AGENT_STATUSES } from "./agent-status.js";
 
 // Herdr registers agents under the derived herdr-safe name, so matching a running
 // agent has to use the same derivation the launcher used.
@@ -14,11 +14,6 @@ function plannedAgentName(plan) {
 function normalizeBranch(value) {
   if (typeof value !== "string") return null;
   return value.startsWith("refs/heads/") ? value.slice("refs/heads/".length) : value;
-}
-
-function listValue(value, key) {
-  if (Array.isArray(value)) return value;
-  return Array.isArray(value?.[key]) ? value[key] : [];
 }
 
 function aggregateStatus(values) {

@@ -3,6 +3,13 @@
 // `blocked` deliberately is NOT a stopped status — a blocked agent is alive and waiting.
 export const HERDR_AGENT_STATUSES = Object.freeze(new Set(["idle", "working", "blocked", "done", "unknown"]));
 
+// The one member of HERDR_AGENT_STATUSES that means "alive and sitting at a permission prompt
+// right now" -- the fact `workflow inbox`'s `blocked` bucket exists to surface. A named export,
+// not a bare "blocked" string literal at the comparison site, so a caller checks membership in
+// the vocabulary first and only then asks "is it this one" -- an unrecognized or renamed status
+// lands as a reported unresolved, not a silent, forever-empty non-match.
+export const HERDR_BLOCKED_STATUS = "blocked";
+
 // Harnesses whose agent registration in Herdr is trustworthy evidence of a live writer
 // touching the checkout. Anything else (e.g. a bare shell pane) is not considered a writer.
 export const WRITER_HARNESSES = new Set(["pi", "claude", "codex"]);
@@ -28,4 +35,14 @@ export function paneId(pane) {
 export function agentStatus(value) {
   const status = value?.agent_status ?? value?.agentStatus ?? value?.status ?? null;
   return typeof status === "string" ? status.toLowerCase() : null;
+}
+
+// Herdr's listAgents()/listWorkspaces()/listTabs()/listPanes() wire shape is `{<key>: [...]}`,
+// but some call sites (and test doubles) hand back a bare array. Was three private, byte-identical
+// three-line copies -- commands.js, reconcile.js, execute.js -- before this module (already the
+// shared home for the same wire-shape normalization concern, `agentStatus`/`paneId` above) picked
+// it up as an eighth collapsed duplication.
+export function listValue(value, key) {
+  if (Array.isArray(value)) return value;
+  return Array.isArray(value?.[key]) ? value[key] : [];
 }

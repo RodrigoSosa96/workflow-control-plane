@@ -1,4 +1,5 @@
 import { basename, resolve } from "node:path";
+import { listValue } from "./agent-status.js";
 import { WorkflowError } from "./errors.js";
 import { buildHarnessLaunch } from "./harnesses.js";
 
@@ -109,11 +110,6 @@ function hydrateAgentProfile(plan) {
     ...(harness === "codex" || profile.sandbox !== undefined ? { sandbox: profile.sandbox ?? "workspace-write" } : {}),
     ...(harness === "codex" || profile.approval_policy !== undefined ? { approval_policy: profile.approval_policy ?? "on-request" } : {}),
   };
-}
-
-function listValue(value, key) {
-  if (Array.isArray(value)) return value;
-  return Array.isArray(value?.[key]) ? value[key] : [];
 }
 
 function getWorkspaceId(value) {

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { agentStatus, paneId } from "./agent-status.js";
+import { agentStatus, HERDR_AGENT_STATUSES, HERDR_BLOCKED_STATUS, listValue, paneId } from "./agent-status.js";
 import { closeWorker as defaultCloseWorker } from "./close.js";
 import { WorkflowError } from "./errors.js";
 import { readCurrentResult as defaultReadCurrentResult, submitHandoff as defaultSubmitHandoff } from "./handoff.js";
@@ -779,15 +779,6 @@ export async function runsCommand(options = {}, deps = {}) {
   };
 }
 
-// Herdr's listAgents() wire shape is `{agents: [...]}`, but some call sites (and test doubles)
-// hand back a bare array -- the same normalization reconcile.js and execute.js already carry as
-// private three-line helpers each; a third private copy here follows that precedent rather than
-// promoting three lines to a shared module.
-function listValue(value, key) {
-  if (Array.isArray(value)) return value;
-  return Array.isArray(value?.[key]) ? value[key] : [];
-}
-
 // herdr.listAgents() is called exactly once here and the result indexed by pane id -- see this
 // function's only caller, inboxCommand, for why (the board can hold dozens of runs and Herdr is a
 // subprocess, so one call amortized over every run beats one call per run). A missing/malformed
@@ -851,14 +842,38 @@ function inboxEntry(run, resolvedPaneId) {
 
 // States whose own definition already means "waiting on the operator" -- `manual-handoff-required`
 // is written when the worker gave up and needs a human (lifecycle.js:77); `needs-input` is a
-// worker's own handoff saying the same (handoff.js:17). A run in either state having no live
-// Herdr agent is the *expected* shape, not a surprise: the worker already exited and left the
-// next move to the operator. Reporting that the same way as a `running` run's vanished pane --
-// "No live Herdr agent found for pane X" -- tells the operator the wrong thing: it reads as an
-// infrastructure problem about a pane, when the real, actionable fact is `workflow result
-// <run-id>`. See this file's `inboxCommand` and the design spec's correction paragraph for the
-// real-data run that found this.
-const AWAITS_OPERATOR_STATES = new Set([RUN_STATES.MANUAL_HANDOFF_REQUIRED, RUN_STATES.NEEDS_INPUT]);
+// worker's own handoff saying the same (handoff.js:17); `blocked` is a worker's own self-reported
+// "I am stuck" (handoff.js:16) -- by this design's own Problem section, a worker that told us it
+// is blocked is waiting on the operator exactly as unambiguously as manual-handoff-required is
+// (branch review finding I3). A run in any of these three, whether or not its agent resolved and
+// whatever its agent status turns out to be, belongs in `waiting` -- see `inboxCommand` below,
+// where this set is checked before agent resolution is even attempted, not only inside the
+// branches where resolution failed (that was the C1 finding: a manual-handoff-required run whose
+// agent was still alive and idle -- the ordinary shape right after a "manual" hook action leaves
+// the harness Stop to proceed, per hooks/lib/lifecycle-hook-core.mjs -- fell through this file's
+// old agent-status check and was silently dropped). A run in one of these states having no live
+// Herdr agent is *also* an expected shape, not a surprise: the worker already exited (or, for
+// self-reported `blocked`, said it needed help) and left the next move to the operator. Reporting
+// that the same way as a `running` run's vanished pane -- "No live Herdr agent found for pane X"
+// -- tells the operator the wrong thing: it reads as an infrastructure problem about a pane, when
+// the real, actionable fact is `workflow result <run-id>`. See this file's `inboxCommand` and the
+// design spec's correction paragraph for the real-data run that found this.
+//
+// `result-stale` is deliberately NOT in this set -- a decision made explicitly during the branch
+// review, not fallen into. Unlike the three states above, it is not a worker self-reporting "I
+// need a human": it means the result recorded on disk no longer matches what the control plane
+// currently expects (missing, invalid, or a generation/fingerprint mismatch -- handoff.js's
+// `readCurrentResult`/`markResultStale`), a fact the worker itself may not know. That is exactly
+// what `unresolved` means -- the control plane does not know what is currently true -- not "a
+// human is needed." Its own recommended next action (`workflow reconcile`, this file's
+// `nextActions` for `status === "result-stale"`) is a diagnostic command, not an acknowledgement.
+// A `result-stale` run whose agent cannot be confirmed keeps the vanished-pane framing in
+// `unresolved`, same as any other active run.
+const AWAITS_OPERATOR_STATES = new Set([
+  RUN_STATES.MANUAL_HANDOFF_REQUIRED,
+  RUN_STATES.NEEDS_INPUT,
+  RUN_STATES.BLOCKED,
+]);
 
 // The message for a `waiting` entry: what the run's own state already means, and the one command
 // that answers it -- never the vanished-pane detail, which is exactly the misleading framing this
@@ -867,17 +882,16 @@ function awaitsOperatorReason(run) {
   return `Waiting on you (${run.state}): run \`workflow result ${run.id}\``;
 }
 
-// Routes an entry the control plane could not confirm a live agent for into `waiting` (the run's
-// own state already means it needs the operator, so the absence of a live pane is expected) or
-// `unresolved` (an active run's agent is supposed to be there, so its absence is a genuine
-// diagnostic, carried verbatim as `cause`). Both lists share `inboxEntry`'s shape plus `reason`.
-function classifyUncertain(run, pane, cause, waiting, unresolved) {
-  const entry = inboxEntry(run, pane);
-  if (AWAITS_OPERATOR_STATES.has(run.state)) {
-    waiting.push({ ...entry, reason: awaitsOperatorReason(run) });
-  } else {
-    unresolved.push({ ...entry, reason: cause });
-  }
+// Reason text for an agent whose status this command does not treat as confirming the run clear:
+// absent (Herdr reported no agent_status field at all), `unknown` (Herdr's own documented "could
+// not determine" value), or anything outside HERDR_AGENT_STATUSES entirely (an unrecognized or,
+// per the C2 finding, a possibly-renamed value). All three used to fall through the old bare
+// `agentStatus(agent) === "blocked"` comparison in silence, indistinguishable from "confirmed not
+// blocked" -- naming which one it was is the fix.
+function unresolvedAgentStatusReason(status, pane) {
+  if (status === null) return `Herdr reported no agent_status for pane ${pane}`;
+  if (status === "unknown") return `Herdr could not determine agent status for pane ${pane} (agent_status: unknown)`;
+  return `Herdr reported an unrecognized agent status "${status}" for pane ${pane}, outside the vocabulary this command knows`;
 }
 
 // `workflow inbox` (roadmap item 2.2): which of my workers are waiting on me -- at a permission
@@ -902,22 +916,49 @@ export async function inboxCommand(options = {}, deps = {}) {
   const unresolved = [];
   for (const run of runs) {
     const pane = correlationPaneId(run);
+
+    // C1 fix: test the run's own state first, independently of agent resolution. A run in one of
+    // AWAITS_OPERATOR_STATES belongs in `waiting` unconditionally -- whether or not its agent
+    // resolved, and whatever its agent status is -- because what makes it wait on a human is its
+    // own persisted state, not any uncertainty about its agent. Checking this only inside the
+    // branches below where resolution had already failed (the pre-fix shape) missed every such
+    // run whose agent was still alive: the fresh, typical case right after a "manual" hook action,
+    // not a corner case.
+    if (AWAITS_OPERATOR_STATES.has(run.state)) {
+      waiting.push({ ...inboxEntry(run, pane), reason: awaitsOperatorReason(run) });
+      continue;
+    }
+
     if (!herdrAvailable) {
-      classifyUncertain(run, pane, "Herdr is unavailable", waiting, unresolved);
+      unresolved.push({ ...inboxEntry(run, pane), reason: "Herdr is unavailable" });
       continue;
     }
     if (!pane) {
-      classifyUncertain(run, pane, "Run has no pane id recorded", waiting, unresolved);
+      unresolved.push({ ...inboxEntry(run, pane), reason: "Run has no pane id recorded" });
       continue;
     }
     const agent = agentsByPane.get(pane);
     if (!agent) {
-      classifyUncertain(run, pane, `No live Herdr agent found for pane ${pane}`, waiting, unresolved);
+      unresolved.push({ ...inboxEntry(run, pane), reason: `No live Herdr agent found for pane ${pane}` });
       continue;
     }
-    if (agentStatus(agent) === "blocked") {
+
+    // C2 fix: classify the resolved agent's status through the shared vocabulary
+    // (HERDR_AGENT_STATUSES/HERDR_BLOCKED_STATUS, agent-status.js) rather than a bare `===
+    // "blocked"` literal. `unknown`, an absent status, and anything outside the vocabulary all
+    // report as unresolved -- with a reason naming which one it was -- instead of silently
+    // dropping the run the old bare comparison did. This also means a future rename of Herdr's own
+    // "blocked" value stops matching nothing forever: it lands here, visibly, instead.
+    const status = agentStatus(agent);
+    if (!HERDR_AGENT_STATUSES.has(status) || status === "unknown") {
+      unresolved.push({ ...inboxEntry(run, pane), reason: unresolvedAgentStatusReason(status, pane) });
+      continue;
+    }
+    if (status === HERDR_BLOCKED_STATUS) {
       blocked.push(inboxEntry(run, pane));
     }
+    // Any other recognized status (idle/working/done) means the agent is confirmed alive and not
+    // waiting on the operator -- nothing to report for this run.
   }
 
   return {
