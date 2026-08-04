@@ -513,12 +513,28 @@ test("--format json for runs stays well under OUTPUT_LIMIT and still carries eve
   // request, digests, delegations, ...). Every one of these extra fields must be dropped by the
   // projection for this test to be meaningful; a fixture built only from the projected fields
   // would pass even with no fix at all.
+  //
+  // Corrected (branch review): this fixture used to inherit runRecord()'s single 26-character
+  // repository path, so its bulk sat entirely in the fields the projection strips, and its
+  // projected size (466 chars/run, measured) came out at roughly half a real three-repo run's
+  // (949 chars/run per the review's standalone-vs-in-array remeasurement) -- overstating real
+  // headroom by about 2x and feeding a wrong "high teens to twenties" estimate into ROADMAP.md
+  // and the design spec. Real records skew three-repo (6 of the developer's 8), each entry a
+  // `{id, path, branch}` under one shared Herdr worktree root, e.g.
+  // `/home/<user>/.herdr/worktrees/<project>/<ticket>-<slug>/repos/<repo>`. This fixture now
+  // matches that shape and depth instead of a single short path.
   function heavyRunRecord(index) {
+    const worktreeRoot = `/home/user/.herdr/worktrees/ocr/A-${index}-some-feature-slug/repos`;
     return {
       ...runRecord({
         id: `${String(index).padStart(8, "0")}-0000-4000-8000-000000000000`,
         primaryTicket: `TICKET-${index}`,
         updatedAt: "2026-08-04T09:00:00.000Z",
+        repositories: [
+          { id: "backend", path: `${worktreeRoot}/backend`, branch: `feature/A-${index}` },
+          { id: "panel", path: `${worktreeRoot}/panel`, branch: `feature/A-${index}` },
+          { id: "webapp", path: `${worktreeRoot}/webapp`, branch: `feature/A-${index}` },
+        ],
       }),
       stateHistory: Array.from({ length: 12 }, (_, i) => ({ from: `state-${i}`, to: `state-${i + 1}`, at: "2026-08-01T00:00:00.000Z" })),
       telemetry: { workers: Array.from({ length: 6 }, (_, i) => ({ id: `worker-${i}`, status: "idle", detail: "x".repeat(120) })) },
@@ -533,9 +549,14 @@ test("--format json for runs stays well under OUTPUT_LIMIT and still carries eve
     };
   }
 
-  // 16: double the 8 real runs that broke this in production. Runs accumulate forever (no
-  // cleanup until item 2.5), so the fix has to hold up past today's exact count, not just at it.
-  const RUN_COUNT = 16;
+  // 12: 50% growth over the 8 real runs that broke this in production, not "double" -- measured
+  // (this test file, driving formatWorkflowResult directly) against this corrected fixture: 14
+  // heavy three-repo runs is the last count that still fits (11,833 characters, 98.6% of budget);
+  // 15 collapses. 12 keeps real margin against that boundary while still proving the fix holds up
+  // past today's exact count, not just at it -- runs accumulate forever (no cleanup until item
+  // 2.5). See ROADMAP.md's 2.1 closeout and the design spec's correction paragraph for the
+  // corrected "roughly 12-14 runs" headroom figure this measurement produced.
+  const RUN_COUNT = 12;
   const runs = Array.from({ length: RUN_COUNT }, (_, index) => heavyRunRecord(index));
   const value = { command: "runs", runs, skipped: [], exitCode: 0 };
 
@@ -546,7 +567,9 @@ test("--format json for runs stays well under OUTPUT_LIMIT and still carries eve
   assert.ok(unprojectedLength > 12000, `fixture is too small to prove anything: ${RUN_COUNT} unprojected heavy runs were only ${unprojectedLength} characters, not over OUTPUT_LIMIT`);
 
   const json = formatWorkflowResult("runs", value, "json");
-  assert.ok(json.length < 12000 * 0.75, `projected JSON for ${RUN_COUNT} heavy runs was ${json.length} characters, expected comfortably under 75% of OUTPUT_LIMIT`);
+  // 90%, not the old 75%: measured real headroom is finite (the fixture collapses at 15), so a
+  // margin promise has to fit inside that boundary, not assume generous slack that doesn't exist.
+  assert.ok(json.length < 12000 * 0.9, `projected JSON for ${RUN_COUNT} heavy runs was ${json.length} characters, expected comfortably under 90% of OUTPUT_LIMIT`);
 
   const parsed = JSON.parse(json);
   assert.equal(parsed.truncated, undefined, "the projection must fit without ever engaging the truncation fallback");
@@ -560,4 +583,60 @@ test("--format json for runs stays well under OUTPUT_LIMIT and still carries eve
     assert.equal(run.request, undefined);
     assert.equal(run.delegations, undefined);
   }
+});
+
+// Finding 3 (branch review): at realistic board scale (see the test above), `--format json` can
+// still collapse -- and the general boundedJson fallback (built for single-record commands like
+// `result`/`reconcile`, which always have a runId to fall back to) was never right for `runs`: it
+// has neither `runId` nor `status`, so the fallback degraded to `{command, truncated,
+// truncationMarker}` with no `runs` key at all -- absent, not empty. `result.runs.length` throws;
+// `result.runs?.length ?? 0` silently reports "no runs", the opposite of "the board overflowed".
+// No test covered this path for `runs` before this fix. This one forces the collapse directly
+// (many heavy runs, well past any board-scale count) and asserts the corrected shape: `runs`
+// present as `[]`, a `runCount` and `runIds` a consumer can act on one run at a time, a
+// `skippedCount` so a collapse does not also erase 0.3's crash-residue visibility, and a
+// truncationMarker that names the actual constraint (no --limit) instead of advice that doesn't
+// apply to this command.
+test("--format json for runs names the overflow instead of silently dropping run data", () => {
+  function overflowRunRecord(index) {
+    return {
+      id: `${String(index).padStart(8, "0")}-0000-4000-8000-000000000000`,
+      state: "running",
+      projectAlias: "ocr",
+      primaryTicket: `TICKET-${index}`,
+      harness: "pi",
+      updatedAt: "2026-08-04T09:00:00.000Z",
+      directory: `/state/workflow/${index}`,
+      repositories: Array.from({ length: 3 }, (_, i) => ({
+        id: `repo-${i}`,
+        path: `/home/user/.herdr/worktrees/ocr/A-${index}-some-feature-slug/repos/repo-${i}`,
+        branch: `feature/A-${index}`,
+      })),
+    };
+  }
+
+  const RUN_COUNT = 40; // well past the ~14-run realistic-scale boundary measured above
+  const runs = Array.from({ length: RUN_COUNT }, (_, index) => overflowRunRecord(index));
+  const skipped = [
+    { runId: "99999999-9999-4999-8999-999999999999", directory: "/state/workflow/broken", message: "malformed run.json" },
+  ];
+  const value = { command: "runs", runs, skipped, exitCode: 0 };
+
+  const json = formatWorkflowResult("runs", value, "json");
+  const parsed = JSON.parse(json);
+
+  assert.equal(parsed.command, "runs");
+  assert.equal(parsed.truncated, true);
+  assert.deepEqual(parsed.runs, [], "runs stays a present empty array, never absent -- absent is indistinguishable from a genuinely empty board");
+  assert.equal(parsed.runCount, RUN_COUNT);
+  assert.equal(parsed.skippedCount, 1, "collapsing must not also erase 0.3's crash-residue visibility");
+  assert.deepEqual(
+    parsed.runIds.slice().sort(),
+    runs.map((run) => run.id).sort(),
+    "every dropped run's full id survives -- not shortRunId's 8-character display slice, which workflow result does not accept",
+  );
+  assert.doesNotMatch(parsed.truncationMarker, /rerun with a narrower result query/, "the single-record fallback's advice does not apply to a command with no --limit");
+  assert.match(parsed.truncationMarker, /--limit/);
+  assert.match(parsed.truncationMarker, /--state/);
+  assert.match(parsed.truncationMarker, /workflow result/);
 });

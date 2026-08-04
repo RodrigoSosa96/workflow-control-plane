@@ -15,10 +15,7 @@ import { fileURLToPath } from "node:url";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { createTelemetryStore } from "../src/workflow/telemetry-store.js";
 import { publicTelemetrySnapshot } from "../src/workflow/telemetry.js";
-
-function shortId(runId) {
-  return typeof runId === "string" && runId.length > 0 ? runId.slice(0, 8) : "unknown";
-}
+import { shortRunId } from "../src/workflow/format.js";
 
 // Mirrors buildObservabilityLines' `reported` helper: a measurement is only
 // surfaced when it was actually reported and its `.value` is a number.
@@ -54,7 +51,7 @@ export function renderClaudeStatusLine({ env, stdinJson, snapshot } = {}) {
   try {
     const safeEnv = env && typeof env === "object" ? env : {};
     const runId = typeof safeEnv.WORKFLOW_RUN_ID === "string" ? safeEnv.WORKFLOW_RUN_ID : undefined;
-    const id = shortId(runId);
+    const id = shortRunId(runId);
 
     // The model comes from the statusLine stdin payload, not the telemetry snapshot, so it is
     // resolved before the thin-snapshot early return — a valid model must surface even when the

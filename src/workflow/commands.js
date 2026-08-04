@@ -708,7 +708,10 @@ function usageError(message) {
 
 function assertKnownRunState(state) {
   if (!isRunState(state)) {
-    usageError(`Unknown run state: ${String(state)}`);
+    // Same courtesy every other argument in this CLI gets (bin/workflow.js's
+    // "--format must be compact or json." is the model) -- name what was rejected AND what
+    // would have been accepted, so the operator does not have to go read run-state.js to find out.
+    usageError(`Unknown run state: ${String(state)}. Valid states: ${Object.values(RUN_STATES).join(", ")}.`);
   }
 }
 

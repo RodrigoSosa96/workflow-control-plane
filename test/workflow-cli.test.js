@@ -1514,7 +1514,14 @@ test("workflow runs end-to-end against a real store: renders the board, an empty
 
   const bogus = io();
   assert.equal(await main(["runs", "--state", "bogus"], { ...bogus, stateRoot }), 64);
-  assert.match(bogus.stderr[0], /USAGE.*Unknown run state/i);
+  // Same courtesy `--format`'s "must be compact or json." gets (bin/workflow.js:199): name what
+  // was rejected AND every value that would have been accepted. A message asserted only against
+  // `/Unknown run state/i` would have passed even if the valid states were never named -- which is
+  // exactly the regression that shipped and went uncaught.
+  assert.match(bogus.stderr[0], /USAGE.*Unknown run state: bogus\./i);
+  for (const state of Object.values(RUN_STATES)) {
+    assert.ok(bogus.stderr[0].includes(state), `expected the usage error to name valid state "${state}": ${bogus.stderr[0]}`);
+  }
 });
 
 test("resume and close subcommands dispatch to their commands read-only until confirmed, wired with the live Pi delegation transport", async () => {

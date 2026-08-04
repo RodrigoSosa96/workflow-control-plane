@@ -351,10 +351,14 @@ function relativeTimeFrom(timestamp, nowMs) {
   return `${Math.floor(diffMs / DAY_MS)}d ago`;
 }
 
-// Matches relaunchSession's own display shortening of a session id (commands.js): first 8
-// characters, display only -- every place that actually needs the full id (--run, result,
-// reconcile) still reads it straight off the record, never off this rendering.
-function shortRunId(id) {
+// First 8 characters of an id, display only -- every place that actually needs the full id
+// (--run, result, reconcile) still reads it straight off the record, never off this rendering.
+// The slice length matches relaunchSession's own display shortening of a session id
+// (commands.js's shortSessionId); the "unknown" fallback does not -- that one falls back to
+// "session" because it feeds a Herdr agent name, not a table cell. Also reused by
+// hooks/claude-statusline.mjs, which already imports from this module -- one definition instead
+// of two copies of the same 8-char-slice-with-fallback concept.
+export function shortRunId(id) {
   return String(id ?? "").slice(0, 8) || "unknown";
 }
 
@@ -489,12 +493,50 @@ function valueForJson(command, value) {
   };
 }
 
+// The general fallback below (`{command, runId?, status?, truncated, truncationMarker}`) was built
+// for single-record commands, where "rerun narrower" is real advice: `result`/`reconcile` take one
+// run id, so a caller can always ask for less. `runs` broke that assumption in two ways, found
+// measuring this board against real data (see runProjection's own comment above for the numbers):
+// first, a `runs` result has neither `runId` nor `status`, so the general fallback degrades to
+// `{command, truncated, truncationMarker}` -- a consumer doing `result.runs.length` throws, and one
+// doing `result.runs?.length ?? 0` silently reports "no runs", the opposite of "the board
+// overflowed". Second, the general marker's "rerun with a narrower result query" is not actionable
+// for this command: there is no `--limit`, and the default view (the live-state set) is already
+// the narrowest query this command has -- `--state <state>` can narrow further only when more than
+// one live state is actually present, so it is offered, not promised.
+//
+// The fix: keep `runs` present (as `[]`, never absent) so "empty" and "overflowed" stay
+// distinguishable by more than a missing key, and preserve every run's full id -- not
+// `shortRunId`'s 8-character display slice, which is not what `workflow result <run-id>` accepts
+// (see shortRunId's own comment) -- so the response an overflow returns is still actionable one run
+// at a time. `skippedCount` is carried too, for the same reason `formatRuns` never drops skipped
+// residue on the compact side: a collapse must not read as "no crash residue either".
+function runsOverflowFallback(command, source, limit) {
+  const droppedRuns = list(source.runs);
+  // runCount counts every dropped run, even a malformed one missing `id`; runIds can only ever
+  // carry the ones that had a usable id to preserve -- so the two are allowed to disagree, and
+  // runCount is the one that must equal what actually overflowed.
+  const runIds = droppedRuns.map((run) => run?.id).filter((id) => typeof id === "string" && id.length > 0);
+  return {
+    command: source.command ?? command,
+    runs: [],
+    runCount: droppedRuns.length,
+    runIds,
+    skippedCount: list(source.skipped).length,
+    truncated: true,
+    truncationMarker: `JSON output truncated at ${limit} characters; ${droppedRuns.length} runs did not fit and were dropped from this response (their ids are in runIds). There is no --limit flag for this command; --state <state> narrows further if more than one live state is present, and \`workflow result <run-id>\` inspects one run at a time.`,
+  };
+}
+
 function boundedJson(command, value) {
   const text = JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
   const limit = command === "launch" ? ASSIGNMENT_OUTPUT_LIMIT + OUTPUT_LIMIT : OUTPUT_LIMIT;
   if (text.length <= limit) return text;
 
   const source = value && typeof value === "object" ? value : {};
+  if (command === "runs") {
+    return JSON.stringify(normalizeJson(runsOverflowFallback(command, source, limit)), null, 2);
+  }
   return JSON.stringify(normalizeJson({
     command: source.command ?? command,
     ...(source.runId ? { runId: source.runId } : {}),

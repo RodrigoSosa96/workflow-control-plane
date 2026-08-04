@@ -1437,7 +1437,13 @@ test("runsCommand refuses an unknown --state", async (t) => {
       assert.ok(error instanceof WorkflowError);
       assert.equal(error.category, "USAGE");
       assert.equal(error.exitCode, 64);
-      assert.match(error.message, /unknown/i);
+      // Same courtesy `--format`'s "must be compact or json." gets: name what was rejected AND
+      // every value that would have been accepted. `/unknown/i` alone would have passed even if
+      // the valid states were never named -- the regression that actually shipped.
+      assert.match(error.message, /unknown run state: bogus\./i);
+      for (const state of Object.values(RUN_STATES)) {
+        assert.ok(error.message.includes(state), `expected the usage error to name valid state "${state}": ${error.message}`);
+      }
       return true;
     },
   );
