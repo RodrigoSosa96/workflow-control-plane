@@ -2339,3 +2339,43 @@ test("a repository entry with no usable path is a recorded error, not a silent p
     assert.equal(existsSync(markerPath), false, `${label}: the command must never have run at all`);
   }
 });
+
+// R2 (branch re-review, same false-green class as C1): a *relative* path string is a different
+// shape of the exact same problem C1 fixed for a missing one. checkCwd used to treat any non-
+// empty string as validated and hand it straight to node's spawn, which resolves a relative cwd
+// against THIS process's own cwd (the CLI's own checkout) -- not against any run worktree -- so a
+// relative repository.path can pass silently whenever that relative segment happens to exist
+// wherever the CLI is invoked from. This repository genuinely has a `src/` directory, so `path:
+// "src"` is exactly the false green the re-review measured (`checkCwd("src")` resolving against
+// this checkout and reporting `passed`) -- reproduced here through the real runner end to end, the
+// same way C1's own test above does for a missing path.
+test("a repository entry with a relative path is a recorded error, not a silent pass in the CLI's own cwd", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+
+  const dir = await mkdtemp(join(tmpdir(), "verify-r2-"));
+  t.after(() => realFs.rm(dir, { recursive: true, force: true }));
+  const markerPath = join(dir, "marker");
+
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "R2-relative-path",
+    repositories: [{ id: "ocr", path: "src" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: [`pwd > ${markerPath} ; true`] } });
+
+  const result = await verifyCommand(
+    { runId: run.id },
+    { store, loadRegistry, runVerifyCommand: realRunVerifyCommand },
+  );
+
+  assert.equal(result.results.length, 1);
+  assert.equal(result.results[0].status, "error");
+  assert.equal(result.results[0].reason, "cwd is not an absolute path: src");
+  assert.equal(result.passed, false);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.failed);
+
+  // The command must never have run at all -- not in this checkout's own src/ (where "src" would
+  // otherwise silently resolve) and not anywhere else either.
+  assert.equal(existsSync(markerPath), false, "the command must never have run at all");
+});

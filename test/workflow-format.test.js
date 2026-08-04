@@ -1082,6 +1082,45 @@ test("formatVerify names an absent cwd explicitly in the Reasons line, not as an
   assert.match(compact, /^ocr \| pnpm typecheck \(cwd: unknown\): no repository path recorded$/m);
 });
 
+// R3 (branch re-review): `truncated` used to have no compact-view rendering at all -- a result
+// whose captured output was capped by verify-runner.js's own maxOutputBytes looked identical to
+// one whose full output fit, in both the table (which never renders output) and the Reasons: line
+// (which only ever fires for an error/timed-out result -- see appendVerifyReasons's own comment --
+// so a *passing* result with truncated output, the common real case, had nothing point at it
+// anywhere). Covers a truncated pass specifically, not just a truncated failure, since that is the
+// shape the old code missed entirely.
+test("formatVerify names a result whose captured output was truncated, even when the command itself passed", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    passed: true,
+    exitCode: 0,
+    results: [
+      verifyResult({ truncated: true }),
+      verifyResult({ repositoryId: "panel", command: "pnpm test", truncated: false }),
+    ],
+  };
+
+  const compact = formatVerify(value);
+  assert.match(compact, /^Truncated output:$/m);
+  assert.match(compact, /^backend \| pnpm typecheck: captured output was truncated$/m);
+  // The untruncated result must not be named here -- only the one whose output was actually capped.
+  assert.doesNotMatch(compact, /^panel \| pnpm test: captured output was truncated$/m);
+});
+
+test("formatVerify says nothing about truncation when no result's output was capped", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    passed: true,
+    exitCode: 0,
+    results: [verifyResult()],
+  };
+
+  const compact = formatVerify(value);
+  assert.doesNotMatch(compact, /Truncated output:/);
+});
+
 test("a refusal says why instead of rendering an empty table that would read as a pass", () => {
   const value = {
     command: "verify",

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 
 // The ONE place in this repo that runs a shell, and the reasoning is in the spec: these are the
 // operator's own strings from their own registry, they come from no worker, and they enter no
@@ -79,6 +80,17 @@ async function checkCwd(cwd) {
     // be a recorded refusal for that repository, never a silent pass in the wrong directory.
     return "no repository path recorded";
   }
+  if (!isAbsolute(cwd)) {
+    // R2 (branch re-review): a non-empty *relative* path is a different shape of the exact same
+    // false green C1 removed for a missing one. node's `spawn` resolves a relative `cwd` against
+    // THIS process's own cwd (the CLI's own checkout), not against any run worktree -- so
+    // `cwd: "src"` runs wherever the CLI happens to have a `src` directory and reports that as the
+    // repository's own result, silently, with no trace beyond `cwd: "src"` sitting in the output
+    // looking like it names a real location. Recorded here, before `stat` ever resolves it against
+    // this process's cwd, with its own reason distinct from "not found" -- the path is not
+    // missing, it is untrustworthy as written.
+    return `cwd is not an absolute path: ${cwd}`;
+  }
   let stats;
   try {
     stats = await stat(cwd);
@@ -118,6 +130,51 @@ function killChild(child, signal) {
   }
 }
 
+// Exit code convention for a process that dies of a signal (128 + signal number) -- the same
+// number a shell reports for the same event, so a caller inspecting this process's own exit code
+// sees the familiar value rather than an arbitrary one.
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+
+// R1 (branch re-review): `detached: true` above (see killChild's own comment) is what lets a
+// timeout reach a backgrounded grandchild's whole process group -- and that part of the fix
+// stands. But the same detachment takes the spawned shell OUT of this CLI's own process group, so
+// a terminal's Ctrl-C -- delivered to the whole *foreground* process group, not to this process by
+// pid -- no longer reaches the child at all. Pre-fix, node and its `/bin/sh` child shared one
+// process group and a Ctrl-C killed both; post-fix, an interrupted CLI exits while the detached
+// shell (and anything it started) is reparented to init with no bound whatsoever -- the
+// `timeoutMs`/`killGraceMs` escalation above lives inside the process that just died, so it never
+// gets to run.
+//
+// This closes that gap without giving the timeout's own group-kill back up: for exactly as long as
+// this one child is alive, an interrupt delivered to THIS process (SIGINT from a terminal, or
+// SIGTERM from e.g. a process manager) kills the child's whole group first -- SIGKILL, not the
+// timeout path's SIGTERM-then-grace-then-SIGKILL escalation, because this process is about to exit
+// and will not be alive to run that timer, so there is no room for a graceful drain, only an
+// immediate and unmissable one -- and then this process exits the same way an uninterrupted
+// SIGINT/SIGTERM would (128 + signal number, the shell's own convention), rather than continuing
+// to run as though nothing happened.
+//
+// Installed and torn down per spawned child (see the two call sites in spawnAndCollect below), and
+// never left registered once that child has settled: `runVerifyMatrix` in commands.js calls
+// runVerifyCommand sequentially, one child at a time, so at most one trap is ever active
+// regardless of how many repositories x commands a `workflow verify` run sweeps, and it does not
+// linger into whatever command line the CLI dispatches next.
+function installInterruptTrap(child) {
+  let firing = false;
+  const onSignal = (signal) => {
+    if (firing) return;
+    firing = true;
+    killChild(child, "SIGKILL");
+    process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  return () => {
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+  };
+}
+
 function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs, spawnProcess, now, startedAt }) {
   return new Promise((resolve) => {
     let child;
@@ -139,6 +196,12 @@ function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs,
       return;
     }
 
+    // R1 (branch re-review): see installInterruptTrap's own comment above. Installed for exactly
+    // this child's lifetime, torn down in `settle` below alongside the timers -- the same
+    // "attached for the duration of this one spawn, never longer" discipline the timeout/kill
+    // timers already follow.
+    const uninstallInterruptTrap = installInterruptTrap(child);
+
     const collector = makeOutputCollector(maxOutputBytes);
     let settled = false;
     let timedOut = false;
@@ -155,6 +218,7 @@ function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs,
       settled = true;
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      uninstallInterruptTrap();
       let outcome;
       try {
         outcome = build();

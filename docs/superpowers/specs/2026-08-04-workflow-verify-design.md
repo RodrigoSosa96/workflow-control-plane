@@ -46,7 +46,7 @@ The event carries the command, the repository, the exit status, a bounded head o
 
 ### No confirmation gate
 
-It runs read-only-in-intent commands the operator wrote in their own registry, for a project they own. It escalates nothing and takes no worker input. Like `status`, `result` and `reconcile`, it runs directly; the cost is time, and the timeout bounds that.
+It runs read-only-in-intent commands the operator wrote in their own registry, for a project they own. It escalates nothing and takes no worker input. Like `status`, `result` and `reconcile`, it runs directly; the cost is time, and the timeout bounds that — including when the operator does not wait out the timeout: `verify-runner.js` traps SIGINT/SIGTERM for exactly as long as its own command is running and kills that command's whole process group before letting the CLI exit, so an interrupted `workflow verify` bounds the same way a timed-out one does, rather than leaving the check running unbounded in the background. (A branch re-review found this untrue for one release — the timeout fix that made a backgrounded grandchild killable, by giving the spawned shell its own process group, incidentally took it out of the CLI's own group too, so a terminal's Ctrl-C no longer reached it. Fixed by the trap described above; see the branch's fix report.)
 
 ## Goals
 

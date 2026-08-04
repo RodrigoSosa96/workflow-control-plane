@@ -646,6 +646,24 @@ function appendVerifyReasons(lines, results) {
   }
 }
 
+// R3 (branch re-review): `truncated` is orthogonal to `status` -- verify-runner.js's own
+// maxOutputBytes cap can trip on a command that ultimately passes or fails just as easily as one
+// that errors or times out, so folding this into appendVerifyReasons above (whose own comment
+// notes `reason` "only ever exists for an error or timed-out command") would silently miss the
+// common case: a passing or failing result whose full log was capped. A separate, plainly-named
+// block instead, appended only when at least one result actually was truncated, so the routine
+// all-passed case stays exactly as short as it already is. `--format json` already carries
+// `truncated` on every result unconditionally; this is its compact counterpart, so an operator
+// reading the table does not mistake a capped log for the command's complete output.
+function appendTruncationNotice(lines, results) {
+  const withTruncatedOutput = results.filter((result) => result?.truncated);
+  if (withTruncatedOutput.length === 0) return;
+  lines.push("Truncated output:");
+  for (const result of withTruncatedOutput) {
+    lines.push(`${text(result.repositoryId)} | ${text(result.command)}: captured output was truncated`);
+  }
+}
+
 export function formatVerify(value = {}) {
   const lines = [`Run: ${text(value.runId)}`];
 
@@ -662,6 +680,7 @@ export function formatVerify(value = {}) {
     lines.push(...renderTable(VERIFY_COLUMNS, results.map(verifyRow)));
   }
   appendVerifyReasons(lines, results);
+  appendTruncationNotice(lines, results);
   // I4 (branch review): the matrix above already ran and is fully rendered by this point --
   // `evidenceError` only ever means store.appendEvent could not persist it (most commonly another
   // command holding the run lock), never that verification itself failed to run. Named last so it

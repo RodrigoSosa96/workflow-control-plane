@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { after, test } from "node:test";
 import { runVerifyCommand } from "../src/workflow/verify-runner.js";
 
@@ -182,6 +183,31 @@ for (const [label, cwd] of [["cwd is undefined (path missing)", undefined], ["cw
     assert.equal(calls.length, 0, "spawnProcess must not be invoked -- there is nowhere for the command to run");
   });
 }
+
+// R2 (branch re-review, same false-green class as C1 above): a non-empty *relative* cwd string
+// used to pass checkCwd's validation and go straight into `stat`, which node resolves against
+// THIS process's own cwd -- so a relative path that happens to exist here (e.g. because this
+// checkout has a directory of that name) reported "passed" for a repository that was never
+// actually visited. Built from REAL_CWD (an absolute, real, mkdtemp'd directory) so the relative
+// form is guaranteed to resolve to something real from wherever this test runs -- proving the
+// rejection is about the path being relative, not about it being missing (that's already covered
+// by the "cwd not found" tests above and below).
+test("a repository path that is relative is reported as error, without invoking spawnProcess, even when it resolves to a real directory", async () => {
+  const relativeCwd = relative(process.cwd(), REAL_CWD);
+  assert.equal(existsSync(relativeCwd), true, "precondition: the relative form must resolve to a real directory from here");
+
+  const calls = [];
+  const result = await runVerifyCommand("pnpm typecheck", {
+    cwd: relativeCwd,
+    spawnProcess: fakeSpawn(calls),
+    now: fakeClock(),
+  });
+
+  assert.equal(result.status, "error");
+  assert.equal(result.exitCode, null);
+  assert.equal(result.reason, `cwd is not an absolute path: ${relativeCwd}`);
+  assert.equal(calls.length, 0, "spawnProcess must not be invoked -- a relative cwd must never resolve against this process's own cwd");
+});
 
 test("a cwd that is a file, not a directory, is reported as error", async () => {
   const dir = mkdtempSync(join(tmpdir(), "verify-runner-file-"));
@@ -366,5 +392,81 @@ test(
 
     assert.equal(result.status, "timed-out");
     assert.ok(wall < 4000, `expected the SIGKILL escalation to bound the wall clock, took ${wall}ms`);
+  },
+);
+
+// R1 (branch re-review): the fix above -- `detached: true` -- is what lets a timeout reach a
+// backgrounded grandchild's whole process group (the two tests above). But detaching the child
+// also removes it from THIS process's own process group, so a terminal's Ctrl-C (SIGINT delivered
+// to the whole foreground group) stops reaching it. Reproduced here through a real subprocess,
+// standing in for the CLI, that runs a real (non-backgrounded) `sleep` under a 60-second
+// `timeoutMs` -- long enough that nothing but the interrupt trap under test can end it inside this
+// test's own window -- and then sent a real SIGINT the same way a terminal would: to the whole
+// process group the subprocess leads (`-child.pid`), not to its pid alone.
+//
+// See test/support/verify-signal-child.mjs for the subprocess script.
+function psSnapshot() {
+  try {
+    return execFileSync("ps", ["-eo", "pid,cmd"], { encoding: "utf8" });
+  } catch {
+    return "";
+  }
+}
+
+async function waitUntil(predicate, { timeoutMs = 5000, intervalMs = 20 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() >= deadline) return predicate();
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+test(
+  "an interrupt (SIGINT) to the CLI's own process group kills the running verify command too, not just the CLI itself",
+  { skip: hasRealShell ? false : "no /bin/sh on this host" },
+  async () => {
+    // Distinctive duration so grepping ps output for it cannot collide with an unrelated sleep
+    // some other process on this machine happens to be running.
+    const sleepMarker = "sleep 194837";
+    const scriptPath = join(import.meta.dirname, "support", "verify-signal-child.mjs");
+
+    // detached: true makes this subprocess the leader of its own new process group -- the same
+    // relationship a terminal has with a directly-invoked `workflow verify`. Sending a signal to
+    // `-child.pid` (the group), not `child.pid` (just this one process), is what reproduces a
+    // terminal's Ctrl-C rather than a more targeted signal a terminal would never actually send.
+    const child = spawn(process.execPath, [scriptPath, sleepMarker, REAL_CWD], {
+      detached: true,
+      stdio: "ignore",
+    });
+
+    let childExited = false;
+    child.once("exit", () => {
+      childExited = true;
+    });
+
+    try {
+      const appeared = await waitUntil(() => psSnapshot().includes(sleepMarker));
+      assert.ok(appeared, "precondition: the sleep command must actually be running before the interrupt is sent");
+
+      const start = Date.now();
+      process.kill(-child.pid, "SIGINT");
+
+      const cliExited = await waitUntil(() => childExited, { timeoutMs: 3000 });
+      const cliWall = Date.now() - start;
+      assert.ok(cliExited, `expected the CLI subprocess itself to exit promptly after SIGINT; still running after ${cliWall}ms`);
+
+      const orphanGone = await waitUntil(() => !psSnapshot().includes(sleepMarker), { timeoutMs: 3000 });
+      const orphanWall = Date.now() - start;
+      assert.ok(orphanGone, `expected the sleep command to be gone once the CLI's own SIGINT was handled; still present after ${orphanWall}ms`);
+    } finally {
+      if (!childExited) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
   },
 );
