@@ -827,14 +827,21 @@ function correlationPaneId(run) {
   return run.transportIdentity?.paneId ?? run.paneId ?? null;
 }
 
-// Shared shape for every blocked/unresolved entry, so the two lists never drift apart on which
-// fields identify a run: enough for an operator to act on (attach or `herdr agent send-keys` by
-// pane, or `workflow result <runId>` for the rest) without exposing the whole run record --
-// deliberately as small as `runs --format json`'s own projection (see runProjection's comment in
-// format.js for why a board-scale JSON dump of full records is the wrong shape).
+// Shared shape for every blocked/waiting/unresolved entry, so the three lists never drift apart
+// on which fields identify a run: enough for an operator to act on (attach or `herdr agent
+// send-keys` by pane, or `workflow result <runId>` for the rest) without exposing the whole run
+// record -- deliberately as small as `runs --format json`'s own projection (see runProjection's
+// comment in format.js for why a board-scale JSON dump of full records is the wrong shape).
+// Carries `state` -- added after running this command against the developer's real state root
+// surfaced a design gap (see the correction paragraph in
+// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md): without it, the renderer cannot
+// tell a `manual-handoff-required`/`needs-input` run whose worker exited normally apart from a
+// `running` run whose pane vanished unexpectedly. Both used to read as the same diagnostic; only
+// `state` lets a caller (here, or `formatInbox`) tell them apart.
 function inboxEntry(run, resolvedPaneId) {
   return {
     runId: run.id,
+    state: run.state,
     projectAlias: run.projectAlias,
     primaryTicket: run.primaryTicket,
     harness: run.harness,
@@ -842,13 +849,45 @@ function inboxEntry(run, resolvedPaneId) {
   };
 }
 
-// `workflow inbox` (roadmap item 2.2): which of my workers are sitting at a permission prompt
-// waiting on me, across every project, without looking at panes. Anchored on store.list() exactly
-// like runsCommand -- `herdr agent list` returns every agent on the machine, including
-// interactive sessions this control plane never launched, and a blocked agent with no run behind
-// it is not this command's business (see the design spec's "anchored on runs, not agents"
-// section). Read-only, exit 0 always: a blocked worker is information, not a failure, and an
-// unreachable Herdr is reported via herdrAvailable/unresolved rather than thrown.
+// States whose own definition already means "waiting on the operator" -- `manual-handoff-required`
+// is written when the worker gave up and needs a human (lifecycle.js:77); `needs-input` is a
+// worker's own handoff saying the same (handoff.js:17). A run in either state having no live
+// Herdr agent is the *expected* shape, not a surprise: the worker already exited and left the
+// next move to the operator. Reporting that the same way as a `running` run's vanished pane --
+// "No live Herdr agent found for pane X" -- tells the operator the wrong thing: it reads as an
+// infrastructure problem about a pane, when the real, actionable fact is `workflow result
+// <run-id>`. See this file's `inboxCommand` and the design spec's correction paragraph for the
+// real-data run that found this.
+const AWAITS_OPERATOR_STATES = new Set([RUN_STATES.MANUAL_HANDOFF_REQUIRED, RUN_STATES.NEEDS_INPUT]);
+
+// The message for a `waiting` entry: what the run's own state already means, and the one command
+// that answers it -- never the vanished-pane detail, which is exactly the misleading framing this
+// bucket exists to avoid (see AWAITS_OPERATOR_STATES's comment above).
+function awaitsOperatorReason(run) {
+  return `Waiting on you (${run.state}): run \`workflow result ${run.id}\``;
+}
+
+// Routes an entry the control plane could not confirm a live agent for into `waiting` (the run's
+// own state already means it needs the operator, so the absence of a live pane is expected) or
+// `unresolved` (an active run's agent is supposed to be there, so its absence is a genuine
+// diagnostic, carried verbatim as `cause`). Both lists share `inboxEntry`'s shape plus `reason`.
+function classifyUncertain(run, pane, cause, waiting, unresolved) {
+  const entry = inboxEntry(run, pane);
+  if (AWAITS_OPERATOR_STATES.has(run.state)) {
+    waiting.push({ ...entry, reason: awaitsOperatorReason(run) });
+  } else {
+    unresolved.push({ ...entry, reason: cause });
+  }
+}
+
+// `workflow inbox` (roadmap item 2.2): which of my workers are waiting on me -- at a permission
+// prompt, or because their own state already means they need a human -- across every project,
+// without looking at panes. Anchored on store.list() exactly like runsCommand -- `herdr agent
+// list` returns every agent on the machine, including interactive sessions this control plane
+// never launched, and a blocked agent with no run behind it is not this command's business (see
+// the design spec's "anchored on runs, not agents" section). Read-only, exit 0 always: a blocked
+// or waiting worker is information, not a failure, and an unreachable Herdr is reported via
+// herdrAvailable/unresolved rather than thrown.
 export async function inboxCommand(options = {}, deps = {}) {
   const { store, skipped } = await runsStoreForCommand(options, deps);
   const filters = options.projectAlias !== undefined ? { projectAlias: options.projectAlias } : {};
@@ -859,20 +898,21 @@ export async function inboxCommand(options = {}, deps = {}) {
   const { agentsByPane, herdrAvailable } = await agentsByPaneFromHerdr(deps.herdr);
 
   const blocked = [];
+  const waiting = [];
   const unresolved = [];
   for (const run of runs) {
     const pane = correlationPaneId(run);
     if (!herdrAvailable) {
-      unresolved.push({ ...inboxEntry(run, pane), reason: "Herdr is unavailable" });
+      classifyUncertain(run, pane, "Herdr is unavailable", waiting, unresolved);
       continue;
     }
     if (!pane) {
-      unresolved.push({ ...inboxEntry(run, pane), reason: "Run has no pane id recorded" });
+      classifyUncertain(run, pane, "Run has no pane id recorded", waiting, unresolved);
       continue;
     }
     const agent = agentsByPane.get(pane);
     if (!agent) {
-      unresolved.push({ ...inboxEntry(run, pane), reason: `No live Herdr agent found for pane ${pane}` });
+      classifyUncertain(run, pane, `No live Herdr agent found for pane ${pane}`, waiting, unresolved);
       continue;
     }
     if (agentStatus(agent) === "blocked") {
@@ -883,6 +923,7 @@ export async function inboxCommand(options = {}, deps = {}) {
   return {
     command: "inbox",
     blocked,
+    waiting,
     unresolved,
     herdrAvailable,
     skipped,

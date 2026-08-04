@@ -1545,6 +1545,7 @@ test("inboxCommand reports a run whose live agent is blocked", async (t) => {
 
   assert.deepEqual(result.blocked, [{
     runId: run.id,
+    state: RUN_STATES.RUNNING,
     projectAlias: "ocr",
     primaryTicket: "A-1",
     harness: "pi",
@@ -1621,6 +1622,88 @@ test("inboxCommand reports a run whose pane id matches no live Herdr agent as un
   assert.match(result.unresolved[0].reason, /no live|not found|no agent/i);
 });
 
+// --- inboxCommand: waiting vs. unresolved (branch review 3b) ----------------------------------
+//
+// Found by running this command against the developer's real state root: a run in
+// `manual-handoff-required` or `needs-input` has, by definition, a worker that already exited and
+// left the next move to the operator. Its pane being gone is the *expected* shape, not a
+// surprise -- reporting it the same way as a `running` run's vanished pane ("No live Herdr agent
+// found for pane X") told the operator the wrong thing. See the design spec's correction
+// paragraph.
+
+test("inboxCommand puts a manual-handoff-required run with no live agent in waiting, not unresolved, naming the state and workflow result", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.MANUAL_HANDOFF_REQUIRED, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "pi",
+    paneId: "w1:exited",
+  });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.unresolved, []);
+  assert.equal(result.waiting.length, 1);
+  assert.equal(result.waiting[0].runId, run.id);
+  assert.equal(result.waiting[0].state, RUN_STATES.MANUAL_HANDOFF_REQUIRED);
+  assert.match(result.waiting[0].reason, /manual-handoff-required/);
+  assert.match(result.waiting[0].reason, /workflow result/);
+  assert.doesNotMatch(result.waiting[0].reason, /no live|pane/i, "the vanished-pane detail is exactly the misleading framing this bucket exists to avoid");
+  assert.equal(result.exitCode, 0);
+});
+
+test("inboxCommand puts a needs-input run with no pane id recorded in waiting, not unresolved", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.NEEDS_INPUT, { projectAlias: "ocr", primaryTicket: "A-1" });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.unresolved, []);
+  assert.equal(result.waiting.length, 1);
+  assert.equal(result.waiting[0].runId, run.id);
+  assert.equal(result.waiting[0].paneId, null);
+  assert.match(result.waiting[0].reason, /needs-input/);
+  assert.match(result.waiting[0].reason, new RegExp(`workflow result ${run.id}`));
+});
+
+test("inboxCommand keeps an active run (idle-awaiting-handoff) with no live agent in unresolved -- that one really is a diagnostic", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await createRunInState(store, RUN_STATES.IDLE_AWAITING_HANDOFF, {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    paneId: "w1:vanished",
+  });
+  const herdr = createHerdr({ agents: [] });
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.deepEqual(result.waiting, []);
+  assert.equal(result.unresolved.length, 1);
+  assert.equal(result.unresolved[0].runId, run.id);
+  assert.equal(result.unresolved[0].state, RUN_STATES.IDLE_AWAITING_HANDOFF);
+  assert.match(result.unresolved[0].reason, /no live|not found|no agent/i);
+});
+
+test("inboxCommand classifies a manual-handoff-required run as waiting even when Herdr itself is unreachable", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const manual = await createRunInState(store, RUN_STATES.MANUAL_HANDOFF_REQUIRED, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
+  const running = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2", paneId: "w1:p2" });
+  const herdr = { async listAgents() { throw new Error("herdr unreachable"); } };
+
+  const result = await inboxCommand({}, { stateRoot, herdr });
+
+  assert.equal(result.herdrAvailable, false);
+  assert.deepEqual(result.waiting.map((entry) => entry.runId), [manual.id]);
+  assert.deepEqual(result.unresolved.map((entry) => entry.runId), [running.id]);
+  assert.match(result.unresolved[0].reason, /herdr/i);
+});
+
 test("inboxCommand puts every non-terminal run in unresolved with herdrAvailable false when Herdr is unreachable, and still exits 0", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
@@ -1668,6 +1751,7 @@ test("inboxCommand never reports a terminal run, blocked or not", async (t) => {
   const result = await inboxCommand({}, { stateRoot, herdr });
 
   assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.waiting, []);
   assert.deepEqual(result.unresolved, []);
 });
 

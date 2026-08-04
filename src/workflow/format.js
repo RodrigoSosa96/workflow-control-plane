@@ -428,10 +428,21 @@ export function formatRuns(value = {}, deps = {}) {
 // Deliberately reuses formatRuns's shape rather than inventing a second board style (see that
 // function's own comment): a table for the actionable entries -- here, blocked runs instead of
 // every run -- an explicit line when there is nothing to report, and residue named underneath
-// rather than folded into the table or dropped. `inboxCommand`'s entries (`{runId, projectAlias,
-// primaryTicket, harness, paneId[, reason]}`, commands.js's `inboxEntry`) are already as small as
-// `runs --format json`'s own projection, so there is no separate projection step here the way
-// runProjection exists for `runs` -- `--format json` below carries them unchanged.
+// rather than folded into the table or dropped. `inboxCommand`'s entries (`{runId, state,
+// projectAlias, primaryTicket, harness, paneId[, reason]}`, commands.js's `inboxEntry`) are
+// already as small as `runs --format json`'s own projection, so there is no separate projection
+// step here the way runProjection exists for `runs` -- `--format json` below carries them
+// unchanged.
+//
+// Three lists, not two -- **correction, recorded after running this command against the
+// developer's real state root** (see the correction paragraph in
+// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md): a run in `manual-handoff-required`
+// or `needs-input` whose worker already exited is not a diagnostic, it is the run doing exactly
+// what that state means. `blocked` (a live pane, sitting at a prompt right now) and `waiting`
+// (the run's own state already means it needs the operator) are both actionable "this needs you"
+// sections; `unresolved` stays a genuine diagnostic, reserved for an *active* run
+// (running/launching/idle-awaiting-handoff) whose agent could not be confirmed -- that one really
+// is surprising, because an active run's worker is supposed to still be there.
 
 const INBOX_COLUMNS = [
   { key: "run", label: "RUN" },
@@ -451,35 +462,48 @@ function inboxRow(entry) {
   };
 }
 
-// The reason string itself already names the pane where one is relevant (e.g. "No live Herdr
-// agent found for pane w1:p1", "Herdr is unavailable") -- see inboxEntry's/agentsByPaneFromHerdr's
-// own comments in commands.js -- so this line does not repeat a separate pane column; project,
-// ticket, and harness are enough to place the run, and the reason carries the rest.
-function unresolvedLine(entry) {
+// Shared by the `waiting` and `unresolved` sections below -- both are `inboxEntry` plus a
+// `reason`, and both render the same way: run, project/ticket, harness, then the reason. The two
+// sections' *reason text* differs in framing (commands.js's `awaitsOperatorReason` vs. the
+// verbatim diagnostic cause), not in shape, so one line renderer covers both. A `waiting` reason
+// deliberately does not repeat the vanished-pane detail `unresolved`'s does (e.g. "No live Herdr
+// agent found for pane w1:p1") -- see AWAITS_OPERATOR_STATES's comment in commands.js for why
+// that framing is exactly what `waiting` exists to avoid.
+function reasonLine(entry) {
   return `${shortRunId(entry.runId)} | ${text(entry.projectAlias)}/${text(entry.primaryTicket)} | ${text(entry.harness)} | ${text(entry.reason)}`;
 }
 
 export function formatInbox(value = {}) {
   const blocked = list(value.blocked);
+  const waiting = list(value.waiting);
   const unresolved = list(value.unresolved);
   const skipped = list(value.skipped);
 
-  // "Nothing waiting on you" is only honest when nothing is blocked AND nothing is uncertain --
-  // an unresolved run's status is unknown, not confirmed clear, so it might in fact be blocked.
-  // Reassuring the operator in that case would be exactly the false negative this whole command
-  // exists to avoid (see the design spec's "reported, not dropped" section). A board with nothing
-  // blocked but something unresolved instead says "Blocked: none" and lets the Unresolved section
-  // underneath speak for itself -- never silence, following formatRuns's own "a blank response is
-  // indistinguishable from a broken command" reasoning.
-  const lines = blocked.length === 0 && unresolved.length === 0
+  // "Nothing waiting on you" is only honest when nothing is blocked, nothing is waiting on the
+  // operator by its own state, AND nothing is uncertain -- an unresolved run's status is unknown,
+  // not confirmed clear, so it might in fact be blocked. Reassuring the operator in that case
+  // would be exactly the false negative this whole command exists to avoid (see the design spec's
+  // "reported, not dropped" section). A board with nothing blocked but something waiting or
+  // unresolved instead says "Blocked: none" and lets the sections underneath speak for themselves
+  // -- never silence, following formatRuns's own "a blank response is indistinguishable from a
+  // broken command" reasoning.
+  const lines = blocked.length === 0 && waiting.length === 0 && unresolved.length === 0
     ? ["Nothing waiting on you"]
     : blocked.length === 0
       ? ["Blocked: none"]
       : renderTable(INBOX_COLUMNS, blocked.map(inboxRow));
 
+  // `waiting` before `unresolved`: both need the operator's attention, but `waiting` already
+  // names what to do (`workflow result <run-id>`) while `unresolved` is still an open question --
+  // the actionable section comes first.
+  if (waiting.length > 0) {
+    lines.push("Waiting on you:");
+    for (const entry of waiting) lines.push(reasonLine(entry));
+  }
+
   if (unresolved.length > 0) {
     lines.push("Unresolved:");
-    for (const entry of unresolved) lines.push(unresolvedLine(entry));
+    for (const entry of unresolved) lines.push(reasonLine(entry));
   }
 
   // Crash residue, reported the same way formatRuns reports it -- a count and the ids, never
@@ -602,33 +626,38 @@ function runsOverflowFallback(command, source, limit) {
 
 // `inbox` entries are far smaller than a full run record (see formatInbox's own comment), but
 // they are not immune to the same collapse `runs` measured: at a realistic-looking combination of
-// long project aliases, tickets, and pane ids, ~45 combined blocked+unresolved entries alone
-// exceed OUTPUT_LIMIT (measured directly against this file's own JSON.stringify, the same way the
-// `runs` numbers above were measured), and both fields inbox accumulates from -- non-terminal
-// runs, and the `no cleanup until item 2.5` growth `runs`'s own comment names -- only grow while an
-// operator lets runs sit open. `inbox` also has neither `runId` nor `status`, so the general
-// fallback below would degrade exactly the way it did for `runs` before that fix: a bare
-// `{command, truncated, truncationMarker}` with the blocked/unresolved data gone and no way to
-// tell "quiet" from "overflowed" apart. Same fix, same shape: `blocked`/`unresolved` stay present
-// as `[]`, counts and ids survive so a consumer can still act one run at a time, `skippedCount`
-// preserves 0.3's crash-residue visibility, and the marker names this command's actual affordance
-// (`--project`, not a `--limit` or `--state` this command does not have).
+// long project aliases, tickets, and pane ids, ~45 combined blocked+waiting+unresolved entries
+// alone exceed OUTPUT_LIMIT (measured directly against this file's own JSON.stringify, the same
+// way the `runs` numbers above were measured), and all three lists inbox accumulates from --
+// non-terminal runs, and the `no cleanup until item 2.5` growth `runs`'s own comment names -- only
+// grow while an operator lets runs sit open. `inbox` also has neither `runId` nor `status`, so the
+// general fallback below would degrade exactly the way it did for `runs` before that fix: a bare
+// `{command, truncated, truncationMarker}` with the blocked/waiting/unresolved data gone and no
+// way to tell "quiet" from "overflowed" apart. Same fix, same shape: `blocked`/`waiting`/
+// `unresolved` stay present as `[]`, counts and ids survive so a consumer can still act one run at
+// a time, `skippedCount` preserves 0.3's crash-residue visibility, and the marker names this
+// command's actual affordance (`--project`, not a `--limit` or `--state` this command does not
+// have).
 function inboxOverflowFallback(command, source, limit) {
   const droppedBlocked = list(source.blocked);
+  const droppedWaiting = list(source.waiting);
   const droppedUnresolved = list(source.unresolved);
   const idsOf = (entries) => entries.map((entry) => entry?.runId).filter((id) => typeof id === "string" && id.length > 0);
   return {
     command: source.command ?? command,
     blocked: [],
+    waiting: [],
     unresolved: [],
     blockedCount: droppedBlocked.length,
     blockedRunIds: idsOf(droppedBlocked),
+    waitingCount: droppedWaiting.length,
+    waitingRunIds: idsOf(droppedWaiting),
     unresolvedCount: droppedUnresolved.length,
     unresolvedRunIds: idsOf(droppedUnresolved),
     herdrAvailable: Boolean(source.herdrAvailable),
     skippedCount: list(source.skipped).length,
     truncated: true,
-    truncationMarker: `JSON output truncated at ${limit} characters; ${droppedBlocked.length + droppedUnresolved.length} inbox entries did not fit and were dropped from this response (their ids are in blockedRunIds/unresolvedRunIds). There is no --limit flag for this command; --project narrows if more than one project has live runs, and \`workflow result <run-id>\` inspects one run at a time.`,
+    truncationMarker: `JSON output truncated at ${limit} characters; ${droppedBlocked.length + droppedWaiting.length + droppedUnresolved.length} inbox entries did not fit and were dropped from this response (their ids are in blockedRunIds/waitingRunIds/unresolvedRunIds). There is no --limit flag for this command; --project narrows if more than one project has live runs, and \`workflow result <run-id>\` inspects one run at a time.`,
   };
 }
 

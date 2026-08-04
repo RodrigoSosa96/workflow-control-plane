@@ -50,6 +50,18 @@ If a run is non-terminal and the control plane cannot determine its agent status
 
 Herdr being unavailable entirely is reported once, not once per run, and does not fail the command.
 
+**Correction (recorded after running this command against the developer's real state root, the implementation task's own verification step):** "the command says so" was too coarse. Run against the real state root, the command reported:
+
+```
+Unresolved: 2
+  <run-id>  No live Herdr agent found for pane <pane>
+  <run-id>  No live Herdr agent found for pane <pane>
+```
+
+Both runs were in state `manual-handoff-required`, verified against `herdr agent list`. The statement was factually true and told the operator the wrong thing. A run in `manual-handoff-required` or `needs-input` has, by definition, a worker that already exited and left the next move to the operator (`manual-handoff-required` is written at `lifecycle.js:77` precisely when the worker gives up; `needs-input` is a worker's own handoff saying the same, `handoff.js:17`). Its pane being gone is not a surprise the control plane failed to explain — it is that state doing exactly what it means. Reporting it identically to a `running` run's vanished pane collapsed two different facts into one diagnostic sentence: "an infrastructure problem with a pane" instead of "this run is waiting on you, go look at it."
+
+The fix needed more than a reworded string in the renderer: the renderer had no way to tell the two cases apart, because the entry it receives never carried the run's own `state`. `inboxEntry` (`commands.js`) now includes `state`; a third bucket, `waiting`, holds any non-terminal run in `manual-handoff-required` or `needs-input` whose agent could not be confirmed live, regardless of which of the three causes (Herdr down / no pane recorded / no live match) produced that uncertainty. Its reason names the state and the one command that answers it — `Waiting on you (manual-handoff-required): run \`workflow result <run-id>\`` — and deliberately does not restate the vanished-pane detail, which was the misleading part. `unresolved` keeps its original meaning, narrowed to what it should always have meant: an *active* run (`running`, `launching`, `idle-awaiting-handoff`) whose agent could not be confirmed, which really is a diagnostic, because an active run's worker is supposed to still be there. See this doc's Architecture section below, and its Verification Strategy and Acceptance Criteria sections, for the corrected shape.
+
 ### It reuses the status vocabulary rather than restating it
 
 `reconcile.js` already has `agentStatus()`, `paneId()` and the harness/status sets, module-private. This repo has collapsed six duplications in recent memory and is sensitive to a seventh, so those move to a shared module and both callers import them. `reconcile`'s behaviour must not change.
@@ -89,12 +101,37 @@ workflow inbox ──> store.list()  ──> runs the control plane owns
         { command: "inbox", blocked, unresolved, herdrAvailable, exitCode: 0 }
 ```
 
+**Correction:** this diagram is stale — see the correction paragraph under "An agent it cannot resolve is reported, not dropped" above for what the real-data run found and why. The shipped shape is three buckets, not two:
+
+```text
+workflow inbox ──> store.list()  ──> runs the control plane owns
+                        │
+                        ├─ drop terminal runs (nothing to wait on)
+                        ├─ herdr.listAgents()  ← once, not per run
+                        │        │
+                        │        └─ index by pane id
+                        ├─ correlate: transportIdentity.paneId ?? paneId
+                        v
+     ┌──────────────────┼───────────────────────────┐
+  blocked             waiting                   unresolved
+  (agent_status ===   (state is manual-handoff-  (an ACTIVE run's --
+   "blocked")          required/needs-input,      running/launching/
+                        agent not confirmed        idle-awaiting-handoff --
+                        live -- expected, the      agent not confirmed
+                        worker already exited)     live -- unexpected)
+     └──────────────────┼───────────────────────────┘
+                        v
+  { command: "inbox", blocked, waiting, unresolved, herdrAvailable, exitCode: 0 }
+```
+
+`blocked` and `waiting` are both "this needs you"; `unresolved` is still "the control plane does not know." What moved a run from the old `unresolved` into the new `waiting` is its own `state` — which the entry did not carry before this correction (`inboxEntry`, `commands.js`, now includes `state`) — not a new source of truth about the run.
+
 `listAgents()` is called once and indexed, not per run — the board may hold dozens of runs and Herdr is a subprocess.
 
 ## Error Handling
 
-- Herdr unreachable or `listAgents` throwing: `herdrAvailable: false`, every non-terminal run lands in `unresolved` with that reason, exit 0. The command reports what it could not determine rather than pretending the inbox is empty.
-- A run with no pane id at all (a `start`-created run, which is never resumable and may never have had one) is `unresolved` with that reason — not an error.
+- Herdr unreachable or `listAgents` throwing: `herdrAvailable: false`, every non-terminal run lands in `unresolved` with that reason, exit 0. The command reports what it could not determine rather than pretending the inbox is empty. **Correction:** superseded for `manual-handoff-required`/`needs-input` runs — see the correction under "An agent it cannot resolve is reported, not dropped" above. Those land in `waiting`, not `unresolved`, even when the cause is Herdr being unreachable; the rest of this criterion (reported once, exit 0) holds for both buckets.
+- A run with no pane id at all (a `start`-created run, which is never resumable and may never have had one) is `unresolved` with that reason — not an error. **Correction:** same narrowing as above — a `manual-handoff-required`/`needs-input` run with no pane id lands in `waiting`; an active run with no pane id stays `unresolved`, and keeps its own distinct reason there (never conflated with "no live agent found for pane X").
 - An unreadable run directory is skipped by `list()` and surfaced the same way `runs` surfaces it.
 - Exit code is 0 in every case, including a non-empty inbox. It is a report; a blocked worker is information, not a failure.
 
@@ -104,8 +141,8 @@ workflow inbox ──> store.list()  ──> runs the control plane owns
 2. A run whose agent reports `working` or `idle` does not.
 3. **A resumed run correlates through `transportIdentity.paneId`, not the stale top-level `paneId`** — the test seeds a run whose two pane ids differ and asserts the live one wins. This is the property the design exists around.
 4. A blocked agent with no corresponding run does not appear at all.
-5. A non-terminal run with no resolvable agent appears in `unresolved` with a reason.
-6. Herdr being unavailable puts every non-terminal run in `unresolved`, reports it once, and exits 0.
+5. A non-terminal run with no resolvable agent appears in `unresolved` with a reason. **Correction:** narrowed — this holds for a run in an *active* state (`running`, `launching`, `idle-awaiting-handoff`). A run in `manual-handoff-required` or `needs-input` with no resolvable agent instead appears in `waiting`, naming the state and `workflow result <run-id>`. See the correction under "An agent it cannot resolve is reported, not dropped" above.
+6. Herdr being unavailable puts every non-terminal run in `unresolved`, reports it once, and exits 0. **Correction:** narrowed the same way as item 5 — an active run lands in `unresolved`; a `manual-handoff-required`/`needs-input` run lands in `waiting` even when Herdr itself is the reason nothing could be confirmed.
 7. Terminal runs never appear, blocked or not.
 8. `--project` narrows; no filter aggregates across projects.
 9. `listAgents()` is called exactly once regardless of run count.
@@ -120,3 +157,5 @@ workflow inbox ──> store.list()  ──> runs the control plane owns
 - What could not be determined is stated, never omitted.
 - Herdr's agent-status vocabulary has one definition in this repo.
 - The stale top-level `paneId` is recorded as a known defect with its evidence.
+
+**Correction (recorded after running this command against the developer's real state root, and adding the `waiting` bucket it found missing — see the correction under "An agent it cannot resolve is reported, not dropped" above):** "what could not be determined is stated, never omitted" was true but insufficient — the real-data run showed that *how* it is stated matters as much as *whether* it is stated. A true diagnostic sentence ("No live Herdr agent found for pane X") told the operator the wrong thing when the run's own state already meant the absence was expected, not a fault. The corrected criterion: what could not be determined is stated, AND a run whose own state already means it needs the operator (`manual-handoff-required`, `needs-input`) is presented as waiting on them — with the one command that answers it, `workflow result <run-id>` — not as an infrastructure diagnostic about a vanished pane.
