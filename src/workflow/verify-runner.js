@@ -19,6 +19,11 @@ import { stat } from "node:fs/promises";
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes: enough for a real test suite, not unbounded.
 const DEFAULT_MAX_OUTPUT_BYTES = 4000; // "a bounded head of the output" (design doc), not the whole log.
 
+// How long to wait, after SIGTERM, before escalating to SIGKILL on a command that ignored it.
+// Only matters on the timeout path (see killChild below); a command that exits or is reaped
+// cleanly never touches this timer.
+const DEFAULT_KILL_GRACE_MS = 2000;
+
 const SHELL_BINARY = "/bin/sh";
 
 function safeNow(now) {
@@ -67,8 +72,12 @@ function makeOutputCollector(maxOutputBytes) {
 
 async function checkCwd(cwd) {
   if (typeof cwd !== "string" || cwd.length === 0) {
-    // No cwd to validate — the spawned process will fall back to the parent's cwd.
-    return null;
+    // A non-string or empty cwd is NOT "nothing to validate" -- node's spawn falls back silently
+    // to the parent process's own cwd (this CLI's own checkout), and the command would then run
+    // there and report whatever it reports there as this repository's result. That is the exact
+    // false green this whole item exists to remove: a repository entry with no usable path must
+    // be a recorded refusal for that repository, never a silent pass in the wrong directory.
+    return "no repository path recorded";
   }
   let stats;
   try {
@@ -82,11 +91,40 @@ async function checkCwd(cwd) {
   return null;
 }
 
-function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess, now, startedAt }) {
+// Sends a signal to the whole process group `child` leads, not just `child` itself. This is what
+// makes a timeout actually bound the wall clock (see the top-of-file discussion this function's
+// call site anchors to): `spawnAndCollect` below spawns with `detached: true`, which on POSIX
+// makes `child.pid` the leader of its own new process group, so `-child.pid` reaches every
+// descendant that hasn't further detached itself -- including a grandchild an operator's own
+// command backgrounded with `&`, which `child.kill()` alone never could (it only ever signals
+// the direct `/bin/sh` child, and a backgrounded grandchild is reparented away from it well
+// before any signal is sent). Falls back to signaling `child` directly when there is no usable
+// pid to form a group from (real spawn always provides one; a test double may not) -- same
+// best-effort, never-throws posture every other kill site in this file already has.
+function killChild(child, signal) {
+  if (typeof child.pid === "number" && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // No such process group (already gone) or group signaling unavailable -- fall through to a
+      // direct kill below rather than assuming the job is done.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Best-effort: if the process is already gone, the close handler still settles below.
+  }
+}
+
+function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs, spawnProcess, now, startedAt }) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawnProcess(SHELL_BINARY, ["-c", command], { cwd, shell: false });
+      // detached: true puts `child` at the head of its own process group (POSIX) instead of
+      // this Node process's -- see killChild above for why the timeout path needs that.
+      child = spawnProcess(SHELL_BINARY, ["-c", command], { cwd, shell: false, detached: true });
     } catch (error) {
       resolve({
         command,
@@ -105,6 +143,7 @@ function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess
     let settled = false;
     let timedOut = false;
     let timer = null;
+    let killTimer = null;
 
     // `build` runs synchronously inside an EventEmitter's listener callback (a "close"/"error"
     // event on `child`), not inside the `await` chain that `runVerifyCommand`'s own try/catch
@@ -115,6 +154,7 @@ function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       let outcome;
       try {
         outcome = build();
@@ -207,17 +247,22 @@ function spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // Best-effort: if the process is already gone, the close handler still settles below.
-        }
+        killChild(child, "SIGTERM");
+        // A command (or something it backgrounded) that ignores SIGTERM would otherwise hold
+        // this promise open exactly as long as it likes -- the property the timeout exists to
+        // rule out. This grace window is the escalation: if `close` still hasn't arrived once it
+        // elapses, SIGKILL cannot be caught or ignored, so the wall clock stays bounded by
+        // `timeoutMs + killGraceMs` even against a command that traps SIGTERM.
+        killTimer = setTimeout(() => {
+          if (settled) return;
+          killChild(child, "SIGKILL");
+        }, Number.isFinite(killGraceMs) && killGraceMs > 0 ? killGraceMs : DEFAULT_KILL_GRACE_MS);
       }, timeoutMs);
     }
   });
 }
 
-async function runOnce({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess, now, startedAt }) {
+async function runOnce({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs, spawnProcess, now, startedAt }) {
   const cwdError = await checkCwd(cwd);
   if (cwdError) {
     return {
@@ -232,7 +277,7 @@ async function runOnce({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess, 
     };
   }
 
-  return await spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess, now, startedAt });
+  return await spawnAndCollect({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs, spawnProcess, now, startedAt });
 }
 
 /**
@@ -246,6 +291,9 @@ async function runOnce({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess, 
  * @param {string} [options.cwd] - the worktree to run the command in.
  * @param {number} [options.timeoutMs] - kill the command after this many milliseconds.
  * @param {number} [options.maxOutputBytes] - cap combined stdout+stderr at this many bytes.
+ * @param {number} [options.killGraceMs] - how long to wait after SIGTERM (sent to the command's
+ *   whole process group, so a backgrounded grandchild is reached too) before escalating to
+ *   SIGKILL on a timed-out command. Only ever matters on the timeout path.
  * @param {Function} [options.spawnProcess] - injectable in place of node:child_process spawn.
  * @param {Function} [options.now] - injectable clock (ms) for computing durationMs.
  * @returns {Promise<{command: string, cwd: string|undefined, status: "passed"|"failed"|"timed-out"|"error", exitCode: number|null, output: string, truncated: boolean, durationMs: number, reason?: string}>}
@@ -255,6 +303,7 @@ export async function runVerifyCommand(command, options = {}) {
     cwd,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+    killGraceMs = DEFAULT_KILL_GRACE_MS,
     spawnProcess = spawn,
     now = Date.now,
   } = options ?? {};
@@ -262,7 +311,7 @@ export async function runVerifyCommand(command, options = {}) {
   const startedAt = safeNow(now);
 
   try {
-    return await runOnce({ command, cwd, timeoutMs, maxOutputBytes, spawnProcess, now, startedAt });
+    return await runOnce({ command, cwd, timeoutMs, maxOutputBytes, killGraceMs, spawnProcess, now, startedAt });
   } catch (error) {
     return {
       command,

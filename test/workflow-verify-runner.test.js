@@ -159,6 +159,30 @@ test("a missing cwd is reported as error without invoking spawnProcess", async (
   assert.equal(calls.length, 0, "spawnProcess must not be invoked for a cwd that does not exist");
 });
 
+// C1 (branch review): checkCwd used to treat a non-string/empty cwd as "nothing to validate", so
+// spawnAndCollect spawned with `cwd: undefined` -- which node resolves to the PARENT process's own
+// cwd (this CLI's own checkout) -- and the command's real exit code (often 0 for something like
+// `pwd > marker; true`) came back as a false "passed", with `cwd` dropped from the result entirely
+// (JSON.stringify drops an `undefined` key) so the false green left no trace. Covers every shape
+// runVerifyCommand's own `cwd` parameter can take for a repository with no usable path recorded --
+// see test/workflow-commands.test.js's own end-to-end version for the run.repositories[] entry
+// shapes (bare string, empty object) that collapse to these same primitive cwd values.
+for (const [label, cwd] of [["cwd is undefined (path missing)", undefined], ["cwd is null", null], ["cwd is an empty string", ""]]) {
+  test(`a repository path that is ${label} is reported as error, without invoking spawnProcess`, async () => {
+    const calls = [];
+    const result = await runVerifyCommand("pnpm typecheck", {
+      cwd,
+      spawnProcess: fakeSpawn(calls),
+      now: fakeClock(),
+    });
+
+    assert.equal(result.status, "error");
+    assert.equal(result.exitCode, null);
+    assert.equal(result.reason, "no repository path recorded");
+    assert.equal(calls.length, 0, "spawnProcess must not be invoked -- there is nowhere for the command to run");
+  });
+}
+
 test("a cwd that is a file, not a directory, is reported as error", async () => {
   const dir = mkdtempSync(join(tmpdir(), "verify-runner-file-"));
   const filePath = join(dir, "not-a-directory");
@@ -294,5 +318,53 @@ test(
     assert.equal(result.status, "passed");
     assert.equal(result.exitCode, 0);
     assert.equal(result.output.trim(), "a\nb");
+  },
+);
+
+// I3 (branch review): before this fix, spawnAndCollect settled on "close", which waits for stdio
+// EOF -- and a grandchild the command backgrounds with `&` inherits the same stdout/stderr pipe,
+// keeping it open (and this promise unsettled) until THAT process exits, regardless of timeoutMs.
+// `child.kill("SIGTERM")` reached only the direct `/bin/sh` child, which had usually already
+// exited by the time the timeout fired -- a no-op against an orphan long since reparented to init.
+// Measured against this exact repro before the fix: a 500ms timeout took over 8 real seconds to
+// resolve (the backgrounded sleep's own duration), not 500ms. The fix spawns `detached: true` and
+// signals the whole process group on timeout (see killChild's own comment), reaching the
+// backgrounded grandchild directly instead of waiting for it to finish on its own.
+test(
+  "a command that backgrounds a long-running process no longer holds the wall clock open past the timeout",
+  { skip: hasRealShell ? false : "no /bin/sh on this host" },
+  async () => {
+    const start = Date.now();
+    const result = await runVerifyCommand("(sleep 8 &) ; echo done", {
+      cwd: process.cwd(),
+      timeoutMs: 500,
+    });
+    const wall = Date.now() - start;
+
+    assert.equal(result.status, "timed-out");
+    // Bounded by timeoutMs plus kill overhead -- nowhere near the backgrounded process's own
+    // 8-second sleep, which is what the wall clock was actually blocked on before this fix.
+    assert.ok(wall < 4000, `expected the wall clock to stay well under the backgrounded process's own duration, took ${wall}ms`);
+  },
+);
+
+// The escalation half of the same fix: a command that traps and ignores SIGTERM must still be
+// bounded, via the SIGKILL that follows once killGraceMs elapses (SIGKILL cannot be caught or
+// ignored). killGraceMs is passed explicitly here to keep the test fast; production leans on
+// DEFAULT_KILL_GRACE_MS.
+test(
+  "a command that ignores SIGTERM is still bounded by the SIGKILL escalation",
+  { skip: hasRealShell ? false : "no /bin/sh on this host" },
+  async () => {
+    const start = Date.now();
+    const result = await runVerifyCommand("trap '' TERM; sleep 8", {
+      cwd: process.cwd(),
+      timeoutMs: 300,
+      killGraceMs: 400,
+    });
+    const wall = Date.now() - start;
+
+    assert.equal(result.status, "timed-out");
+    assert.ok(wall < 4000, `expected the SIGKILL escalation to bound the wall clock, took ${wall}ms`);
   },
 );

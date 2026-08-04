@@ -627,12 +627,22 @@ function verifyRow(result = {}) {
 // A result only ever carries `reason` for an error or timed-out command (tasks 1/2's own
 // contract); named underneath the table rather than folded into it as a sixth column, the same
 // layering formatDoctor uses for a check's optional reason.
+//
+// Carries `cwd` here rather than adding it as a seventh table column (M9, branch review): a cwd
+// column would widen every row of every table, including the common all-passed case where it adds
+// nothing, to guard against a failure mode -- a repository entry with no usable path -- that is
+// now visible a different way (verify-runner.js's checkCwd turns it into an "error" status with
+// exactly the reason this line renders, C1's own fix). The Reasons section is where cwd context is
+// actually load-bearing: it is attached to every error/timed-out result, i.e. every result where an
+// operator might reasonably ask "where did this even run". `--format json` already carries `cwd` on
+// every result unconditionally (verifyRow deliberately omits it from the table for the same
+// space-cost reason).
 function appendVerifyReasons(lines, results) {
   const withReason = results.filter((result) => result?.reason);
   if (withReason.length === 0) return;
   lines.push("Reasons:");
   for (const result of withReason) {
-    lines.push(`${text(result.repositoryId)} | ${text(result.command)}: ${result.reason}`);
+    lines.push(`${text(result.repositoryId)} | ${text(result.command)} (cwd: ${text(result.cwd)}): ${result.reason}`);
   }
 }
 
@@ -652,6 +662,14 @@ export function formatVerify(value = {}) {
     lines.push(...renderTable(VERIFY_COLUMNS, results.map(verifyRow)));
   }
   appendVerifyReasons(lines, results);
+  // I4 (branch review): the matrix above already ran and is fully rendered by this point --
+  // `evidenceError` only ever means store.appendEvent could not persist it (most commonly another
+  // command holding the run lock), never that verification itself failed to run. Named last so it
+  // reads as "and one more thing", not folded into `Verify: passed/failed` where it would look like
+  // a verdict about the checks themselves.
+  if (value.evidenceError) {
+    lines.push(`Evidence: ${value.evidenceError}`);
+  }
 
   return bound(lines.join("\n"));
 }
@@ -857,6 +875,26 @@ function inboxOverflowFallback(command, source, limit) {
 // or commands -- rerunning faces the exact same matrix, still capped the same way -- so its own
 // fallback names what actually happened instead of offering advice that does not apply, the same
 // fix runsOverflowFallback/inboxOverflowFallback made for their own commands.
+//
+// **Correction (branch review, M6):** this used to drop the `results` array entirely, keeping only
+// `repositoryIds`/`commands` -- which loses every result's status, exit code, and the
+// repository<->command pairing, not just the bulky captured output that actually caused the
+// overflow. `output` is the one field whose size scales with the matrix (VERIFY_JSON_OUTPUT_LIMIT's
+// own comment); status/exitCode do not, so dropping only `output` and keeping
+// `{repositoryId, command, status, exitCode}` per result preserves the half of the evidence an
+// operator can actually act on -- measured (see the headroom test in test/workflow-format.test.js)
+// to stay well under budget even at extreme scale. The stale ROADMAP.md sentence this comment used
+// to contradict ("descarta el texto de output por resultado") was actually describing THIS
+// behavior, not the one the code had -- both now agree.
+function strippedVerifyResult(result) {
+  return {
+    repositoryId: result?.repositoryId,
+    command: result?.command,
+    status: result?.status,
+    exitCode: result?.exitCode ?? null,
+  };
+}
+
 function verifyOverflowFallback(command, source, limit) {
   const results = list(source.results);
   const repositoryIds = unique(results.map((result) => result?.repositoryId));
@@ -869,8 +907,50 @@ function verifyOverflowFallback(command, source, limit) {
     resultCount: results.length,
     repositoryIds,
     commands: commandsRun,
+    results: results.map(strippedVerifyResult),
     truncated: true,
-    truncationMarker: `JSON output truncated at ${limit} characters even after bounding each result's captured output to ${VERIFY_JSON_OUTPUT_LIMIT} characters; ${results.length} results did not fit and were dropped from this response. repositoryIds/commands name what ran; the compact view (--format compact, the default) always renders the full matrix without this bound.`,
+    truncationMarker: `JSON output truncated at ${limit} characters even after bounding each result's captured output to ${VERIFY_JSON_OUTPUT_LIMIT} characters; every result's captured output was dropped to fit, but repositoryId/command/status/exitCode survive per result in \`results\` below (${results.length} results). The compact view (--format compact, the default) renders the same matrix bounded to ${OUTPUT_LIMIT} characters -- not unbounded, just a different truncation point.`,
+  };
+}
+
+// The same collapse can happen to `workflow result`'s embedded evidence: `verifiedEvidence.results`
+// is the exact same matrix `verify` measures, carried here for the claim/proof split (roadmap item
+// 2.3). Unlike `verify`, `result` is a single-record command -- it takes exactly one run id, same
+// as `reconcile` -- so the general fallback below looked like the right one when this branch first
+// shipped it. It is not: that fallback keeps only `{command, runId, status, truncated,
+// truncationMarker}`, and at a realistic evidence size it discarded `result` itself along with it
+// -- the worker's own summary/verification claim, the repositories with their fingerprints,
+// decisions, and nextAction, none of which scale with the evidence matrix at all. Measured directly
+// against this file's own `formatWorkflowResult("result", ..., "json")`, with a realistic envelope
+// (the full runOutputBase fields, a canonicalResult-shaped `result` with three repositories'
+// fingerprints/decisions/nextAction, and a 3-repository x 5-command evidence matrix at each
+// result's real per-command capture cap): the general fallback collapsed this at **n=12** evidence
+// results (n=11 = 11,506 characters, 95.9% of budget; n=12 = 227 characters, `result` gone
+// entirely) -- well inside a plausible registry (3 repositories x 5 commands = 15). The fix mirrors
+// `verify`'s own (see verifyOverflowFallback/strippedVerifyResult above): keep every top-level
+// field -- `result`, `status`, and everything else in the envelope -- and degrade only
+// `verifiedEvidence.results`, the one field whose size actually scales with the matrix.
+function resultOverflowFallback(command, source, limit) {
+  const evidence = source.verifiedEvidence && typeof source.verifiedEvidence === "object" ? source.verifiedEvidence : null;
+  const evidenceResults = list(evidence?.results);
+  const repositoryIds = unique(evidenceResults.map((result) => result?.repositoryId));
+  const commandsRun = unique(evidenceResults.map((result) => result?.command));
+  const degradedEvidence = evidence
+    ? {
+      verifiedAt: evidence.verifiedAt,
+      passed: evidence.passed,
+      exitCode: evidence.exitCode,
+      results: evidenceResults.map(strippedVerifyResult),
+      resultCount: evidenceResults.length,
+      repositoryIds,
+      commands: commandsRun,
+    }
+    : (source.verifiedEvidence ?? null);
+  return {
+    ...source,
+    verifiedEvidence: degradedEvidence,
+    truncated: true,
+    truncationMarker: `JSON output truncated at ${limit} characters; the verified-evidence matrix (${evidenceResults.length} results) had its captured output dropped to fit, keeping repositoryId/command/status/exitCode per result. \`result\`, \`status\`, and every other field in this response are unabridged. ${source.runId ? `\`workflow verify ${source.runId}\`` : "`workflow verify <run-id>`"} re-runs the same matrix if the full evidence is needed.`,
   };
 }
 
@@ -888,6 +968,17 @@ function boundedJson(command, value) {
   }
   if (command === "verify") {
     return JSON.stringify(normalizeJson(verifyOverflowFallback(command, source, limit)), null, 2);
+  }
+  if (command === "result") {
+    const degraded = JSON.stringify(normalizeJson(resultOverflowFallback(command, source, limit)), null, 2);
+    // Degrading the evidence is enough for the realistic cause of a result overflow (a wide
+    // verify matrix) and is what keeps `result`/`status` on the response -- see
+    // resultOverflowFallback's own comment. It is not guaranteed enough on its own: every other
+    // field in the envelope, including `result` itself (an operator-authored `summary`, for
+    // instance, has no cap of its own here), is carried through unabridged. If it is still over
+    // budget after that, something else is the actual cause, and the minimal shape below -- the
+    // same one every other command without a dedicated fallback uses -- is the honest answer.
+    if (degraded.length <= limit) return degraded;
   }
   return JSON.stringify(normalizeJson({
     command: source.command ?? command,

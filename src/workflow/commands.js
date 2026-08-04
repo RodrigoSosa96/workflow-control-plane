@@ -1774,9 +1774,31 @@ export async function verifyCommand(options = {}, deps = {}) {
 
   // Evidence, appended only once the matrix has actually run -- every refusal above returns before
   // this point, so a run that was never verified never gets an entry here.
-  await store.appendEvent(runId, { type: "verification", passed, exitCode, results });
+  //
+  // I4 (branch review): appendEvent goes through store.withLock, and the matrix above has already
+  // paid the real cost -- possibly minutes of `pnpm ci:verify` per repository -- by the time this
+  // line runs. Before this fix, a lock held by any other in-flight command (another `workflow`
+  // invocation against the same run) turned that into a thrown lock diagnostic and NOTHING else:
+  // no table, no results, the whole matrix silently discarded after being fully paid for. The work
+  // was already done; the operator should see it regardless of whether it could be persisted. So a
+  // persistence failure here is recorded on the response instead of thrown -- `evidenceError`
+  // names why nothing landed in the run's event log this time, and `workflow verify` can simply be
+  // rerun once the lock clears to get both the results AND a persisted record.
+  let evidenceError;
+  try {
+    await store.appendEvent(runId, { type: "verification", passed, exitCode, results });
+  } catch (error) {
+    evidenceError = `evidence could not be persisted: ${error?.message ?? String(error)}`;
+  }
 
-  return { command: "verify", runId, results, passed, exitCode };
+  return {
+    command: "verify",
+    runId,
+    results,
+    passed,
+    exitCode,
+    ...(evidenceError ? { evidenceError } : {}),
+  };
 }
 
 function assertWorkerTransportDependency(deps, command) {

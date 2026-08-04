@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import * as realFs from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,6 +10,7 @@ import { WorkflowError } from "../src/workflow/errors.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
+import { runVerifyCommand as realRunVerifyCommand } from "../src/workflow/verify-runner.js";
 
 const registry = {
   launcher: {
@@ -2239,4 +2241,101 @@ test("the evidence lands in the run's event log, in a form workflow result can r
   assert.equal(event.passed, true);
   assert.equal(event.exitCode, VERIFY_EXIT_CODES.passed);
   assert.deepEqual(event.results, result.results);
+});
+
+// I4 (branch review): before this fix, a held run lock turned `store.appendEvent`'s lock
+// diagnostic into a thrown error that discarded the entire matrix -- no table, no results, after
+// the real cost (a serial run of every verify command x every repository) had already been paid.
+// Simulated the same way workflow-run-store.test.js proves lock contention: a real `run.lock/active`
+// directory created out-of-band (not a mocked store), with `retryNow`/`sleep` injected so the
+// bounded retry exhausts its budget in simulated time instead of real wall-clock seconds.
+test("a held run lock does not discard the matrix that already ran; the results come back with an evidenceError instead of being thrown away", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  let elapsedMs = 0;
+  const store = createRunStore({
+    stateRoot,
+    clock: fixedClock("2025-01-01T00:00:00.000Z"),
+    retryNow: () => elapsedMs,
+    sleep: async (ms) => {
+      elapsedMs += ms;
+    },
+  });
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    repositories: [{ id: "ocr", path: "/repo/ocr", branch: "main" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck", "pnpm test"] } });
+  const runner = scriptedVerifyRunner();
+
+  // Another in-flight command already holds the run lock.
+  await realFs.mkdir(join(stateRoot, run.id, "run.lock", "active"), { recursive: true, mode: 0o700 });
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  // The matrix ran to completion despite the lock -- nothing about it was discarded.
+  assert.equal(result.command, "verify");
+  assert.equal(result.runId, run.id);
+  assert.equal(result.results.length, 2);
+  assert.equal(result.passed, true);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.passed);
+  assert.deepEqual(runner.calls.map((call) => call.command), ["pnpm typecheck", "pnpm test"]);
+
+  // Persistence failed, and that failure is on the response for the operator to see -- not thrown.
+  assert.match(result.evidenceError, /evidence could not be persisted/i);
+  assert.match(result.evidenceError, /lock/i);
+
+  // Nothing was appended: the lock was never released for this attempt to write through.
+  const eventsPath = join(run.directory, "events.jsonl");
+  await assert.rejects(() => realFs.readFile(eventsPath, "utf8"), { code: "ENOENT" });
+});
+
+// C1 (branch review): a repository entry with no usable path must be a recorded error for that
+// repository, never a silent pass in the CLI's own cwd. Uses the REAL runner (task 1's
+// runVerifyCommand, not scriptedVerifyRunner) with a command that writes its actual cwd to a
+// marker file -- the same reproduction the review used -- against every shape run-store.js/
+// launch.js can actually produce: run-store.js does not validate repositories[] at all (nothing in
+// it even mentions "repositories"), and commands.js's own `runLikeFromLaunchPreview`
+// (`path: repository.worktreePath ?? repository.path`) and launch.js's `repositoriesForDigest`
+// (`path: repository.path ?? null`) both round-trip a missing path through to a bare `null` on the
+// run record without complaint.
+test("a repository entry with no usable path is a recorded error, not a silent pass in the CLI's own cwd, across every shape a run record can carry", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+
+  const shapes = {
+    "path missing": { id: "no-path" },
+    "path null": { id: "path-null", path: null },
+    "path empty string": { id: "path-empty", path: "" },
+    "entry is a bare string": "bare-string",
+    "entry is an empty object": {},
+  };
+
+  for (const [label, repository] of Object.entries(shapes)) {
+    const dir = await mkdtemp(join(tmpdir(), "verify-c1-"));
+    t.after(() => realFs.rm(dir, { recursive: true, force: true }));
+    const markerPath = join(dir, "marker");
+
+    const run = await store.create({
+      projectAlias: "ocr",
+      primaryTicket: `C1-${label}`,
+      repositories: [repository],
+    });
+    const loadRegistry = verifyLoadRegistry({ ocr: { verify: [`pwd > ${markerPath} ; true`] } });
+
+    const result = await verifyCommand(
+      { runId: run.id },
+      { store, loadRegistry, runVerifyCommand: realRunVerifyCommand },
+    );
+
+    assert.equal(result.results.length, 1, label);
+    assert.equal(result.results[0].status, "error", label);
+    assert.equal(result.results[0].reason, "no repository path recorded", label);
+    assert.equal(result.passed, false, label);
+    assert.equal(result.exitCode, VERIFY_EXIT_CODES.failed, label);
+
+    // The command must never have run at all -- not in the repository's own worktree (there is
+    // none), and not silently in the CLI's own cwd either.
+    assert.equal(existsSync(markerPath), false, `${label}: the command must never have run at all`);
+  }
 });

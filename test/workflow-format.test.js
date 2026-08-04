@@ -1061,8 +1061,25 @@ test("formatVerify names a repository whose command errored or timed out underne
 
   const compact = formatVerify(value);
   assert.match(compact, /^Reasons:$/m);
-  assert.match(compact, /^gone \| pnpm typecheck: cwd not found: \/repo\/acme\/gone$/m);
-  assert.match(compact, /^backend \| pnpm test: timed out after 300000ms$/m);
+  assert.match(compact, /^gone \| pnpm typecheck \(cwd: \/repo\/acme\/gone\): cwd not found: \/repo\/acme\/gone$/m);
+  assert.match(compact, /^backend \| pnpm test \(cwd: \/repo\/acme\/backend\): timed out after 300000ms$/m);
+});
+
+// M9 (branch review): a result with no usable cwd at all -- C1's own repro shape -- must still
+// name that explicitly in the Reasons line rather than rendering an empty parenthetical.
+test("formatVerify names an absent cwd explicitly in the Reasons line, not as an empty parenthetical", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    passed: false,
+    exitCode: 1,
+    results: [
+      verifyResult({ repositoryId: "ocr", cwd: undefined, status: "error", exitCode: null, reason: "no repository path recorded" }),
+    ],
+  };
+
+  const compact = formatVerify(value);
+  assert.match(compact, /^ocr \| pnpm typecheck \(cwd: unknown\): no repository path recorded$/m);
 });
 
 test("a refusal says why instead of rendering an empty table that would read as a pass", () => {
@@ -1088,6 +1105,32 @@ test("formatWorkflowResult dispatches \"verify\" to the compact per-repository t
   const compact = formatWorkflowResult("verify", value, "compact");
   assert.match(compact, /^Verify: passed$/m);
   assert.match(compact, /^REPO\s+\|\s+COMMAND/m);
+});
+
+// I4 (branch review): a matrix that ran to completion but whose evidence could not be persisted
+// (a held run lock, most commonly) must still show the operator the full table -- the whole point
+// of the fix is that the work is not thrown away -- with the persistence failure named separately
+// from the pass/fail verdict, not folded into it.
+test("formatVerify renders the full table plus a separate note when the evidence could not be persisted", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    results: [verifyResult()],
+    passed: true,
+    exitCode: 0,
+    evidenceError: "evidence could not be persisted: Run is locked by an active lock at /state/run.lock/active; age 0ms.",
+  };
+
+  const compact = formatVerify(value);
+  assert.match(compact, /^Verify: passed$/m);
+  assert.match(compact, /^REPO\s+\|\s+COMMAND/m);
+  assert.match(compact, /^backend\s+\|\s+pnpm typecheck\s+\|\s+passed/m);
+  assert.match(compact, /^Evidence: evidence could not be persisted: Run is locked by an active lock/m);
+
+  const json = formatWorkflowResult("verify", value, "json");
+  const parsed = JSON.parse(json);
+  assert.match(parsed.evidenceError, /evidence could not be persisted/i);
+  assert.equal(parsed.results.length, 1);
 });
 
 // --- formatResult's claim/proof split (roadmap item 2.3) -------------------------------------
@@ -1228,6 +1271,7 @@ test("--format json for verify names the overflow instead of silently dropping t
   const value = { command: "verify", runId: RUN_ID, passed: false, exitCode: 1, results };
 
   const json = formatWorkflowResult("verify", value, "json");
+  assert.ok(json.length < 12000, `overflow fallback itself must stay under budget: ${json.length} characters`);
   const parsed = JSON.parse(json);
 
   assert.equal(parsed.command, "verify");
@@ -1236,7 +1280,19 @@ test("--format json for verify names the overflow instead of silently dropping t
   assert.equal(parsed.resultCount, results.length);
   assert.deepEqual(parsed.repositoryIds.slice().sort(), repositories.slice().sort());
   assert.deepEqual(parsed.commands.slice().sort(), commands.slice().sort());
-  assert.equal(parsed.results, undefined, "the collapsed shape must not pretend to still carry the full matrix");
+
+  // M6 (branch review): the collapsed shape used to drop the whole `results` array -- statuses,
+  // exit codes, and the repository<->command pairing gone along with the bulky output that
+  // actually caused the overflow. It now keeps a stripped entry per result (no `output`), so the
+  // actionable half of the evidence survives even when the matrix itself does not fit.
+  assert.equal(parsed.results.length, results.length);
+  for (const result of parsed.results) {
+    assert.equal(Object.hasOwn(result, "output"), false, "captured output must still be dropped -- that's what made room");
+    assert.ok(typeof result.repositoryId === "string" && result.repositoryId.length > 0);
+    assert.ok(typeof result.command === "string" && result.command.length > 0);
+    assert.equal(result.status, "passed");
+    assert.equal(result.exitCode, 0);
+  }
 });
 
 test("--format json for result also bounds each verified-evidence result's captured output", () => {
@@ -1256,4 +1312,134 @@ test("--format json for result also bounds each verified-evidence result's captu
   const parsed = JSON.parse(json);
   assert.equal(parsed.truncated, undefined);
   assert.ok(parsed.verifiedEvidence.results[0].output.length < 4000);
+});
+
+// --- I2 (branch review): `result --format json` must not collapse the whole envelope when its
+// embedded evidence overflows -------------------------------------------------------------------
+//
+// Measured directly against this file's own `formatWorkflowResult("result", ..., "json")`, with a
+// realistic envelope built here (the full runOutputBase field set, a canonicalResult-shaped
+// `result` with three repositories' fingerprints/decisions/nextAction, and a growing
+// 3-repository x 5-command evidence matrix at each result's real per-command capture cap): before
+// resultOverflowFallback existed, this collapsed the ENTIRE response -- `result` included -- at
+// n=12 evidence results, one test's worth of prior headroom coverage away from the 13-result shape
+// this test uses (3 repos x 5 commands, well within a plausible project registry). Same failure
+// shape item 2.1 fixed for `runs`, found here by measuring the one JSON surface this branch did
+// not.
+function realisticResultEnvelope(evidenceResultCount) {
+  const repositories = ["backend", "panel", "docs"];
+  const commands = ["pnpm typecheck", "pnpm biome:check", "pnpm ci:verify", "pnpm lint", "pnpm build"];
+  const evidenceResults = [];
+  outer:
+  for (const repositoryId of repositories) {
+    for (const command of commands) {
+      if (evidenceResults.length >= evidenceResultCount) break outer;
+      evidenceResults.push(heavyVerifyResult(repositoryId, command));
+    }
+  }
+
+  return {
+    command: "result",
+    runId: RUN_ID,
+    runDirectory: `/state/runs/${RUN_ID}`,
+    projectAlias: "acme",
+    projectLabel: "Acme Corp",
+    task: "A-1",
+    primaryTicket: "A-1",
+    relatedTickets: [],
+    state: "completed",
+    harness: "claude",
+    profileName: "default",
+    workspace: { path: "/repo/acme/backend" },
+    fallbackWorkspace: "/repo/acme/backend",
+    resultCommand: `workflow result ${RUN_ID}`,
+    reconcileCommand: `workflow reconcile --run ${RUN_ID}`,
+    verifyCommand: `workflow verify ${RUN_ID}`,
+    handoffCommand: `workflow handoff ${RUN_ID} --input /path/to/handoff-input.json`,
+    status: "completed",
+    result: {
+      version: 1,
+      runId: RUN_ID,
+      generation: 1,
+      status: "completed",
+      summary: "Implemented the feature across backend/panel/docs, added tests, verified locally.",
+      tickets: ["A-1"],
+      repositories: repositories.map((id) => ({
+        id,
+        head: "a".repeat(40),
+        branch: "feature/a-1",
+        dirty: false,
+        entries: 0,
+        worktreeFingerprint: `sha256:${"0".repeat(64)}`,
+        changedFiles: ["src/index.js", "src/util.js", "test/index.test.js"],
+      })),
+      verification: [
+        { command: "pnpm typecheck", status: "passed", summary: "clean" },
+        { command: "pnpm test", status: "passed", summary: "47 passed" },
+      ],
+      decisions: ["Used approach X over Y for reason Z"],
+      concerns: [],
+      nextAction: "Ready for review",
+    },
+    verifiedEvidence: {
+      verifiedAt: "2026-08-04T12:00:00.000Z",
+      passed: true,
+      exitCode: 0,
+      results: evidenceResults,
+    },
+    errors: [],
+    exitCode: 0,
+    nextActions: [],
+  };
+}
+
+test("--format json for result stays under OUTPUT_LIMIT and keeps result/status at a realistic evidence count that used to collapse the whole envelope", () => {
+  const value = realisticResultEnvelope(13);
+
+  const unboundedLength = JSON.stringify(value, null, 2).length;
+  assert.ok(unboundedLength > 12000, `fixture too small to prove anything: ${unboundedLength} characters unbounded`);
+
+  const json = formatWorkflowResult("result", value, "json");
+  assert.ok(json.length < 12000, `result JSON at a realistic 13-result evidence matrix was ${json.length} characters`);
+
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.status, "completed");
+  // The property the old collapse violated: `result` -- the worker's own claim -- must survive
+  // even though the evidence matrix did not fit, because it does not scale with that matrix.
+  assert.ok(parsed.result, "result must survive the overflow");
+  assert.equal(parsed.result.summary, value.result.summary);
+  assert.equal(parsed.result.repositories.length, 3);
+  assert.equal(parsed.result.decisions.length, 1);
+  assert.equal(parsed.result.nextAction, "Ready for review");
+  assert.equal(parsed.verifiedEvidence.resultCount, 13);
+  assert.equal(parsed.verifiedEvidence.results.length, 13);
+  for (const result of parsed.verifiedEvidence.results) {
+    assert.equal(Object.hasOwn(result, "output"), false, "captured output must still be dropped -- that's what made room");
+  }
+});
+
+// M11 (branch review): every existing refusal assertion for `verify` was compact-only; nothing
+// proved a refusal survives --format json rather than being reshaped by boundedJson's normal path
+// (a refusal never overflows, but it does still flow through valueForJson's {...value, results:
+// ...} spread, and nothing previously pinned that `reason` and the other refusal fields come out
+// the other side unchanged).
+test("--format json for verify carries a refusal's reason, not just the compact rendering", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    results: [],
+    passed: false,
+    exitCode: 10,
+    reason: "Project ocr has no verify commands configured.",
+  };
+
+  const json = formatWorkflowResult("verify", value, "json");
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.command, "verify");
+  assert.equal(parsed.runId, RUN_ID);
+  assert.equal(parsed.passed, false);
+  assert.equal(parsed.exitCode, 10);
+  assert.deepEqual(parsed.results, []);
+  assert.equal(parsed.reason, "Project ocr has no verify commands configured.");
 });
