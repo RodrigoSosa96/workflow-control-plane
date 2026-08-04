@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { doctorCommand, inboxCommand, launchCommand, planCommand, reconcileCommand, resultCommand, runsCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
+import { doctorCommand, inboxCommand, launchCommand, planCommand, reconcileCommand, resultCommand, runsCommand, statusCommand, unlockCommand, VERIFY_EXIT_CODES, verifyCommand } from "../src/workflow/commands.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 import { createRunStore } from "../src/workflow/run-store.js";
@@ -1960,4 +1960,283 @@ test("inboxCommand surfaces a skipped record as data the same way runsCommand do
   assert.equal(result.skipped.length, 1);
   assert.equal(result.skipped[0].runId, brokenRunId);
   assert.equal(result.exitCode, 0);
+});
+
+// --- verifyCommand ----------------------------------------------------------
+//
+// A real store over a temp state root (runsCommand/inboxCommand's own lesson: a stubbed store
+// hides exactly the defects that matter), with the project registry and the bounded shell runner
+// (task 1's `runVerifyCommand`) both injected -- the matrix/refusal logic under test here has
+// nothing to do with real YAML parsing or a real shell, and task 1 already covers the runner's own
+// contract exhaustively.
+
+// Wraps a real store so a test can assert exactly how many times (and with what) appendEvent was
+// called, without giving up the real store's real file-backed appendEvent behavior underneath.
+// Object.freeze on the store (run-store.js) blocks mutation, not spreading -- this makes a new
+// plain object, so the override is safe.
+function withAppendSpy(store) {
+  const appendEventCalls = [];
+  return {
+    ...store,
+    appendEventCalls,
+    async appendEvent(runId, event) {
+      appendEventCalls.push({ runId, event });
+      return store.appendEvent(runId, event);
+    },
+  };
+}
+
+function verifyLoadRegistry(projects) {
+  return async () => ({ projects });
+}
+
+// A test double for task 1's `runVerifyCommand`, scripted by `${cwd}::${command}` so a test can
+// pick exactly one cell of the repository x command matrix to fail/error/time out while every
+// other cell defaults to a clean pass -- the shape needed to prove attribution (a failure in one
+// repository must not smear onto, or hide, the others).
+function scriptedVerifyRunner(script = {}) {
+  const calls = [];
+  return {
+    calls,
+    async run(command, options = {}) {
+      calls.push({ command, cwd: options.cwd });
+      const scripted = script[`${options.cwd}::${command}`] ?? { status: "passed" };
+      const exitCode = scripted.exitCode
+        ?? (scripted.status === "passed" ? 0 : scripted.status === "failed" ? 1 : null);
+      return {
+        command,
+        cwd: options.cwd,
+        status: scripted.status,
+        exitCode,
+        output: scripted.output ?? "",
+        truncated: scripted.truncated ?? false,
+        durationMs: scripted.durationMs ?? 5,
+        ...(scripted.reason !== undefined ? { reason: scripted.reason } : {}),
+      };
+    },
+  };
+}
+
+test("verifyCommand runs every verify command once per repository, with that repository's path as cwd, and attributes a second-repository failure to it", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-1",
+    repositories: [
+      { id: "backend", path: "/repo/acme/backend", branch: "feature/a" },
+      { id: "panel", path: "/repo/acme/panel", branch: "feature/a" },
+      { id: "docs", path: "/repo/acme/docs", branch: "feature/a" },
+    ],
+  });
+  const loadRegistry = verifyLoadRegistry({ acme: { verify: ["pnpm typecheck", "pnpm test"] } });
+  const runner = scriptedVerifyRunner({
+    "/repo/acme/panel::pnpm test": { status: "failed", exitCode: 1, output: "1 failing" },
+  });
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  // The matrix is every command x every repository: 2 commands x 3 repositories = 6 calls, each
+  // with the owning repository's own path as cwd.
+  assert.deepEqual(runner.calls, [
+    { command: "pnpm typecheck", cwd: "/repo/acme/backend" },
+    { command: "pnpm test", cwd: "/repo/acme/backend" },
+    { command: "pnpm typecheck", cwd: "/repo/acme/panel" },
+    { command: "pnpm test", cwd: "/repo/acme/panel" },
+    { command: "pnpm typecheck", cwd: "/repo/acme/docs" },
+    { command: "pnpm test", cwd: "/repo/acme/docs" },
+  ]);
+  assert.equal(result.results.length, 6);
+
+  const panelFailure = result.results.find((entry) => entry.repositoryId === "panel" && entry.command === "pnpm test");
+  assert.equal(panelFailure.status, "failed");
+  assert.equal(panelFailure.cwd, "/repo/acme/panel");
+  assert.equal(panelFailure.exitCode, 1);
+
+  // The failure is attributed to panel specifically -- backend and docs, and panel's own
+  // typecheck, must all still read as passed rather than being smeared by panel's one failure.
+  for (const entry of result.results) {
+    if (entry === panelFailure) continue;
+    assert.equal(entry.status, "passed", `${entry.repositoryId}/${entry.command} must not be affected by panel's failure`);
+  }
+
+  assert.equal(result.passed, false);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.failed);
+});
+
+test("verifyCommand records a passed status for a clean command and a failed status with its exit code otherwise", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+
+  const cleanRun = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    repositories: [{ id: "ocr", path: "/repo/ocr", branch: "main" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+  const cleanResult = await verifyCommand(
+    { runId: cleanRun.id },
+    { store, loadRegistry, runVerifyCommand: scriptedVerifyRunner().run },
+  );
+  assert.equal(cleanResult.results[0].status, "passed");
+  assert.equal(cleanResult.results[0].exitCode, 0);
+  assert.equal(cleanResult.passed, true);
+  assert.equal(cleanResult.exitCode, VERIFY_EXIT_CODES.passed);
+
+  const brokenRun = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-2",
+    repositories: [{ id: "ocr", path: "/repo/ocr", branch: "main" }],
+  });
+  const runner = scriptedVerifyRunner({
+    "/repo/ocr::pnpm typecheck": { status: "failed", exitCode: 2, output: "type error" },
+  });
+  const brokenResult = await verifyCommand({ runId: brokenRun.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+  assert.equal(brokenResult.results[0].status, "failed");
+  assert.equal(brokenResult.results[0].exitCode, 2);
+  assert.equal(brokenResult.passed, false);
+  assert.equal(brokenResult.exitCode, VERIFY_EXIT_CODES.failed);
+});
+
+test("a missing repository path is recorded as an error for that repository, and the remaining repositories still run", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-1",
+    repositories: [
+      { id: "backend", path: "/repo/acme/backend", branch: "feature/a" },
+      { id: "gone", path: "/repo/acme/gone", branch: "feature/a" },
+    ],
+  });
+  const loadRegistry = verifyLoadRegistry({ acme: { verify: ["pnpm typecheck"] } });
+  const runner = scriptedVerifyRunner({
+    "/repo/acme/gone::pnpm typecheck": { status: "error", exitCode: null, reason: "cwd not found: /repo/acme/gone" },
+  });
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  assert.equal(result.results.length, 2);
+  const backend = result.results.find((entry) => entry.repositoryId === "backend");
+  const gone = result.results.find((entry) => entry.repositoryId === "gone");
+  assert.equal(backend.status, "passed");
+  assert.equal(gone.status, "error");
+  assert.equal(gone.reason, "cwd not found: /repo/acme/gone");
+  assert.equal(result.passed, false);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.failed);
+});
+
+test("a timed-out command does not abort the remaining matrix", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-1",
+    repositories: [{ id: "backend", path: "/repo/acme/backend", branch: "feature/a" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ acme: { verify: ["pnpm typecheck", "pnpm test"] } });
+  const runner = scriptedVerifyRunner({
+    "/repo/acme/backend::pnpm typecheck": { status: "timed-out", exitCode: null, reason: "timed out after 300000ms" },
+  });
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  assert.equal(result.results.length, 2);
+  assert.equal(result.results[0].status, "timed-out");
+  assert.equal(result.results[0].reason, "timed out after 300000ms");
+  // pnpm test still ran even though pnpm typecheck timed out first.
+  assert.equal(result.results[1].status, "passed");
+  assert.equal(result.passed, false);
+});
+
+test("verifyCommand refuses a run with no repositories[] recorded, and appends nothing", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = withAppendSpy(createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") }));
+  const run = await store.create({ projectAlias: "ocr", primaryTicket: "A-1" });
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+  const runner = scriptedVerifyRunner();
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  assert.equal(result.command, "verify");
+  assert.equal(result.runId, run.id);
+  assert.deepEqual(result.results, []);
+  assert.equal(result.passed, false);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.refused);
+  assert.match(result.reason, /no repositories/i);
+  assert.deepEqual(runner.calls, []);
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("verifyCommand refuses a run whose project is absent from the registry, and appends nothing", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = withAppendSpy(createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") }));
+  const run = await store.create({
+    projectAlias: "ghost",
+    primaryTicket: "A-1",
+    repositories: [{ id: "ghost", path: "/repo/ghost", branch: "main" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } }); // no "ghost" project
+  const runner = scriptedVerifyRunner();
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  assert.deepEqual(result.results, []);
+  assert.equal(result.passed, false);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.refused);
+  assert.match(result.reason, /unknown workflow project: ghost/i);
+  assert.deepEqual(runner.calls, []);
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("verifyCommand refuses a project with no verify commands configured, and appends nothing", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = withAppendSpy(createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") }));
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    repositories: [{ id: "ocr", path: "/repo/ocr", branch: "main" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ ocr: {} }); // no verify field at all
+  const runner = scriptedVerifyRunner();
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  assert.deepEqual(result.results, []);
+  assert.equal(result.passed, false);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.refused);
+  assert.match(result.reason, /no verify commands/i);
+  assert.deepEqual(store.appendEventCalls, []);
+
+  // An empty verify array is the same refusal as an absent field -- not a matrix of zero results.
+  const emptyLoadRegistry = verifyLoadRegistry({ ocr: { verify: [] } });
+  const emptyResult = await verifyCommand({ runId: run.id }, { store, loadRegistry: emptyLoadRegistry, runVerifyCommand: runner.run });
+  assert.equal(emptyResult.exitCode, VERIFY_EXIT_CODES.refused);
+  assert.match(emptyResult.reason, /no verify commands/i);
+});
+
+test("the evidence lands in the run's event log, in a form workflow result can read back", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    repositories: [{ id: "ocr", path: "/repo/ocr", branch: "main" }],
+  });
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+  const runner = scriptedVerifyRunner();
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run });
+
+  const eventsPath = join(run.directory, "events.jsonl");
+  const lines = (await realFs.readFile(eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(lines.length, 1);
+  const [event] = lines;
+  assert.equal(event.type, "verification");
+  assert.equal(event.runId, run.id);
+  assert.equal(typeof event.id, "string");
+  assert.equal(typeof event.timestamp, "string");
+  assert.equal(event.passed, true);
+  assert.equal(event.exitCode, VERIFY_EXIT_CODES.passed);
+  assert.deepEqual(event.results, result.results);
 });

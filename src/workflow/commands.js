@@ -30,11 +30,23 @@ import { isTelemetrySupportedVersion, telemetrySupportedVersions } from "./telem
 import { createTelemetryStore } from "./telemetry-store.js";
 import { publicTelemetrySnapshot } from "./telemetry.js";
 import { createWorkerWatch } from "./telemetry-watch.js";
+import { runVerifyCommand as defaultRunVerifyCommand } from "./verify-runner.js";
 
 export const RESULT_EXIT_CODES = Object.freeze({
   pending: 20,
   "result-stale": 21,
   "manual-handoff-required": 22,
+});
+
+// verifyCommand's own exit codes. Pass/fail follow every other read command's 0/nonzero
+// convention; `refused` is its own value (not reused from RESULT_EXIT_CODES or the PREFLIGHT
+// family in bin/workflow.js) because a refusal here is not "an error occurred" -- it's the
+// command's designed response to "there is nothing to verify", and it needs to stay
+// distinguishable from a verification that ran and failed (exitCode 1).
+export const VERIFY_EXIT_CODES = Object.freeze({
+  passed: 0,
+  failed: 1,
+  refused: 10,
 });
 
 const EMPTY_HERDR_READ_MODEL = {
@@ -1609,6 +1621,108 @@ export async function reconcileCommand(options = {}, deps = {}) {
     repairs: [],
     ...(lock ? { lock } : {}),
   };
+}
+
+// verifyCommand's own refusal shape: structured evidence that nothing ran, not a thrown error.
+// The whole point of this command is that an operator asking "did this pass" always gets a
+// legible answer back -- never a stack trace -- even when the answer is "could not check, because
+// X". Refusing here, before the matrix ever starts, is also what makes "refusals append nothing"
+// true for free: appendEvent is only ever reached after every refusal check below has passed.
+function verifyRefusal(runId, reason) {
+  return {
+    command: "verify",
+    runId,
+    results: [],
+    passed: false,
+    exitCode: VERIFY_EXIT_CODES.refused,
+    reason,
+  };
+}
+
+// The matrix is every project.verify command x every run.repositories[] entry (design doc:
+// "Once per repository, not once per run"). Repository-outer, command-inner so the evidence reads
+// the way an operator thinks about it -- repository A's checks in order, then repository B's --
+// rather than interleaved across repositories. Never stops early: a missing repository path, a
+// timeout, a failure are all just another cell of the matrix, and the loop below has no branch
+// that would skip or abort on any of them. Task 1's runVerifyCommand never throws for any of those
+// cases, so nothing here needs to guard against one outcome breaking the rest of the sweep.
+async function runVerifyMatrix(repositories, commands, { runVerify, timeoutMs, maxOutputBytes, spawnProcess, now }) {
+  const results = [];
+  for (const repository of repositories) {
+    for (const command of commands) {
+      const outcome = await runVerify(command, { cwd: repository.path, timeoutMs, maxOutputBytes, spawnProcess, now });
+      results.push({
+        repositoryId: repository.id,
+        cwd: outcome.cwd,
+        command: outcome.command,
+        status: outcome.status,
+        exitCode: outcome.exitCode,
+        output: outcome.output,
+        truncated: outcome.truncated,
+        durationMs: outcome.durationMs,
+        ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}),
+      });
+    }
+  }
+  return results;
+}
+
+// `workflow verify <run-id>` (roadmap item 2.3): re-runs the project's OWN verify commands, from
+// the CURRENT registry, in the EXACT worktree paths the run recorded -- so "verification: passed"
+// stops being the worker's self-report and becomes something an operator can check.
+//
+// The registry is read by run.projectAlias, not options.projectAlias, and deliberately reflects
+// today's registry rather than anything snapshotted on the run (there is no verify-shaped field on
+// a run record to snapshot). This is the mirror of item 1.3's security envelope: a resumed worker
+// must run under what was approved, but evidence should reflect today's bar -- if the project has
+// tightened its checks since the run launched, a stale standard would certify work as passing
+// checks the project no longer considers sufficient.
+//
+// Never reports an unverified run as passing: a run with no repositories[], a project missing from
+// the registry, and a project with no verify commands are each refused with their own reason
+// (verifyRefusal above) and append nothing to the event log -- a run that was never verified must
+// leave no evidence behind. Once the matrix actually runs, though, every outcome -- including a
+// missing repository path or a timeout -- is recorded as evidence, not silently dropped, and a
+// verification failure is reported cleanly (passed: false, a nonzero exitCode) rather than thrown.
+export async function verifyCommand(options = {}, deps = {}) {
+  const store = await storeForCommand(options, deps);
+  const runId = assertRunId(options.runId);
+  const run = await store.read(runId);
+
+  const repositories = list(run.repositories);
+  if (repositories.length === 0) {
+    return verifyRefusal(runId, `Run ${runId} has no repositories[] recorded; nothing to verify.`);
+  }
+
+  const injectedLoadRegistry = deps.loadRegistry ?? loadRegistry;
+  const registry = await injectedLoadRegistry(options.registryPath);
+  const project = registry?.projects?.[run.projectAlias];
+  if (!project) {
+    return verifyRefusal(runId, `Unknown workflow project: ${run.projectAlias}`);
+  }
+
+  const commands = list(project.verify);
+  if (commands.length === 0) {
+    return verifyRefusal(runId, `Project ${run.projectAlias} has no verify commands configured.`);
+  }
+
+  const runVerify = deps.runVerifyCommand ?? defaultRunVerifyCommand;
+  const results = await runVerifyMatrix(repositories, commands, {
+    runVerify,
+    timeoutMs: deps.timeoutMs,
+    maxOutputBytes: deps.maxOutputBytes,
+    spawnProcess: deps.spawnProcess,
+    now: deps.now,
+  });
+
+  const passed = results.every((result) => result.status === "passed");
+  const exitCode = passed ? VERIFY_EXIT_CODES.passed : VERIFY_EXIT_CODES.failed;
+
+  // Evidence, appended only once the matrix has actually run -- every refusal above returns before
+  // this point, so a run that was never verified never gets an entry here.
+  await store.appendEvent(runId, { type: "verification", passed, exitCode, results });
+
+  return { command: "verify", runId, results, passed, exitCode };
 }
 
 function assertWorkerTransportDependency(deps, command) {
