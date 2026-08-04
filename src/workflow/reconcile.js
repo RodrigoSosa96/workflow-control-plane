@@ -1,6 +1,7 @@
 import { realpath as defaultRealpath } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { herdrAgentName } from "./naming.js";
+import { agentStatus, paneId, WRITER_HARNESSES, STOPPED_AGENT_STATUSES } from "./agent-status.js";
 
 // Herdr registers agents under the derived herdr-safe name, so matching a running
 // agent has to use the same derivation the launcher used.
@@ -86,10 +87,6 @@ async function panePath(pane, canonicalPath) {
   return await canonicalPath(pane?.foreground_cwd ?? pane?.cwd);
 }
 
-function paneId(pane) {
-  return pane?.pane_id ?? pane?.paneId ?? null;
-}
-
 function commandExecutable(command) {
   if (typeof command !== "string") return null;
   return command.trim().split(/\s+/u)[0] ?? null;
@@ -139,9 +136,6 @@ function hasLiveProcessEvidence(processInfo) {
   return processInfoRunning(processInfo) || Boolean(processInfoCommand(processInfo) || processInfoExecutable(processInfo));
 }
 
-const WRITER_HARNESSES = new Set(["pi", "claude", "codex"]);
-const STOPPED_AGENT_STATUSES = new Set(["done", "completed", "exited", "stopped", "dead", "failed"]);
-
 function boundedReason(text, limit = 500) {
   const normalized = String(text ?? "").replace(/\s+/gu, " ").trim();
   if (normalized.length <= limit) return normalized;
@@ -181,11 +175,6 @@ function nativeSessionId(value) {
     ?? value?.agent_session?.native_session_id
     ?? value?.agentSession?.nativeSessionId
     ?? null;
-}
-
-function agentStatus(value) {
-  const status = value?.agent_status ?? value?.agentStatus ?? value?.status ?? null;
-  return typeof status === "string" ? status.toLowerCase() : null;
 }
 
 function isLiveAgentWriter(value) {
