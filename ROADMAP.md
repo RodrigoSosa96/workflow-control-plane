@@ -268,10 +268,15 @@ Orden sugerido para el resto de la Fase 1, por dependencia:
 6. ~~**1.2** (lifecycle core único)~~ — **completo**, ver "1.2 completa" arriba y el Registro de progreso para el rango de commits.
 7. ~~**1.5** (chequeo de `version` en `run.json` + inventario de campos)~~ — **completo**, ver "1.5 completa" arriba y el Registro de progreso para el rango de commits.
 
-**Fase 1 completa.** Sus ocho ítems — 1.1, 1.1b, 1.1c, 1.2, 1.3, 1.4, 1.5, 1.6 — están hechos. Los
-primeros siete están mergeados, pusheados, con CI verde. **1.5 llega con esta rama**
-(`hardening/run-record-version`, todavía no mergeada ni pusheada a `origin/main`); su resultado de
-CI no se conoce todavía — este mismo documento registró dos incidentes recientes de push que salió
-rojo, así que no vale la pena afirmarlo por adelantado.
+**Fase 1 completa.** Sus ocho ítems — 1.1, 1.1b, 1.1c, 1.2, 1.3, 1.4, 1.5, 1.6 — están hechos,
+mergeados y pusheados, con CI verde (`970dcd5`). Suite: 959 tests, 959 pass, 0 skips, bajo `npm
+test` y `npm run test:ci-like`.
+
+Nota de método, porque costó una corrección: la versión anterior de este párrafo afirmaba
+"mergeados, pusheados, con CI verde" **desde la rama que todavía no se había mergeado**. Lo cazó
+la review de rama, y tenía razón en que era la afirmación menos digna de escribirse por
+adelantado: este mismo documento registra dos pushes recientes que salieron rojos. Se corrigió a
+decir lo que era cierto al escribirlo, y recién ahora — con el merge hecho y el CI en verde — se
+afirma lo demás.
 
 **Próximo paso: Fase 2**, el lado de salida (superficie de operador) — el propio roadmap sostiene que es donde todo el ecosistema es más débil (ver la introducción de Fase 2 arriba). Su primer ítem es **2.1** (`workflow runs`), que depende de **0.3** — ya hecho.
