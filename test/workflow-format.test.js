@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatWorkflowResult } from "../src/workflow/format.js";
+import { formatRuns, formatWorkflowResult } from "../src/workflow/format.js";
 
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -313,4 +313,164 @@ test("resume and close compact output render a short human line; JSON output is 
 
   const closeValue = { command: "close", runId: RUN_ID, closed: false, reason: "identity-unconfirmed" };
   assert.deepEqual(JSON.parse(formatWorkflowResult("close", closeValue, "json")), closeValue);
+});
+
+// --- formatRuns (roadmap item 2.1's compact board) -------------------------------------------
+//
+// Real records only ever carry projectAlias/primaryTicket/harness/id/state/updatedAt (see
+// docs/run-record-fields.md) -- no `worktree` field exists, so every fixture below that stands
+// in for "leaks a path" carries `repositories`/`runDirectory` deliberately, the way a real record
+// does, and every test asserting no leak checks against those exact values.
+
+const NOW = "2026-08-04T12:00:00.000Z";
+const fixedNow = () => Date.parse(NOW);
+
+function runRecord(overrides = {}) {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    state: "running",
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    harness: "pi",
+    updatedAt: "2026-08-04T10:00:00.000Z", // exactly 2h before NOW
+    repositories: [{ id: "backend", path: "/worktrees/ocr/A-1/backend", branch: "feature/A-1" }],
+    runDirectory: "/state/workflow/11111111-1111-4111-8111-111111111111",
+    ...overrides,
+  };
+}
+
+test("formatRuns renders a populated board with each run on one line, its columns, and no worktree path", () => {
+  const value = {
+    command: "runs",
+    runs: [
+      runRecord(),
+      runRecord({
+        id: "22222222-2222-4222-8222-222222222222",
+        state: "blocked",
+        projectAlias: "acme",
+        primaryTicket: "B-2",
+        harness: "codex",
+        updatedAt: "2026-08-04T11:59:30.000Z", // 30s before NOW
+        repositories: [{ id: "panel", path: "/worktrees/acme/B-2/panel", branch: "feature/B-2" }],
+        runDirectory: "/state/workflow/22222222-2222-4222-8222-222222222222",
+      }),
+    ],
+    skipped: [],
+    exitCode: 0,
+  };
+
+  const compact = formatRuns(value, { now: fixedNow });
+  const lines = compact.split("\n");
+
+  assert.equal(lines.length, 3, "one header line plus one line per run, nothing else");
+  assert.match(lines[0], /^RUN\s+\|\s+STATE\s+\|\s+PROJECT\s+\|\s+TICKET\s+\|\s+HARNESS\s+\|\s+UPDATED$/);
+  assert.match(lines[1], /^11111111\s+\|\s+running\s+\|\s+ocr\s+\|\s+A-1\s+\|\s+pi\s+\|\s+2h ago$/);
+  assert.match(lines[2], /^22222222\s+\|\s+blocked\s+\|\s+acme\s+\|\s+B-2\s+\|\s+codex\s+\|\s+just now$/);
+
+  assert.doesNotMatch(compact, /\/worktrees\//);
+  assert.doesNotMatch(compact, /\/state\/workflow\//);
+  assert.doesNotMatch(compact, /repositories/i);
+});
+
+test("an empty board says so rather than printing nothing", () => {
+  const compact = formatRuns({ command: "runs", runs: [], skipped: [], exitCode: 0 }, { now: fixedNow });
+  assert.equal(compact, "Runs: none");
+
+  const dispatched = formatWorkflowResult("runs", { command: "runs", runs: [], skipped: [], exitCode: 0 }, "compact");
+  assert.equal(dispatched, "Runs: none");
+});
+
+test("skipped records are named under the table with a count and their ids, never swallowed", () => {
+  const skipped = [
+    { runId: "99999999-9999-4999-8999-999999999999", directory: "/state/workflow/99999999-9999-4999-8999-999999999999", message: "malformed run.json" },
+    { runId: "88888888-8888-4888-8888-888888888888", directory: "/state/workflow/88888888-8888-4888-8888-888888888888", message: "malformed run.json" },
+  ];
+
+  const emptyBoard = formatRuns({ command: "runs", runs: [], skipped }, { now: fixedNow });
+  assert.equal(emptyBoard, [
+    "Runs: none",
+    "Skipped: 2 (99999999-9999-4999-8999-999999999999, 88888888-8888-4888-8888-888888888888)",
+  ].join("\n"));
+
+  const populatedBoard = formatRuns({ command: "runs", runs: [runRecord()], skipped }, { now: fixedNow });
+  assert.match(populatedBoard, /Skipped: 2 \(99999999-9999-4999-8999-999999999999, 88888888-8888-4888-8888-888888888888\)$/);
+  // The skip footer follows the table directly; it never removes the readable run above it.
+  assert.match(populatedBoard, /^11111111\s+\|\s+running/m);
+});
+
+test("column alignment survives a long project alias and a long ticket without breaking other columns or truncating either", () => {
+  const value = {
+    command: "runs",
+    runs: [
+      runRecord(),
+      runRecord({
+        id: "33333333-3333-4333-8333-333333333333",
+        state: "needs-input",
+        projectAlias: "a-very-long-project-alias-that-stretches-the-column",
+        primaryTicket: "SHARY-1234567890-extra-long-ticket-identifier",
+        harness: "claude",
+        updatedAt: "2026-08-04T11:00:00.000Z",
+      }),
+    ],
+    skipped: [],
+  };
+
+  const compact = formatRuns(value, { now: fixedNow });
+  const lines = compact.split("\n");
+  assert.equal(lines.length, 3);
+
+  // Every column before the last (UPDATED, which is never padded past its own content) must
+  // occupy the identical character span on every line -- header included -- regardless of how
+  // long one row's project alias or ticket is. A misaligned line would report a different total
+  // length for its first five padded cells.
+  const leadingSpan = (line) => line.split(" | ").slice(0, 5).reduce((total, cell) => total + cell.length + 3, 0);
+  const spans = lines.map(leadingSpan);
+  assert.equal(new Set(spans).size, 1, `expected identical column spans, got ${JSON.stringify(spans)}`);
+
+  assert.match(compact, /a-very-long-project-alias-that-stretches-the-column/);
+  assert.match(compact, /SHARY-1234567890-extra-long-ticket-identifier/);
+});
+
+test("the widest realistic board line stays within 100 columns", () => {
+  const value = {
+    command: "runs",
+    runs: [
+      runRecord({
+        id: "44444444-4444-4444-8444-444444444444",
+        state: "manual-handoff-required", // longest real state (run-state.js), 23 chars
+        projectAlias: "workflows-control-plane", // realistic long alias, 24 chars
+        primaryTicket: "CTRLPLANE-45231", // realistic long ticket, 15 chars
+        harness: "opencode", // longest real harness (harnesses.js), 8 chars
+        updatedAt: "2026-07-23T12:00:00.000Z", // 12 days before NOW
+      }),
+    ],
+    skipped: [],
+  };
+
+  const compact = formatRuns(value, { now: fixedNow });
+  const widest = Math.max(...compact.split("\n").map((line) => line.length));
+  assert.ok(widest <= 100, `widest line was ${widest} columns`);
+});
+
+test("formatWorkflowResult dispatches \"runs\" to the compact board", () => {
+  const value = { command: "runs", runs: [runRecord()], skipped: [], exitCode: 0 };
+  const compact = formatWorkflowResult("runs", value, "compact");
+  assert.match(compact, /^RUN\s+\|\s+STATE\s+\|\s+PROJECT\s+\|\s+TICKET\s+\|\s+HARNESS\s+\|\s+UPDATED$/m);
+  assert.match(compact, /^11111111\s+\|\s+running\s+\|\s+ocr\s+\|\s+A-1\s+\|\s+pi\s+\|/m);
+  assert.doesNotMatch(compact, /\/worktrees\//);
+});
+
+test("--format json for runs carries the full records, including repositories, untouched by the compact renderer", () => {
+  const value = {
+    command: "runs",
+    runs: [runRecord()],
+    skipped: [{ runId: "99999999-9999-4999-8999-999999999999", directory: "/x", message: "malformed run.json" }],
+    exitCode: 0,
+  };
+  const json = formatWorkflowResult("runs", value, "json");
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.runs[0].repositories[0].path, "/worktrees/ocr/A-1/backend");
+  assert.equal(parsed.runs[0].id, "11111111-1111-4111-8111-111111111111");
+  assert.equal(parsed.skipped[0].runId, "99999999-9999-4999-8999-999999999999");
+  assert.equal(parsed.command, "runs");
 });

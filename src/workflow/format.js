@@ -322,6 +322,98 @@ function formatDelegation(value) {
   return bound(lines.join("\n"));
 }
 
+// --- formatRuns: the compact board for `workflow runs` (roadmap item 2.1) ----------------------
+//
+// No worktree column: verified against a real record, the paths live inside `repositories[]` as
+// `{id, path, branch}`, one entry per repository, and a multi-repo run carries several under one
+// shared worktree root. A table column cannot honestly render that -- `--format json` carries
+// `repositories` whole (boundedJson, untouched by this file); an operator who needs the paths
+// runs `workflow result <run-id>`. So this renderer only ever reads `id`/`state`/`projectAlias`/
+// `primaryTicket`/`harness`/`updatedAt` off a run record -- never `repositories`, `runDirectory`,
+// `stateRoot`, or anything else that could carry a filesystem path.
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+// Clock is injectable (`deps.now`, defaulting to the real `Date.now`) purely so tests can pin an
+// instant instead of asserting against the wall clock. Production callers (formatWorkflowResult,
+// and therefore the CLI) never pass one.
+function relativeTimeFrom(timestamp, nowMs) {
+  const then = Date.parse(timestamp);
+  if (!Number.isFinite(then)) return "unknown";
+  const diffMs = Math.max(0, nowMs - then);
+  if (diffMs < MINUTE_MS) return "just now";
+  if (diffMs < HOUR_MS) return `${Math.floor(diffMs / MINUTE_MS)}m ago`;
+  if (diffMs < DAY_MS) return `${Math.floor(diffMs / HOUR_MS)}h ago`;
+  return `${Math.floor(diffMs / DAY_MS)}d ago`;
+}
+
+// Matches relaunchSession's own display shortening of a session id (commands.js): first 8
+// characters, display only -- every place that actually needs the full id (--run, result,
+// reconcile) still reads it straight off the record, never off this rendering.
+function shortRunId(id) {
+  return String(id ?? "").slice(0, 8) || "unknown";
+}
+
+const RUNS_COLUMNS = [
+  { key: "run", label: "RUN" },
+  { key: "state", label: "STATE" },
+  { key: "project", label: "PROJECT" },
+  { key: "ticket", label: "TICKET" },
+  { key: "harness", label: "HARNESS" },
+  { key: "updated", label: "UPDATED" },
+];
+
+function runRow(run, nowMs) {
+  return {
+    run: shortRunId(run.id),
+    state: text(run.state),
+    project: text(run.projectAlias),
+    ticket: text(run.primaryTicket),
+    harness: text(run.harness),
+    updated: relativeTimeFrom(run.updatedAt, nowMs),
+  };
+}
+
+// Each column's width is the max of its header label and every row's own value -- recomputed per
+// call, never a fixed budget -- so one long project alias or ticket only ever widens its own
+// column for this render. It cannot misalign, truncate, or bleed into a neighbour, and it cannot
+// affect any other call's output. The trailing `.trimEnd()` only ever removes padding after the
+// last column, so it never touches alignment of the columns before it.
+function renderRunsTable(rows) {
+  const widths = RUNS_COLUMNS.map((column) => (
+    Math.max(column.label.length, ...rows.map((row) => row[column.key].length))
+  ));
+  const renderRow = (values) => RUNS_COLUMNS
+    .map((column, index) => values[column.key].padEnd(widths[index]))
+    .join(" | ")
+    .trimEnd();
+  const header = renderRow(Object.fromEntries(RUNS_COLUMNS.map((column) => [column.key, column.label])));
+  return [header, ...rows.map((row) => renderRow(row))];
+}
+
+export function formatRuns(value = {}, deps = {}) {
+  const nowMs = typeof deps.now === "function" ? deps.now() : Date.now();
+  const runs = list(value.runs);
+  const skipped = list(value.skipped);
+
+  // A blank response is indistinguishable from a broken command -- an empty board says so
+  // explicitly rather than printing nothing.
+  const lines = runs.length === 0
+    ? ["Runs: none"]
+    : renderRunsTable(runs.map((run) => runRow(run, nowMs)));
+
+  // Crash residue item 0.3's list() skips rather than swallows: named here as a count and the
+  // ids, following this file's no-blank-line-between-sections idiom (formatDoctor, formatPlanLike).
+  if (skipped.length > 0) {
+    const ids = skipped.map((problem) => text(problem.runId)).join(", ");
+    lines.push(`Skipped: ${skipped.length} (${ids})`);
+  }
+
+  return bound(lines.join("\n"));
+}
+
 function valueForJson(command, value) {
   if (command === "worker-status" || command === "worker-watch") return publicWorkerResult(value);
   if (command !== "launch" || !value || typeof value !== "object" || !Object.hasOwn(value, "assignment")) {
@@ -382,6 +474,8 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatResume(value);
     case "close":
       return formatClose(value);
+    case "runs":
+      return formatRuns(value);
     case "worker-status":
     case "worker-watch":
       return bound(formatWorkers(value));
