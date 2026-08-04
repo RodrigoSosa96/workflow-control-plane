@@ -551,6 +551,10 @@ function reconcileCommandFor(runId) {
   return `workflow reconcile --run ${runId}`;
 }
 
+function verifyCommandFor(runId) {
+  return `workflow verify ${runId}`;
+}
+
 function relatedTicketsFromRun(run = {}) {
   if (Array.isArray(run.relatedTickets)) return run.relatedTickets.map(String);
   const primary = run.primaryTicket ?? run.task;
@@ -591,6 +595,7 @@ function runCommandSummary(run) {
   return {
     resultCommand: resultCommandFor(run.id),
     reconcileCommand: reconcileCommandFor(run.id),
+    verifyCommand: verifyCommandFor(run.id),
     handoffCommand: `workflow handoff ${run.id} --input ${canonicalHandoffInputPath(run)}`,
     ...(statusCommand ? { statusCommand } : {}),
   };
@@ -1542,12 +1547,59 @@ export async function delegationRemediateCommand(options = {}, deps = {}) {
   };
 }
 
+// The run's own append-only event log (run-store.js's appendEvent, EVENTS_FILE) is where
+// verifyCommand's evidence lands, and there is no store method to read it back -- appendEvent is
+// write-only by design, matching every other event producer in this file (telemetry-store.js, for
+// example, keeps its own separate bounded journal rather than reading this file back). resultCommand
+// is the one place that needs the evidence, so it reads the run's events.jsonl directly, the same
+// way handoffCommand reads handoff-input.json directly (an injectable fs, defaulting to the real
+// one). Read-only, and best-effort: any read or parse failure -- including the ordinary case of no
+// verification event ever having been appended -- degrades to "no evidence" rather than breaking a
+// command whose whole contract is "report what is known," the same fail-open discipline
+// reconcileLockDiagnostic's own comment describes ("a diagnostic must never break reconcile").
+// Only the LATEST verification event is surfaced -- `workflow result` shows one proof alongside one
+// claim, not a history; an operator who reruns `workflow verify` gets a fresh entry that replaces
+// the one shown here, never a merge of the two.
+async function readLatestVerificationEvidence(run, fs) {
+  let text;
+  try {
+    text = await fs.readFile(join(run.directory, "events.jsonl"), "utf8");
+  } catch {
+    return null;
+  }
+  let latest = null;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event && typeof event === "object" && event.type === "verification") latest = event;
+  }
+  if (!latest) return null;
+  return {
+    verifiedAt: latest.timestamp,
+    passed: latest.passed,
+    exitCode: latest.exitCode,
+    results: list(latest.results),
+  };
+}
+
 export async function resultCommand(options = {}, deps = {}) {
   const store = await storeForCommand(options, deps);
   const readCurrentResult = deps.readCurrentResult ?? defaultReadCurrentResult;
+  const fs = deps.fs ?? defaultFs;
   const runId = assertRunId(options.runId);
   const run = await store.read(runId);
   const base = runOutputBase(run);
+  // Reported by the worker (current.result.verification, once a result is registered below) and
+  // verified by `workflow verify` (this) are two different sources about the same question, kept
+  // and rendered separately -- see format.js's verificationClaimLines/verificationEvidenceLines.
+  // Read regardless of whether a result has been registered yet: verification is independent of
+  // the handoff, and an operator may well run `workflow verify` before the worker ever reports in.
+  const verifiedEvidence = await readLatestVerificationEvidence(run, fs);
 
   if (!hasRegisteredResult(run)) {
     const status = resultStatusWithoutArtifact(run);
@@ -1555,6 +1607,7 @@ export async function resultCommand(options = {}, deps = {}) {
       command: "result",
       ...base,
       status,
+      verifiedEvidence,
       exitCode: stableResultExitCode(status),
       nextActions: status === "pending"
         ? [base.resultCommand, base.reconcileCommand]
@@ -1569,6 +1622,7 @@ export async function resultCommand(options = {}, deps = {}) {
     ...base,
     status,
     result: current.result,
+    verifiedEvidence,
     errors: current.errors ?? [],
     exitCode: stableResultExitCode(status),
     nextActions: status === "result-stale" ? [base.reconcileCommand] : [],

@@ -406,6 +406,18 @@ test("parses documented workflow commands and options", () => {
     format: "compact",
   });
 
+  assert.deepEqual(parseArgs(["verify", RUN_ID]), {
+    command: "verify",
+    runId: RUN_ID,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["verify", RUN_ID, "--format", "json"]), {
+    command: "verify",
+    runId: RUN_ID,
+    format: "json",
+  });
+
   assert.deepEqual(parseArgs(["reconcile", "acme", "--run", RUN_ID, "--format", "json"]), {
     command: "reconcile",
     projectAlias: "acme",
@@ -538,6 +550,10 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["status", "ocr", "ASANA-123", "--yes"]), /does not accept --yes/i);
   assert.throws(() => parseArgs(["result", RUN_ID, "--yes"]), /result does not accept --yes/i);
   assert.throws(() => parseArgs(["result", RUN_ID, "--prompt-file", "/tmp/request.md"]), /result does not accept --prompt-file/i);
+  assert.throws(() => parseArgs(["verify", RUN_ID, "--yes"]), /verify does not accept --yes/i);
+  assert.throws(() => parseArgs(["verify"]), /verify requires an argument/i);
+  assert.throws(() => parseArgs(["verify", "not-a-uuid"]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["verify", RUN_ID, "extra"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["reconcile", "--run", RUN_ID, "--yes"]), /reconcile does not accept --yes/i);
   assert.throws(() => parseArgs(["runs", "acme", "extra"]), /unexpected argument/i);
   assert.throws(() => parseArgs(["runs", "--yes"]), /runs does not accept --yes/i);
@@ -1388,6 +1404,54 @@ test("result uses stable non-success exits for pending, stale, and manual cases"
   assert.deepEqual(terminal.stdout, ["result:compact:completed"]);
 });
 
+test("verify dispatches to verifyCommand and exits per pass, fail, and refused", async () => {
+  const cases = [
+    [true, 0],
+    [false, 1],
+  ];
+
+  for (const [passed, expectedCode] of cases) {
+    const output = io();
+    const code = await main(["verify", RUN_ID], {
+      ...output,
+      verifyCommand: async (options) => ({ command: "verify", runId: options.runId, results: [], passed, exitCode: expectedCode }),
+      formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.passed}`,
+    });
+    assert.equal(code, expectedCode);
+    assert.deepEqual(output.stdout, [`verify:compact:${passed}`]);
+    assert.deepEqual(output.stderr, []);
+  }
+
+  const refused = io();
+  const code = await main(["verify", RUN_ID], {
+    ...refused,
+    verifyCommand: async (options) => ({
+      command: "verify",
+      runId: options.runId,
+      results: [],
+      passed: false,
+      exitCode: 10,
+      reason: "Project ocr has no verify commands configured.",
+    }),
+    formatWorkflowResult: (command, value) => `${command}:${value.exitCode}:${value.reason}`,
+  });
+  assert.equal(code, 10);
+  assert.deepEqual(refused.stdout, ["verify:10:Project ocr has no verify commands configured."]);
+});
+
+test("verify with no run id is a usage error, not a crash", async () => {
+  const output = io();
+  const code = await main(["verify"], {
+    ...output,
+    verifyCommand: async () => {
+      throw new Error("verifyCommand must not run without a run id");
+    },
+  });
+  assert.equal(code, 64);
+  assert.match(output.stderr[0], /USAGE/i);
+  assert.match(output.stderr[0], /verify requires an argument/i);
+});
+
 test("reconcile is read-only, accepts --run, and emits exact safe next actions", async () => {
   const output = io();
   const calls = [];
@@ -1646,6 +1710,68 @@ test("workflow inbox end-to-end against a real store: an empty inbox, a blocked 
   const skipped = io();
   assert.equal(await main(["inbox"], { ...skipped, stateRoot, herdr: herdrWithBlocked }), 0);
   assert.match(skipped.stdout[0], new RegExp(`Skipped: 1 \\(${brokenRunId}\\)`));
+});
+
+// This is the one command in the CLI that runs a real shell (verify-runner.js's own documented
+// departure) -- "against a real store" here means against a real store AND a real /bin/sh, using
+// `true`/`false` as stand-ins for a project's own verify commands so the test proves the actual
+// wiring (parseArgs -> verifyCommand -> the bounded shell runner -> store.appendEvent -> formatVerify)
+// rather than a mocked slice of it. loadRegistry is still injected -- reading a real projects.yaml
+// is registry.js's own concern, already covered elsewhere, and irrelevant to what this test proves.
+test("workflow verify end-to-end against a real store and a real shell: passes, fails, refuses, and the evidence lands where workflow result reads it back", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-verify-cli-e2e-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateRoot = join(dir, "state");
+  const repoPath = join(dir, "repo");
+  await mkdir(repoPath, { recursive: true });
+  const store = createRunStore({ stateRoot });
+
+  const passingRun = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    repositories: [{ id: "ocr", path: repoPath, branch: "main" }],
+  });
+  const passingRegistry = async () => ({ projects: { ocr: { verify: ["true"] } } });
+
+  const passed = io();
+  assert.equal(await main(["verify", passingRun.id], { ...passed, stateRoot, loadRegistry: passingRegistry }), 0);
+  assert.match(passed.stdout[0], /^Verify: passed$/m);
+  assert.match(passed.stdout[0], /^ocr\s+\|\s+true\s+\|\s+passed\s+\|\s+0/m);
+  assert.deepEqual(passed.stderr, []);
+
+  const failingRun = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-2",
+    repositories: [{ id: "ocr", path: repoPath, branch: "main" }],
+  });
+  const failingRegistry = async () => ({ projects: { ocr: { verify: ["true", "false"] } } });
+
+  const failed = io();
+  assert.equal(await main(["verify", failingRun.id], { ...failed, stateRoot, loadRegistry: failingRegistry }), 1);
+  assert.match(failed.stdout[0], /^Verify: failed$/m);
+  assert.match(failed.stdout[0], /^ocr\s+\|\s+true\s+\|\s+passed\s+\|\s+0/m);
+  assert.match(failed.stdout[0], /^ocr\s+\|\s+false\s+\|\s+FAILED\s+\|\s+1/m);
+
+  const json = io();
+  assert.equal(await main(["verify", failingRun.id, "--format", "json"], { ...json, stateRoot, loadRegistry: failingRegistry }), 1);
+  const parsedFailed = JSON.parse(json.stdout[0]);
+  assert.equal(parsedFailed.passed, false);
+  assert.equal(parsedFailed.results.length, 2);
+  assert.deepEqual(parsedFailed.results.map((result) => result.status), ["passed", "failed"]);
+
+  const refusedRun = await store.create({ projectAlias: "ocr", primaryTicket: "A-3" }); // no repositories[]
+  const refused = io();
+  assert.equal(await main(["verify", refusedRun.id], { ...refused, stateRoot, loadRegistry: passingRegistry }), 10);
+  assert.match(refused.stdout[0], /^Verify: refused/m);
+  assert.match(refused.stdout[0], /no repositories/i);
+
+  // The evidence lands where `workflow result` reads it back -- no fake fs, no injected
+  // resultCommand, the real one against the same real store.
+  const result = io();
+  assert.equal(await main(["result", passingRun.id], { ...result, stateRoot }), 20); // pending: no handoff submitted
+  assert.match(result.stdout[0], /^Reported by the worker: none$/m);
+  assert.match(result.stdout[0], /^Verified by workflow verify \(passed, ran \S+\):$/m);
+  assert.match(result.stdout[0], /^ocr\s+\|\s+true\s+\|\s+passed\s+\|\s+0/m);
 });
 
 test("resume and close subcommands dispatch to their commands read-only until confirmed, wired with the live Pi delegation transport", async () => {

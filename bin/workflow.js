@@ -29,6 +29,7 @@ import {
   runsCommand as defaultRunsCommand,
   statusCommand as defaultStatusCommand,
   unlockCommand as defaultUnlockCommand,
+  verifyCommand as defaultVerifyCommand,
   workerStatusCommand as defaultWorkerStatusCommand,
   workerWatchCommand as defaultWorkerWatchCommand,
 } from "../src/workflow/commands.js";
@@ -55,6 +56,7 @@ Commands:
   workflow start <project> <task> [--feature <text>] [--repos <csv>] [--tickets <csv>] [--agent <profile>] [--format compact|json] [--yes]
   workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow result <run-id> [--format compact|json]
+  workflow verify <run-id> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
   workflow runs [project] [--state <state>] [--all] [--format compact|json]
   workflow inbox [project] [--format compact|json]
@@ -317,6 +319,16 @@ export function parseArgs(argv) {
   if (command === "result") {
     validateShape("result", positionals, options, { min: 1, max: 1, allowedOptions: [] });
     assertPathSafeUuidSyntax(positionals[0], "result run ID");
+    return {
+      command,
+      runId: positionals[0],
+      format,
+    };
+  }
+
+  if (command === "verify") {
+    validateShape("verify", positionals, options, { min: 1, max: 1, allowedOptions: [] });
+    assertPathSafeUuidSyntax(positionals[0], "verify run ID");
     return {
       command,
       runId: positionals[0],
@@ -733,6 +745,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const workerWatchCommand = dependencies.workerWatchCommand ?? defaultWorkerWatchCommand;
   const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
+  const verifyCommand = dependencies.verifyCommand ?? defaultVerifyCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const runsCommand = dependencies.runsCommand ?? defaultRunsCommand;
   const inboxCommand = dependencies.inboxCommand ?? defaultInboxCommand;
@@ -855,6 +868,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     if (args.command === "result") {
       const result = await resultCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("result", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "verify") {
+      const result = await verifyCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("verify", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

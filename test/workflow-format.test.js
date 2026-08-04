@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatInbox, formatRuns, formatWorkflowResult } from "../src/workflow/format.js";
+import { formatInbox, formatRuns, formatVerify, formatWorkflowResult } from "../src/workflow/format.js";
 
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -999,4 +999,261 @@ test("--format json for inbox names the overflow instead of silently dropping bl
   assert.doesNotMatch(parsed.truncationMarker, /rerun with a narrower result query/, "the single-record fallback's advice does not apply to a command with no --limit");
   assert.match(parsed.truncationMarker, /--project/);
   assert.match(parsed.truncationMarker, /workflow result/);
+});
+
+// --- formatVerify (roadmap item 2.3's `workflow verify`) -------------------------------------
+//
+// verifyCommand's own return shape (commands.js): `{command: "verify", runId, results, passed,
+// exitCode}` on a real run; `{..., results: [], reason}` on a refusal, which appends nothing to
+// the run's event log and must not be rendered as an empty (and therefore falsely reassuring)
+// table.
+
+function verifyResult(overrides = {}) {
+  return {
+    repositoryId: "backend",
+    cwd: "/repo/acme/backend",
+    command: "pnpm typecheck",
+    status: "passed",
+    exitCode: 0,
+    output: "",
+    truncated: false,
+    durationMs: 1200,
+    ...overrides,
+  };
+}
+
+test("formatVerify renders a per-repository, per-command table, and a failure is visually distinguishable from a pass", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    passed: false,
+    exitCode: 1,
+    results: [
+      verifyResult(),
+      verifyResult({ repositoryId: "panel", cwd: "/repo/acme/panel", command: "pnpm test", status: "failed", exitCode: 1, durationMs: 340 }),
+    ],
+  };
+
+  const compact = formatVerify(value);
+  const lines = compact.split("\n");
+  assert.match(lines[0], new RegExp(`Run: ${RUN_ID}`));
+  assert.match(lines[1], /^Verify: failed$/);
+  assert.match(lines[2], /^REPO\s+\|\s+COMMAND\s+\|\s+STATUS\s+\|\s+EXIT\s+\|\s+DURATION$/);
+  assert.match(lines[3], /^backend\s+\|\s+pnpm typecheck\s+\|\s+passed\s+\|\s+0\s+\|\s+1200ms$/);
+  assert.match(lines[4], /^panel\s+\|\s+pnpm test\s+\|\s+FAILED\s+\|\s+1\s+\|\s+340ms$/);
+  assert.equal(lines.length, 5);
+
+  const dispatched = formatWorkflowResult("verify", value, "compact");
+  assert.equal(dispatched, compact);
+});
+
+test("formatVerify names a repository whose command errored or timed out underneath the table, not silently", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    passed: false,
+    exitCode: 1,
+    results: [
+      verifyResult({ repositoryId: "gone", cwd: "/repo/acme/gone", status: "error", exitCode: null, reason: "cwd not found: /repo/acme/gone" }),
+      verifyResult({ repositoryId: "backend", command: "pnpm test", status: "timed-out", exitCode: null, durationMs: 300000, reason: "timed out after 300000ms" }),
+    ],
+  };
+
+  const compact = formatVerify(value);
+  assert.match(compact, /^Reasons:$/m);
+  assert.match(compact, /^gone \| pnpm typecheck: cwd not found: \/repo\/acme\/gone$/m);
+  assert.match(compact, /^backend \| pnpm test: timed out after 300000ms$/m);
+});
+
+test("a refusal says why instead of rendering an empty table that would read as a pass", () => {
+  const value = {
+    command: "verify",
+    runId: RUN_ID,
+    results: [],
+    passed: false,
+    exitCode: 10,
+    reason: "Project ocr has no verify commands configured.",
+  };
+
+  const compact = formatVerify(value);
+  assert.equal(compact, [
+    `Run: ${RUN_ID}`,
+    "Verify: refused — Project ocr has no verify commands configured.",
+  ].join("\n"));
+  assert.doesNotMatch(compact, /Verify: passed|Verify: failed|REPO\s+\|/);
+});
+
+test("formatWorkflowResult dispatches \"verify\" to the compact per-repository table", () => {
+  const value = { command: "verify", runId: RUN_ID, passed: true, exitCode: 0, results: [verifyResult()] };
+  const compact = formatWorkflowResult("verify", value, "compact");
+  assert.match(compact, /^Verify: passed$/m);
+  assert.match(compact, /^REPO\s+\|\s+COMMAND/m);
+});
+
+// --- formatResult's claim/proof split (roadmap item 2.3) -------------------------------------
+//
+// resultCommand's own new field, `verifiedEvidence`: `{verifiedAt, passed, exitCode, results}` or
+// `null` when `workflow verify` has never successfully completed against this run (a refusal
+// appends nothing, so "never run" and "always refused" are indistinguishable from the event log
+// alone -- this renderer does not claim to know which).
+
+function workerClaim() {
+  return [
+    { command: "pnpm typecheck", status: "passed", summary: "clean" },
+    { command: "pnpm test", status: "passed", summary: "47 passed" },
+  ];
+}
+
+test("formatResult renders the worker's claim and the recorded evidence as two labeled, unmerged sections", () => {
+  const value = {
+    command: "result",
+    runId: RUN_ID,
+    status: "completed",
+    result: { status: "completed", summary: "Done", verification: workerClaim() },
+    verifiedEvidence: {
+      verifiedAt: "2026-08-04T12:00:00.000Z",
+      passed: true,
+      exitCode: 0,
+      results: [
+        verifyResult({ command: "pnpm typecheck" }),
+        verifyResult({ command: "pnpm test", durationMs: 5000 }),
+      ],
+    },
+  };
+
+  const compact = formatWorkflowResult("result", value, "compact");
+  assert.match(compact, /^Reported by the worker:$/m);
+  assert.match(compact, /^- pnpm typecheck: passed — clean$/m);
+  assert.match(compact, /^- pnpm test: passed — 47 passed$/m);
+  assert.match(compact, /^Verified by workflow verify \(passed, ran 2026-08-04T12:00:00\.000Z\):$/m);
+  assert.match(compact, /^REPO\s+\|\s+COMMAND\s+\|\s+STATUS/m);
+  assert.match(compact, /^backend\s+\|\s+pnpm typecheck\s+\|\s+passed/m);
+});
+
+test("a claim with no recorded evidence says the evidence is missing, not nothing", () => {
+  const value = {
+    command: "result",
+    runId: RUN_ID,
+    status: "completed",
+    result: { status: "completed", verification: workerClaim() },
+    verifiedEvidence: null,
+    verifyCommand: `workflow verify ${RUN_ID}`,
+  };
+
+  const compact = formatWorkflowResult("result", value, "compact");
+  assert.match(compact, /^Reported by the worker:$/m);
+  assert.match(compact, new RegExp(`^Verified by workflow verify: no recorded evidence \\(run \`workflow verify ${RUN_ID}\`\\)$`, "m"));
+  assert.doesNotMatch(compact, /^Verified by workflow verify:\s*$/m, "must not read as an empty section with nothing to say");
+});
+
+test("no worker claim and no evidence still names both sections explicitly", () => {
+  const value = { command: "result", runId: RUN_ID, status: "pending", verifiedEvidence: null };
+  const compact = formatWorkflowResult("result", value, "compact");
+  assert.match(compact, /^Reported by the worker: none$/m);
+  assert.match(compact, /^Verified by workflow verify: no recorded evidence$/m);
+});
+
+test("a disagreement between the worker's claim and the recorded evidence is visible in both sections, with no computed verdict", () => {
+  const value = {
+    command: "result",
+    runId: RUN_ID,
+    status: "completed",
+    result: {
+      status: "completed",
+      verification: [{ command: "pnpm test", status: "passed", summary: "all green" }],
+    },
+    verifiedEvidence: {
+      verifiedAt: "2026-08-04T12:00:00.000Z",
+      passed: false,
+      exitCode: 1,
+      results: [verifyResult({ command: "pnpm test", status: "failed", exitCode: 1, output: "1 failing" })],
+    },
+  };
+
+  const compact = formatWorkflowResult("result", value, "compact");
+  assert.match(compact, /^- pnpm test: passed — all green$/m);
+  assert.match(compact, /^backend\s+\|\s+pnpm test\s+\|\s+FAILED\s+\|\s+1/m);
+
+  // The disagreement is left for the operator to read, not computed or named by this renderer --
+  // no "mismatch"/"disagreement"/"conflict" verdict word anywhere in the output.
+  assert.doesNotMatch(compact, /mismatch|disagree|conflict|discrepanc/i);
+});
+
+// --- JSON size discipline for verify's own results, and result's embedded evidence -----------
+//
+// verify-runner.js's own per-command capture cap is 4000 bytes (DEFAULT_MAX_OUTPUT_BYTES); a
+// modest 3-repository x 3-command matrix -- a real multi-repo project's realistic scale, see the
+// design doc's own Acme example -- can carry up to 36,000 raw bytes of captured output alone,
+// several times over the shared 12,000-character OUTPUT_LIMIT before counting anything else in
+// the payload. This is the scale the brief names explicitly: "the bulkiest thing this repo has
+// put in a result yet."
+
+function heavyVerifyResult(repositoryId, command, overrides = {}) {
+  return verifyResult({
+    repositoryId,
+    cwd: `/repo/acme/${repositoryId}`,
+    command,
+    output: "x".repeat(4000), // the runner's own real per-command cap
+    ...overrides,
+  });
+}
+
+test("--format json for verify stays well under OUTPUT_LIMIT for a realistic multi-repository matrix, even at each command's full captured-output cap", () => {
+  const repositories = ["backend", "panel", "docs"];
+  const commands = ["pnpm typecheck", "pnpm biome:check", "pnpm ci:verify"];
+  const results = repositories.flatMap((repositoryId) => commands.map((command) => heavyVerifyResult(repositoryId, command)));
+  const value = { command: "verify", runId: RUN_ID, passed: true, exitCode: 0, results };
+
+  // Sanity check on the fixture: unbounded, this really would overflow -- otherwise the test
+  // proves nothing about the bounding this task adds (the same discipline runs/inbox's own
+  // headroom tests apply, see their own comments).
+  const unboundedLength = JSON.stringify(value, null, 2).length;
+  assert.ok(unboundedLength > 12000, `fixture too small to prove anything: ${unboundedLength} characters unbounded`);
+
+  const json = formatWorkflowResult("verify", value, "json");
+  assert.ok(json.length < 12000 * 0.9, `verify JSON for a 3x3 matrix at full output was ${json.length} characters`);
+
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, undefined, "a realistic matrix must not engage the overflow fallback");
+  assert.equal(parsed.results.length, 9);
+  for (const result of parsed.results) {
+    assert.ok(result.output.length < 4000, "each result's output must be bounded well below the runner's own capture cap");
+  }
+});
+
+test("--format json for verify names the overflow instead of silently dropping the matrix at extreme scale", () => {
+  const repositories = Array.from({ length: 10 }, (_, i) => `repo-${i}`);
+  const commands = Array.from({ length: 6 }, (_, i) => `command-${i}`);
+  const results = repositories.flatMap((repositoryId) => commands.map((command) => heavyVerifyResult(repositoryId, command)));
+  const value = { command: "verify", runId: RUN_ID, passed: false, exitCode: 1, results };
+
+  const json = formatWorkflowResult("verify", value, "json");
+  const parsed = JSON.parse(json);
+
+  assert.equal(parsed.command, "verify");
+  assert.equal(parsed.runId, RUN_ID);
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.resultCount, results.length);
+  assert.deepEqual(parsed.repositoryIds.slice().sort(), repositories.slice().sort());
+  assert.deepEqual(parsed.commands.slice().sort(), commands.slice().sort());
+  assert.equal(parsed.results, undefined, "the collapsed shape must not pretend to still carry the full matrix");
+});
+
+test("--format json for result also bounds each verified-evidence result's captured output", () => {
+  const value = {
+    command: "result",
+    runId: RUN_ID,
+    status: "completed",
+    verifiedEvidence: {
+      verifiedAt: "2026-08-04T12:00:00.000Z",
+      passed: true,
+      exitCode: 0,
+      results: [heavyVerifyResult("backend", "pnpm test")],
+    },
+  };
+
+  const json = formatWorkflowResult("result", value, "json");
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, undefined);
+  assert.ok(parsed.verifiedEvidence.results[0].output.length < 4000);
 });

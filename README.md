@@ -54,7 +54,7 @@ workflow status ocr ASANA-123 --feature "Discovered Docs"
 
 ## Safety boundaries
 
-- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, `workflow reconcile`, `workflow runs`, and `workflow inbox` are read-only.
+- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, `workflow verify`, `workflow reconcile`, `workflow runs`, and `workflow inbox` are read-only.
 - `workflow start`, `workflow launch`, and `workflow runtime` require explicit confirmation or `--yes`; `workflow launch --yes` also requires the current `--approval-digest` from a dry-run preview.
 - In other words, every mutating launcher command requires explicit confirmation or --yes.
 - `workflow launch` reads the untrusted request only from `--prompt-file`; there is no `--prompt` option.
@@ -117,7 +117,7 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 
 ### Launcher safety boundaries
 
-- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, `workflow reconcile`, `workflow runs`, and `workflow inbox` are read-only.
+- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, `workflow verify`, `workflow reconcile`, `workflow runs`, and `workflow inbox` are read-only.
 - `workflow start`, `workflow launch`, and `workflow runtime` require explicit confirmation or `--yes`; `workflow launch --yes` also requires the current `--approval-digest` from a dry-run preview.
 - In other words, every mutating launcher command requires explicit confirmation or --yes.
 - `workflow start` and `workflow launch` are separate: `workflow start` preserves the original no-prompt workspace preparation semantics, while `workflow launch` creates an approved run assignment from `--prompt-file` and starts one selected worker harness.
@@ -167,6 +167,7 @@ workflow launch ocr ASANA-123 --agent claude-worker --prompt-file request.md --d
 workflow launch ocr ASANA-123 --agent codex-worker --prompt-file request.md --dry-run
 workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --approval-digest sha256:<digest> --yes
 workflow result <run-id>
+workflow verify <run-id>
 workflow reconcile [project] --run <run-id>
 workflow runs [project] [--state <state>] [--all]
 workflow inbox [project]
@@ -184,6 +185,8 @@ Use `workflow plan` as the read-only environment checkpoint before `workflow sta
 `workflow runs [project] [--state <state>] [--all]` is the read-only board across every project: it answers what is running and what needs input without already knowing a run id. It defaults to the live set — everything except `completed`, `failed`, and `interrupted`, since the control plane cannot tell "completed and merged" from "completed and forgotten" apart — `--all` shows every state, and `--state <state>` narrows to exactly one. `--format json` carries a documented per-run projection sized for a board — `id`, `directory`, `state`, `projectAlias`, `primaryTicket`, `harness`, `updatedAt`, and `repositories` (the field the compact table cannot render) — not the full run record; see `runProjection` in `src/workflow/format.js` and the correction in `docs/superpowers/specs/2026-08-04-workflow-runs-board-design.md`. An operator or script that needs the rest of a run's fields runs `workflow result <run-id>`.
 
 `workflow inbox [project]` is the read-only answer to "which of my workers is waiting on me", across every project, without looking at panes. It starts from the same live-run set `workflow runs`' default view uses, asks Herdr for each run's live agent status exactly once, and reports three lists: `blocked` (an agent actually sitting at a permission prompt right now, per Herdr's live `agent_status` — distinct from `workflow runs --state blocked`, which only ever shows a worker that self-reported being stuck in its own handoff, never a live prompt); `waiting` (a non-terminal run whose own state already means it needs the operator — `manual-handoff-required`, `needs-input`, or self-reported `blocked` — decided by the run's state alone, regardless of whether its agent could be resolved or what status it reports, because that is what makes it wait on a human); and `unresolved` (an *active* run — `running`, `launching`, `idle-awaiting-handoff`, or `result-stale` — whose agent status could not be confirmed or classified: no pane id, no matching live agent, Herdr unreachable, or a status Herdr reported that this command does not recognize, all reported with a reason rather than silently dropped, because an inbox that omits what it could not check is worse than one that admits uncertainty). Exit code is always `0`, including a non-empty inbox: a blocked or waiting worker is information, not a failure. See `docs/superpowers/specs/2026-08-04-workflow-inbox-design.md` for the correlation defect this command works around (a resumed run's live pane lives at `transportIdentity.paneId`, not the stale top-level `paneId`) and why the command is anchored on runs rather than on Herdr's raw agent list.
+
+`workflow verify <run-id> [--format compact|json]` re-runs the project's own `verify` commands (from the *current* registry, not a snapshot) once per repository the run recorded, inside the exact worktree paths that run used, and writes structured pass/fail evidence to the run's event log — so "verification: passed" is something an operator can check, not just something a worker claimed. It is the one command in this CLI that runs a real shell (`/bin/sh -c`), a documented, single-site departure from every other spawn's `shell: false`: these are the operator's own strings from their own registry, not a worker's, and they enter no approval digest. A run with no repositories recorded, a project missing from the registry, or a project with no `verify` commands is refused with that specific reason, and nothing is appended for a run that was never actually verified. Exit code reflects the outcome: `0` for a pass, `1` for a failure, `10` for a refusal. `workflow result <run-id>` then shows two labeled, never-merged sections: **Reported by the worker** (the handoff's own self-reported `verification[]`) and **Verified by `workflow verify`** (the recorded evidence, with when it last ran, or an explicit "no recorded evidence" line if `workflow verify` has never completed against the run). Neither section overwrites the other and no verdict is computed about a disagreement between them — a command the worker called `passed` that the evidence shows failing is the most useful thing this pairing can surface, and it is left for the operator to read. See `docs/superpowers/specs/2026-08-04-workflow-verify-design.md`.
 
 ### Worker handoff and results
 

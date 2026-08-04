@@ -186,6 +186,48 @@ function formatLaunch(value) {
     : formatLaunchRun(value);
 }
 
+// --- formatResult's claim/proof split (roadmap item 2.3) ---------------------------------------
+//
+// Two sources, never merged, and no computed verdict about their disagreement (design spec: "A
+// design that overwrote the self-report would destroy the more interesting half of the signal"):
+//  - the claim: the worker's own self-reported `verification[]` from its handoff (handoff.js),
+//    carried on `value.result.verification` exactly as resultCommand already exposes the rest of
+//    the worker's result.
+//  - the proof: the recorded evidence from the run's event log, resultCommand's own
+//    `verifiedEvidence` (`readLatestVerificationEvidence` there) -- absent when `workflow verify`
+//    has never successfully completed against this run. A refusal appends nothing to the event
+//    log (verifyRefusal's own contract), so "never run" and "always refused" are indistinguishable
+//    from the log alone; this renderer does not claim to know which -- it only ever says the
+//    evidence is missing, not why.
+// Both sections always render, even when empty, so an operator never has to wonder whether a
+// missing section means "nothing to report" or "this view forgot to ask" -- the same discipline
+// formatRuns/formatInbox apply to an empty board (see their own comments).
+function verificationClaimLines(result) {
+  const claim = list(result?.verification);
+  if (claim.length === 0) return ["Reported by the worker: none"];
+  const lines = ["Reported by the worker:"];
+  for (const entry of claim) {
+    const summary = entry?.summary ? ` — ${entry.summary}` : "";
+    lines.push(`- ${text(entry?.command)}: ${text(entry?.status)}${summary}`);
+  }
+  return lines;
+}
+
+function verificationEvidenceLines(evidence, verifyCommandHint) {
+  if (!evidence) {
+    const hint = verifyCommandHint ? ` (run \`${verifyCommandHint}\`)` : "";
+    return [`Verified by workflow verify: no recorded evidence${hint}`];
+  }
+  const lines = [`Verified by workflow verify (${evidence.passed ? "passed" : "failed"}, ran ${text(evidence.verifiedAt)}):`];
+  const results = list(evidence.results);
+  if (results.length === 0) {
+    lines.push("Results: none");
+  } else {
+    lines.push(...renderTable(VERIFY_COLUMNS, results.map(verifyRow)));
+  }
+  return lines;
+}
+
 function formatResult(value) {
   const lines = [
     `Run: ${text(value.runId)}`,
@@ -193,6 +235,8 @@ function formatResult(value) {
   ];
   if (value.state) lines.push(`State: ${value.state}`);
   if (value.result?.summary) lines.push(`Summary: ${value.result.summary}`);
+  lines.push(...verificationClaimLines(value.result));
+  lines.push(...verificationEvidenceLines(value.verifiedEvidence, value.verifyCommand));
   if (value.resultCommand) lines.push(`Result: ${value.resultCommand}`);
   if (value.statusCommand) lines.push(`Status command: ${value.statusCommand}`);
   if (value.reconcileCommand) lines.push(`Reconcile: ${value.reconcileCommand}`);
@@ -532,6 +576,86 @@ export function formatInbox(value = {}) {
   return bound(lines.join("\n"));
 }
 
+// --- formatVerify: the compact view for `workflow verify` (roadmap item 2.3) -------------------
+//
+// verifyCommand's own return shape (commands.js): `{command: "verify", runId, results, passed,
+// exitCode}` on a real run, or `{command: "verify", runId, results: [], passed: false, exitCode,
+// reason}` on a refusal (no repositories[], unknown project, no verify commands configured) --
+// verifyRefusal's own comment there: refusals append nothing to the run's event log because
+// nothing was verified, and rendering an empty table for one would read as "verified, and
+// everything passed" -- the exact false green this whole item exists to remove. `reason` is the
+// refusal's own signal (a real run never carries one), checked here rather than importing
+// VERIFY_EXIT_CODES from commands.js -- this file stays dependency-free, matching every other
+// renderer in it.
+//
+// Never renders a result's captured command output in the compact table -- a verify result can
+// carry up to several KB of stdout/stderr (verify-runner.js's own per-command cap), and a summary
+// table is the wrong place for it regardless of size (the same call formatRuns's own comment makes
+// about repositories: "the table cannot honestly render this at all"). `--format json` carries a
+// bounded head of it instead -- see boundVerificationResultForJson below. Shared with
+// formatResult's own "Verified by workflow verify" section (verificationEvidenceLines above), so
+// the compact table for `workflow verify` and the evidence table inside `workflow result` are
+// exactly the same rendering, not two copies that could drift.
+const VERIFY_COLUMNS = [
+  { key: "repo", label: "REPO" },
+  { key: "command", label: "COMMAND" },
+  { key: "status", label: "STATUS" },
+  { key: "exit", label: "EXIT" },
+  { key: "duration", label: "DURATION" },
+];
+
+// Only "passed" stays lowercase; every other status (failed/timed-out/error) is upper-cased so a
+// failing row visually stands out from a passing one at a glance, without leaning on color or
+// emoji this file does not use anywhere else in a table cell (RUNS_COLUMNS/INBOX_COLUMNS render
+// their status-shaped values verbatim). This is the property the design spec names as the single
+// most valuable thing this command can show: a command the worker called passed that the evidence
+// shows failing must not blend into the row above it.
+function verifyStatusLabel(status) {
+  return status === "passed" ? "passed" : text(status).toUpperCase();
+}
+
+function verifyRow(result = {}) {
+  return {
+    repo: text(result.repositoryId),
+    command: text(result.command),
+    status: verifyStatusLabel(result.status),
+    exit: result.exitCode === null || result.exitCode === undefined ? "-" : String(result.exitCode),
+    duration: Number.isFinite(result.durationMs) ? `${result.durationMs}ms` : "unknown",
+  };
+}
+
+// A result only ever carries `reason` for an error or timed-out command (tasks 1/2's own
+// contract); named underneath the table rather than folded into it as a sixth column, the same
+// layering formatDoctor uses for a check's optional reason.
+function appendVerifyReasons(lines, results) {
+  const withReason = results.filter((result) => result?.reason);
+  if (withReason.length === 0) return;
+  lines.push("Reasons:");
+  for (const result of withReason) {
+    lines.push(`${text(result.repositoryId)} | ${text(result.command)}: ${result.reason}`);
+  }
+}
+
+export function formatVerify(value = {}) {
+  const lines = [`Run: ${text(value.runId)}`];
+
+  if (value.reason) {
+    lines.push(`Verify: refused — ${value.reason}`);
+    return bound(lines.join("\n"));
+  }
+
+  const results = list(value.results);
+  lines.push(`Verify: ${value.passed ? "passed" : "failed"}`);
+  if (results.length === 0) {
+    lines.push("Results: none");
+  } else {
+    lines.push(...renderTable(VERIFY_COLUMNS, results.map(verifyRow)));
+  }
+  appendVerifyReasons(lines, results);
+
+  return bound(lines.join("\n"));
+}
+
 // The projection roadmap item 2.1's design spec promised ("machines get complete records") was
 // wrong at board scale, and the wrongness is measured, not theoretical: against the 8 real runs
 // on the machine that first ran this command, whole records serialize to 53,791 characters for
@@ -577,11 +701,46 @@ function runProjection(run) {
   };
 }
 
+// Verify's own captured command output (verify-runner.js's DEFAULT_MAX_OUTPUT_BYTES, 4000 bytes
+// per command) is the bulkiest thing this repo has put in a result: a modest 3-repository,
+// 3-command matrix (9 results) can carry up to 36,000 raw bytes of output alone, several times
+// over the shared OUTPUT_LIMIT, before counting anything else in the payload. The compact view
+// never shows this text at all (verifyRow only ever renders status/exit/duration -- see its own
+// comment); `--format json` still carries a head of each command's output (useful to a consumer
+// that wants it) but caps it far below the source-side per-command capture limit, on a per-result
+// basis -- measured (see the headroom test in test/workflow-format.test.js) to keep a realistic
+// matrix comfortably under budget without falling through to the overflow fallback below, which
+// drops the evidence's structure entirely, not just its bulk. Shared by both `workflow verify`'s
+// own JSON and `workflow result`'s embedded `verifiedEvidence.results` -- one bound, not two.
+const VERIFY_JSON_OUTPUT_LIMIT = 500;
+
+function boundVerificationResultForJson(result) {
+  if (!result || typeof result !== "object") return result;
+  return { ...result, output: bound(result.output ?? "", VERIFY_JSON_OUTPUT_LIMIT, "output") };
+}
+
+function boundVerificationResultsForJson(results) {
+  return list(results).map(boundVerificationResultForJson);
+}
+
 function valueForJson(command, value) {
   if (command === "worker-status" || command === "worker-watch") return publicWorkerResult(value);
   if (command === "runs") {
     if (!value || typeof value !== "object") return value;
     return { ...value, runs: list(value.runs).map(runProjection) };
+  }
+  if (command === "verify") {
+    if (!value || typeof value !== "object") return value;
+    return { ...value, results: boundVerificationResultsForJson(value.results) };
+  }
+  if (command === "result") {
+    if (!value || typeof value !== "object" || !value.verifiedEvidence || typeof value.verifiedEvidence !== "object") {
+      return value;
+    }
+    return {
+      ...value,
+      verifiedEvidence: { ...value.verifiedEvidence, results: boundVerificationResultsForJson(value.verifiedEvidence.results) },
+    };
   }
   if (command !== "launch" || !value || typeof value !== "object" || !Object.hasOwn(value, "assignment")) {
     return value;
@@ -688,6 +847,33 @@ function inboxOverflowFallback(command, source, limit) {
   };
 }
 
+// The same collapse `runs`/`inbox` measured at board scale can happen to a SINGLE `workflow
+// verify` invocation, because the multiplier here is not run count but repository count x command
+// count (see VERIFY_JSON_OUTPUT_LIMIT's own comment) -- and unlike `runs`/`inbox`, this is not just
+// an extreme-scale edge case: a real multi-repository project with a handful of verify commands
+// each is well within reach of an operator's own registry. The general fallback below was built
+// for single-record commands where "rerun narrower" is real advice (`result`/`reconcile` take one
+// run id, so a caller can always ask for less); `verify` has no way to ask for fewer repositories
+// or commands -- rerunning faces the exact same matrix, still capped the same way -- so its own
+// fallback names what actually happened instead of offering advice that does not apply, the same
+// fix runsOverflowFallback/inboxOverflowFallback made for their own commands.
+function verifyOverflowFallback(command, source, limit) {
+  const results = list(source.results);
+  const repositoryIds = unique(results.map((result) => result?.repositoryId));
+  const commandsRun = unique(results.map((result) => result?.command));
+  return {
+    command: source.command ?? command,
+    runId: source.runId,
+    passed: Boolean(source.passed),
+    exitCode: source.exitCode,
+    resultCount: results.length,
+    repositoryIds,
+    commands: commandsRun,
+    truncated: true,
+    truncationMarker: `JSON output truncated at ${limit} characters even after bounding each result's captured output to ${VERIFY_JSON_OUTPUT_LIMIT} characters; ${results.length} results did not fit and were dropped from this response. repositoryIds/commands name what ran; the compact view (--format compact, the default) always renders the full matrix without this bound.`,
+  };
+}
+
 function boundedJson(command, value) {
   const text = JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
   const limit = command === "launch" ? ASSIGNMENT_OUTPUT_LIMIT + OUTPUT_LIMIT : OUTPUT_LIMIT;
@@ -699,6 +885,9 @@ function boundedJson(command, value) {
   }
   if (command === "inbox") {
     return JSON.stringify(normalizeJson(inboxOverflowFallback(command, source, limit)), null, 2);
+  }
+  if (command === "verify") {
+    return JSON.stringify(normalizeJson(verifyOverflowFallback(command, source, limit)), null, 2);
   }
   return JSON.stringify(normalizeJson({
     command: source.command ?? command,
@@ -724,6 +913,8 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatLaunch(value);
     case "result":
       return formatResult(value);
+    case "verify":
+      return formatVerify(value);
     case "reconcile":
       return formatReconcile(value);
     case "resume":
