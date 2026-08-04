@@ -25,6 +25,7 @@ import {
   reconcileCommand as defaultReconcileCommand,
   resultCommand as defaultResultCommand,
   resumeCommand as defaultResumeCommand,
+  runsCommand as defaultRunsCommand,
   statusCommand as defaultStatusCommand,
   unlockCommand as defaultUnlockCommand,
   workerStatusCommand as defaultWorkerStatusCommand,
@@ -54,6 +55,7 @@ Commands:
   workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow result <run-id> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
+  workflow runs [project] [--state <state>] [--all] [--format compact|json]
   workflow resume <run-id> [--yes] [--format compact|json]
   workflow close <run-id> [--format compact|json]
   workflow unlock <run-id> [--yes] [--format compact|json]
@@ -72,7 +74,7 @@ Commands:
 Environment:
   WORKFLOW_PROJECTS_FILE   Alternate workflow registry path
   WORKFLOW_STATE_ROOT      Workflow run-state root for handoff`;
-const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help", "input", "prompt-file", "selection-reason", "origin-session", "dry-run", "approval-digest", "run"]);
+const KNOWN_OPTIONS = new Set(["feature", "repos", "tickets", "profile", "agent", "format", "yes", "help", "input", "prompt-file", "selection-reason", "origin-session", "dry-run", "approval-digest", "run", "state", "all"]);
 
 function bound(text, limit = OUTPUT_LIMIT) {
   const value = String(text ?? "").replace(/\r\n?/g, "\n");
@@ -98,7 +100,7 @@ function consumeOptions(tokens) {
     const name = token.slice(2);
     if (!KNOWN_OPTIONS.has(name)) throw new Error(`Unknown option: --${name}`);
     if (Object.hasOwn(options, name)) throw new Error(`Duplicate option: --${name}`);
-    if (name === "yes" || name === "help" || name === "dry-run") {
+    if (name === "yes" || name === "help" || name === "dry-run" || name === "all") {
       options[name] = true;
       continue;
     }
@@ -328,6 +330,17 @@ export function parseArgs(argv) {
       command,
       ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
       runId: options.run,
+      format,
+    };
+  }
+
+  if (command === "runs") {
+    validateShape("runs", positionals, options, { min: 0, max: 1, allowedOptions: ["state", "all"] });
+    return {
+      command,
+      ...(positionals[0] ? { projectAlias: positionals[0] } : {}),
+      ...(options.state ? { state: options.state } : {}),
+      ...(options.all ? { all: true } : {}),
       format,
     };
   }
@@ -710,6 +723,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
+  const runsCommand = dependencies.runsCommand ?? defaultRunsCommand;
   const resumeCommand = dependencies.resumeCommand ?? defaultResumeCommand;
   const closeCommand = dependencies.closeCommand ?? defaultCloseCommand;
   const unlockCommand = dependencies.unlockCommand ?? defaultUnlockCommand;
@@ -843,6 +857,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
         { ...liveDependencies, inspectProcess: liveDependencies.inspectProcessByPid },
       );
       emit(out, formatWorkflowResult("reconcile", result, args.format));
+      return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    if (args.command === "runs") {
+      const result = await runsCommand(options, liveDependencies);
+      emit(out, formatWorkflowResult("runs", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }
 

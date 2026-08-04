@@ -324,6 +324,7 @@ test("installed symlink executes the workflow entry point", async () => {
   assert.match(result.stdout, /workflow launch <project> <primary-ticket> .*--prompt-file <path>/);
   assert.match(result.stdout, /workflow result <run-id>/);
   assert.match(result.stdout, /workflow reconcile \[project\] --run <run-id>/);
+  assert.match(result.stdout, /workflow runs \[project\] \[--state <state>\] \[--all\]/);
   assert.match(result.stdout, /workflow resume <run-id>/);
   assert.match(result.stdout, /workflow close <run-id>/);
   assert.match(result.stdout, /workflow unlock <run-id>/);
@@ -408,6 +409,19 @@ test("parses documented workflow commands and options", () => {
     command: "reconcile",
     projectAlias: "acme",
     runId: RUN_ID,
+    format: "json",
+  });
+
+  assert.deepEqual(parseArgs(["runs"]), {
+    command: "runs",
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["runs", "acme", "--state", "running", "--all", "--format", "json"]), {
+    command: "runs",
+    projectAlias: "acme",
+    state: "running",
+    all: true,
     format: "json",
   });
 
@@ -513,6 +527,9 @@ test("rejects unknown, duplicate, and disallowed options", () => {
   assert.throws(() => parseArgs(["result", RUN_ID, "--yes"]), /result does not accept --yes/i);
   assert.throws(() => parseArgs(["result", RUN_ID, "--prompt-file", "/tmp/request.md"]), /result does not accept --prompt-file/i);
   assert.throws(() => parseArgs(["reconcile", "--run", RUN_ID, "--yes"]), /reconcile does not accept --yes/i);
+  assert.throws(() => parseArgs(["runs", "acme", "extra"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["runs", "--yes"]), /runs does not accept --yes/i);
+  assert.throws(() => parseArgs(["runs", "--bogus"]), /Unknown option: --bogus/i);
   assert.throws(() => parseArgs(["resume", "../not-a-run"]), /path-safe|UUID/i);
   assert.throws(() => parseArgs(["close", RUN_ID, "--yes"]), /close does not accept --yes/i);
   assert.throws(() => parseArgs(["close", "../not-a-run"]), /path-safe|UUID/i);
@@ -1406,6 +1423,98 @@ test("main wires reconcile with the same ps-based process inspector unlock and g
 
   assert.equal(code, 0);
   assert.deepEqual(output.stdout, ["reconcile:pending"]);
+});
+
+test("runs is read-only and passes the positional project, --state, and --all through to the command", async () => {
+  const output = io();
+  const calls = [];
+  const code = await main(["runs", "acme", "--state", "running", "--format", "json"], {
+    ...output,
+    runsCommand: async (options) => {
+      calls.push(options);
+      return { command: "runs", runs: [], skipped: [], exitCode: 0 };
+    },
+    executeStart: async () => {
+      throw new Error("runs must not launch or repair");
+    },
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{
+    command: "runs",
+    projectAlias: "acme",
+    state: "running",
+    format: "json",
+    registryPath: join(packageRoot, "projects.yaml"),
+  }]);
+  assert.deepEqual(JSON.parse(output.stdout[0]), { command: "runs", runs: [], skipped: [], exitCode: 0 });
+  assert.deepEqual(output.stderr, []);
+});
+
+test("runs --all reaches the command with no project narrowing", async () => {
+  const output = io();
+  const calls = [];
+  const code = await main(["runs", "--all"], {
+    ...output,
+    runsCommand: async (options) => {
+      calls.push(options);
+      return { command: "runs", runs: [], skipped: [], exitCode: 0 };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.runs.length}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(calls, [{
+    command: "runs",
+    all: true,
+    format: "compact",
+    registryPath: join(packageRoot, "projects.yaml"),
+  }]);
+  assert.deepEqual(output.stdout, ["runs:0"]);
+});
+
+test("workflow runs end-to-end against a real store: renders the board, an empty board, skipped residue, JSON with repositories, and refuses an unknown --state", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "workflow-runs-cli-e2e-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateRoot = join(dir, "state");
+  const store = createRunStore({ stateRoot });
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    state: RUN_STATES.PLANNED,
+    repositories: [{ id: "repository", path: "/tmp/ocr", branch: "main" }],
+  });
+  await store.update(run.id, () => ({ state: RUN_STATES.LAUNCHING }));
+  await store.update(run.id, () => ({ state: RUN_STATES.RUNNING }));
+
+  const populated = io();
+  assert.equal(await main(["runs"], { ...populated, stateRoot }), 0);
+  assert.match(populated.stdout[0], /RUN\s+\| STATE/);
+  assert.match(populated.stdout[0], /ocr/);
+  assert.match(populated.stdout[0], /A-1/);
+  assert.deepEqual(populated.stderr, []);
+
+  const json = io();
+  assert.equal(await main(["runs", "--format", "json"], { ...json, stateRoot }), 0);
+  const parsed = JSON.parse(json.stdout[0]);
+  assert.equal(parsed.runs.length, 1);
+  assert.deepEqual(parsed.runs[0].repositories, [{ id: "repository", path: "/tmp/ocr", branch: "main" }]);
+
+  const empty = io();
+  assert.equal(await main(["runs", "acme"], { ...empty, stateRoot }), 0);
+  assert.deepEqual(empty.stdout, ["Runs: none"]);
+
+  const brokenRunId = "99999999-9999-4999-8999-999999999999";
+  await mkdir(join(stateRoot, brokenRunId), { recursive: true, mode: 0o700 });
+  await writeFile(join(stateRoot, brokenRunId, "run.json"), "not json", { mode: 0o600 });
+
+  const skipped = io();
+  assert.equal(await main(["runs"], { ...skipped, stateRoot }), 0);
+  assert.match(skipped.stdout[0], new RegExp(`Skipped: 1 \\(${brokenRunId}\\)`));
+
+  const bogus = io();
+  assert.equal(await main(["runs", "--state", "bogus"], { ...bogus, stateRoot }), 64);
+  assert.match(bogus.stderr[0], /USAGE.*Unknown run state/i);
 });
 
 test("resume and close subcommands dispatch to their commands read-only until confirmed, wired with the live Pi delegation transport", async () => {

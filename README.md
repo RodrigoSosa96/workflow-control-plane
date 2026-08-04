@@ -54,7 +54,7 @@ workflow status ocr ASANA-123 --feature "Discovered Docs"
 
 ## Safety boundaries
 
-- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, and `workflow reconcile` are read-only.
+- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, `workflow reconcile`, and `workflow runs` are read-only.
 - `workflow start`, `workflow launch`, and `workflow runtime` require explicit confirmation or `--yes`; `workflow launch --yes` also requires the current `--approval-digest` from a dry-run preview.
 - In other words, every mutating launcher command requires explicit confirmation or --yes.
 - `workflow launch` reads the untrusted request only from `--prompt-file`; there is no `--prompt` option.
@@ -117,7 +117,7 @@ The repository also includes a deterministic `workflow` CLI for read-only planni
 
 ### Launcher safety boundaries
 
-- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, and `workflow reconcile` are read-only.
+- `workflow doctor`, `workflow plan`, `workflow status`, `workflow result`, `workflow reconcile`, and `workflow runs` are read-only.
 - `workflow start`, `workflow launch`, and `workflow runtime` require explicit confirmation or `--yes`; `workflow launch --yes` also requires the current `--approval-digest` from a dry-run preview.
 - In other words, every mutating launcher command requires explicit confirmation or --yes.
 - `workflow start` and `workflow launch` are separate: `workflow start` preserves the original no-prompt workspace preparation semantics, while `workflow launch` creates an approved run assignment from `--prompt-file` and starts one selected worker harness.
@@ -168,6 +168,7 @@ workflow launch ocr ASANA-123 --agent codex-worker --prompt-file request.md --dr
 workflow launch ocr ASANA-123 --agent pi-worker --prompt-file request.md --approval-digest sha256:<digest> --yes
 workflow result <run-id>
 workflow reconcile [project] --run <run-id>
+workflow runs [project] [--state <state>] [--all]
 workflow handoff <run-id> --input <run-directory>/handoff-input.json
 workflow delegation result <run-id> <delegation-id>
 workflow delegation reconcile <run-id> <delegation-id>
@@ -178,6 +179,8 @@ workflow plan acme ASANA-456 --feature Onboarding --repos backend,panel
 ```
 
 Use `workflow plan` as the read-only environment checkpoint before `workflow start`. Use `workflow launch ... --dry-run` as the assignment preview checkpoint before `workflow launch --yes`: the preview prints the full approved assignment and an approval digest, and the non-dry launch recomputes the current preview before accepting that digest. If a launch is interrupted, inspect `workflow result <run-id>`, `workflow reconcile --run <run-id>`, and the preserved fallback terminal/workspace before retrying any mutating command.
+
+`workflow runs [project] [--state <state>] [--all]` is the read-only board across every project: it answers what is running and what needs input without already knowing a run id. It defaults to the live set — everything except `completed`, `failed`, and `interrupted`, since the control plane cannot tell "completed and merged" from "completed and forgotten" apart — `--all` shows every state, and `--state <state>` narrows to exactly one. `--format json` carries full run records, including `repositories`.
 
 ### Worker handoff and results
 
