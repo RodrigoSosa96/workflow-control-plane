@@ -14,6 +14,24 @@ export const RUN_STATES = Object.freeze({
   RESULT_STALE: "result-stale",
 });
 
+// The board's default view, defined next to the states so a new state has to be classified
+// deliberately rather than defaulting in or out.
+// NOT a state-machine property: completed/failed/interrupted can all transition back to
+// running via resume (see ALLOWED below). This is a presentation decision about what an
+// operator wants to see as currently in play, not a terminal/non-terminal split the state
+// machine itself defines. `planned` is live: a run that never launched is either about to or
+// is residue, and both want attention.
+export const LIVE_RUN_STATES = Object.freeze(new Set([
+  RUN_STATES.PLANNED,
+  RUN_STATES.LAUNCHING,
+  RUN_STATES.RUNNING,
+  RUN_STATES.IDLE_AWAITING_HANDOFF,
+  RUN_STATES.NEEDS_INPUT,
+  RUN_STATES.BLOCKED,
+  RUN_STATES.MANUAL_HANDOFF_REQUIRED,
+  RUN_STATES.RESULT_STALE,
+]));
+
 const ALLOWED = Object.freeze({
   [RUN_STATES.PLANNED]: new Set([RUN_STATES.LAUNCHING, RUN_STATES.FAILED]),
   [RUN_STATES.LAUNCHING]: new Set([RUN_STATES.RUNNING, RUN_STATES.FAILED, RUN_STATES.INTERRUPTED]),

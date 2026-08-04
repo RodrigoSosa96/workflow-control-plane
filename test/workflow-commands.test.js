@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import * as realFs from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { doctorCommand, launchCommand, planCommand, reconcileCommand, resultCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
+import { doctorCommand, launchCommand, planCommand, reconcileCommand, resultCommand, runsCommand, statusCommand, unlockCommand } from "../src/workflow/commands.js";
+import { WorkflowError } from "../src/workflow/errors.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
-import { RUN_STATES } from "../src/workflow/run-state.js";
+import { createRunStore } from "../src/workflow/run-store.js";
+import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
 
 const registry = {
   launcher: {
@@ -1303,4 +1309,181 @@ test("reconcile performs no mutation even when the lock is removable", async () 
 
   assert.equal(result.lock.ownership.removable, true);
   assert.deepEqual(result.nextActions.at(-1), `workflow unlock ${run.id} --yes`);
+});
+
+// --- runsCommand ----------------------------------------------------------
+//
+// A real store over a temp state root, never a stub: the board's whole job is reading real
+// records, and this repo has repeatedly found that stubbed stores hide exactly the defects that
+// matter (see the roadmap's lessons). Runs are driven through the real state machine
+// (create -> update -> update) rather than written as raw run.json, so these tests exercise the
+// same legality run-state.js's ALLOWED map enforces in production.
+
+async function tempStateRoot(t) {
+  const root = await mkdtemp(join(tmpdir(), "workflow-runs-command-"));
+  t.after(() => realFs.rm(root, { recursive: true, force: true }));
+  return join(root, "state");
+}
+
+function fixedClock(timestamp) {
+  return { now: () => timestamp };
+}
+
+// One second per now() call, so ordering assertions get strictly increasing updatedAt values
+// without depending on wall-clock timing. Each state-machine hop (create, or one update) consumes
+// exactly one now() call.
+function incrementingClock() {
+  let seconds = 0;
+  return {
+    now: () => {
+      const value = `2025-01-01T00:00:${String(seconds).padStart(2, "0")}.000Z`;
+      seconds += 1;
+      return value;
+    },
+  };
+}
+
+// Lands a run in `targetState` using only real store.update() transitions. Every state other than
+// planned/launching/running is reachable directly from running (see run-state.js's
+// ALLOWED[RUNNING]), so this never needs more than three store calls regardless of target.
+async function createRunInState(store, targetState, overrides = {}) {
+  const run = await store.create({
+    state: RUN_STATES.PLANNED,
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    relatedTickets: [],
+    ...overrides,
+  });
+  if (targetState === RUN_STATES.PLANNED) return run;
+
+  const launching = await store.update(run.id, () => ({ state: RUN_STATES.LAUNCHING }));
+  if (targetState === RUN_STATES.LAUNCHING) return launching;
+
+  const running = await store.update(run.id, () => ({ state: RUN_STATES.RUNNING }));
+  if (targetState === RUN_STATES.RUNNING) return running;
+
+  return store.update(run.id, () => ({ state: targetState }));
+}
+
+test("runsCommand lists runs across every project when none is given", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const ocrRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
+  const acmeRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "acme", primaryTicket: "B-1" });
+
+  const result = await runsCommand({}, { stateRoot });
+
+  assert.equal(result.command, "runs");
+  assert.deepEqual(result.runs.map((run) => run.id).sort(), [ocrRun.id, acmeRun.id].sort());
+  assert.deepEqual(result.skipped, []);
+  assert.equal(result.exitCode, 0);
+});
+
+test("runsCommand narrows to --project", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const ocrRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "acme", primaryTicket: "B-1" });
+
+  const result = await runsCommand({ projectAlias: "ocr" }, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.id), [ocrRun.id]);
+});
+
+test("runsCommand defaults to the live set, excluding completed/failed/interrupted and including the rest", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  for (const state of Object.values(RUN_STATES)) {
+    await createRunInState(store, state, { projectAlias: "ocr", primaryTicket: state });
+  }
+
+  const result = await runsCommand({}, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.state).sort(), [...LIVE_RUN_STATES].sort());
+  for (const excluded of [RUN_STATES.COMPLETED, RUN_STATES.FAILED, RUN_STATES.INTERRUPTED]) {
+    assert.equal(result.runs.some((run) => run.state === excluded), false, `${excluded} must not appear in the default view`);
+  }
+});
+
+test("runsCommand --all includes every state, live or not", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  for (const state of Object.values(RUN_STATES)) {
+    await createRunInState(store, state, { projectAlias: "ocr", primaryTicket: state });
+  }
+
+  const result = await runsCommand({ all: true }, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.state).sort(), Object.values(RUN_STATES).sort());
+});
+
+test("runsCommand --state completed returns exactly the completed runs, bypassing the live-set default", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const completedRun = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
+  await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2" });
+
+  const result = await runsCommand({ state: RUN_STATES.COMPLETED }, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.id), [completedRun.id]);
+});
+
+test("runsCommand refuses an unknown --state", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+
+  await assert.rejects(
+    () => runsCommand({ state: "bogus" }, { stateRoot }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "USAGE");
+      assert.equal(error.exitCode, 64);
+      assert.match(error.message, /unknown/i);
+      return true;
+    },
+  );
+});
+
+test("runsCommand orders by updatedAt descending with a deterministic id tiebreak", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: incrementingClock() });
+  const older = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
+  const newer = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2" });
+  assert.ok(newer.updatedAt > older.updatedAt, "fixture assumption: the second run must be strictly newer");
+
+  const result = await runsCommand({}, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.id), [newer.id, older.id]);
+});
+
+test("runsCommand breaks an updatedAt tie deterministically by id", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const first = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
+  const second = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2" });
+  assert.equal(first.updatedAt, second.updatedAt, "fixture assumption: both runs share one updatedAt");
+  const [expectedFirst, expectedSecond] = [first.id, second.id].sort();
+
+  const result = await runsCommand({}, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.id), [expectedFirst, expectedSecond]);
+});
+
+test("runsCommand surfaces a skipped record as data while the readable runs still list", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const readable = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
+
+  // Crash residue: a run directory whose run.json cannot be parsed (item 0.3's no-cleanup
+  // policy preserves exactly this shape). list() must skip it, report it, and keep listing.
+  const brokenRunId = "99999999-9999-4999-8999-999999999999";
+  await realFs.mkdir(join(stateRoot, brokenRunId), { recursive: true, mode: 0o700 });
+  await realFs.writeFile(join(stateRoot, brokenRunId, "run.json"), "not json", { mode: 0o600 });
+
+  const result = await runsCommand({}, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.id), [readable.id]);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].runId, brokenRunId);
+  assert.match(result.skipped[0].message, /malformed/i);
+  assert.equal(result.exitCode, 0);
 });

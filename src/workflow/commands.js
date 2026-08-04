@@ -23,7 +23,7 @@ import { resolveAgentProfile } from "./profiles.js";
 import { loadRegistry, resolveProject } from "./registry.js";
 import { reconcilePlan } from "./reconcile.js";
 import { executeResume as defaultExecuteResume } from "./resume.js";
-import { RUN_STATES } from "./run-state.js";
+import { isRunState, LIVE_RUN_STATES, RUN_STATES } from "./run-state.js";
 import { createRunStore } from "./run-store.js";
 import { isTelemetrySupportedVersion, telemetrySupportedVersions } from "./telemetry-adapters.js";
 import { createTelemetryStore } from "./telemetry-store.js";
@@ -700,6 +700,79 @@ async function storeForCommand(options = {}, deps = {}) {
   // createRunStore's own `readOwnOwnership: async () => null` default, and every lock marker this
   // store's own acquireLock writes would carry no pid/startedAt for `workflow unlock` to prove.
   return factory({ stateRoot, readOwnOwnership: deps.readOwnOwnership });
+}
+
+function usageError(message) {
+  throw new WorkflowError("USAGE", message, { exitCode: 64 });
+}
+
+function assertKnownRunState(state) {
+  if (!isRunState(state)) {
+    usageError(`Unknown run state: ${String(state)}`);
+  }
+}
+
+// runsCommand needs list()'s skipped records back as data, not just written to the CLI's shared
+// stderr reporter -- bin/workflow.js's reportListProblem, which is what deps.store already carries
+// baked in whenever WORKFLOW_STATE_ROOT is set (storeForCommand's `if (deps.store) return
+// deps.store` shortcut). A store's onListProblem is fixed at construction; there is no way to
+// intercept it on an already-built store. So this builds its OWN store instance -- following
+// stateRootForCommand's same resolution and the same createRunStore/readOwnOwnership threading
+// storeForCommand uses -- with an onListProblem that collects into `skipped` instead of writing
+// anywhere. It never touches, wraps, or repurposes the CLI's shared reporter, and it never calls
+// storeForCommand, so every other command's stderr reporting is untouched by this function's
+// existence.
+async function runsStoreForCommand(options, deps) {
+  const stateRoot = await stateRootForCommand(options, deps);
+  const factory = deps.createRunStore ?? createRunStore;
+  const skipped = [];
+  const store = factory({
+    stateRoot,
+    readOwnOwnership: deps.readOwnOwnership,
+    onListProblem: (problem) => skipped.push(problem),
+  });
+  return { store, skipped };
+}
+
+// Sorted separately from store.list(): that primitive's createdAt-ascending order is right for a
+// store (and other callers may depend on it -- it is untouched by this command), but an operator
+// asking "what is running right now" wants the most recently touched run first. `id` is a stable
+// tiebreak only -- two runs sharing an updatedAt must still sort deterministically run to run.
+function sortRunsForBoard(runs) {
+  return [...runs].sort((left, right) => (
+    String(right.updatedAt).localeCompare(String(left.updatedAt)) || left.id.localeCompare(right.id)
+  ));
+}
+
+// Every read-only command asks store.list() to filter by project; only this command also decides
+// WHICH states to show, because "what is running" has no single obvious answer -- see
+// LIVE_RUN_STATES's own comment in run-state.js for why that set is a presentation decision, not
+// a state-machine fact. `state` is the most specific ask and wins outright over `all`; with
+// neither, the live set is the default so a run that fell out of it (completed/failed/interrupted)
+// does not linger on the board an operator has stopped watching.
+function selectRunsForBoard(runs, { state, all }) {
+  if (state !== undefined) return runs.filter((run) => run.state === state);
+  if (all) return runs;
+  return runs.filter((run) => LIVE_RUN_STATES.has(run.state));
+}
+
+// The board underneath `workflow runs` (roadmap item 2.1): answers "what is running right now"
+// across every project without an operator already knowing a run id. Read-only -- it only ever
+// calls store.list(), never create/update -- so exit code is always 0: a report, not a check, the
+// same contract with runs, without runs, and with skipped records.
+export async function runsCommand(options = {}, deps = {}) {
+  if (options.state !== undefined) assertKnownRunState(options.state);
+
+  const { store, skipped } = await runsStoreForCommand(options, deps);
+  const filters = options.projectAlias !== undefined ? { projectAlias: options.projectAlias } : {};
+  const runs = await store.list(filters);
+
+  return {
+    command: "runs",
+    runs: sortRunsForBoard(selectRunsForBoard(runs, { state: options.state, all: Boolean(options.all) })),
+    skipped,
+    exitCode: 0,
+  };
 }
 
 async function telemetryForCommand(options = {}, deps = {}) {
