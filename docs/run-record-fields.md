@@ -4,8 +4,9 @@ Every workflow run is a JSON object (`run.json` inside its run directory, `src/w
 This document lists every top-level field that object can carry, grouped by the module that
 writes it, and is checked by `test/workflow-run-record-inventory.test.js`: that test builds a
 record through real store operations and a representative slice of the lanes below, then asserts
-every key the resulting record carries is named (as inline code) somewhere in this file. **A field
-present in that test's record but missing from this document fails the suite.**
+every key the resulting record carries heads a table row (`` `fieldName` `` as the first column)
+somewhere in this file — a field merely mentioned in prose does not count. **A field present in
+that test's record but missing from this document fails the suite.**
 
 ## Scope — what this document is, and is not
 
@@ -30,11 +31,12 @@ present in that test's record but missing from this document fails the suite.**
   markers — is **not** exercised, and is marked `No` below with the writer that would produce it.
   The check cannot see those; this document is the only place they're recorded.
 - **The check matches field *names*, not field *shapes* or *writer attribution*.** It confirms
-  every key produced by its fixture appears in this file as inline code (`` `fieldName` ``). It does
-  not verify a row's "written by" text is accurate, or that a field's documented meaning is
-  correct — that's a human review question, same as any other doc.
-- **Known gap, not a documented field: `run.consumedAt`.** `run-store.js`'s `list()` filters on it
-  (`filters.unconsumed === true && run.consumedAt`), but no production writer ever sets a
+  every key produced by its fixture heads a table row in this file (`` `fieldName` `` as the first
+  column) — a name only mentioned in prose does not count. It does not verify a row's "written by"
+  text is accurate, or that a field's documented meaning is correct — that's a human review
+  question, same as any other doc.
+- **Not a documented field, because nothing carries it: `run.consumedAt`.** `run-store.js`'s
+  `list()` filters on it (`filters.unconsumed === true && run.consumedAt`), but no production writer ever sets a
   *top-level* `consumedAt` on a run record — only `run.delegations[id].result.consumedAt`
   (`delegation-store.js`), a different field that happens to share a name. See the task-2 report
   for detail; it is intentionally left out of the table below because nothing actually carries it.

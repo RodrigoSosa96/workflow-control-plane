@@ -136,17 +136,27 @@ function validateRunRecord(record, expectedRunId, path) {
   return record;
 }
 
-// Runs before shape validation: a record from the future must be refused on its version, not on
-// whatever shape mismatch its new fields happen to trigger in validateRunRecord, which would
-// send an operator chasing the wrong problem. `?.` guards a non-object `parsed` (e.g. `null`)
-// so this never crashes ahead of validateRunRecord's own object check.
+// Runs before the rest of shape validation (validateRunRecord's id/state/stateHistory checks): a
+// record from the future must be refused on its version, not on whatever shape mismatch its new
+// fields happen to trigger there, which would send an operator chasing the wrong problem. A
+// non-object record (`null`, an array, or any other JSON scalar) is not "a record from the
+// future" in that sense — it is simply not a run record — so object-ness is checked first and
+// reported the same "Invalid run record" way validateRunRecord's own check would, instead of a
+// version message that would misdirect for that case.
 // When a version 2 exists, this is the dispatch point for a migrator, mirroring
 // registry.js:565-568's explicit per-version handling; there is nothing to migrate yet.
 function assertSupportedRunVersion(record, path) {
-  const found = record?.version;
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
+    failStore(`Invalid run record at ${path}`);
+  }
+  const found = record.version;
   if (found === SUPPORTED_RUN_VERSION) return;
+  // The found value is echoed for operator diagnosis, but it is untrusted record content — bound
+  // it the same way onListProblem bounds its message (:982) so a maliciously or corruptly huge
+  // `version` cannot turn this into an unbounded echo of the record.
   failStore(
-    `Run record at ${path} must use version ${SUPPORTED_RUN_VERSION} (received ${found ?? "unknown"}); ` +
+    `Run record at ${path} must use version ${SUPPORTED_RUN_VERSION} ` +
+      `(received ${String(found ?? "unknown").slice(0, 40)}); ` +
       "upgrade the control plane reading this state root, or point it at one built for this record's version.",
   );
 }
@@ -818,7 +828,7 @@ export function createRunStore({
     }
 
     return {
-      version: 1,
+      version: SUPPORTED_RUN_VERSION,
       ...fields,
       id: runId,
       state: requestedState,

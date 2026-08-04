@@ -243,6 +243,46 @@ test("read refuses a run record with an absent, non-integer, or zero version", a
   }
 });
 
+test("read refuses an outsized version without echoing it unbounded", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot });
+  const secret = `SECRET-${"X".repeat(4000)}`;
+  await writeRawRun(stateRoot, RUN_ID_1, rawRunRecord({ version: secret }));
+
+  await assert.rejects(
+    () => store.read(RUN_ID_1),
+    (error) => {
+      assert.match(error.message, /version/i);
+      assert.ok(error.message.length < 300, `expected a bounded message, got ${error.message.length} chars`);
+      assert.doesNotMatch(error.message, /X{100}/);
+      return true;
+    },
+  );
+});
+
+test("read reports a non-object run record as invalid, not as a version mismatch", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot });
+
+  const cases = [
+    ["an array", []],
+    ["null", null],
+  ];
+
+  for (const [label, record] of cases) {
+    await writeRawRun(stateRoot, RUN_ID_1, record);
+    await assert.rejects(
+      () => store.read(RUN_ID_1),
+      (error) => {
+        assert.match(error.message, /invalid run record/i, label);
+        assert.doesNotMatch(error.message, /version/i, label);
+        return true;
+      },
+      label,
+    );
+  }
+});
+
 test("update refuses a run record whose version this control plane does not support, same as read", async (t) => {
   const stateRoot = await tempStateRoot(t);
   const store = createRunStore({ stateRoot });

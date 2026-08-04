@@ -46,26 +46,29 @@ const RELAUNCH_SESSION_IDENTITY = Object.freeze({
   harness: "pi",
 });
 
-// Extracts every inline-code token (`` `like this` ``) from the document. The inventory check
-// only requires each produced field name to appear as one of these tokens somewhere in the file
-// — it does not parse table structure, and it does not care that some tokens are module/function
-// names rather than field names (a stray match only widens the "documented" set, it can never
-// hide a real gap). See docs/run-record-fields.md's "Scope" section for why that asymmetry is the
-// honest shape for this check.
-function extractInlineCodeTokens(docText) {
-  const tokens = new Set();
-  for (const match of docText.matchAll(/`([^`\n]+)`/g)) {
-    tokens.add(match[1]);
+// Extracts every field name that heads a table row (line-anchored `| \`name\` |`) from the
+// document, rather than every inline-code span. A prose sentence that merely mentions a field
+// name in backticks — or a module/function name that happens to look like one — does not land in
+// this set: a stray backtick match used to widen the "documented" set and silently hide a real
+// gap (a field could pass just by being named in passing prose, never in its own table row); this
+// line-anchored form makes that impossible; only a name that actually heads a table row counts as
+// documented. See docs/run-record-fields.md's "Scope" section for why `directory` and
+// `consumedAt` are deliberately kept out of every table — with this extraction, the check now
+// agrees with the document and treats them as undocumented too.
+function extractDocumentedFieldNames(docText) {
+  const documented = new Set();
+  for (const match of docText.matchAll(/^\| `([A-Za-z][A-Za-z0-9]*)` \|/gm)) {
+    documented.add(match[1]);
   }
-  return tokens;
+  return documented;
 }
 
-// The reusable comparison both the main test and the load-bearing regression test below share:
-// every top-level key of `record` must be one of `docText`'s inline-code tokens. Returns the
-// missing keys (empty when the record is fully documented) rather than asserting directly, so
-// callers can inspect the failure shape instead of only its presence.
+// The reusable comparison both the main test and the load-bearing regression tests below share:
+// every top-level key of `record` must head a table row in `docText`. Returns the missing keys
+// (empty when the record is fully documented) rather than asserting directly, so callers can
+// inspect the failure shape instead of only its presence.
 export function undocumentedFields(record, docText) {
-  const documented = extractInlineCodeTokens(docText);
+  const documented = extractDocumentedFieldNames(docText);
   return Object.keys(record).filter((key) => !documented.has(key));
 }
 
@@ -317,13 +320,20 @@ test("every field the representative record carries is documented in docs/run-re
 });
 
 test("the inventory check is load-bearing: a field missing from the document fails it", () => {
-  const docText = "the doc mentions `version` and `id` but nothing else";
+  const docText = "| `version` | Meaning | When | Yes |\n| `id` | Meaning | When | Yes |\n";
   const missing = undocumentedFields({ version: 1, id: "r1", state: "running", totallyUndocumentedField: true }, docText);
   assert.deepEqual(missing, ["state", "totallyUndocumentedField"]);
 });
 
-test("the inventory check passes once every field is named as inline code in the document", () => {
-  const docText = "`version`, `id`, and `state` are all documented here.";
+test("the inventory check passes once every field heads a table row in the document", () => {
+  const docText = "| `version` | Meaning | When | Yes |\n| `id` | Meaning | When | Yes |\n| `state` | Meaning | When | Yes |\n";
   const missing = undocumentedFields({ version: 1, id: "r1", state: "running" }, docText);
   assert.deepEqual(missing, []);
+});
+
+test("a field merely mentioned in prose, not heading a table row, does not count as documented", () => {
+  const docText = "the internal record shape (`role`, `state`, `budget`, `result`, `remediation`, ...) is out of scope here.\n" +
+    "| `version` | Meaning | When | Yes |\n";
+  const missing = undocumentedFields({ version: 1, role: "scout", budget: {} }, docText);
+  assert.deepEqual(missing, ["role", "budget"]);
 });
