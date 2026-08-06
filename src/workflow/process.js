@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { WorkflowError } from "./errors.js";
 
-const OUTPUT_LIMIT = 12000;
+// Exported so a parser of a captured stream can say that its input was cut off here, rather
+// than repeating the number and drifting from it.
+export const OUTPUT_LIMIT = 12000;
 const PROCESS_EXIT_CODE = 12;
 
 function appendBounded(current, chunk) {

@@ -64,6 +64,9 @@ const MERGE_TREE_CONFLICTED_STDOUT = [
 // Same command, same git, a mergeable pair: exit 0, the tree OID and nothing else.
 const MERGE_TREE_CLEAN_STDOUT = "ef908b10469726996ef0f1c1166b58e01e181cdc\0";
 
+// process.js caps every captured stream at 12,000 characters.
+const PROCESS_OUTPUT_LIMIT = 12000;
+
 async function snapshotRepository(cwd) {
   const refs = await gitExec(cwd, ["rev-parse", "--all"]);
   const status = await gitExec(cwd, ["status", "--porcelain"]);
@@ -680,6 +683,163 @@ test("previewMerge reports unknown for a source ref that does not exist in a rea
   assert.equal(preview.status, "unknown");
   assert.deepEqual(preview.conflicts, []);
   assert.ok(preview.reason);
+});
+
+test("mergeArgv exposes the argv the operator approves before any merge runs", async () => {
+  const fixture = fixtureRunner({
+    "git merge --no-ff --no-edit feature/task": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const previewed = git.mergeArgv({ source: "feature/task" });
+  assert.deepEqual(previewed, ["git", "merge", "--no-ff", "--no-edit", "feature/task"]);
+  assert.equal(fixture.calls.length, 0, "obtaining the argv must not run anything");
+
+  const result = await git.mergeBranch({ cwd: "/base", source: "feature/task" });
+
+  // The digested string and the executed string come from one expression, and the test compares
+  // the preview against what the runner was actually handed rather than against a second literal.
+  assert.deepEqual(previewed, [fixture.calls[0].command, ...fixture.calls[0].args]);
+  assert.deepEqual(result.argv, previewed);
+});
+
+test("mergeArgv is the only source of the merge argv, for any branch name", async () => {
+  const fixture = fixtureRunner({
+    "git merge --no-ff --no-edit release/2026-08-06": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const previewed = git.mergeArgv({ source: "release/2026-08-06" });
+  await git.mergeBranch({ cwd: "/base", source: "release/2026-08-06" });
+
+  assert.deepEqual(previewed, [fixture.calls[0].command, ...fixture.calls[0].args]);
+});
+
+test("previewMerge refuses a merge-tree that reported no tree at all", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({ code: 0 }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "unknown", "an absent stdout is never a clean merge");
+  assert.deepEqual(preview.conflicts, []);
+  assert.ok(preview.reason);
+});
+
+test("previewMerge refuses a first field that is not a tree object id", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 0,
+      stdout: "not-an-object-id\0",
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "unknown");
+  assert.deepEqual(preview.conflicts, []);
+  assert.ok(preview.reason);
+});
+
+test("previewMerge accepts a sha256 repository's 64-character tree id", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 0,
+      stdout: `${"a1b2c3d4".repeat(8)}\0`,
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "clean");
+  assert.equal(preview.tree, "a1b2c3d4".repeat(8));
+});
+
+test("previewMerge says so when the conflict list was cut off by the output limit", async () => {
+  // Built the way process.js would really deliver it: a genuine merge-tree payload whose path
+  // section is longer than the 12,000-character cap, sliced at exactly the cap.
+  const paths = Array.from(
+    { length: 900 },
+    (_, index) => `src/very/long/path/segment/file-${String(index).padStart(4, "0")}.ts`,
+  );
+  const complete = [
+    "106dbfca1358dd5c1ffee228f3b0cba541e45ddd",
+    ...paths,
+    "",
+    "1",
+    paths[0],
+    "CONFLICT (contents)",
+    "CONFLICT (content): Merge conflict\n",
+    "",
+  ].join("\0");
+  assert.ok(complete.length > PROCESS_OUTPUT_LIMIT, "the fixture must actually exceed the cap");
+  const capped = complete.slice(0, PROCESS_OUTPUT_LIMIT);
+
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 1,
+      stdout: capped,
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "conflicted");
+  assert.equal(preview.truncated, true, "the caller must be able to tell the list is a prefix");
+  assert.ok(preview.reason, "a truncated list has to carry its own reason");
+  assert.ok(preview.conflicts.length > 0);
+  assert.ok(preview.conflicts.length < paths.length, "a truncated list is shorter than the truth");
+  // The decisive assertion: no half-truncated path is ever reported as a conflicted file.
+  const known = new Set(paths);
+  assert.deepEqual(preview.conflicts.filter((path) => !known.has(path)), []);
+});
+
+test("previewMerge marks a complete conflict list as not truncated", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 1,
+      stdout: MERGE_TREE_CONFLICTED_STDOUT,
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.truncated, undefined);
+  assert.deepEqual(preview.conflicts, ["a.txt", "b.txt"]);
+});
+
+test("previewMerge is bounded and a timeout lands on unknown", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => {
+      throw new WorkflowError("PROCESS", "git timed out after 250ms", {
+        exitCode: 12,
+        details: { reason: "timeout", stdout: "", stderr: "" },
+      });
+    },
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({
+    cwd: "/base",
+    base: "dev",
+    source: "feature/task",
+    timeoutMs: 250,
+  });
+
+  assert.equal(fixture.calls[0].options.timeoutMs, 250, "the read must be bounded like the write");
+  assert.equal(preview.status, "unknown");
+  assert.deepEqual(preview.conflicts, []);
+  assert.match(preview.reason, /timed out/);
 });
 
 test("mergeBranch performs a real --no-ff merge and leaves a merge commit", async (t) => {

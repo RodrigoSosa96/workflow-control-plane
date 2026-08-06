@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import * as defaultFs from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { WorkflowError } from "./errors.js";
+import { OUTPUT_LIMIT } from "./process.js";
 
 function trimLine(value) {
   return value.trim();
@@ -81,21 +82,41 @@ function parseStatus(output) {
   return entries;
 }
 
+// sha1 (40) or sha256 (64) hex. An answer that is not an object id is not an answer.
+const TREE_OID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+
+// The one merge argv, written once. Both the approval digest and the child process read it from
+// here, so the string an operator approves cannot drift from the string that runs.
+function mergeArgvFor(source) {
+  return ["git", "merge", "--no-ff", "--no-edit", source];
+}
+
 // `git merge-tree --write-tree --name-only -z <base> <source>` (measured on git 2.43) writes
 // the merged tree OID first, then one field per conflicted path, then an EMPTY field, then
 // git's informational records. Only the OID and the paths are contractual enough to depend on;
 // the informational section's shape is volatile and nothing here needs it.
 function parseMergeTree(output) {
-  const fields = String(output).split("\0");
+  // Never String(): String(undefined) is the truthy "undefined", which would pass for a tree in
+  // the one function whose entire mandate is to fail closed.
+  const fields = (typeof output === "string" ? output : "").split("\0");
   const tree = trimLine(fields[0] ?? "");
   const conflicts = [];
+  let complete = false;
 
   for (let index = 1; index < fields.length; index += 1) {
-    if (fields[index] === "") break;
+    if (fields[index] === "") {
+      complete = true;
+      break;
+    }
     conflicts.push(fields[index]);
   }
 
-  return { tree, conflicts };
+  // process.js caps a captured stream at 12,000 characters. Past that the empty field that ends
+  // the path section never arrives and the final path is half a path, so the list is a prefix of
+  // the truth rather than the truth. Drop the fragment; the caller is told the rest is missing.
+  if (!complete) conflicts.pop();
+
+  return { tree: TREE_OID.test(tree) ? tree : "", conflicts, complete };
 }
 
 // `rev-parse --abbrev-ref HEAD` answers the literal string "HEAD" on a detached HEAD, which is
@@ -107,6 +128,12 @@ function normalizeHeadBranch(value) {
 
 function reasonFrom(error) {
   return String(error?.message ?? error).slice(0, 256);
+}
+
+// A captured stream is a string in every ordinary path, but `previewMerge` must survive a runner
+// that answers without one — it is the function that may never throw.
+function trimText(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function fail(category, message, details, exitCode) {
@@ -332,12 +359,14 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
 
     // The non-mutating conflict oracle: real merge machinery, no ref, no index, no working tree.
     // Never throws — the caller is gathering evidence, and "unknown" is the fail-closed answer.
-    async previewMerge({ cwd, base, source }) {
+    // Bounded like the writer is: this read runs against every repository before anything
+    // executes, so it is the one that can hang a preview.
+    async previewMerge({ cwd, base, source, timeoutMs }) {
       const args = ["merge-tree", "--write-tree", "--name-only", "-z", base, source];
       let result;
 
       try {
-        result = await runner.run("git", args, { cwd, allowFailure: true });
+        result = await runner.run("git", args, { cwd, timeoutMs, allowFailure: true });
       } catch (error) {
         return {
           status: "unknown",
@@ -346,18 +375,29 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
         };
       }
 
-      const { tree, conflicts } = parseMergeTree(result.stdout);
+      const { tree, conflicts, complete } = parseMergeTree(result.stdout);
 
-      if (tree && result.code === 0) {
+      if (tree && result.code === 0 && complete) {
         return { status: "clean", tree, conflicts: [] };
       }
       if (tree && result.code === 1) {
+        // The status is known — this merge conflicts. Only the list may be short, and saying
+        // "unknown" here would throw away a fact the operator needs.
+        if (!complete) {
+          return {
+            status: "conflicted",
+            tree,
+            conflicts,
+            truncated: true,
+            reason: `git merge-tree output exceeded the ${OUTPUT_LIMIT}-character capture limit; ${conflicts.length} conflicted paths shown, the rest are not listed`,
+          };
+        }
         return { status: "conflicted", tree, conflicts };
       }
 
       // Measured on git 2.43: a source ref git cannot merge exits 1 with EMPTY stdout, which is
       // indistinguishable from a conflict by exit code alone. No tree means no prediction.
-      const detail = trimLine(result.stderr) || trimLine(result.stdout);
+      const detail = trimText(result.stderr) || trimText(result.stdout);
       const missingTree = tree ? "" : " without producing a merge tree";
       return {
         status: "unknown",
@@ -366,15 +406,20 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
       };
     },
 
+    // The argv an operator approves, available without running anything. Task 2 puts this in the
+    // approval digest; `mergeBranch` executes this same expression.
+    mergeArgv({ source }) {
+      return mergeArgvFor(source);
+    },
+
     // The one writer. `--no-ff` so the integration is always its own revertible commit and the
     // preview's prediction cannot depend on ancestry at execution time; `--no-edit` so git never
     // opens an editor there is no terminal for; `GIT_TERMINAL_PROMPT=0` so a credential prompt
     // cannot hang it. `argv` is reported from the same array that runs — it is what the approval
     // digest approves, so the two can never drift.
     async mergeBranch({ cwd, source, timeoutMs }) {
-      const command = "git";
-      const args = ["merge", "--no-ff", "--no-edit", source];
-      const argv = [command, ...args];
+      const argv = this.mergeArgv({ source });
+      const [command, ...args] = argv;
 
       try {
         const result = await runner.run(command, args, {
