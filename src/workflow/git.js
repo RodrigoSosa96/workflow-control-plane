@@ -81,6 +81,34 @@ function parseStatus(output) {
   return entries;
 }
 
+// `git merge-tree --write-tree --name-only -z <base> <source>` (measured on git 2.43) writes
+// the merged tree OID first, then one field per conflicted path, then an EMPTY field, then
+// git's informational records. Only the OID and the paths are contractual enough to depend on;
+// the informational section's shape is volatile and nothing here needs it.
+function parseMergeTree(output) {
+  const fields = String(output).split("\0");
+  const tree = trimLine(fields[0] ?? "");
+  const conflicts = [];
+
+  for (let index = 1; index < fields.length; index += 1) {
+    if (fields[index] === "") break;
+    conflicts.push(fields[index]);
+  }
+
+  return { tree, conflicts };
+}
+
+// `rev-parse --abbrev-ref HEAD` answers the literal string "HEAD" on a detached HEAD, which is
+// not a branch name and must never be compared against one.
+function normalizeHeadBranch(value) {
+  if (!value || value === "HEAD") return null;
+  return value;
+}
+
+function reasonFrom(error) {
+  return String(error?.message ?? error).slice(0, 256);
+}
+
 function fail(category, message, details, exitCode) {
   throw new WorkflowError(category, message, { details, exitCode });
 }
@@ -161,7 +189,7 @@ function digestFor(value) {
   return `sha256:${hash}`;
 }
 
-export function createGitAdapter({ runner, fs = defaultFs }) {
+export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) {
   return {
     async inspectRepository({ cwd }) {
       const root = await runner.run("git", ["rev-parse", "--show-toplevel"], { cwd });
@@ -271,6 +299,114 @@ export function createGitAdapter({ runner, fs = defaultFs }) {
 
       await runner.run("git", ["worktree", "add", "-b", branch, path, base], { cwd });
       return { path, branch, createdBranch: true };
+    },
+
+    // Where the work actually is. Read from the checkout, never derived from a run record: a
+    // recorded branch is a launch-time intention and two of the eight real runs on this machine
+    // name a ref that no longer exists.
+    async resolveHead({ cwd }) {
+      const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+      const shaResult = await runner.run("git", ["rev-parse", "HEAD"], { cwd });
+
+      return {
+        branch: normalizeHeadBranch(trimLine(branchResult.stdout)),
+        sha: trimLine(shaResult.stdout),
+      };
+    },
+
+    // Is this checkout safe to merge into right now? `dirty: null` means the status could not be
+    // read; the caller must treat that as a conflict and never as clean — same direction as
+    // reconcile.js's `safeStatus`, applied to a heavier operation.
+    async checkoutState({ cwd }) {
+      const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+      const branch = normalizeHeadBranch(trimLine(branchResult.stdout));
+
+      try {
+        const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd });
+        const entries = parseStatus(statusResult.stdout);
+        return { branch, dirty: entries.length > 0, entries };
+      } catch (error) {
+        return { branch, dirty: null, entries: [], statusError: reasonFrom(error) };
+      }
+    },
+
+    // The non-mutating conflict oracle: real merge machinery, no ref, no index, no working tree.
+    // Never throws — the caller is gathering evidence, and "unknown" is the fail-closed answer.
+    async previewMerge({ cwd, base, source }) {
+      const args = ["merge-tree", "--write-tree", "--name-only", "-z", base, source];
+      let result;
+
+      try {
+        result = await runner.run("git", args, { cwd, allowFailure: true });
+      } catch (error) {
+        return {
+          status: "unknown",
+          conflicts: [],
+          reason: `git merge-tree could not run: ${reasonFrom(error)}`,
+        };
+      }
+
+      const { tree, conflicts } = parseMergeTree(result.stdout);
+
+      if (tree && result.code === 0) {
+        return { status: "clean", tree, conflicts: [] };
+      }
+      if (tree && result.code === 1) {
+        return { status: "conflicted", tree, conflicts };
+      }
+
+      // Measured on git 2.43: a source ref git cannot merge exits 1 with EMPTY stdout, which is
+      // indistinguishable from a conflict by exit code alone. No tree means no prediction.
+      const detail = trimLine(result.stderr) || trimLine(result.stdout);
+      const missingTree = tree ? "" : " without producing a merge tree";
+      return {
+        status: "unknown",
+        conflicts: [],
+        reason: `git merge-tree exited with code ${result.code}${missingTree}${detail ? `: ${detail}` : ""}`.slice(0, 512),
+      };
+    },
+
+    // The one writer. `--no-ff` so the integration is always its own revertible commit and the
+    // preview's prediction cannot depend on ancestry at execution time; `--no-edit` so git never
+    // opens an editor there is no terminal for; `GIT_TERMINAL_PROMPT=0` so a credential prompt
+    // cannot hang it. `argv` is reported from the same array that runs — it is what the approval
+    // digest approves, so the two can never drift.
+    async mergeBranch({ cwd, source, timeoutMs }) {
+      const command = "git";
+      const args = ["merge", "--no-ff", "--no-edit", source];
+      const argv = [command, ...args];
+
+      try {
+        const result = await runner.run(command, args, {
+          cwd,
+          env: { ...env, GIT_TERMINAL_PROMPT: "0" },
+          timeoutMs,
+          allowFailure: true,
+        });
+
+        return {
+          ok: result.code === 0,
+          code: result.code,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          argv,
+        };
+      } catch (error) {
+        // A timeout, a signal, or a failed spawn. The merges already performed in a group run
+        // still have to be reported, so this is a result and not a throw.
+        const details = error?.details ?? {};
+        const message = reasonFrom(error);
+        const stderr = typeof details.stderr === "string" ? details.stderr : "";
+
+        return {
+          ok: false,
+          code: Number.isInteger(details.code) && details.code !== 0 ? details.code : 1,
+          stdout: typeof details.stdout === "string" ? details.stdout : "",
+          stderr: stderr || message,
+          argv,
+          error: message,
+        };
+      }
     },
   };
 }

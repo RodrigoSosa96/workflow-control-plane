@@ -33,6 +33,48 @@ async function createDisposableRepo(t) {
   return { root, repoPath };
 }
 
+// Measured on this machine against git 2.43 with two files conflicting in content:
+//   git merge-tree --write-tree --name-only -z main feature
+// exit 1, 282 bytes. The tree OID comes first, then one field per conflicted path,
+// then an EMPTY field, then git's informational records — which this adapter ignores.
+const MERGE_TREE_CONFLICTED_STDOUT = [
+  "106dbfca1358dd5c1ffee228f3b0cba541e45ddd",
+  "a.txt",
+  "b.txt",
+  "",
+  "1",
+  "a.txt",
+  "Auto-merging",
+  "Auto-merging a.txt\n",
+  "1",
+  "a.txt",
+  "CONFLICT (contents)",
+  "CONFLICT (content): Merge conflict in a.txt\n",
+  "1",
+  "b.txt",
+  "Auto-merging",
+  "Auto-merging b.txt\n",
+  "1",
+  "b.txt",
+  "CONFLICT (contents)",
+  "CONFLICT (content): Merge conflict in b.txt\n",
+  "",
+].join("\0");
+
+// Same command, same git, a mergeable pair: exit 0, the tree OID and nothing else.
+const MERGE_TREE_CLEAN_STDOUT = "ef908b10469726996ef0f1c1166b58e01e181cdc\0";
+
+async function snapshotRepository(cwd) {
+  const refs = await gitExec(cwd, ["rev-parse", "--all"]);
+  const status = await gitExec(cwd, ["status", "--porcelain"]);
+  const index = await gitExec(cwd, ["ls-files", "-s"]);
+  return {
+    refs: refs.stdout,
+    status: status.stdout,
+    index: index.stdout,
+  };
+}
+
 function fixtureRunner(handlers) {
   const calls = [];
   return {
@@ -291,4 +333,372 @@ test("fingerprint rejects porcelain paths outside the worktree", async () => {
     () => git.fingerprint({ cwd: "/repo" }),
     /path|worktree|traversal/i,
   );
+});
+
+test("resolveHead reads the branch and sha the checkout is actually on", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "feature/registro-impl\n", stderr: "" }),
+    "git rev-parse HEAD": async () => ({ code: 0, stdout: "0123456789012345678901234567890123456789\n", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const head = await git.resolveHead({ cwd: "/repo/.worktrees/task" });
+
+  assert.deepEqual(head, {
+    branch: "feature/registro-impl",
+    sha: "0123456789012345678901234567890123456789",
+  });
+  assert.deepEqual(fixture.calls[0].args, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  assert.equal(fixture.calls[0].options.cwd, "/repo/.worktrees/task");
+  assert.deepEqual(fixture.calls[1].args, ["rev-parse", "HEAD"]);
+});
+
+test("resolveHead reports a detached HEAD as a null branch", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "HEAD\n", stderr: "" }),
+    "git rev-parse HEAD": async () => ({ code: 0, stdout: "abcdefabcdefabcdefabcdefabcdefabcdefabcd\n", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const head = await git.resolveHead({ cwd: "/repo" });
+
+  assert.equal(head.branch, null);
+  assert.equal(head.sha, "abcdefabcdefabcdefabcdefabcdefabcdefabcd");
+});
+
+test("checkoutState reports the branch and a dirty working tree", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "dev\n", stderr: "" }),
+    "git status --porcelain=v1 -z": async () => ({
+      code: 0,
+      stdout: " M src/app.ts\0?? notes.md\0",
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const state = await git.checkoutState({ cwd: "/repo" });
+
+  assert.equal(state.branch, "dev");
+  assert.equal(state.dirty, true);
+  assert.equal(state.statusError, undefined);
+  assert.deepEqual(state.entries.map((entry) => entry.path), ["src/app.ts", "notes.md"]);
+});
+
+test("checkoutState reports a clean checkout as not dirty", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "dev\n", stderr: "" }),
+    "git status --porcelain=v1 -z": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const state = await git.checkoutState({ cwd: "/repo" });
+
+  assert.deepEqual(state, { branch: "dev", dirty: false, entries: [] });
+});
+
+test("checkoutState reports dirty: null with a reason when git status cannot be read", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "dev\n", stderr: "" }),
+    "git status --porcelain=v1 -z": async () => {
+      throw new WorkflowError("PROCESS", "git failed with exit code 128", { exitCode: 12 });
+    },
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const state = await git.checkoutState({ cwd: "/repo" });
+
+  assert.equal(state.branch, "dev");
+  assert.equal(state.dirty, null, "an unreadable status must never be reported as clean");
+  assert.match(state.statusError, /exit code 128/);
+  assert.deepEqual(state.entries, []);
+});
+
+test("previewMerge maps exit 0 to a clean merge", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 0,
+      stdout: MERGE_TREE_CLEAN_STDOUT,
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.deepEqual(preview, {
+    status: "clean",
+    tree: "ef908b10469726996ef0f1c1166b58e01e181cdc",
+    conflicts: [],
+  });
+  assert.deepEqual(fixture.calls[0].args, [
+    "merge-tree",
+    "--write-tree",
+    "--name-only",
+    "-z",
+    "dev",
+    "feature/task",
+  ]);
+  assert.equal(fixture.calls[0].options.cwd, "/base");
+  assert.equal(fixture.calls[0].options.allowFailure, true);
+});
+
+test("previewMerge parses conflicted paths from real merge-tree output and ignores the info section", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 1,
+      stdout: MERGE_TREE_CONFLICTED_STDOUT,
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.deepEqual(preview, {
+    status: "conflicted",
+    tree: "106dbfca1358dd5c1ffee228f3b0cba541e45ddd",
+    conflicts: ["a.txt", "b.txt"],
+  });
+});
+
+test("previewMerge reports unknown with a reason when merge-tree exits above 1", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 129,
+      stdout: "",
+      stderr: "error: unknown option `write-tree'\n",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "unknown", "a merge-tree that could not run is never clean");
+  assert.deepEqual(preview.conflicts, []);
+  assert.match(preview.reason, /129/);
+  assert.match(preview.reason, /unknown option/);
+});
+
+test("previewMerge reports unknown when merge-tree exits 1 without producing a tree", async () => {
+  // Measured on git 2.43: an unmergeable argument exits 1 with EMPTY stdout, which is
+  // indistinguishable from "conflicted" by exit code alone. Fail closed.
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/gone": async () => ({
+      code: 1,
+      stdout: "",
+      stderr: "merge-tree: feature/gone - not something we can merge\n",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/gone" });
+
+  assert.equal(preview.status, "unknown");
+  assert.deepEqual(preview.conflicts, []);
+  assert.match(preview.reason, /not something we can merge/);
+});
+
+test("previewMerge reports unknown instead of throwing when merge-tree cannot be spawned", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => {
+      throw new WorkflowError("PROCESS", "Failed to start git: spawn git ENOENT", { exitCode: 12 });
+    },
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "unknown");
+  assert.deepEqual(preview.conflicts, []);
+  assert.match(preview.reason, /ENOENT/);
+});
+
+test("mergeBranch runs exactly the approved argv with no terminal prompt", async () => {
+  const fixture = fixtureRunner({
+    "git merge --no-ff --no-edit feature/task": async () => ({
+      code: 0,
+      stdout: "Merge made by the 'ort' strategy.\n",
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({
+    runner: fixture.runner,
+    env: { PATH: "/usr/bin", GIT_TERMINAL_PROMPT: "1" },
+  });
+
+  const result = await git.mergeBranch({ cwd: "/base", source: "feature/task", timeoutMs: 60000 });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, "Merge made by the 'ort' strategy.\n");
+  assert.equal(result.stderr, "");
+  assert.deepEqual(result.argv, ["git", "merge", "--no-ff", "--no-edit", "feature/task"]);
+  assert.deepEqual(fixture.calls[0].args, ["merge", "--no-ff", "--no-edit", "feature/task"]);
+  assert.deepEqual(result.argv, [fixture.calls[0].command, ...fixture.calls[0].args]);
+  assert.deepEqual(fixture.calls[0].options.env, { PATH: "/usr/bin", GIT_TERMINAL_PROMPT: "0" });
+  assert.equal(fixture.calls[0].options.cwd, "/base");
+  assert.equal(fixture.calls[0].options.timeoutMs, 60000);
+  assert.equal(fixture.calls[0].options.allowFailure, true);
+});
+
+test("mergeBranch inherits the process environment without mutating it", async () => {
+  const fixture = fixtureRunner({
+    "git merge --no-ff --no-edit feature/task": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  await git.mergeBranch({ cwd: "/base", source: "feature/task" });
+
+  const passed = fixture.calls[0].options.env;
+  assert.equal(passed.GIT_TERMINAL_PROMPT, "0");
+  assert.equal(passed.PATH, process.env.PATH);
+  assert.notEqual(passed, process.env);
+  assert.equal(process.env.GIT_TERMINAL_PROMPT, undefined);
+});
+
+test("mergeBranch reports a failed merge as ok: false rather than throwing", async () => {
+  const fixture = fixtureRunner({
+    "git merge --no-ff --no-edit feature/task": async () => ({
+      code: 1,
+      stdout: "Auto-merging a.txt\nCONFLICT (content): Merge conflict in a.txt\n",
+      stderr: "Automatic merge failed; fix conflicts and then commit the result.\n",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.mergeBranch({ cwd: "/base", source: "feature/task" });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Automatic merge failed/);
+  assert.deepEqual(result.argv, ["git", "merge", "--no-ff", "--no-edit", "feature/task"]);
+});
+
+test("mergeBranch reports a spawn failure as ok: false rather than throwing", async () => {
+  const fixture = fixtureRunner({
+    "git merge --no-ff --no-edit feature/task": async () => {
+      throw new WorkflowError("PROCESS", "git timed out after 100ms", {
+        exitCode: 12,
+        details: { reason: "timeout", stdout: "", stderr: "" },
+      });
+    },
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.mergeBranch({ cwd: "/base", source: "feature/task", timeoutMs: 100 });
+
+  assert.equal(result.ok, false);
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /timed out/);
+  assert.deepEqual(result.argv, ["git", "merge", "--no-ff", "--no-edit", "feature/task"]);
+});
+
+test("resolveHead and checkoutState read a real repository, detached HEAD included", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  const head = await git.resolveHead({ cwd: repoPath });
+  assert.equal(head.branch, "main");
+  assert.match(head.sha, /^[0-9a-f]{40}$/);
+
+  const clean = await git.checkoutState({ cwd: repoPath });
+  assert.deepEqual(clean, { branch: "main", dirty: false, entries: [] });
+
+  await writeFile(join(repoPath, "README.md"), "changed\n");
+  const dirty = await git.checkoutState({ cwd: repoPath });
+  assert.equal(dirty.dirty, true);
+  assert.equal(dirty.statusError, undefined);
+  assert.ok(dirty.entries.some((entry) => entry.path === "README.md"));
+
+  await gitExec(repoPath, ["checkout", "--detach"]);
+  const detached = await git.resolveHead({ cwd: repoPath });
+  assert.equal(detached.branch, null, "a literal HEAD from rev-parse is not a branch name");
+  assert.equal(detached.sha, head.sha);
+  assert.equal((await git.checkoutState({ cwd: repoPath })).branch, null);
+});
+
+test("previewMerge predicts a real conflict and mutates no ref, index, or working-tree file", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  await writeFile(join(repoPath, "a.txt"), "one\n");
+  await writeFile(join(repoPath, "b.txt"), "x\n");
+  await gitExec(repoPath, ["add", "a.txt", "b.txt"]);
+  await gitExec(repoPath, ["commit", "-m", "files"]);
+  await gitExec(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(join(repoPath, "a.txt"), "feature\n");
+  await writeFile(join(repoPath, "b.txt"), "fb\n");
+  await gitExec(repoPath, ["commit", "-am", "feature edit"]);
+  await gitExec(repoPath, ["checkout", "main"]);
+  await writeFile(join(repoPath, "a.txt"), "main\n");
+  await writeFile(join(repoPath, "b.txt"), "mb\n");
+  await gitExec(repoPath, ["commit", "-am", "main edit"]);
+
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const before = await snapshotRepository(repoPath);
+  const beforeFile = await readFile(join(repoPath, "a.txt"), "utf8");
+
+  const preview = await git.previewMerge({ cwd: repoPath, base: "main", source: "feature/task" });
+
+  assert.equal(preview.status, "conflicted");
+  assert.deepEqual(preview.conflicts, ["a.txt", "b.txt"]);
+  assert.match(preview.tree, /^[0-9a-f]{40}$/);
+
+  const after = await snapshotRepository(repoPath);
+  const afterFile = await readFile(join(repoPath, "a.txt"), "utf8");
+
+  assert.deepEqual(after, before, "previewMerge must touch no ref, no index, and no working tree");
+  assert.equal(afterFile, beforeFile);
+  assert.equal(afterFile, "main\n");
+  assert.equal((await git.resolveHead({ cwd: repoPath })).branch, "main");
+});
+
+test("previewMerge reports a real mergeable pair as clean", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  await gitExec(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(join(repoPath, "feature.txt"), "feature only\n");
+  await gitExec(repoPath, ["add", "feature.txt"]);
+  await gitExec(repoPath, ["commit", "-m", "feature file"]);
+  await gitExec(repoPath, ["checkout", "main"]);
+  await writeFile(join(repoPath, "main.txt"), "main only\n");
+  await gitExec(repoPath, ["add", "main.txt"]);
+  await gitExec(repoPath, ["commit", "-m", "main file"]);
+
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const preview = await git.previewMerge({ cwd: repoPath, base: "main", source: "feature/task" });
+
+  assert.equal(preview.status, "clean");
+  assert.deepEqual(preview.conflicts, []);
+  assert.match(preview.tree, /^[0-9a-f]{40}$/);
+});
+
+test("previewMerge reports unknown for a source ref that does not exist in a real repository", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  const preview = await git.previewMerge({ cwd: repoPath, base: "main", source: "feature/gone" });
+
+  assert.equal(preview.status, "unknown");
+  assert.deepEqual(preview.conflicts, []);
+  assert.ok(preview.reason);
+});
+
+test("mergeBranch performs a real --no-ff merge and leaves a merge commit", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  await gitExec(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(join(repoPath, "feature.txt"), "feature only\n");
+  await gitExec(repoPath, ["add", "feature.txt"]);
+  await gitExec(repoPath, ["commit", "-m", "feature file"]);
+  await gitExec(repoPath, ["checkout", "main"]);
+
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const result = await git.mergeBranch({ cwd: repoPath, source: "feature/task", timeoutMs: 60000 });
+
+  assert.equal(result.ok, true, result.stderr);
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.argv, ["git", "merge", "--no-ff", "--no-edit", "feature/task"]);
+
+  const parents = (await gitExec(repoPath, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout.trim().split(" ");
+  assert.equal(parents.length, 3, "--no-ff must produce a merge commit even when a fast-forward was available");
+  assert.equal(await readFile(join(repoPath, "feature.txt"), "utf8"), "feature only\n");
+  assert.equal((await git.checkoutState({ cwd: repoPath })).dirty, false);
 });
