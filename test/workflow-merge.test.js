@@ -84,12 +84,17 @@ function scriptedGit(script = {}) {
         const entries = (entry.dirtyPaths ?? []).map((path) => ({ x: " ", y: "M", path }));
         return { branch: entry.branch ?? null, dirty: Boolean(entry.dirty) || entries.length > 0, entries };
       },
-      async refExists({ cwd, ref, kind }) {
-        calls.push({ method: "refExists", cwd, ref, kind });
+      // Models the ref namespace of ONE checkout. `refsFrom` is the ordinary linked-worktree
+      // topology -- base checkout and run worktree share a ref store, so the branch resolves to
+      // exactly what the worktree's HEAD is at. `refs` overrides it, which is how a test builds
+      // the separate-clone case where the base checkout's own `feature/x` points somewhere else.
+      async resolveRef({ cwd, ref }) {
+        calls.push({ method: "resolveRef", cwd, ref });
         const entry = entryFor(cwd);
-        if (entry.refExistsError) throw new WorkflowError("PROCESS", entry.refExistsError, { exitCode: 12 });
-        if (Array.isArray(entry.unreachable) && entry.unreachable.includes(ref)) return false;
-        return entry.reachable ?? true;
+        if (entry.resolveRefError) throw new WorkflowError("PROCESS", entry.resolveRefError, { exitCode: 12 });
+        if (entry.refs && Object.hasOwn(entry.refs, ref)) return entry.refs[ref] ?? null;
+        const shared = entry.refsFrom ? entryFor(entry.refsFrom) : null;
+        return shared && shared.branch === ref ? shared.sha ?? null : null;
       },
       async previewMerge({ cwd, base, source, timeoutMs }) {
         calls.push({ method: "previewMerge", cwd, base, source, timeoutMs });
@@ -102,6 +107,10 @@ function scriptedGit(script = {}) {
         calls.push({ method: "mergeBranch", cwd, source, timeoutMs });
         const scripted = entryFor(cwd).merge ?? {};
         const argv = argvBuilder.mergeArgv({ source });
+        // Production's adapter is documented never to throw. This models an adapter that breaks
+        // that contract, so the "never discard a report of merges that already happened"
+        // property can be tested rather than assumed.
+        if (scripted.throws) throw new WorkflowError("PROCESS", scripted.throws, { exitCode: 12 });
         if (scripted.ok === false) {
           return {
             ok: false,
@@ -129,9 +138,11 @@ function groupFixture(overrides = {}) {
     "/wt/backend": { branch: "feature/actual", sha: "aaaa111", committedAt: "2026-08-01T10:00:00+00:00" },
     "/wt/panel": { branch: "feature/actual", sha: "bbbb222", committedAt: "2026-08-01T10:00:00+00:00" },
     "/wt/webapp": { branch: "feature/actual", sha: "cccc333", committedAt: "2026-08-01T10:00:00+00:00" },
-    "/base/backend": { branch: "dev", dirty: false, sha: "base111" },
-    "/base/panel": { branch: "dev", dirty: false, sha: "base222" },
-    "/base/webapp": { branch: "dev", dirty: false, sha: "base333" },
+    // `refsFrom` pairs each base checkout with its linked worktree, so the source branch resolves
+    // in the base checkout to exactly the sha the worktree's HEAD is at -- the ordinary topology.
+    "/base/backend": { branch: "dev", dirty: false, sha: "base111", refsFrom: "/wt/backend" },
+    "/base/panel": { branch: "dev", dirty: false, sha: "base222", refsFrom: "/wt/panel" },
+    "/base/webapp": { branch: "dev", dirty: false, sha: "base333", refsFrom: "/wt/webapp" },
   };
   for (const [path, entry] of Object.entries(overrides)) {
     script[path] = { ...script[path], ...entry };
@@ -594,7 +605,7 @@ test("a group repository that is no longer in the registry is refused, never mer
     { id: "backend", path: "/wt/backend", branch: "feature/recorded" },
     { id: "renamed-away", path: "/wt/renamed", branch: "feature/recorded" },
   ]);
-  const fixture = scriptedGit(groupFixture({ "/wt/renamed": { branch: "feature/actual", sha: "dddd444" } }));
+  const fixture = scriptedGit(groupFixture({ "/wt/renamed": { branch: "feature/actual", sha: "dddd444", refsFrom: "/wt/renamed" } }));
 
   const command = await mergeCommand(
     { runId: run.id },
@@ -666,10 +677,13 @@ test("a run worktree on a detached HEAD is refused: there is no source branch to
   assert.deepEqual(store.appendEventCalls, []);
 });
 
-test("a source commit unreachable from the base checkout is refused", async (t) => {
+// Important 1 (branch review): proving the source OBJECT is present in the base checkout is a
+// different question from proving the branch NAME resolves there to that same object -- and the
+// name is what `git merge` is handed. Both halves are refusals.
+test("a source branch the base checkout does not have is refused", async (t) => {
   const store = withAppendSpy(await newStore(t));
   const run = await groupRun(store, [GROUP_REPOSITORIES[0]]);
-  const fixture = scriptedGit(groupFixture({ "/base/backend": { unreachable: ["aaaa111"] } }));
+  const fixture = scriptedGit(groupFixture({ "/base/backend": { refs: { "feature/actual": null } } }));
 
   const command = await mergeCommand(
     { runId: run.id },
@@ -677,8 +691,28 @@ test("a source commit unreachable from the base checkout is refused", async (t) 
   );
 
   assert.equal(command.preview.refused, true);
-  assert.match(command.preview.reason, /not reachable/i);
-  assert.match(command.preview.reason, /aaaa111/);
+  assert.match(command.preview.reason, /does not resolve to a commit/i);
+  assert.match(command.preview.reason, /feature\/actual/);
+  assert.deepEqual(fixture.calls.filter((call) => call.method === "previewMerge"), []);
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("a source branch that resolves in the base checkout to a different commit than the worktree's is refused", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const run = await groupRun(store, [GROUP_REPOSITORIES[0]]);
+  // The separate-clone case: the base checkout has the object (an earlier fetch) but its own
+  // feature/actual still points at an older commit. Merging the NAME would merge that older one.
+  const fixture = scriptedGit(groupFixture({ "/base/backend": { refs: { "feature/actual": "older11" } } }));
+
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: fixture.git },
+  );
+
+  assert.equal(command.preview.refused, true);
+  assert.match(command.preview.reason, /resolves to older11/);
+  assert.match(command.preview.reason, /is at aaaa111/);
+  assert.match(command.preview.reason, /previewing one commit and merging another/);
   assert.deepEqual(fixture.calls.filter((call) => call.method === "previewMerge"), []);
   assert.deepEqual(store.appendEventCalls, []);
 });
@@ -711,7 +745,7 @@ test("an ordinary monorepo project merges into the project's own path and base_b
   });
   const fixture = scriptedGit({
     "/wt/ocr": { branch: "feature/actual", sha: "ffff555" },
-    "/repo/ocr": { branch: "main", dirty: false, sha: "base555" },
+    "/repo/ocr": { branch: "main", dirty: false, sha: "base555", refsFrom: "/wt/ocr" },
   });
 
   const command = await mergeCommand(
@@ -989,6 +1023,185 @@ test("a held run lock does not discard a merge that really happened; the report 
   assert.match(report.evidenceError, /evidence could not be persisted/i);
   assert.equal(fixture.calls.filter((call) => call.method === "mergeBranch").length, 1);
   await assert.rejects(() => realFs.readFile(join(run.directory, "events.jsonl"), "utf8"), { code: "ENOENT" });
+});
+
+// Important 1 (branch review), against REAL git in the exact topology the refusal exists for:
+// a separate clone, not a linked worktree. The base checkout HAS the source object (it fetched
+// it) so the old object-presence guard passes -- and its own branch of that name still points at
+// an older commit, so `git merge feature/actual` would merge something other than the sha the
+// preview predicted and the digest bound.
+test("a base checkout holding the source object but a stale branch of that name is refused, even though the object is present", async (t) => {
+  const store = await newStore(t);
+  const root = await mkdtemp(join(tmpdir(), "workflow-merge-clone-"));
+  t.after(() => realFs.rm(root, { recursive: true, force: true }));
+
+  const basePath = join(root, "base");
+  await realFs.mkdir(basePath);
+  await gitExec(root, ["init", "--initial-branch=dev", basePath]);
+  await gitExec(basePath, ["config", "user.name", "Workflow Tests"]);
+  await gitExec(basePath, ["config", "user.email", "workflow@example.test"]);
+  await realFs.writeFile(join(basePath, "README.md"), "base\n");
+  await gitExec(basePath, ["add", "README.md"]);
+  await gitExec(basePath, ["commit", "-m", "initial"]);
+
+  // A SEPARATE CLONE, not a linked worktree: its refs are its own.
+  const clonePath = join(root, "clone");
+  await gitExec(root, ["clone", basePath, clonePath]);
+  await gitExec(clonePath, ["config", "user.name", "Workflow Tests"]);
+  await gitExec(clonePath, ["config", "user.email", "workflow@example.test"]);
+  await gitExec(clonePath, ["checkout", "-b", "feature/actual"]);
+  await realFs.writeFile(join(clonePath, "feature.txt"), "work\n");
+  await gitExec(clonePath, ["add", "feature.txt"]);
+  await gitExec(clonePath, ["commit", "-m", "feature work"]);
+  const cloneSha = (await gitExec(clonePath, ["rev-parse", "HEAD"])).stdout.trim();
+
+  // The base checkout has a local branch of the same name at the OLD commit, and has fetched the
+  // clone's objects -- so the new commit is present without the branch pointing at it.
+  await gitExec(basePath, ["branch", "feature/actual", "dev"]);
+  await gitExec(basePath, ["fetch", clonePath, "feature/actual"]);
+  const baseBranchSha = (await gitExec(basePath, ["rev-parse", "feature/actual"])).stdout.trim();
+  assert.notEqual(baseBranchSha, cloneSha, "the fixture must actually disagree");
+
+  const git = realGit();
+  // The load-bearing part: object presence alone -- the previous guard -- says this is fine.
+  assert.equal(
+    await git.refExists({ cwd: basePath, ref: cloneSha, kind: "commit" }),
+    true,
+    "the object IS present; object presence alone cannot catch this",
+  );
+
+  const run = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-3",
+    repositories: [{ id: "primary", path: clonePath, branch: "feature/actual" }],
+  });
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry({ acme: { repository: "monorepo", path: basePath, base_branch: "dev" } }), git },
+  );
+
+  assert.equal(command.preview.refused, true);
+  assert.match(command.preview.reason, new RegExp(`resolves to ${baseBranchSha}`));
+  assert.match(command.preview.reason, new RegExp(`is at ${cloneSha}`));
+  assert.match(command.preview.reason, /previewing one commit and merging another/);
+
+  const before = (await gitExec(basePath, ["rev-parse", "dev"])).stdout;
+  await assert.rejects(
+    () => command.execute({ approvalDigest: `sha256:${"0".repeat(64)}` }),
+    (error) => error instanceof WorkflowError && error.exitCode === MERGE_EXIT_CODES.refused,
+  );
+  assert.equal((await gitExec(basePath, ["rev-parse", "dev"])).stdout, before);
+});
+
+// Important 2 (branch review): the property the whole digest design rests on. ONE mutable script
+// and ONE command instance -- the world moves after the preview was taken, and `execute` must
+// notice because it re-reads, not because a second preview was constructed for it.
+test("execute re-reads the world: the same command instance refuses once the repositories move under it", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const run = await groupRun(store, [GROUP_REPOSITORIES[0]]);
+  const script = groupFixture();
+  const fixture = scriptedGit(script);
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: fixture.git },
+  );
+  const approved = command.preview.approvalDigest;
+
+  // The worktree gains a commit between preview and approval. Nothing else changes, and no second
+  // mergeCommand is built -- an execute that trusted its construction-time preview would merge.
+  script["/wt/backend"] = { ...script["/wt/backend"], sha: "moved99" };
+
+  await assert.rejects(
+    () => command.execute({ approvalDigest: approved }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.match(error.message, /stale approval digest/i);
+      assert.notEqual(error.details.expected, approved);
+      return true;
+    },
+  );
+  assert.deepEqual(fixture.calls.filter((call) => call.method === "mergeBranch"), []);
+  assert.deepEqual(store.appendEventCalls, []);
+
+  // And the freshly computed digest is the one that works, against the world as it now is.
+  const report = await command.execute({ approvalDigest: (await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: fixture.git },
+  )).preview.approvalDigest });
+  assert.equal(report.status, "merged");
+  assert.equal(report.merged[0].sourceSha, "moved99");
+});
+
+// Minor (branch review): the "never discard a report of merges that already happened" property
+// must not depend on another module keeping its never-throws contract.
+test("a git adapter that breaks its contract and throws mid-sequence still reports the merge that already happened", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const run = await groupRun(store);
+  const fixture = scriptedGit(groupFixture({
+    "/base/panel": { merge: { throws: "git merge could not be spawned: EAGAIN" } },
+  }));
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: fixture.git },
+  );
+
+  const report = await command.execute({ approvalDigest: command.preview.approvalDigest });
+
+  assert.equal(report.status, "partial");
+  assert.equal(report.exitCode, MERGE_EXIT_CODES.partial);
+  assert.deepEqual(report.merged.map((entry) => entry.repositoryId), ["backend"]);
+  assert.deepEqual(report.failed.map((entry) => entry.repositoryId), ["panel"]);
+  assert.match(report.failed[0].reason, /EAGAIN/);
+  assert.deepEqual(report.skipped.map((entry) => entry.repositoryId), ["webapp"]);
+  assert.equal(store.appendEventCalls.length, 1, "the partial outcome is still recorded");
+});
+
+// Minor (branch review): a refusal names what to go do, rather than leaving the renderer to
+// invent one. Run-record problems point at reconcile, registry problems at doctor, and every
+// refusal ends with the dry-run to come back to.
+test("every refusal carries a concrete next action", async (t) => {
+  const store = await newStore(t);
+  const fixture = () => scriptedGit(groupFixture()).git;
+  const previewFor = async (repositories, projects, ticket) => {
+    const run = await store.create({ projectAlias: "sharyco", primaryTicket: ticket, ...(repositories ? { repositories } : {}) });
+    return (await mergeCommand({ runId: run.id }, { store, loadRegistry: mergeLoadRegistry(projects), git: fixture() })).preview;
+  };
+
+  const noRepositories = await previewFor(null, GROUP_PROJECT, "N-1");
+  assert.equal(noRepositories.refused, true);
+  assert.deepEqual(noRepositories.nextActions, [
+    `workflow reconcile --run ${noRepositories.runId}`,
+    `workflow merge ${noRepositories.runId} --dry-run`,
+  ]);
+
+  const unknownProject = await previewFor(GROUP_REPOSITORIES, { other: {} }, "N-2");
+  assert.deepEqual(unknownProject.nextActions, [
+    "workflow doctor sharyco",
+    `workflow merge ${unknownProject.runId} --dry-run`,
+  ]);
+
+  const noPath = await previewFor([{ id: "backend" }], GROUP_PROJECT, "N-3");
+  assert.deepEqual(noPath.nextActions[0], `workflow reconcile --run ${noPath.runId}`);
+
+  const noBaseBranch = await previewFor(
+    [GROUP_REPOSITORIES[0]],
+    { sharyco: { repository: "group", path: "/base/meta", repositories: { backend: { path: "/base/backend" } } } },
+    "N-4",
+  );
+  assert.deepEqual(noBaseBranch.nextActions[0], "workflow doctor sharyco");
+
+  // A conflicted (not refused) preview keeps its own single action; a mergeable one offers the
+  // approval command with the digest already in it.
+  const conflicted = (await mergeCommand(
+    { runId: (await store.create({ projectAlias: "sharyco", primaryTicket: "N-5", repositories: [GROUP_REPOSITORIES[0]] })).id },
+    {
+      store,
+      loadRegistry: mergeLoadRegistry(GROUP_PROJECT),
+      git: scriptedGit(groupFixture({ "/base/backend": { dirty: true, dirtyPaths: ["x.ts"] } })).git,
+    },
+  )).preview;
+  assert.deepEqual(conflicted.nextActions, [`workflow merge ${conflicted.runId} --dry-run`]);
 });
 
 // --- git.commitTimestamp -----------------------------------------------------

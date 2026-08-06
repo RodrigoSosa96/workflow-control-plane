@@ -1873,7 +1873,12 @@ function mergeCommandFor(runId) {
 // trace. A refused preview carries `approvalDigest: null`, so there is nothing an operator could
 // pass back to execute -- and execute rebuilds this same preview and refuses again rather than
 // trusting a digest from a previous, non-refused run.
-function mergeRefusal(runId, run, reason) {
+//
+// Every refusal reason names a concrete thing to go do, so `nextActions` is filled in here rather
+// than left for the renderer to invent: run-record problems point at `reconcile`, registry
+// problems at `doctor`, and every one of them ends with the dry-run to come back to once it is
+// fixed. Callers pass the diagnostic; the re-preview is appended for all of them.
+function mergeRefusal(runId, run, reason, diagnostics = []) {
   return {
     command: "merge",
     runId,
@@ -1887,13 +1892,19 @@ function mergeRefusal(runId, run, reason) {
     mergeable: false,
     approvalDigest: null,
     exitCode: MERGE_EXIT_CODES.refused,
-    nextActions: [],
+    nextActions: [...diagnostics, mergeCommandFor(runId)],
   };
+}
+
+// The two diagnostics a refusal can point at. `doctorCommandFor` takes the alias because a
+// registry problem is about the project, not about this run.
+function doctorCommandFor(projectAlias) {
+  return projectAlias ? `workflow doctor ${projectAlias}` : "workflow doctor";
 }
 
 function mergeGitAdapter(deps) {
   const git = deps.git;
-  for (const method of ["resolveHead", "checkoutState", "refExists", "previewMerge", "mergeArgv", "mergeBranch"]) {
+  for (const method of ["resolveHead", "checkoutState", "resolveRef", "previewMerge", "mergeArgv", "mergeBranch"]) {
     if (typeof git?.[method] !== "function") {
       mergeError("PREFLIGHT", `workflow merge requires a git adapter with ${method}()`, 10);
     }
@@ -1980,22 +1991,22 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   const worktreePath = recordedRepositoryPath(entry);
 
   if (!worktreePath) {
-    return { refusal: `Run ${runId} repository ${label} has no worktree path recorded; refusing rather than merging from an unknown directory.` };
+    return { refusal: `Run ${runId} repository ${label} has no worktree path recorded; refusing rather than merging from an unknown directory.`, actions: [reconcileCommandFor(runId)] };
   }
   if (!isAbsolute(worktreePath)) {
     // Same false-green class item 2.3's R2 finding removed for verify: a relative path resolves
     // against THIS process's own cwd (the control plane's own checkout), not against any run
     // worktree -- and here that would mean reading a source branch out of the control plane itself.
-    return { refusal: `Run ${runId} repository ${label} records a relative worktree path (${worktreePath}); refusing rather than resolving it against the control plane's own directory.` };
+    return { refusal: `Run ${runId} repository ${label} records a relative worktree path (${worktreePath}); refusing rather than resolving it against the control plane's own directory.`, actions: [reconcileCommandFor(runId)] };
   }
 
   const base = baseCheckoutFor(project, projectAlias, repositoryId, label);
-  if (base.error) return { refusal: base.error };
+  if (base.error) return { refusal: base.error, actions: [doctorCommandFor(projectAlias)] };
   if (typeof base.path !== "string" || !base.path || !isAbsolute(base.path)) {
-    return { refusal: `Project ${projectAlias} has no absolute base checkout path for repository ${label}; there is nothing to merge into.` };
+    return { refusal: `Project ${projectAlias} has no absolute base checkout path for repository ${label}; there is nothing to merge into.`, actions: [doctorCommandFor(projectAlias)] };
   }
   if (typeof base.baseBranch !== "string" || !base.baseBranch.trim()) {
-    return { refusal: `Project ${projectAlias} has no base_branch configured for repository ${label}; there is nothing to merge into.` };
+    return { refusal: `Project ${projectAlias} has no base_branch configured for repository ${label}; there is nothing to merge into.`, actions: [doctorCommandFor(projectAlias)] };
   }
   const basePath = base.path;
   const baseBranch = base.baseBranch.trim();
@@ -2007,13 +2018,13 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   try {
     head = await git.resolveHead({ cwd: worktreePath });
   } catch (error) {
-    return { refusal: `Run ${runId} repository ${label} worktree HEAD could not be resolved at ${worktreePath}: ${mergeErrorText(error)}` };
+    return { refusal: `Run ${runId} repository ${label} worktree HEAD could not be resolved at ${worktreePath}: ${mergeErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
   }
   if (!head?.branch) {
-    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is on a detached HEAD; there is no source branch to merge.` };
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is on a detached HEAD; there is no source branch to merge.`, actions: [reconcileCommandFor(runId)] };
   }
   if (typeof head.sha !== "string" || !head.sha) {
-    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} reported no HEAD commit; there is nothing to merge.` };
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} reported no HEAD commit; there is nothing to merge.`, actions: [reconcileCommandFor(runId)] };
   }
 
   let baseState;
@@ -2022,20 +2033,28 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
     baseState = await git.checkoutState({ cwd: basePath });
     baseHead = await git.resolveHead({ cwd: basePath });
   } catch (error) {
-    return { refusal: `Project ${projectAlias} base checkout for repository ${label} could not be read at ${basePath}: ${mergeErrorText(error)}` };
+    return { refusal: `Project ${projectAlias} base checkout for repository ${label} could not be read at ${basePath}: ${mergeErrorText(error)}`, actions: [doctorCommandFor(projectAlias)] };
   }
 
-  let reachable;
+  // The preview predicts conflicts against the SHA, and the digest binds the SHA -- but the merge
+  // that runs is `git merge --no-ff --no-edit <branch-name>`, which git resolves in the BASE
+  // CHECKOUT's own ref namespace. Proving the object is merely present there is not enough: in a
+  // separate-clone topology (the very case this refusal exists for), the base checkout can hold
+  // the object from an earlier fetch while its own `feature/x` still points at an older commit --
+  // and then the preview says "clean, merging X" while git merges Y and the report records X.
+  // So the branch is resolved HERE, the same way merge will resolve it, and anything other than
+  // an exact match with the worktree's sha is a refusal.
+  let baseSourceSha;
   try {
-    reachable = await git.refExists({ cwd: basePath, ref: head.sha, kind: "commit" });
+    baseSourceSha = await git.resolveRef({ cwd: basePath, ref: head.branch, timeoutMs });
   } catch (error) {
-    return { refusal: `Run ${runId} repository ${label} source commit ${head.sha} could not be checked against the base checkout at ${basePath}: ${mergeErrorText(error)}` };
+    return { refusal: `Run ${runId} repository ${label} source branch ${head.branch} could not be resolved in the base checkout at ${basePath}: ${mergeErrorText(error)}` };
   }
-  if (!reachable) {
-    // A separate clone rather than a linked worktree of the same repository. `git merge` would
-    // resolve the branch NAME locally and merge something else, or fail -- either way the preview
-    // would have predicted a merge that cannot be the one that runs.
-    return { refusal: `Run ${runId} repository ${label} source commit ${head.sha} is not reachable from the base checkout at ${basePath}; refusing rather than merging a commit that checkout does not have.` };
+  if (!baseSourceSha) {
+    return { refusal: `Run ${runId} repository ${label} source branch ${head.branch} does not resolve to a commit in the base checkout at ${basePath}; refusing rather than merging a ref that checkout does not have.` };
+  }
+  if (baseSourceSha !== head.sha) {
+    return { refusal: `Run ${runId} repository ${label} source branch ${head.branch} resolves to ${baseSourceSha} in the base checkout at ${basePath}, but the worktree at ${worktreePath} is at ${head.sha}; refusing rather than previewing one commit and merging another.` };
   }
 
   const preview = await git.previewMerge({ cwd: basePath, base: baseBranch, source: head.sha, timeoutMs });
@@ -2200,14 +2219,14 @@ function publicMergeRepository(record) {
 async function buildMergePreview(runId, run, options, deps) {
   const repositories = list(run.repositories);
   if (repositories.length === 0) {
-    return { preview: mergeRefusal(runId, run, `Run ${runId} has no repositories[] recorded; nothing to merge.`), records: [] };
+    return { preview: mergeRefusal(runId, run, `Run ${runId} has no repositories[] recorded; nothing to merge.`, [reconcileCommandFor(runId)]), records: [] };
   }
 
   const injectedLoadRegistry = deps.loadRegistry ?? loadRegistry;
   const registry = await injectedLoadRegistry(options.registryPath);
   const project = registry?.projects?.[run.projectAlias];
   if (!project) {
-    return { preview: mergeRefusal(runId, run, `Unknown workflow project: ${run.projectAlias}`), records: [] };
+    return { preview: mergeRefusal(runId, run, `Unknown workflow project: ${run.projectAlias}`, [doctorCommandFor(run.projectAlias)]), records: [] };
   }
 
   const git = mergeGitAdapter(deps);
@@ -2225,7 +2244,7 @@ async function buildMergePreview(runId, run, options, deps) {
       git,
       timeoutMs,
     });
-    if (outcome.refusal) return { preview: mergeRefusal(runId, run, outcome.refusal), records: [] };
+    if (outcome.refusal) return { preview: mergeRefusal(runId, run, outcome.refusal, list(outcome.actions)), records: [] };
     records.push(outcome.record);
   }
 
@@ -2306,7 +2325,17 @@ async function runMergeSequence(records, git, timeoutMs) {
       continue;
     }
 
-    const result = await git.mergeBranch({ cwd: record.basePath, source: record.sourceBranch, timeoutMs });
+    // git.js's mergeBranch is documented never to throw, and does not. This guard exists anyway
+    // because "never discard a report of merges that already happened" must not depend on another
+    // module keeping its contract: one thrown error from repository 2 would otherwise unwind past
+    // repository 1's real, already-committed merge and leave the operator with a stack trace
+    // instead of the only record that it happened. These merges are not undoable by rerunning.
+    let result;
+    try {
+      result = await git.mergeBranch({ cwd: record.basePath, source: record.sourceBranch, timeoutMs });
+    } catch (error) {
+      result = { ok: false, code: 1, stdout: "", stderr: "", argv: record.argv, error: String(error?.message ?? error) };
+    }
     // The EXECUTED argv is reported, not the approved one. They are the same expression by
     // construction (git.js builds both from mergeArgvFor), and reporting the approved one would be
     // the false green if they ever were not.

@@ -82,8 +82,9 @@ function parseStatus(output) {
   return entries;
 }
 
-// sha1 (40) or sha256 (64) hex. An answer that is not an object id is not an answer.
-const TREE_OID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+// sha1 (40) or sha256 (64) hex. An answer that is not an object id is not an answer. Used both
+// for `merge-tree`'s tree and for `resolveRef`'s commit -- one shape, one constant.
+const OBJECT_ID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 
 // The one merge argv, written once. Both the approval digest and the child process read it from
 // here, so the string an operator approves cannot drift from the string that runs.
@@ -116,11 +117,11 @@ function parseMergeTree(output) {
   // the truth rather than the truth. Drop the fragment; the caller is told the rest is missing.
   if (!complete) conflicts.pop();
 
-  return { tree: TREE_OID.test(tree) ? tree : "", conflicts, complete };
+  return { tree: OBJECT_ID.test(tree) ? tree : "", conflicts, complete };
 }
 
 // `git log -1 --format=%cI` emits a strict ISO-8601 committer date. Validated rather than trusted
-// for the same reason TREE_OID is: a value that is not a timestamp is not an answer, and the one
+// for the same reason OBJECT_ID is: a value that is not a timestamp is not an answer, and the one
 // caller compares it against verification evidence to decide whether that evidence is stale.
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -360,6 +361,23 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
       } catch (error) {
         return { branch, dirty: null, entries: [], statusError: reasonFrom(error) };
       }
+    },
+
+    // What a ref name resolves to IN THIS CHECKOUT's own ref namespace. `refExists` answers only
+    // whether an OBJECT is present, which is a different question: `git merge <branch>` resolves
+    // the NAME here, so a caller that previewed a sha has to prove the name it is about to hand
+    // git resolves to that same sha. Never throws; an absent, ambiguous, or non-commit ref
+    // answers null, which the caller must treat as a refusal rather than as a match.
+    async resolveRef({ cwd, ref, timeoutMs }) {
+      let result;
+      try {
+        result = await runner.run("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { cwd, timeoutMs, allowFailure: true });
+      } catch {
+        return null;
+      }
+      if (result.code !== 0) return null;
+      const value = trimText(result.stdout);
+      return OBJECT_ID.test(value) ? value : null;
     },
 
     // When a commit came to exist, so a caller can say whether verification evidence predates the
