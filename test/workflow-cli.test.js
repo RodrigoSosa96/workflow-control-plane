@@ -2626,3 +2626,279 @@ test("bounds formatted output before printing", async () => {
   assert.equal(output.stdout.length, 1);
   assert.ok(output.stdout[0].length <= 12000);
 });
+
+// --- `workflow merge` (roadmap item 2.4) ------------------------------------------------------
+//
+// The CLI gate mirrors `launch`'s: `--yes` without `--approval-digest` is a usage error, and
+// neither `--dry-run` nor `--yes` is a usage error too -- merge has no interactive confirmation
+// path, because the thing being approved is a digest over the exact commits and argv, not a
+// yes/no about a plan.
+
+const MERGE_APPROVAL_DIGEST = `sha256:${"b".repeat(64)}`;
+
+function mergePreviewFixture(overrides = {}) {
+  return {
+    command: "merge",
+    runId: RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: false,
+    repositories: [],
+    verification: { status: "none", verifiedAt: null, passed: null, exitCode: null, staleRelativeToSource: null },
+    conflicts: [],
+    mergeable: true,
+    approvalDigest: MERGE_APPROVAL_DIGEST,
+    exitCode: 0,
+    nextActions: [`workflow merge ${RUN_ID} --yes --approval-digest ${MERGE_APPROVAL_DIGEST}`],
+    ...overrides,
+  };
+}
+
+test("merge parses its dry-run and approval shapes, and rejects everything else", () => {
+  assert.deepEqual(parseArgs(["merge", RUN_ID, "--dry-run"]), {
+    command: "merge",
+    runId: RUN_ID,
+    dryRun: true,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["merge", RUN_ID, "--yes", "--approval-digest", MERGE_APPROVAL_DIGEST, "--format", "json"]), {
+    command: "merge",
+    runId: RUN_ID,
+    approvalDigest: MERGE_APPROVAL_DIGEST,
+    yes: true,
+    format: "json",
+  });
+
+  assert.throws(() => parseArgs(["merge"]), /merge requires an argument/i);
+  assert.throws(() => parseArgs(["merge", "not-a-uuid", "--dry-run"]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["merge", RUN_ID, "extra", "--dry-run"]), /unexpected argument/i);
+  assert.throws(() => parseArgs(["merge", RUN_ID, "--repos", "backend"]), /merge does not accept --repos/i);
+});
+
+test("merge --dry-run previews without executing and returns the preview's own exit code", async () => {
+  for (const [preview, expectedCode] of [
+    [mergePreviewFixture(), 0],
+    [mergePreviewFixture({ mergeable: false, exitCode: 11, conflicts: [{ repositoryId: "panel", resource: "merge:/base/panel", reason: "conflicts in 2 file(s)" }] }), 11],
+    [mergePreviewFixture({ refused: true, reason: "Unknown workflow project: sharyco", mergeable: false, approvalDigest: null, exitCode: 10 }), 10],
+  ]) {
+    const output = io();
+    const code = await main(["merge", RUN_ID, "--dry-run"], {
+      ...output,
+      mergeCommand: async (options) => {
+        assert.equal(options.runId, RUN_ID);
+        return {
+          preview,
+          execute: async () => {
+            throw new Error("a dry-run must never execute a merge");
+          },
+        };
+      },
+      formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.exitCode}`,
+    });
+    assert.equal(code, expectedCode);
+    assert.deepEqual(output.stdout, [`merge:compact:${expectedCode}`]);
+    assert.deepEqual(output.stderr, []);
+  }
+});
+
+test("merge --yes without --approval-digest is a usage error, and never even builds the command", async () => {
+  const output = io();
+  const code = await main(["merge", RUN_ID, "--yes"], {
+    ...output,
+    mergeCommand: async () => {
+      throw new Error("merge --yes without a digest must not reach mergeCommand");
+    },
+  });
+  assert.equal(code, 64);
+  assert.match(output.stderr[0], /USAGE/);
+  assert.match(output.stderr[0], /--approval-digest/);
+  assert.deepEqual(output.stdout, []);
+});
+
+test("merge with neither --dry-run nor --yes is a usage error", async () => {
+  const output = io();
+  const code = await main(["merge", RUN_ID], {
+    ...output,
+    mergeCommand: async () => {
+      throw new Error("merge with no mode must not reach mergeCommand");
+    },
+  });
+  assert.equal(code, 64);
+  assert.match(output.stderr[0], /USAGE/);
+  assert.match(output.stderr[0], /--dry-run/);
+  assert.deepEqual(output.stdout, []);
+});
+
+test("merge --yes --approval-digest passes the digest through and exits the report's own code", async () => {
+  const calls = [];
+  const output = io();
+  const code = await main(["merge", RUN_ID, "--yes", "--approval-digest", MERGE_APPROVAL_DIGEST], {
+    ...output,
+    mergeCommand: async () => ({
+      preview: mergePreviewFixture(),
+      execute: async (executeOptions) => {
+        calls.push(executeOptions);
+        return {
+          command: "merge",
+          runId: RUN_ID,
+          status: "partial",
+          merged: [{ repositoryId: "backend" }],
+          failed: [{ repositoryId: "panel", reason: "hook rejected the merge" }],
+          skipped: [{ repositoryId: "webapp", reason: "never attempted: an earlier repository's merge failed" }],
+          passed: false,
+          exitCode: 13,
+        };
+      },
+    }),
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status}`,
+  });
+  assert.equal(code, 13);
+  assert.deepEqual(calls, [{ approvalDigest: MERGE_APPROVAL_DIGEST }]);
+  assert.deepEqual(output.stdout, ["merge:compact:partial"]);
+});
+
+test("merge surfaces a thrown refusal as PREFLIGHT/10 and a thrown conflict as CONFLICT/11", async () => {
+  for (const [category, exitCode, expectedCode, message] of [
+    ["PREFLIGHT", 10, 10, "Stale approval digest; rerun workflow merge <id> --dry-run before executing. Current digest: sha256:beef"],
+    ["CONFLICT", 11, 11, "merge:/base/panel: Merging feature/x into dev conflicts in 2 file(s)"],
+  ]) {
+    const output = io();
+    const code = await main(["merge", RUN_ID, "--yes", "--approval-digest", MERGE_APPROVAL_DIGEST], {
+      ...output,
+      mergeCommand: async () => ({
+        preview: mergePreviewFixture(),
+        execute: async () => {
+          throw new WorkflowError(category, message, { exitCode });
+        },
+      }),
+    });
+    assert.equal(code, expectedCode);
+    assert.match(output.stderr[0], new RegExp(`^${category}: `));
+    assert.ok(output.stderr[0].includes(message), output.stderr[0]);
+    assert.deepEqual(output.stdout, []);
+  }
+});
+
+// The one test that proves the whole lane against real git rather than a double: a real base
+// checkout, a real linked worktree on a real feature branch, a real run record in a real store,
+// driven through the real `main` -- parseArgs -> mergeCommand -> git.js -> formatMerge -- with
+// only the registry injected (reading a real projects.yaml is registry.js's own concern).
+function gitRun(cwd, args) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+async function realMergePair(t, { conflicting = false } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "workflow-merge-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const basePath = join(root, "base");
+  await mkdir(basePath, { recursive: true });
+  gitRun(root, ["init", "--initial-branch=dev", basePath]);
+  gitRun(basePath, ["config", "user.name", "Workflow Tests"]);
+  gitRun(basePath, ["config", "user.email", "workflow@example.test"]);
+  await writeFile(join(basePath, "README.md"), "base\n");
+  gitRun(basePath, ["add", "README.md"]);
+  gitRun(basePath, ["commit", "-m", "initial"]);
+
+  const worktreePath = join(root, "work");
+  gitRun(basePath, ["worktree", "add", "-b", "feature/actual", worktreePath, "dev"]);
+  await writeFile(join(worktreePath, conflicting ? "README.md" : "feature.txt"), "feature side\n");
+  gitRun(worktreePath, ["add", "."]);
+  gitRun(worktreePath, ["commit", "-m", "feature work"]);
+
+  if (conflicting) {
+    await writeFile(join(basePath, "README.md"), "base side\n");
+    gitRun(basePath, ["add", "README.md"]);
+    gitRun(basePath, ["commit", "-m", "base work"]);
+  }
+
+  return { root, basePath, worktreePath };
+}
+
+function worktreeFingerprint(cwd) {
+  return {
+    head: gitRun(cwd, ["rev-parse", "HEAD"]),
+    branch: gitRun(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    status: gitRun(cwd, ["status", "--porcelain"]),
+    files: gitRun(cwd, ["ls-files", "-s"]),
+  };
+}
+
+test("workflow merge end-to-end against real git: the dry-run's digest merges, the base branch advances with a --no-ff merge commit, and the run worktree is untouched", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "workflow-merge-cli-state-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const stateRoot = join(stateDir, "state");
+  const store = createRunStore({ stateRoot });
+  const { basePath, worktreePath } = await realMergePair(t);
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    // The real-data shape: the recorded branch is a launch-time intention that no longer exists.
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/1216110941098331/gone" }],
+  });
+  const loadRegistry = async () => ({ projects: { ocr: { path: basePath, base_branch: "dev" } } });
+
+  const beforeWorktree = worktreeFingerprint(worktreePath);
+  const beforeBaseSha = gitRun(basePath, ["rev-parse", "dev"]);
+
+  const preview = io();
+  assert.equal(await main(["merge", run.id, "--dry-run"], { ...preview, stateRoot, loadRegistry }), 0);
+  assert.match(preview.stdout[0], /^Merge: mergeable$/m);
+  assert.match(preview.stdout[0], /^primary: \["git","merge","--no-ff","--no-edit","feature\/actual"\]$/m);
+  assert.match(preview.stdout[0], /^Branch mismatch:$/m);
+  assert.match(preview.stdout[0], /^Verification: none recorded/m);
+  const digest = preview.stdout[0].match(/^Approval digest: (sha256:[0-9a-f]{64})$/m)?.[1];
+  assert.ok(digest, `the preview must print a digest:\n${preview.stdout[0]}`);
+
+  // The dry-run mutated nothing an operator can observe.
+  assert.equal(gitRun(basePath, ["rev-parse", "dev"]), beforeBaseSha);
+  assert.deepEqual(worktreeFingerprint(worktreePath), beforeWorktree);
+
+  const executed = io();
+  assert.equal(await main(["merge", run.id, "--yes", "--approval-digest", digest], { ...executed, stateRoot, loadRegistry }), 0);
+  assert.match(executed.stdout[0], /^Merge: merged$/m);
+
+  const afterBaseSha = gitRun(basePath, ["rev-parse", "dev"]);
+  assert.notEqual(afterBaseSha, beforeBaseSha, "dev must have advanced");
+  assert.equal(gitRun(basePath, ["rev-list", "--parents", "-n", "1", "dev"]).split(" ").length, 3, "--no-ff must leave a two-parent merge commit");
+  assert.deepEqual(worktreeFingerprint(worktreePath), beforeWorktree, "the run worktree must be byte-identical after the merge");
+
+  // Replaying the same digest is refused: the base sha moved, so the preview it approved is gone.
+  const replay = io();
+  assert.equal(await main(["merge", run.id, "--yes", "--approval-digest", digest], { ...replay, stateRoot, loadRegistry }), 10);
+  assert.match(replay.stderr[0], /^PREFLIGHT: Stale approval digest/);
+  assert.equal(gitRun(basePath, ["rev-parse", "dev"]), afterBaseSha, "a refused replay must move nothing");
+});
+
+test("workflow merge end-to-end against a real conflicting pair: the dry-run predicts the conflict, exits nonzero, and nothing moves", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "workflow-merge-cli-conflict-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const stateRoot = join(stateDir, "state");
+  const store = createRunStore({ stateRoot });
+  const { basePath, worktreePath } = await realMergePair(t, { conflicting: true });
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-2",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const loadRegistry = async () => ({ projects: { ocr: { path: basePath, base_branch: "dev" } } });
+
+  const beforeBaseSha = gitRun(basePath, ["rev-parse", "dev"]);
+  const beforeWorktree = worktreeFingerprint(worktreePath);
+
+  const preview = io();
+  assert.equal(await main(["merge", run.id, "--dry-run"], { ...preview, stateRoot, loadRegistry }), 11, "a conflicted dry-run must not exit 0");
+  assert.match(preview.stdout[0], /^Merge: blocked by 1 conflict/m);
+  assert.match(preview.stdout[0], /CONFLICTED \(1\)/);
+  assert.match(preview.stdout[0], /README\.md/);
+  const digest = preview.stdout[0].match(/^Approval digest: (sha256:[0-9a-f]{64})$/m)?.[1];
+  assert.ok(digest, "a conflicted preview still carries a digest; it is the execution that refuses");
+
+  const executed = io();
+  assert.equal(await main(["merge", run.id, "--yes", "--approval-digest", digest], { ...executed, stateRoot, loadRegistry }), 11);
+  assert.match(executed.stderr[0], /^CONFLICT: /);
+  assert.equal(gitRun(basePath, ["rev-parse", "dev"]), beforeBaseSha, "a blocked merge must move nothing");
+  assert.deepEqual(worktreeFingerprint(worktreePath), beforeWorktree);
+});

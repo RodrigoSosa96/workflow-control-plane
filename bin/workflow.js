@@ -22,6 +22,7 @@ import {
   handoffCommand as defaultHandoffCommand,
   inboxCommand as defaultInboxCommand,
   launchCommand as defaultLaunchCommand,
+  mergeCommand as defaultMergeCommand,
   planCommand as defaultPlanCommand,
   reconcileCommand as defaultReconcileCommand,
   resultCommand as defaultResultCommand,
@@ -57,6 +58,8 @@ Commands:
   workflow launch <project> <primary-ticket> --prompt-file <path> [--tickets <csv>] [--feature <text>] [--repos <csv>] [--agent <profile>] [--selection-reason <text>] [--origin-session <id>] [--dry-run] [--approval-digest <digest>] [--format compact|json] [--yes]
   workflow result <run-id> [--format compact|json]
   workflow verify <run-id> [--format compact|json]
+  workflow merge <run-id> --dry-run [--format compact|json]
+  workflow merge <run-id> --yes --approval-digest <digest> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
   workflow runs [project] [--state <state>] [--all] [--format compact|json]
   workflow inbox [project] [--format compact|json]
@@ -332,6 +335,23 @@ export function parseArgs(argv) {
     return {
       command,
       runId: positionals[0],
+      format,
+    };
+  }
+
+  // Same three options `launch` takes for the same three reasons: `--dry-run` previews, and
+  // `--yes` plus `--approval-digest` is the only way to execute. Nothing else is accepted --
+  // `--repos` in particular, because a merge covers exactly the repositories the run recorded, and
+  // silently narrowing that would half-merge a group project by argument.
+  if (command === "merge") {
+    validateShape("merge", positionals, options, { min: 1, max: 1, allowedOptions: ["dry-run", "approval-digest", "yes"] });
+    assertPathSafeUuidSyntax(positionals[0], "merge run ID");
+    return {
+      command,
+      runId: positionals[0],
+      ...(options["dry-run"] ? { dryRun: true } : {}),
+      ...(options["approval-digest"] ? { approvalDigest: options["approval-digest"] } : {}),
+      ...(options.yes ? { yes: true } : {}),
       format,
     };
   }
@@ -746,6 +766,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const launchCommand = dependencies.launchCommand ?? defaultLaunchCommand;
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const verifyCommand = dependencies.verifyCommand ?? defaultVerifyCommand;
+  const mergeCommand = dependencies.mergeCommand ?? defaultMergeCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const runsCommand = dependencies.runsCommand ?? defaultRunsCommand;
   const inboxCommand = dependencies.inboxCommand ?? defaultInboxCommand;
@@ -875,6 +896,46 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       const result = await verifyCommand(options, liveDependencies);
       emit(out, formatWorkflowResult("verify", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
+    }
+
+    // The most consequential mutation this CLI performs, and the gate mirrors `launch`'s (:798)
+    // exactly: `--yes` without `--approval-digest` is a usage error, because the digest is the
+    // whole approval -- it binds the resolved source and base commit shas, the base checkout's
+    // cleanliness, the exact argv, and the verification status, so a `--yes` on its own would be
+    // approving a preview nobody read.
+    //
+    // Unlike `launch`, there is no interactive-confirmation path and therefore no isInteractive()
+    // branch: "neither --dry-run nor --yes" is simply a usage error. A y/N prompt would be
+    // approving a rendering rather than a digest, and the digest is what makes an approval
+    // refusable once anything moves underneath it.
+    if (args.command === "merge") {
+      if (args.yes && !args.approvalDigest) {
+        emit(err, "USAGE: merge --yes requires --approval-digest from the current dry-run preview.");
+        return 64;
+      }
+      if (!args.dryRun && !args.yes) {
+        emit(err, "USAGE: merge requires --dry-run to preview, or --yes with --approval-digest to execute.");
+        return 64;
+      }
+
+      const command = await mergeCommand(options, liveDependencies);
+
+      if (args.dryRun) {
+        // `preview.exitCode` verbatim: 0 mergeable, 11 conflicted, 10 refused. A conflicted
+        // dry-run must not exit 0 -- a script gating on this command's exit code is the whole
+        // reason the preview computes conflicts for every repository before anything runs.
+        emit(out, formatWorkflowResult("merge", command.preview, args.format));
+        return Number.isInteger(command.preview.exitCode) ? command.preview.exitCode : 0;
+      }
+
+      // execute() throws for a refusal, a missing/invalid/stale digest (PREFLIGHT -> 10) and for
+      // conflicts (CONFLICT -> 11); categorizeError already maps both. It returns a report only
+      // for merges that actually ran, and that report's own exitCode distinguishes merged (0)
+      // from partial (13) from failed (1) -- never collapsed into a single success code, because
+      // a partially merged group project is not a success.
+      const report = await command.execute({ approvalDigest: args.approvalDigest });
+      emit(out, formatWorkflowResult("merge", report, args.format));
+      return Number.isInteger(report.exitCode) ? report.exitCode : 0;
     }
 
     if (args.command === "reconcile") {

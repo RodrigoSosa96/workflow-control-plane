@@ -693,6 +693,270 @@ export function formatVerify(value = {}) {
   return bound(lines.join("\n"));
 }
 
+// --- formatMerge (roadmap item 2.4's `workflow merge`) ----------------------------------------
+//
+// Two shapes reach this renderer and the discriminator is structural, never an import from
+// commands.js: this file is deliberately dependency-free (nothing here imports MERGE_EXIT_CODES or
+// any other command constant), so a preview is recognized by its `repositories[]` and an execution
+// report by its `merged`/`failed`/`skipped` lists. A refusal is recognized by `refused` on the
+// value, the same way formatVerify recognizes one by `reason`.
+//
+// The four things this view must never lose (Task 2's own interface notes, and the reason the
+// design spec puts a digest in front of this command at all):
+//   1. the exact argv per repository -- it is what the approval digest binds, so it is rendered
+//      verbatim as JSON rather than shell-joined, exactly as formatLaunchPreview renders its own
+//      `Launch argv:` line;
+//   2. the conflicts -- and never a shortened list rendered as the complete set;
+//   3. the branch mismatch, with the recorded branch and the worktree's actual branch beside each
+//      other (the real-data finding: two of the eight real runs on this machine record a branch
+//      that no longer exists);
+//   4. the verification status, including `none`.
+
+const MERGE_COLUMNS = [
+  { key: "repo", label: "REPO" },
+  { key: "source", label: "SOURCE" },
+  { key: "base", label: "BASE" },
+  { key: "checkout", label: "BASE CHECKOUT" },
+  { key: "merge", label: "MERGE" },
+];
+
+// Same convention verifyStatusLabel established: only the clean case stays lowercase, so anything
+// that blocks the merge stands out from the row above it without color or emoji. `baseDirty` is
+// tri-state (`true`/`false`/`null`) and only an explicit `false` may read as clean -- item 0.14's
+// lesson, applied here at the point where an operator actually reads it.
+function mergeCheckoutLabel(record) {
+  const branch = text(record.baseCheckedOutBranch, "DETACHED");
+  const onBase = record.baseBranchCheckedOut === true ? branch : `${branch} (NOT ${text(record.baseBranch)})`;
+  const state = record.baseDirty === false
+    ? "clean"
+    : record.baseDirty === true
+      ? `DIRTY (${Number.isFinite(record.baseDirtyCount) ? record.baseDirtyCount : list(record.baseDirtyPaths).length})`
+      : "STATUS UNKNOWN";
+  return `${onBase}, ${state}`;
+}
+
+// `conflictsTruncated` is true for either of two causes the public preview cannot tell apart
+// (git's own 12,000-character capture cap, or commands.js's display cap), and under the first one
+// `conflictCount` is itself a floor rather than the true total. `900+` is therefore the only
+// reading that is correct under both.
+function mergeConflictLabel(record) {
+  const count = Number.isFinite(record.conflictCount) ? record.conflictCount : list(record.conflicts).length;
+  if (record.conflictStatus === "clean") return "clean";
+  if (record.conflictStatus === "conflicted") return `CONFLICTED (${count}${record.conflictsTruncated ? "+" : ""})`;
+  return text(record.conflictStatus).toUpperCase();
+}
+
+function mergeRow(record = {}) {
+  return {
+    repo: text(record.repositoryId),
+    source: text(record.sourceBranch),
+    base: text(record.baseBranch),
+    checkout: mergeCheckoutLabel(record),
+    merge: mergeConflictLabel(record),
+  };
+}
+
+// Rendered for every repository, blocked or not: an operator reading a refused-to-execute preview
+// still wants to see what would have run, and the argv is the thing the digest actually approves.
+function appendMergeArgv(lines, repositories) {
+  if (repositories.length === 0) {
+    lines.push("Argv: none");
+    return;
+  }
+  lines.push("Argv:");
+  for (const record of repositories) {
+    lines.push(`${text(record.repositoryId)}: ${Array.isArray(record.argv) ? JSON.stringify(record.argv) : "unavailable"}`);
+  }
+}
+
+// `branchMismatch` is `recordedBranch !== sourceBranch` (commands.js), so a run that recorded no
+// branch at all also lands here -- that disagreement is worth naming too. The empty case prints an
+// explicit line rather than vanishing, the same discipline formatResult applies to its two
+// verification sections: a missing section must never be readable as "this view forgot to ask".
+function appendMergeBranchMismatch(lines, repositories) {
+  const mismatched = repositories.filter((record) => record.branchMismatch);
+  if (mismatched.length === 0) {
+    lines.push("Branch mismatch: none");
+    return;
+  }
+  lines.push("Branch mismatch:");
+  for (const record of mismatched) {
+    lines.push(`${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; the worktree ${text(record.worktreePath)} is on ${text(record.sourceBranch)} — the worktree's branch is what would be merged`);
+  }
+}
+
+// The conflicted paths themselves, per repository. Three cases, and only the first may read as a
+// complete list:
+//   - conflicted with the whole list present -> the paths, with the total beside them;
+//   - conflicted with a shortened list       -> the paths, explicitly marked TRUNCATED. Approving
+//     "these 10 conflicts" when there are 900 is the wrong approval, so this must never be
+//     silently indistinguishable from the case above;
+//   - anything else (`unknown`)              -> named as undetermined with git's own reason. An
+//     undetermined conflict list is an EMPTY array; printing it as "none" would be the exact false
+//     green this roadmap keeps removing.
+function appendMergeConflictFiles(lines, repositories) {
+  const affected = repositories.filter((record) => record.conflictStatus !== "clean");
+  if (affected.length === 0) return;
+  lines.push("Conflicted files:");
+  for (const record of affected) {
+    const label = text(record.repositoryId);
+    if (record.conflictStatus !== "conflicted") {
+      lines.push(...reasonBlock(`${label}: NOT DETERMINED`, text(record.conflictReason, "git could not report the conflicts; treated as conflicted, never as clean")));
+      continue;
+    }
+    const shown = list(record.conflicts).map((path) => String(path));
+    const count = Number.isFinite(record.conflictCount) ? record.conflictCount : shown.length;
+    const suffix = record.conflictsTruncated
+      ? ` (showing ${shown.length} of at least ${count}; this list is TRUNCATED, not the complete set)`
+      : ` (${count} total)`;
+    lines.push(`${label}: ${shown.join(", ") || "none listed"}${suffix}`);
+  }
+}
+
+// Verification is surfaced and folded into the digest; it gates nothing (design spec, open
+// decision 2). Every branch of the tri-state prints something: `staleRelativeToSource` is
+// `null` when it could not be determined, and "unknown" must not render as "not stale".
+function mergeVerificationLine(verification) {
+  if (!verification || typeof verification !== "object") return "Verification: unknown";
+  if (verification.status !== "recorded") {
+    return "Verification: none recorded (workflow verify has never completed for this run); it is folded into the approval digest and gates nothing";
+  }
+  const verdict = verification.passed === true ? "passed" : verification.passed === false ? "FAILED" : "UNKNOWN";
+  const exitCode = verification.exitCode === null || verification.exitCode === undefined ? "-" : String(verification.exitCode);
+  const staleness = verification.staleRelativeToSource === true
+    ? "; STALE: the source commit is newer than this evidence"
+    : verification.staleRelativeToSource === false
+      ? ""
+      : "; staleness unknown";
+  return `Verification: ${verdict} (exit ${exitCode}, ran ${text(verification.verifiedAt)})${staleness}`;
+}
+
+// A merge reason is not a sentence this codebase wrote -- it is git's own stderr (commands.js's
+// `mergeFailureText`, capped at 2,000 characters), and git writes multiple lines. Found running
+// the real CLI against a base checkout whose `pre-merge-commit` hook rejects the merge: git's
+// stderr is two lines, and rendered raw the second one lands in the Reasons section with no
+// repository label in front of it, reading as a statement about the whole run. In that exact case
+// the orphaned line was git's own advice to *complete* the merge -- sitting unattributed inside a
+// report about a merge that failed, which is precisely backwards. Continuation lines are indented
+// so every line of a reason is visibly part of one entry, and git's text is preserved verbatim
+// rather than collapsed onto one line, which would mangle output an operator has to act on.
+function reasonBlock(label, reason) {
+  const [first, ...rest] = String(reason).replace(/\r\n?/g, "\n").split("\n");
+  return [`${label}: ${first}`, ...rest.map((line) => `    ${line}`)];
+}
+
+function appendMergeNextActions(lines, nextActions) {
+  const actions = list(nextActions).map((action) => String(action));
+  if (actions.length === 0) return;
+  lines.push("Next:");
+  for (const action of actions) lines.push(`- ${action}`);
+}
+
+function formatMergePreview(value) {
+  const repositories = list(value.repositories);
+  const conflicts = list(value.conflicts);
+  const lines = [
+    `Run: ${text(value.runId)}`,
+    `Project: ${text(value.projectAlias)} (run state: ${text(value.runState)})`,
+    conflicts.length === 0
+      ? "Merge: mergeable"
+      : `Merge: blocked by ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}`,
+    mergeVerificationLine(value.verification),
+  ];
+
+  if (repositories.length === 0) lines.push("Repositories: none");
+  else lines.push(...renderTable(MERGE_COLUMNS, repositories.map(mergeRow)));
+
+  appendMergeArgv(lines, repositories);
+  appendMergeBranchMismatch(lines, repositories);
+  appendMergeConflictFiles(lines, repositories);
+
+  // The aggregated list -- what actually blocks execution -- with each reason on its own line,
+  // the layering formatVerify uses for its own Reasons section.
+  if (conflicts.length === 0) lines.push("Conflicts: none");
+  else addConflicts(lines, conflicts);
+
+  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
+  appendMergeNextActions(lines, value.nextActions);
+  return bound(lines.join("\n"));
+}
+
+const MERGE_REPORT_COLUMNS = [
+  { key: "repo", label: "REPO" },
+  { key: "status", label: "STATUS" },
+  { key: "base", label: "BASE" },
+  { key: "argv", label: "ARGV" },
+];
+
+function mergeReportRow(entry = {}, status) {
+  return {
+    repo: text(entry.repositoryId),
+    status,
+    base: `${text(entry.basePath)} (${text(entry.baseBranch)})`,
+    argv: Array.isArray(entry.argv) ? JSON.stringify(entry.argv) : "unavailable",
+  };
+}
+
+// There is no cross-repository transaction for a group project, so this report is written to admit
+// partial completion rather than to avoid admitting it. One table, three statuses, so a repository
+// that was never attempted cannot be mistaken for one that merged -- and the ARGV column carries
+// the EXECUTED argv (commands.js reports `result.argv`, not the approved one), which is the audit
+// trail for what actually ran.
+function formatMergeReport(value) {
+  const merged = list(value.merged);
+  const failed = list(value.failed);
+  const skipped = list(value.skipped);
+  const status = value.status === "merged" ? "merged" : text(value.status).toUpperCase();
+
+  const lines = [
+    `Run: ${text(value.runId)}`,
+    `Merge: ${status}`,
+  ];
+  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
+
+  const rows = [
+    ...merged.map((entry) => mergeReportRow(entry, "merged")),
+    ...failed.map((entry) => mergeReportRow(entry, "FAILED")),
+    ...skipped.map((entry) => mergeReportRow(entry, "NOT ATTEMPTED")),
+  ];
+  if (rows.length === 0) lines.push("Repositories: none");
+  else lines.push(...renderTable(MERGE_REPORT_COLUMNS, rows));
+
+  // Explicit empty lines for the two lists whose emptiness is the good news: an operator scanning
+  // a report must be able to read "nothing failed" off the page, not infer it from an absence.
+  if (merged.length === 0) lines.push("Merged: none");
+  if (failed.length === 0) lines.push("Failed: none");
+  if (skipped.length === 0) lines.push("Never attempted: none");
+
+  const withReason = [...failed, ...skipped].filter((entry) => entry?.reason);
+  if (withReason.length > 0) {
+    lines.push("Reasons:");
+    for (const entry of withReason) lines.push(...reasonBlock(text(entry.repositoryId), entry.reason));
+  }
+
+  // Item 2.3's I4 finding, and it matters more here: by the time this line renders, real merge
+  // commits exist in real repositories and rerunning cannot undo them. A persistence failure is
+  // named last, as "and one more thing", never folded into the verdict above.
+  if (value.evidenceError) lines.push(`Evidence: ${value.evidenceError}`);
+  appendMergeNextActions(lines, value.nextActions);
+  return bound(lines.join("\n"));
+}
+
+export function formatMerge(value = {}) {
+  if (value.refused) {
+    const lines = [
+      `Run: ${text(value.runId)}`,
+      `Merge: refused — ${text(value.reason, "no reason recorded")}`,
+    ];
+    appendMergeNextActions(lines, value.nextActions);
+    return bound(lines.join("\n"));
+  }
+  if (Array.isArray(value.merged) || Array.isArray(value.failed) || Array.isArray(value.skipped)) {
+    return formatMergeReport(value);
+  }
+  return formatMergePreview(value);
+}
+
 // The projection roadmap item 2.1's design spec promised ("machines get complete records") was
 // wrong at board scale, and the wrongness is measured, not theoretical: against the 8 real runs
 // on the machine that first ran this command, whole records serialize to 53,791 characters for
@@ -973,6 +1237,116 @@ function resultOverflowFallback(command, source, limit) {
   };
 }
 
+// `merge` needs its own fallback for the same reason `verify` did, and the numbers are worse.
+// Measured directly against this file's own `formatWorkflowResult("merge", ..., "json")`, at the
+// display caps commands.js already ships (10 conflicted paths, 5 reason paths, and 5 uncommitted
+// paths per repository) and realistic sharyco-shaped path lengths (~95 characters):
+//
+//   clean 3-repository preview                                    3,598
+//   realistic 3-repository preview (2 conflicts each)             5,733
+//   3-repository preview at the display caps                     11,814   98.5% of budget
+//   4-repository preview at the display caps                        200   COLLAPSED
+//
+// The 200 is the finding. The general fallback below keeps only `{command, runId, truncated,
+// truncationMarker}`, so one repository past the measured worst case turns a preview into a
+// response with **no argv and no conflicts in it at all** -- the two things an operator cannot act
+// without, and the two things this command exists to show before anything mutates. Three
+// repositories is the real sharyco group project; four is not an extreme-scale hypothetical.
+//
+// What actually scales here is per-path text: the conflicted-path lists, the `conflictReason`
+// strings that restate a prefix of those lists, the `baseDirtyPaths` arrays, and the aggregated
+// `conflicts[].reason` sentences that restate them a third time. Everything else on a repository
+// record -- ids, branches, shas, booleans, and the argv -- is fixed-size. So this degrades exactly
+// the text that scales and keeps the rest, including every argv and the aggregated conflict list
+// (bounded per reason), the same shape resultOverflowFallback settled on for its own evidence.
+//
+// `conflictCount` and `conflictsTruncated` are recomputed rather than copied, so shortening a list
+// here can only ever make a response MORE truncation-aware, never less: a list this function cut
+// down is marked truncated even if the source's own list was complete.
+// Two tiers, tried in order, because one tier is not enough and the second one is measured too.
+// Tier 1 keeps every field on the envelope and every field on a repository record except the three
+// that scale with path text, and shortens the rest. Tier 2 keeps ONLY the fixed-size half of each
+// repository record -- the argv above all -- and drops every path list entirely, so a group project
+// too wide for tier 1 still answers "which repositories, what would run, how many conflicts each"
+// instead of the general fallback's nothing. Measured with the same worst-case fixture, one
+// repository at a time (n = repositories, each at the display caps):
+//
+//   n = 1..3   no fallback needed             (n=1: 4,372 · n=3: 11,814)
+//   n = 4..5   tier 1                         (n=4: 9,084 · n=5: 11,038)
+//   n = 6..9   tier 2                         (n=6: 7,888 · n=9: 11,140)
+//   n >= 10    the general fallback below     (200 characters, no argv, no conflicts)
+//
+// Ten repositories is three times the largest group project on this machine and every one of them
+// at 900 conflicts; the general fallback is the honest answer there rather than a fourth tier that
+// would have to start dropping repositories. What the tiers buy is that the shape degrades
+// gradually instead of falling off a cliff one repository past a measured number -- which is
+// exactly what items 2.1 and 2.3 each shipped once and had to correct.
+//
+// The execute report never needed any of this and is measured too, since it flows through the same
+// path: three repositories with a failure carrying git's stderr at commands.js's own 2,000-character
+// cap is 3,667 characters, and ten repositories is 6,800 -- its per-entry cost is fixed-size and
+// there is only ever at most one `failed` entry. The tiers apply to it anyway (bounding each
+// entry's `reason`) so a future shape change cannot silently reach the general fallback.
+const MERGE_OVERFLOW_TIERS = [
+  { conflictPaths: 3, reasonLimit: 240, minimal: false },
+  { conflictPaths: 0, reasonLimit: 100, minimal: true },
+];
+
+function strippedMergeRepository(record, tier) {
+  if (!record || typeof record !== "object") return record;
+  const all = list(record.conflicts);
+  const conflicts = all.slice(0, tier.conflictPaths);
+  const conflictCount = Number.isFinite(record.conflictCount) ? record.conflictCount : all.length;
+  const conflictsTruncated = Boolean(record.conflictsTruncated) || conflicts.length < conflictCount;
+  if (tier.minimal) {
+    return {
+      repositoryId: record.repositoryId,
+      basePath: record.basePath,
+      baseBranch: record.baseBranch,
+      baseBranchCheckedOut: record.baseBranchCheckedOut,
+      baseDirty: record.baseDirty ?? null,
+      baseDirtyCount: record.baseDirtyCount ?? 0,
+      sourceBranch: record.sourceBranch,
+      sourceSha: record.sourceSha,
+      branchMismatch: record.branchMismatch,
+      argv: record.argv,
+      conflictStatus: record.conflictStatus,
+      conflicts,
+      conflictCount,
+      conflictsTruncated,
+    };
+  }
+  const { baseDirtyPaths, conflictReason, ...rest } = record;
+  return { ...rest, conflicts, conflictCount, conflictsTruncated };
+}
+
+function boundedMergeReason(entry, tier) {
+  if (!entry || typeof entry !== "object" || typeof entry.reason !== "string") return entry;
+  return { ...entry, reason: bound(entry.reason, tier.reasonLimit, "reason") };
+}
+
+function mergeOverflowFallback(command, source, limit, tier) {
+  const degraded = {
+    ...source,
+    ...(Object.hasOwn(source, "repositories")
+      ? { repositories: list(source.repositories).map((record) => strippedMergeRepository(record, tier)) }
+      : {}),
+    ...(Object.hasOwn(source, "conflicts") ? { conflicts: list(source.conflicts).map((entry) => boundedMergeReason(entry, tier)) } : {}),
+    // The execute report's own lists carry a per-entry `reason` (git's stderr, already capped at
+    // 2,000 characters by commands.js) and the executed argv. Same treatment: the reason is the
+    // part that scales, the argv is the part that must survive.
+    ...(Object.hasOwn(source, "merged") ? { merged: list(source.merged).map((entry) => boundedMergeReason(entry, tier)) } : {}),
+    ...(Object.hasOwn(source, "failed") ? { failed: list(source.failed).map((entry) => boundedMergeReason(entry, tier)) } : {}),
+    ...(Object.hasOwn(source, "skipped") ? { skipped: list(source.skipped).map((entry) => boundedMergeReason(entry, tier)) } : {}),
+    truncated: true,
+  };
+  const dropped = tier.minimal
+    ? "every conflicted-path list and every base checkout's uncommitted-path list were dropped, along with each repository record's worktree path, base sha, and recorded branch"
+    : `each repository's conflicted-path list was cut to ${tier.conflictPaths} paths, and each base checkout's uncommitted-path list was dropped`;
+  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. The compact view (--format compact, the default) renders the same response bounded to ${OUTPUT_LIMIT} characters.`;
+  return degraded;
+}
+
 function boundedJson(command, value) {
   const text = JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
   const limit = command === "launch" ? ASSIGNMENT_OUTPUT_LIMIT + OUTPUT_LIMIT : OUTPUT_LIMIT;
@@ -987,6 +1361,16 @@ function boundedJson(command, value) {
   }
   if (command === "verify") {
     return JSON.stringify(normalizeJson(verifyOverflowFallback(command, source, limit)), null, 2);
+  }
+  if (command === "merge") {
+    // Same escalate-then-admit shape resultOverflowFallback uses, with one extra tier: degrading
+    // the per-path text is what keeps the argv on the response. If even the minimal tier does not
+    // fit, something other than path text is the cause and the general shape below is the honest
+    // answer rather than a response that claims to be complete.
+    for (const tier of MERGE_OVERFLOW_TIERS) {
+      const degraded = JSON.stringify(normalizeJson(mergeOverflowFallback(command, source, limit, tier)), null, 2);
+      if (degraded.length <= limit) return degraded;
+    }
   }
   if (command === "result") {
     const degraded = JSON.stringify(normalizeJson(resultOverflowFallback(command, source, limit)), null, 2);
@@ -1025,6 +1409,8 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatResult(value);
     case "verify":
       return formatVerify(value);
+    case "merge":
+      return formatMerge(value);
     case "reconcile":
       return formatReconcile(value);
     case "resume":

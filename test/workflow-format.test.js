@@ -1482,3 +1482,483 @@ test("--format json for verify carries a refusal's reason, not just the compact 
   assert.deepEqual(parsed.results, []);
   assert.equal(parsed.reason, "Project ocr has no verify commands configured.");
 });
+
+// --- formatMerge (roadmap item 2.4's `workflow merge`) ----------------------------------------
+//
+// Two shapes reach this renderer, and the discriminator is structural rather than a field this
+// file imports from commands.js (format.js is deliberately dependency-free): a preview carries
+// `repositories[]`, an execution report carries `merged`/`failed`/`skipped`.
+//
+// The four things Task 2's own interface notes say the compact view must not lose: the exact argv
+// per repository, the conflicts (never a truncated list rendered as the complete set), the branch
+// mismatch with both branches beside each other, and the verification status including "none".
+
+const MERGE_RUN_ID = "0b2612a8-6f2c-4a1e-8b7d-3f9c2a1d5e40";
+const MERGE_DIGEST = `sha256:${"a3f9".repeat(16)}`;
+
+function mergeRepository(overrides = {}) {
+  return {
+    repositoryId: "backend",
+    worktreePath: "/home/op/work/sharyco/worktrees/registro-impl/backend",
+    recordedBranch: "feature/1216110941098331/registro-impl",
+    sourceBranch: "feature/registro-impl",
+    sourceSha: "9e1c4b7a2d8f60315c4e9a7b3d2f81065c9a4e7b",
+    sourceCommittedAt: "2026-08-05T18:42:11.000Z",
+    branchMismatch: true,
+    basePath: "/home/op/work/sharyco/backend",
+    baseBranch: "dev",
+    baseCheckedOutBranch: "dev",
+    baseBranchCheckedOut: true,
+    baseDirty: false,
+    baseDirtyPaths: [],
+    baseDirtyCount: 0,
+    baseSha: "1f7d3c9b5a2e84670d1b6f3a9c5e2807b4d1a6f3",
+    argv: ["git", "merge", "--no-ff", "--no-edit", "feature/registro-impl"],
+    conflictStatus: "clean",
+    conflicts: [],
+    conflictCount: 0,
+    conflictsTruncated: false,
+    ...overrides,
+  };
+}
+
+function mergePreview(overrides = {}) {
+  const repositories = overrides.repositories ?? [mergeRepository()];
+  const conflicts = overrides.conflicts ?? [];
+  const mergeable = overrides.mergeable ?? conflicts.length === 0;
+  return {
+    command: "merge",
+    runId: MERGE_RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: false,
+    verification: {
+      status: "recorded",
+      verifiedAt: "2026-08-05T19:03:44.000Z",
+      passed: true,
+      exitCode: 0,
+      staleRelativeToSource: false,
+    },
+    mergeable,
+    approvalDigest: MERGE_DIGEST,
+    exitCode: mergeable ? 0 : 11,
+    nextActions: mergeable
+      ? [`workflow merge ${MERGE_RUN_ID} --yes --approval-digest ${MERGE_DIGEST}`]
+      : [`workflow merge ${MERGE_RUN_ID} --dry-run`],
+    ...overrides,
+    repositories,
+    conflicts,
+  };
+}
+
+function threeRepositoryPreview(perRepository = () => ({})) {
+  const repositories = ["backend", "panel", "webapp"].map((repositoryId, index) => mergeRepository({
+    repositoryId,
+    worktreePath: `/home/op/work/sharyco/worktrees/registro-impl/${repositoryId}`,
+    basePath: `/home/op/work/sharyco/${repositoryId}`,
+    ...perRepository(repositoryId, index),
+  }));
+  return mergePreview({ repositories });
+}
+
+test("the compact merge preview renders each repository's argv verbatim, exactly as it would run", () => {
+  const preview = threeRepositoryPreview((repositoryId) => ({
+    argv: ["git", "merge", "--no-ff", "--no-edit", `feature/${repositoryId}-work`],
+  }));
+
+  const compact = formatWorkflowResult("merge", preview, "compact");
+
+  assert.match(compact, /^Argv:$/m);
+  for (const repository of preview.repositories) {
+    const line = `${repository.repositoryId}: ${JSON.stringify(repository.argv)}`;
+    assert.ok(
+      compact.split("\n").includes(line),
+      `the exact argv line must appear verbatim: ${line}\n---\n${compact}`,
+    );
+  }
+});
+
+test("a conflicted merge preview never renders like a clean one, and names the conflicted files", () => {
+  const clean = formatWorkflowResult("merge", threeRepositoryPreview(), "compact");
+  assert.match(clean, /^Merge: mergeable$/m);
+  assert.doesNotMatch(clean, /CONFLICTED/);
+
+  const conflicted = threeRepositoryPreview((repositoryId) => (repositoryId === "panel"
+    ? {
+      conflictStatus: "conflicted",
+      conflicts: ["packages/panel/src/registro/index.tsx", "packages/panel/src/registro/form.tsx"],
+      conflictCount: 2,
+      conflictReason: "Merging feature/registro-impl into dev conflicts in 2 file(s)",
+    }
+    : {}));
+  conflicted.conflicts = [{
+    repositoryId: "panel",
+    resource: "merge:/home/op/work/sharyco/panel",
+    reason: "Merging feature/registro-impl into dev conflicts in 2 file(s): packages/panel/src/registro/index.tsx, packages/panel/src/registro/form.tsx",
+  }];
+  conflicted.mergeable = false;
+  conflicted.exitCode = 11;
+
+  const compact = formatWorkflowResult("merge", conflicted, "compact");
+  assert.doesNotMatch(compact, /^Merge: mergeable$/m);
+  assert.match(compact, /^Merge: blocked by 1 conflict/m);
+  assert.match(compact, /CONFLICTED \(2\)/);
+  assert.match(compact, /^Conflicted files:$/m);
+  assert.match(compact, /packages\/panel\/src\/registro\/index\.tsx/);
+  assert.match(compact, /packages\/panel\/src\/registro\/form\.tsx/);
+  assert.match(compact, /^Conflicts:$/m);
+  assert.match(compact, /merge:\/home\/op\/work\/sharyco\/panel/);
+});
+
+test("a truncated conflict list is never rendered as the complete set", () => {
+  const preview = threeRepositoryPreview((repositoryId) => (repositoryId === "backend"
+    ? {
+      conflictStatus: "conflicted",
+      conflicts: Array.from({ length: 10 }, (_, index) => `packages/backend/src/step-${index}.ts`),
+      conflictCount: 900,
+      conflictsTruncated: true,
+    }
+    : {}));
+  preview.mergeable = false;
+  preview.exitCode = 11;
+  preview.conflicts = [{ repositoryId: "backend", resource: "merge:/home/op/work/sharyco/backend", reason: "900 conflicts" }];
+
+  const compact = formatWorkflowResult("merge", preview, "compact");
+  assert.match(compact, /TRUNCATED/, "the operator must not read 10 of 900 conflicts as the whole list");
+  assert.match(compact, /showing 10 of at least 900/);
+});
+
+test("a conflict status git could not determine is never rendered as clean", () => {
+  const preview = threeRepositoryPreview((repositoryId) => (repositoryId === "webapp"
+    ? {
+      conflictStatus: "unknown",
+      conflicts: [],
+      conflictCount: 0,
+      conflictReason: "git merge-tree exited with code 128",
+    }
+    : {}));
+  preview.mergeable = false;
+  preview.exitCode = 11;
+  preview.conflicts = [{
+    repositoryId: "webapp",
+    resource: "merge:/home/op/work/sharyco/webapp",
+    reason: "Conflicts could not be determined: git merge-tree exited with code 128",
+  }];
+
+  const compact = formatWorkflowResult("merge", preview, "compact");
+  assert.match(compact, /UNKNOWN/);
+  assert.doesNotMatch(compact, /^webapp: none$/m, "an undetermined conflict list must not read as an empty one");
+  assert.match(compact, /git merge-tree exited with code 128/);
+});
+
+test("a base checkout that is dirty, on the wrong branch, or unreadable is named in the compact table and never as clean", () => {
+  const preview = threeRepositoryPreview((repositoryId) => {
+    if (repositoryId === "panel") return { baseDirty: true, baseDirtyPaths: ["src/a.ts", "src/b.ts"], baseDirtyCount: 7 };
+    if (repositoryId === "webapp") return { baseDirty: null, baseCheckedOutBranch: "main", baseBranchCheckedOut: false };
+    return {};
+  });
+  preview.mergeable = false;
+  preview.exitCode = 11;
+
+  const compact = formatWorkflowResult("merge", preview, "compact");
+  assert.match(compact, /DIRTY \(7\)/);
+  assert.match(compact, /STATUS UNKNOWN/);
+  assert.match(compact, /main \(NOT dev\)/);
+});
+
+test("a branch mismatch names both the recorded branch and the worktree's actual branch", () => {
+  const mismatched = formatWorkflowResult("merge", mergePreview(), "compact");
+  assert.match(mismatched, /^Branch mismatch:$/m);
+  assert.match(mismatched, /feature\/1216110941098331\/registro-impl/);
+  assert.match(mismatched, /feature\/registro-impl/);
+
+  const agreed = formatWorkflowResult("merge", mergePreview({
+    repositories: [mergeRepository({ recordedBranch: "feature/registro-impl", branchMismatch: false })],
+  }), "compact");
+  assert.match(agreed, /^Branch mismatch: none$/m, "an empty section says so rather than vanishing");
+});
+
+test("the merge preview names the verification status, including when there is none", () => {
+  const none = formatWorkflowResult("merge", mergePreview({
+    verification: { status: "none", verifiedAt: null, passed: null, exitCode: null, staleRelativeToSource: null },
+  }), "compact");
+  assert.match(none, /^Verification: none recorded/m);
+  assert.doesNotMatch(none, /^Verification:\s*$/m);
+
+  const failed = formatWorkflowResult("merge", mergePreview({
+    verification: { status: "recorded", verifiedAt: "2026-08-05T19:03:44.000Z", passed: false, exitCode: 1, staleRelativeToSource: false },
+  }), "compact");
+  assert.match(failed, /^Verification: FAILED \(exit 1, ran 2026-08-05T19:03:44\.000Z\)/m);
+
+  const stale = formatWorkflowResult("merge", mergePreview({
+    verification: { status: "recorded", verifiedAt: "2026-08-05T19:03:44.000Z", passed: true, exitCode: 0, staleRelativeToSource: true },
+  }), "compact");
+  assert.match(stale, /STALE/);
+
+  const unknownStaleness = formatWorkflowResult("merge", mergePreview({
+    verification: { status: "recorded", verifiedAt: "2026-08-05T19:03:44.000Z", passed: true, exitCode: 0, staleRelativeToSource: null },
+  }), "compact");
+  assert.match(unknownStaleness, /staleness unknown/);
+});
+
+test("a mergeable preview prints the approval digest and the copy-pasteable approval command", () => {
+  const compact = formatWorkflowResult("merge", mergePreview(), "compact");
+  assert.match(compact, new RegExp(`^Approval digest: ${MERGE_DIGEST}$`, "m"));
+  assert.match(compact, new RegExp(`^- workflow merge ${MERGE_RUN_ID} --yes --approval-digest ${MERGE_DIGEST}$`, "m"));
+});
+
+test("a refused merge preview renders as a refusal, never as an empty success, and keeps its next actions", () => {
+  const value = {
+    command: "merge",
+    runId: MERGE_RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: true,
+    reason: "Run 0b2612a8 has no repositories[] recorded; nothing to merge.",
+    repositories: [],
+    verification: null,
+    conflicts: [],
+    mergeable: false,
+    approvalDigest: null,
+    exitCode: 10,
+    nextActions: [`workflow reconcile --run ${MERGE_RUN_ID}`, `workflow merge ${MERGE_RUN_ID} --dry-run`],
+  };
+
+  const compact = formatWorkflowResult("merge", value, "compact");
+  assert.match(compact, /^Merge: refused — Run 0b2612a8 has no repositories\[\] recorded; nothing to merge\.$/m);
+  assert.doesNotMatch(compact, /mergeable/);
+  assert.doesNotMatch(compact, /^Approval digest:/m, "there is no digest an operator could pass back");
+  assert.match(compact, new RegExp(`^- workflow reconcile --run ${MERGE_RUN_ID}$`, "m"));
+  assert.match(compact, new RegExp(`^- workflow merge ${MERGE_RUN_ID} --dry-run$`, "m"));
+});
+
+test("the merge execution report separates merged, failed, and never-attempted, and a partial never reads as merged", () => {
+  const report = {
+    command: "merge",
+    runId: MERGE_RUN_ID,
+    projectAlias: "sharyco",
+    approvalDigest: MERGE_DIGEST,
+    status: "partial",
+    merged: [{
+      repositoryId: "backend",
+      basePath: "/home/op/work/sharyco/backend",
+      baseBranch: "dev",
+      sourceBranch: "feature/registro-impl",
+      sourceSha: "9e1c4b7a",
+      argv: ["git", "merge", "--no-ff", "--no-edit", "feature/registro-impl"],
+      code: 0,
+    }],
+    failed: [{
+      repositoryId: "panel",
+      basePath: "/home/op/work/sharyco/panel",
+      baseBranch: "dev",
+      sourceBranch: "feature/registro-impl",
+      sourceSha: "9e1c4b7a",
+      argv: ["git", "merge", "--no-ff", "--no-edit", "feature/registro-impl"],
+      code: 1,
+      reason: "error: Your local changes would be overwritten by merge.",
+    }],
+    skipped: [{
+      repositoryId: "webapp",
+      basePath: "/home/op/work/sharyco/webapp",
+      baseBranch: "dev",
+      sourceBranch: "feature/registro-impl",
+      sourceSha: "9e1c4b7a",
+      argv: ["git", "merge", "--no-ff", "--no-edit", "feature/registro-impl"],
+      reason: "never attempted: an earlier repository's merge failed",
+    }],
+    passed: false,
+    exitCode: 13,
+    evidenceError: "evidence could not be persisted: run lock held",
+    nextActions: [`workflow merge ${MERGE_RUN_ID} --dry-run`],
+  };
+
+  const compact = formatWorkflowResult("merge", report, "compact");
+  assert.match(compact, /^Merge: PARTIAL$/m);
+  assert.doesNotMatch(compact, /^Merge: merged$/m);
+  assert.match(compact, /backend\s+\|\s+merged/);
+  assert.match(compact, /panel\s+\|\s+FAILED/);
+  assert.match(compact, /webapp\s+\|\s+NOT ATTEMPTED/);
+  assert.match(compact, /^Reasons:$/m);
+  assert.match(compact, /error: Your local changes would be overwritten by merge\./);
+  assert.match(compact, /^Evidence: evidence could not be persisted: run lock held$/m);
+  // The executed argv is the audit trail; it must survive into the report's rendering too.
+  assert.match(compact, /\["git","merge","--no-ff","--no-edit","feature\/registro-impl"\]/);
+
+  const merged = formatWorkflowResult("merge", { ...report, status: "merged", failed: [], skipped: [], passed: true, exitCode: 0, evidenceError: undefined }, "compact");
+  assert.match(merged, /^Merge: merged$/m);
+  assert.match(merged, /^Failed: none$/m);
+  assert.match(merged, /^Never attempted: none$/m);
+});
+
+// Found running the real CLI (task 3, step 5) against a base checkout whose `pre-merge-commit`
+// hook rejects the merge. git's stderr is two lines; rendered raw, the second one appeared in the
+// Reasons section with no repository label in front of it -- and in that case the orphaned line
+// was git's own "use 'git commit' to complete the merge", reading as advice about the whole run
+// inside a report about a merge that failed.
+test("a multi-line reason from git's own stderr stays attributed to its repository", () => {
+  const report = {
+    command: "merge",
+    runId: MERGE_RUN_ID,
+    status: "partial",
+    merged: [{ repositoryId: "one", basePath: "/base/one", baseBranch: "dev", argv: ["git", "merge"] }],
+    failed: [{
+      repositoryId: "two",
+      basePath: "/base/two",
+      baseBranch: "dev",
+      argv: ["git", "merge"],
+      code: 1,
+      reason: "policy: this repository requires a signed integration ticket\nNot committing merge; use 'git commit' to complete the merge.",
+    }],
+    skipped: [],
+    passed: false,
+    exitCode: 13,
+    nextActions: [],
+  };
+
+  const compact = formatWorkflowResult("merge", report, "compact");
+  const lines = compact.split("\n");
+  const reasonsIndex = lines.indexOf("Reasons:");
+  assert.ok(reasonsIndex >= 0);
+  assert.equal(lines[reasonsIndex + 1], "two: policy: this repository requires a signed integration ticket");
+  assert.equal(
+    lines[reasonsIndex + 2],
+    "    Not committing merge; use 'git commit' to complete the merge.",
+    "a continuation line must be visibly part of its entry, not a statement about the whole run",
+  );
+});
+
+test("formatWorkflowResult dispatches \"merge\" to the compact merge renderer rather than raw JSON", () => {
+  const compact = formatWorkflowResult("merge", mergePreview(), "compact");
+  assert.match(compact, new RegExp(`^Run: ${MERGE_RUN_ID}$`, "m"));
+  assert.doesNotMatch(compact, /^\{$/m, "the default JSON dump would mean the dispatch is missing");
+});
+
+// --- JSON size discipline for merge -----------------------------------------------------------
+//
+// Measured, not computed. Task 2's own display caps (10 conflict paths, 5 reason paths, 5 dirty
+// paths per repository) put a three-repository conflicted preview at 11,814 characters against the
+// shared 12,000 limit -- 98.5% of budget -- and a FOUR-repository one collapses to the general
+// fallback's 200-character `{command, runId, truncated, truncationMarker}`, with every argv and
+// every conflict gone. That is the exact shape an operator cannot act on.
+
+const MERGE_CONFLICT_PATH = (repositoryId, index) =>
+  `packages/${repositoryId}/src/features/registro/components/step-${String(index).padStart(4, "0")}/index.tsx`;
+const MERGE_DIRTY_PATH = (repositoryId, index) =>
+  `packages/${repositoryId}/src/features/registro/hooks/use-registro-${String(index).padStart(4, "0")}.ts`;
+
+function worstCaseMergePreview(repositoryIds) {
+  const repositories = repositoryIds.map((repositoryId) => {
+    const conflicts = Array.from({ length: 10 }, (_, index) => MERGE_CONFLICT_PATH(repositoryId, index));
+    const dirty = Array.from({ length: 5 }, (_, index) => MERGE_DIRTY_PATH(repositoryId, index));
+    return mergeRepository({
+      repositoryId,
+      worktreePath: `/home/op/projects/work/sharyco/worktrees/1216110941098331-registro-impl/${repositoryId}`,
+      basePath: `/home/op/projects/work/sharyco/${repositoryId}`,
+      baseDirty: true,
+      baseDirtyPaths: dirty,
+      baseDirtyCount: 5,
+      conflictStatus: "conflicted",
+      conflicts,
+      conflictCount: 900,
+      conflictsTruncated: true,
+      conflictReason: `Merging feature/registro-impl into dev conflicts in 900 file(s): ${conflicts.slice(0, 5).join(", ")} (+895 more)`,
+    });
+  });
+  const conflicts = repositories.flatMap((repository) => [
+    {
+      repositoryId: repository.repositoryId,
+      resource: `base:${repository.basePath}`,
+      reason: `Base checkout ${repository.basePath} has 5 uncommitted path(s): ${repository.baseDirtyPaths.join(", ")}`,
+    },
+    {
+      repositoryId: repository.repositoryId,
+      resource: `merge:${repository.basePath}`,
+      reason: repository.conflictReason,
+    },
+  ]);
+  return mergePreview({ repositories, conflicts, mergeable: false, exitCode: 11 });
+}
+
+test("--format json for a realistic three-repository merge preview fits the shared 12,000-character limit", () => {
+  const realistic = threeRepositoryPreview((repositoryId) => ({
+    conflictStatus: "conflicted",
+    conflicts: [MERGE_CONFLICT_PATH(repositoryId, 0), MERGE_CONFLICT_PATH(repositoryId, 1)],
+    conflictCount: 2,
+    conflictReason: `Merging feature/registro-impl into dev conflicts in 2 file(s)`,
+  }));
+  realistic.mergeable = false;
+  realistic.exitCode = 11;
+
+  const json = formatWorkflowResult("merge", realistic, "json");
+  assert.ok(json.length < 12000 * 0.9, `a realistic three-repository preview was ${json.length} characters`);
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, undefined, "it must not have fallen through to an overflow fallback");
+  assert.equal(parsed.repositories.length, 3);
+});
+
+test("--format json for a merge preview that overflows keeps every argv and every conflict rather than collapsing the envelope", () => {
+  const overflowing = worstCaseMergePreview(["backend", "panel", "webapp", "admin"]);
+
+  const json = formatWorkflowResult("merge", overflowing, "json");
+  assert.ok(json.length <= 12000, `the degraded response was ${json.length} characters`);
+  const parsed = JSON.parse(json);
+
+  assert.equal(parsed.truncated, true);
+  assert.match(parsed.truncationMarker, /argv/i);
+  // The two things an operator cannot act without.
+  assert.equal(parsed.repositories.length, 4);
+  for (const [index, repository] of parsed.repositories.entries()) {
+    assert.deepEqual(repository.argv, overflowing.repositories[index].argv, "the argv is what the digest approves; it must survive");
+    assert.ok(repository.conflicts.length > 0, "at least some conflicted paths must survive");
+    assert.equal(repository.conflictCount, 900);
+    assert.equal(repository.conflictsTruncated, true, "a shortened list must never read as complete");
+  }
+  assert.equal(parsed.conflicts.length, 8, "the aggregated conflict list -- what actually blocks -- must survive");
+  assert.equal(parsed.approvalDigest, MERGE_DIGEST);
+  assert.equal(parsed.mergeable, false);
+  assert.equal(parsed.exitCode, 11);
+});
+
+test("--format json for a merge preview too wide for the first fallback still keeps every argv rather than dropping every repository", () => {
+  const repositoryIds = Array.from({ length: 9 }, (_, index) => ["backend", "panel", "webapp", "admin", "mobile", "docs", "infra", "edge", "cms"][index]);
+  const overflowing = worstCaseMergePreview(repositoryIds);
+
+  const json = formatWorkflowResult("merge", overflowing, "json");
+  assert.ok(json.length <= 12000, `the second-tier response was ${json.length} characters`);
+  const parsed = JSON.parse(json);
+
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.repositories.length, 9, "the general fallback would have dropped all nine");
+  for (const [index, repository] of parsed.repositories.entries()) {
+    assert.deepEqual(repository.argv, overflowing.repositories[index].argv);
+    assert.equal(repository.conflictCount, 900);
+    assert.equal(repository.conflictsTruncated, true);
+    assert.deepEqual(repository.conflicts, [], "the second tier drops the paths themselves; the count and the flag carry the truth");
+    assert.equal(Object.hasOwn(repository, "baseDirtyPaths"), false);
+  }
+  assert.equal(parsed.conflicts.length, 18);
+  assert.equal(parsed.approvalDigest, MERGE_DIGEST);
+});
+
+test("--format json for merge carries a refusal's reason and next actions unchanged", () => {
+  const value = {
+    command: "merge",
+    runId: MERGE_RUN_ID,
+    refused: true,
+    reason: "Unknown workflow project: sharyco",
+    repositories: [],
+    verification: null,
+    conflicts: [],
+    mergeable: false,
+    approvalDigest: null,
+    exitCode: 10,
+    nextActions: ["workflow doctor sharyco", `workflow merge ${MERGE_RUN_ID} --dry-run`],
+  };
+
+  const parsed = JSON.parse(formatWorkflowResult("merge", value, "json"));
+  assert.equal(parsed.refused, true);
+  assert.equal(parsed.reason, "Unknown workflow project: sharyco");
+  assert.equal(parsed.approvalDigest, null);
+  assert.deepEqual(parsed.nextActions, value.nextActions);
+});
