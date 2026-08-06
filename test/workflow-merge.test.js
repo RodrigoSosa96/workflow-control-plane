@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { mergeCommand, MERGE_EXIT_CODES } from "../src/workflow/commands.js";
+import { mergeCommand, MERGE_DISPLAY_LIMITS, MERGE_EXIT_CODES } from "../src/workflow/commands.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
@@ -125,6 +125,13 @@ function scriptedGit(script = {}) {
             argv,
             ...(scripted.error ? { error: scripted.error } : {}),
           };
+        }
+        // A real successful merge ADVANCES the base branch, and commands.js now reads the base HEAD
+        // back to tell an integration from an "Already up to date." no-op (M4, branch review). A
+        // double whose base sha never moves would make every scripted merge look like a no-op, so
+        // it models the advance here. `merge: { alreadyUpToDate: true }` scripts the no-op instead.
+        if (script[cwd] && scripted.alreadyUpToDate !== true) {
+          script[cwd] = { ...script[cwd], sha: scripted.resultSha ?? `${script[cwd].sha ?? "base"}-merged` };
         }
         return { ok: true, code: 0, stdout: scripted.stdout ?? "Merge made by the 'ort' strategy.\n", stderr: "", argv };
       },
@@ -356,7 +363,16 @@ test("a three-repository run previews three exact argvs, in the order the run re
   const previews = fixture.calls.filter((call) => call.method === "previewMerge");
   assert.deepEqual(previews.map((call) => call.cwd), ["/base/backend", "/base/panel", "/base/webapp"]);
   assert.deepEqual(previews.map((call) => call.source), ["aaaa111", "bbbb222", "cccc333"]);
-  assert.deepEqual(previews.map((call) => call.base), ["dev", "dev", "dev"]);
+  // BOTH sides of merge-tree are resolved object ids, never a ref NAME (M5, branch review): a base
+  // passed as `dev` is resolved by merge-tree in its own namespace, and with a `refs/tags/dev`
+  // present that is a DIFFERENT commit from the `refs/heads/dev` the real merge advances -- a
+  // preview of a merge that is not the one execution performs, under a stable digest.
+  assert.deepEqual(previews.map((call) => call.base), ["base111", "base222", "base333"]);
+  assert.deepEqual(
+    previews.map((call) => call.base),
+    command.preview.repositories.map((entry) => entry.baseSha),
+    "the previewed base must be exactly the sha the digest binds",
+  );
   for (const call of previews) {
     assert.equal(typeof call.timeoutMs, "number", "the conflict oracle must be bounded");
     assert.ok(call.timeoutMs > 0);
@@ -1407,4 +1423,141 @@ test("an unknown in-progress-merge state still names the uncommitted paths it di
   const conflict = preview.conflicts.find((entry) => entry.repositoryId === "panel");
   assert.match(conflict.reason, /MERGE_HEAD is unreadable/);
   assert.match(conflict.reason, /with 2 uncommitted path\(s\): src\/a\.ts, src\/b\.ts/);
+});
+
+// --- branch review, fix wave -----------------------------------------------------------------
+
+// The coverage gap the reviewer tied to I1: the truncation machinery's VALUES were tested, but
+// nothing asserted the relationship the whole design rests on -- the printed list is a display
+// projection, and the DIGEST binds the full list. Deleting the `slice` in publicMergeRepository
+// used to leave the suite green.
+test("the public conflict list is a display projection; the digest binds the full one", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const full = Array.from({ length: 40 }, (_, index) => `packages/panel/src/step-${index}.tsx`);
+  const script = groupFixture({
+    "/base/panel": { preview: { status: "conflicted", tree: "t".repeat(40), conflicts: full } },
+  });
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: scriptedGit(script).git },
+  );
+
+  const panel = command.preview.repositories.find((entry) => entry.repositoryId === "panel");
+  assert.equal(panel.conflicts.length, MERGE_DISPLAY_LIMITS.conflicts, "the PRINTED list is capped");
+  assert.ok(panel.conflicts.length < full.length);
+  assert.equal(panel.conflictCount, full.length, "but the true count is reported");
+  assert.equal(panel.conflictsTruncated, true, "and the shortening is declared, never silent");
+  assert.deepEqual(panel.conflicts, full.slice(0, MERGE_DISPLAY_LIMITS.conflicts));
+
+  // The load-bearing half: the digest must move when a path BEYOND the display cap changes, or an
+  // operator would be approving a prefix while a different full list gets merged.
+  const beyondCap = groupFixture({
+    "/base/panel": {
+      preview: {
+        status: "conflicted",
+        tree: "t".repeat(40),
+        conflicts: [...full.slice(0, full.length - 1), "packages/panel/src/step-CHANGED.tsx"],
+      },
+    },
+  });
+  const other = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: scriptedGit(beyondCap).git },
+  );
+  const otherPanel = other.preview.repositories.find((entry) => entry.repositoryId === "panel");
+
+  assert.deepEqual(otherPanel.conflicts, panel.conflicts, "the printed lists are identical...");
+  assert.notEqual(other.preview.approvalDigest, command.preview.approvalDigest, "...but the digest still notices the change past the cap");
+});
+
+// M1: `dirty` never got the tri-state treatment `merging` got. An adapter whose checkoutState
+// omits `dirty` produced `mergeable: true` with a usable digest while the renderer printed
+// `STATUS UNKNOWN` beside it -- the view and the verdict disagreeing.
+test("a base checkout whose dirty state is absent entirely is a conflict, never mergeable", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const partialAdapter = {
+    ...scriptedGit(groupFixture()).git,
+    async checkoutState({ cwd }) {
+      // `dirty` and `entries` omitted altogether -- an older or partial adapter.
+      return { branch: "dev", merging: false, ...(cwd === "/base/panel" ? {} : { dirty: false, entries: [] }) };
+    },
+  };
+
+  const { preview } = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: partialAdapter },
+  );
+
+  assert.equal(preview.mergeable, false);
+  assert.equal(preview.exitCode, MERGE_EXIT_CODES.conflicted);
+  const conflict = preview.conflicts.find((entry) => entry.repositoryId === "panel");
+  assert.ok(conflict, JSON.stringify(preview.conflicts));
+  assert.match(conflict.reason, /status could not be read/);
+  assert.match(conflict.reason, /an unreadable status is a conflict, never clean/);
+});
+
+// M8: previewMerge was the only adapter call in inspectRepositoryForMerge not defensively wrapped.
+test("a git adapter whose previewMerge throws produces a blocked preview, not a stack trace", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const throwingAdapter = {
+    ...scriptedGit(groupFixture()).git,
+    async previewMerge() {
+      throw new WorkflowError("PROCESS", "git merge-tree blew up", { exitCode: 12 });
+    },
+  };
+
+  const { preview } = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: throwingAdapter },
+  );
+
+  assert.equal(preview.refused, false);
+  assert.equal(preview.mergeable, false);
+  assert.equal(preview.repositories.every((entry) => entry.conflictStatus === "unknown"), true);
+  assert.match(preview.conflicts[0].reason, /git merge-tree could not run: git merge-tree blew up/);
+});
+
+// M4: `git merge` against an already-integrated branch exits 0, prints "Already up to date." and
+// creates NO commit. Recording that as `merged` puts an integration in the audit log that never
+// happened -- against a design whose whole `--no-ff, always` argument is that the merge commit IS
+// the audit trail. Real git, twice, because the second run is the entire point.
+test("a second merge of an already-integrated branch is reported as already-up-to-date, not as a merge", async (t) => {
+  const store = await newStore(t);
+  const { basePath, worktreePath } = await realRepositoryPair(t);
+  const run = await store.create({
+    projectAlias: "solo",
+    primaryTicket: "A-1",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const deps = { store, loadRegistry: mergeLoadRegistry({ solo: { path: basePath, base_branch: "dev" } }), git: realGit() };
+
+  const first = await mergeCommand({ runId: run.id }, deps);
+  const firstReport = await first.execute({ approvalDigest: first.preview.approvalDigest });
+  assert.equal(firstReport.status, "merged");
+  assert.equal(firstReport.merged[0].integrated, true, "the first merge really did advance dev");
+  const afterFirst = (await gitExec(basePath, ["rev-parse", "dev"])).stdout.trim();
+  assert.notEqual(afterFirst, firstReport.merged[0].sourceSha);
+
+  const second = await mergeCommand({ runId: run.id }, deps);
+  const secondReport = await second.execute({ approvalDigest: second.preview.approvalDigest });
+
+  assert.equal(secondReport.status, "already-up-to-date", "exit 0 does not prove an integration happened");
+  assert.equal(secondReport.passed, true, "it is not a failure: the desired state holds");
+  assert.equal(secondReport.exitCode, MERGE_EXIT_CODES.merged);
+  assert.equal(secondReport.merged[0].integrated, false);
+  assert.equal(secondReport.merged[0].baseShaAfter, afterFirst);
+  assert.equal((await gitExec(basePath, ["rev-parse", "dev"])).stdout.trim(), afterFirst, "and dev really did not move");
+
+  // The event log must carry the honest status, since it IS the audit record -- read from the file
+  // the store actually writes, not through an optional accessor that could silently skip.
+  const events = (await realFs.readFile(join(run.directory, "events.jsonl"), "utf8"))
+    .trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(
+    events.filter((event) => event.type === "merge").map((event) => event.status),
+    ["merged", "already-up-to-date"],
+    "the second event must not claim an integration that produced no commit",
+  );
 });

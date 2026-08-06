@@ -99,25 +99,75 @@ function mergeArgvFor(source) {
 function parseMergeTree(output) {
   // Never String(): String(undefined) is the truthy "undefined", which would pass for a tree in
   // the one function whose entire mandate is to fail closed.
-  const fields = (typeof output === "string" ? output : "").split("\0");
+  const text = typeof output === "string" ? output : "";
+  const fields = text.split("\0");
   const tree = trimLine(fields[0] ?? "");
   const conflicts = [];
-  let complete = false;
+  let terminatorIndex = -1;
 
   for (let index = 1; index < fields.length; index += 1) {
     if (fields[index] === "") {
-      complete = true;
+      terminatorIndex = index;
       break;
     }
     conflicts.push(fields[index]);
   }
 
-  // process.js caps a captured stream at 12,000 characters. Past that the empty field that ends
-  // the path section never arrives and the final path is half a path, so the list is a prefix of
-  // the truth rather than the truth. Drop the fragment; the caller is told the rest is missing.
-  if (!complete) conflicts.pop();
+  // process.js caps a captured stream at exactly OUTPUT_LIMIT characters, and that cut can land in
+  // one of two places. If it lands mid-path, the last collected field is half a path and there is
+  // no empty field at all -- that is the case below, and dropping the fragment is the fix.
+  if (terminatorIndex < 0) conflicts.pop();
 
-  return { tree: OBJECT_ID.test(tree) ? tree : "", conflicts, complete };
+  // But if the cut lands exactly on the NUL that terminates a path, `split("\0")` produces a
+  // trailing "" that is INDISTINGUISHABLE from git's real end-of-paths marker -- so this function
+  // used to report a 1,196-path prefix of a 1,696-path conflict list as COMPLETE, with no
+  // `truncated` flag, and the digest then bound that prefix as the whole truth. That is precisely
+  // the "a shortened list must never read as complete" property the entire conflictsTruncated
+  // chain exists to guarantee. (Measured repro: OID(40) + NUL + 1195 nine-character paths + one
+  // eight-character path = exactly 12,000 characters.)
+  //
+  // The length of the captured stream is what actually settles it: at or above the cap, the stream
+  // was cut, whatever the last field happens to look like. An empty field with data AFTER it is
+  // still a genuine terminator even in a capped stream -- that is the ordinary clean-merge shape,
+  // where the marker arrives immediately after the tree OID and git's informational section is
+  // what got cut -- so capping alone must not turn a clean merge into an unknown one.
+  const capped = text.length >= OUTPUT_LIMIT;
+  const terminated = terminatorIndex >= 0 && (terminatorIndex < fields.length - 1 || !capped);
+
+  return { tree: OBJECT_ID.test(tree) ? tree : "", conflicts, complete: terminated };
+}
+
+// Is this checkout sitting inside an unfinished merge? Deliberately NOT
+// `rev-parse --verify --quiet MERGE_HEAD`, which cannot answer the question: measured on git 2.43,
+// an ABSENT MERGE_HEAD, a corrupt one, and one this process cannot read all exit 1 with empty
+// stderr -- and all three print the identical `fatal: Needed a single revision` when --quiet is
+// dropped. So an exit-code probe reports "not merging" for a checkout whose merge state it simply
+// could not read, which is the opposite of what this adapter promises.
+//
+// Reading the file is what distinguishes them, and ENOENT is the only answer that PROVES "not
+// merging". Everything else -- unreadable, permission denied, contents that are not an object id
+// -- is `null`, "cannot say", which callers must treat as a conflict. The path comes from git
+// rather than being assembled here because a linked worktree's `.git` is a file, not a directory,
+// and its MERGE_HEAD lives under the worktree's own admin directory. One git call, same as the
+// probe it replaces.
+async function readMergeState({ runner, fs, cwd }) {
+  let path;
+  try {
+    const result = await runner.run("git", ["rev-parse", "--git-path", "MERGE_HEAD"], { cwd });
+    path = trimLine(result.stdout);
+  } catch {
+    return null;
+  }
+  if (!path) return null;
+
+  let contents;
+  try {
+    contents = await fs.readFile(isAbsolute(path) ? path : resolve(cwd, path), "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT" ? false : null;
+  }
+  // An octopus merge records one parent per line; the first is enough to prove a merge is running.
+  return OBJECT_ID.test(trimLine(String(contents).split("\n")[0] ?? "")) ? true : null;
 }
 
 // `git log -1 --format=%cI` emits a strict ISO-8601 committer date. Validated rather than trusted
@@ -359,19 +409,14 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     // preview correctly refused, but described that checkout only as "has 1 uncommitted path(s)",
     // whose natural reading is `git add`/`git stash` — the wrong move. The right one is
     // `git merge --abort`, and a caller cannot say so without being able to tell the two states
-    // apart. `true`/`false`/`null` for unknown, never throwing: an unanswerable probe must degrade
-    // to "cannot say" rather than to "not merging".
+    // apart. `true`/`false`/`null` for unknown, never throwing: an unanswerable probe degrades
+    // to "cannot say" rather than to "not merging" — see readMergeState for why that required
+    // reading the file rather than asking `rev-parse`.
     async checkoutState({ cwd }) {
       const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
       const branch = normalizeHeadBranch(trimLine(branchResult.stdout));
 
-      let merging = null;
-      try {
-        const mergeHead = await runner.run("git", ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], { cwd, allowFailure: true });
-        merging = mergeHead.code === 0;
-      } catch {
-        merging = null;
-      }
+      const merging = await readMergeState({ runner, fs, cwd });
 
       try {
         const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd });

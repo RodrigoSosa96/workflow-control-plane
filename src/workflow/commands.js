@@ -2068,7 +2068,27 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
     return { refusal: `Run ${runId} repository ${label} source branch ${head.branch} resolves to ${baseSourceSha} in the base checkout at ${basePath}, but the worktree at ${worktreePath} is at ${head.sha}; refusing rather than previewing one commit and merging another.` };
   }
 
-  const preview = await git.previewMerge({ cwd: basePath, base: baseBranch, source: head.sha, timeoutMs });
+  // M5: the base side is the RESOLVED SHA, never the branch NAME. The source side always was a
+  // sha, and the asymmetry was a real preview-versus-execute divergence: with `refs/tags/dev`
+  // alongside `refs/heads/dev`, `git merge-tree dev <src>` resolves the TAG and can report a clean
+  // merge while the real `git merge` into `refs/heads/dev` conflicts -- a stable digest over a
+  // prediction of a different merge. Both sides are now object ids, so merge-tree cannot resolve
+  // anything other than what execution will.
+  const baseSha = typeof baseHead?.sha === "string" && baseHead.sha ? baseHead.sha : null;
+  if (!baseSha) {
+    return { refusal: `Project ${projectAlias} base checkout for repository ${label} at ${basePath} reported no HEAD commit; there is nothing to merge into.`, actions: [doctorCommandFor(projectAlias)] };
+  }
+
+  // M8: the only adapter call in this function that was not defensively wrapped. `previewMerge` is
+  // documented never to throw and does not -- but `runMergeSequence` wraps `mergeBranch` for
+  // exactly this reason, and a contract must not be depended on where breaking it turns a
+  // read-only `--dry-run` into a stack trace instead of a refusal.
+  let preview;
+  try {
+    preview = await git.previewMerge({ cwd: basePath, base: baseSha, source: head.sha, timeoutMs });
+  } catch (error) {
+    preview = { status: "unknown", conflicts: [], reason: `git merge-tree could not run: ${mergeErrorText(error)}` };
+  }
   const sourceCommittedAt = await safeCommitTimestamp(git, worktreePath, head.sha, timeoutMs);
 
   const recordedBranch = recordedRepositoryBranch(entry);
@@ -2104,12 +2124,16 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
       `base:${basePath}`,
       `Base checkout ${basePath} could not be checked for an in-progress merge (MERGE_HEAD is unreadable)${uncommitted}; an unknown merge state is a conflict, never clean. Confirm with \`git -C ${basePath} status\` before approving anything.`,
     ));
-  } else if (baseState.dirty === null) {
-    // Item 0.14's direction applied to a heavier operation: an unreadable status is a conflict,
-    // never clean.
-    conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} status could not be read (${baseState.statusError ?? "reason unknown"}); an unreadable status is a conflict, never clean.`));
-  } else if (baseState.dirty) {
+  } else if (baseState.dirty === true) {
     conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} has ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`));
+  } else if (baseState.dirty !== false) {
+    // Item 0.14's direction applied to a heavier operation: an unreadable status is a conflict,
+    // never clean. `!== false` rather than `=== null` for the same reason the `merging` branch
+    // above uses it: an adapter that omits `dirty` entirely produced `mergeable: true` with a
+    // usable digest while the renderer printed `STATUS UNKNOWN` beside it -- the view and the
+    // verdict disagreeing, which is the shape of every false green this roadmap has removed.
+    // Ordered after the `=== true` branch so a genuinely dirty checkout still names its paths.
+    conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} status could not be read (${baseState.statusError ?? "reason unknown"}); an unreadable status is a conflict, never clean.`));
   }
   if (baseState.branch !== baseBranch) {
     conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} is on ${baseState.branch ?? "a detached HEAD"}, not ${baseBranch}; git merge would advance the wrong branch.`));
@@ -2394,8 +2418,32 @@ async function runMergeSequence(records, git, timeoutMs) {
       argv: [...(result.argv ?? record.argv)],
       code: result.code,
     });
-    if (result.ok) merged.push(entry);
-    else failed.push({ ...entry, reason: mergeFailureText(result) });
+    if (!result.ok) {
+      failed.push({ ...entry, reason: mergeFailureText(result) });
+      continue;
+    }
+
+    // M4: exit 0 does NOT prove an integration happened. `git merge --no-ff --no-edit <src>`
+    // against an already-integrated branch prints "Already up to date.", exits 0, and creates NO
+    // commit -- and this used to be recorded as `merged`, with a `merge` event appended, claiming
+    // an integration that never occurred. The design's own `--no-ff, always` reasoning is that the
+    // merge commit IS the audit trail, so an audit record that asserts one where none exists is
+    // the thing that reasoning exists to prevent.
+    //
+    // Whether the base branch actually moved is read back rather than parsed out of git's
+    // human-readable stdout, which is localizable. `null` means the read failed, which is reported
+    // as "unconfirmed" and never as either outcome.
+    let baseShaAfter = null;
+    try {
+      const head = await git.resolveHead({ cwd: record.basePath });
+      baseShaAfter = typeof head?.sha === "string" && head.sha ? head.sha : null;
+    } catch {
+      baseShaAfter = null;
+    }
+    const integrated = baseShaAfter === null || typeof record.baseSha !== "string" || !record.baseSha
+      ? null
+      : baseShaAfter !== record.baseSha;
+    merged.push({ ...entry, integrated, baseShaAfter });
   }
 
   return { merged, failed, skipped };
@@ -2430,7 +2478,14 @@ async function executeMerge(options, deps, supplied) {
   const { merged, failed, skipped } = await runMergeSequence(fresh.records, git, timeoutMs);
 
   const passed = failed.length === 0;
-  const status = passed ? "merged" : merged.length > 0 ? "partial" : "failed";
+  // A run in which every repository was already up to date advanced no branch and produced no
+  // merge commit. It is not a failure -- the desired state holds -- but calling it `merged` puts
+  // an integration in the event log that did not happen, so it gets its own status. A MIX still
+  // reports `merged`, and the per-repository `integrated` flag carries which was which.
+  const nothingIntegrated = merged.length > 0 && merged.every((entry) => entry.integrated === false);
+  const status = passed
+    ? (nothingIntegrated ? "already-up-to-date" : "merged")
+    : merged.length > 0 ? "partial" : "failed";
   const exitCode = passed
     ? MERGE_EXIT_CODES.merged
     : status === "partial" ? MERGE_EXIT_CODES.partial : MERGE_EXIT_CODES.failed;

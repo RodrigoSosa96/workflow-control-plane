@@ -940,6 +940,17 @@ function mergeReportRow(entry = {}, status) {
 // that was never attempted cannot be mistaken for one that merged -- and the ARGV column carries
 // the EXECUTED argv (commands.js reports `result.argv`, not the approved one), which is the audit
 // trail for what actually ran.
+// Exit 0 from `git merge` does not prove an integration happened -- an already-integrated branch
+// exits 0, prints "Already up to date.", and creates no commit. commands.js reads the base HEAD
+// back and records `integrated` per repository; this renders that distinction rather than calling
+// both of them `merged`, because the design's whole `--no-ff, always` argument is that the merge
+// commit IS the audit trail. `null` (the read-back itself failed) is neither outcome and says so.
+function mergeReportStatusFor(entry) {
+  if (entry?.integrated === false) return "ALREADY UP TO DATE";
+  if (entry?.integrated === true) return "merged";
+  return "merged (UNCONFIRMED)";
+}
+
 function formatMergeReport(value) {
   const merged = list(value.merged);
   const failed = list(value.failed);
@@ -953,7 +964,7 @@ function formatMergeReport(value) {
   if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
 
   const rows = [
-    ...merged.map((entry) => mergeReportRow(entry, "merged")),
+    ...merged.map((entry) => mergeReportRow(entry, mergeReportStatusFor(entry))),
     ...failed.map((entry) => mergeReportRow(entry, "FAILED")),
     ...skipped.map((entry) => mergeReportRow(entry, "NOT ATTEMPTED")),
   ];

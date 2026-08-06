@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { createProcessRunner } from "../src/workflow/process.js";
+import { createProcessRunner, OUTPUT_LIMIT } from "../src/workflow/process.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 
@@ -923,4 +923,97 @@ test("a spawn into a directory that does not exist names the directory, not the 
     () => runner.run("definitely-not-a-real-binary-xyz", [], { cwd: root }),
     /Failed to start definitely-not-a-real-binary-xyz: spawn definitely-not-a-real-binary-xyz ENOENT/,
   );
+});
+
+// --- I1: the capture boundary, not just the over-cap case ------------------------------------
+//
+// `process.js` caps a captured stream at exactly OUTPUT_LIMIT characters. parseMergeTree used to
+// decide "the list is complete" purely by finding an empty field after the path section -- but when
+// the cut lands exactly on the NUL terminating a path, `split("\0")` produces a trailing "" that is
+// indistinguishable from git's real end-of-paths marker. The list was then reported as COMPLETE,
+// with no `truncated` flag, and commands.js bound that prefix into the approval digest as the whole
+// truth. Exactly the "a shortened list must never read as complete" property the whole chain exists
+// to guarantee.
+function cappedMergeTreeStdout({ paths, pad = 8 }) {
+  // OID(40) + NUL(1) + `paths` nine-character paths (9 + NUL each) + one `pad`-character path + NUL.
+  let output = `${"a".repeat(40)}\0`;
+  for (let index = 0; index < paths; index += 1) output += `p${String(index).padStart(8, "0")}\0`;
+  output += `${"q".repeat(pad)}\0`;
+  return output;
+}
+
+test("a merge-tree conflict list cut exactly on a path separator is reported as truncated, not as complete", async () => {
+  const stdout = cappedMergeTreeStdout({ paths: 1195 });
+  assert.equal(stdout.length, OUTPUT_LIMIT, "this fixture must sit exactly on the capture boundary");
+  assert.equal(stdout.split("\0").at(-1), "", "and its last field must look exactly like git's own terminator");
+
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({ code: 1, stdout, stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+
+  assert.equal(preview.status, "conflicted");
+  assert.equal(preview.truncated, true, "a stream cut at the cap is a prefix of the truth, whatever its last field looks like");
+  assert.equal(preview.conflicts.length, 1196, "every path that WAS captured survives; none is a fragment here");
+  assert.match(preview.reason, /exceeded the 12000-character capture limit/);
+});
+
+test("a merge-tree stream under the cap that simply ends in a separator is still complete", async () => {
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({
+      code: 1,
+      stdout: `${"a".repeat(40)}\0src/one.ts\0src/two.ts\0`,
+      stderr: "",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+  assert.equal(preview.status, "conflicted");
+  assert.equal(preview.truncated, undefined, "under the cap, a trailing separator is git's own terminator");
+  assert.deepEqual(preview.conflicts, ["src/one.ts", "src/two.ts"]);
+});
+
+test("a clean merge whose informational tail was capped stays clean rather than becoming unknown", async () => {
+  // The path section terminates immediately after the tree OID; it is git's volatile informational
+  // section that got cut. Capping alone must not turn a known-clean merge into an unknown one.
+  const stdout = `${"a".repeat(40)}\0\0${"x".repeat(OUTPUT_LIMIT)}`.slice(0, OUTPUT_LIMIT);
+  const fixture = fixtureRunner({
+    "git merge-tree --write-tree --name-only -z dev feature/task": async () => ({ code: 0, stdout, stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
+  assert.equal(preview.status, "clean");
+  assert.deepEqual(preview.conflicts, []);
+});
+
+// --- M6: the merge probe must fail closed on an unreadable MERGE_HEAD -------------------------
+//
+// Measured on git 2.43: `rev-parse --verify --quiet MERGE_HEAD` exits 1 with EMPTY stderr for an
+// absent MERGE_HEAD, a corrupt one, AND one this process cannot read -- and prints the identical
+// `fatal: Needed a single revision` for all three when --quiet is dropped. The exit code cannot
+// answer the question, so the file is read instead: ENOENT is the only proof of "not merging".
+test("a corrupt MERGE_HEAD reports an unknown merge state rather than 'not merging'", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  assert.equal((await git.checkoutState({ cwd: repoPath })).merging, false, "absent MERGE_HEAD is the only proof of not-merging");
+
+  await writeFile(join(repoPath, ".git", "MERGE_HEAD"), "not-a-sha\n");
+  assert.equal(
+    (await git.checkoutState({ cwd: repoPath })).merging,
+    null,
+    "a MERGE_HEAD git cannot resolve must degrade to 'cannot say', which the caller treats as a conflict",
+  );
+
+  // The exit-code probe this replaced cannot tell that case from an absent ref: both exit 1.
+  const probe = await createProcessRunner().run("git", ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], { cwd: repoPath, allowFailure: true });
+  assert.equal(probe.code, 1, "identical to the absent case -- which is why the exit code cannot be the answer");
+  assert.equal(probe.stderr.trim(), "");
+
+  await writeFile(join(repoPath, ".git", "MERGE_HEAD"), `${await gitExec(repoPath, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim())}\n`);
+  assert.equal((await git.checkoutState({ cwd: repoPath })).merging, true);
 });
