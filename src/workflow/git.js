@@ -350,16 +350,35 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     // Is this checkout safe to merge into right now? `dirty: null` means the status could not be
     // read; the caller must treat that as a conflict and never as clean — same direction as
     // reconcile.js's `safeStatus`, applied to a heavier operation.
+    //
+    // `merging` is a SEPARATE fact from `dirty`, and it exists because "dirty" alone was
+    // under-specified in exactly the case it matters most. Found running the real CLI (roadmap item
+    // 2.4, task 3, step 5): a `git merge` that fails at commit time — a rejecting
+    // `pre-merge-commit` hook, and equally a real conflict `merge-tree` did not predict — leaves
+    // the base checkout mid-merge, with MERGE_HEAD present and the merged content staged. The next
+    // preview correctly refused, but described that checkout only as "has 1 uncommitted path(s)",
+    // whose natural reading is `git add`/`git stash` — the wrong move. The right one is
+    // `git merge --abort`, and a caller cannot say so without being able to tell the two states
+    // apart. `true`/`false`/`null` for unknown, never throwing: an unanswerable probe must degrade
+    // to "cannot say" rather than to "not merging".
     async checkoutState({ cwd }) {
       const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
       const branch = normalizeHeadBranch(trimLine(branchResult.stdout));
 
+      let merging = null;
+      try {
+        const mergeHead = await runner.run("git", ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], { cwd, allowFailure: true });
+        merging = mergeHead.code === 0;
+      } catch {
+        merging = null;
+      }
+
       try {
         const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd });
         const entries = parseStatus(statusResult.stdout);
-        return { branch, dirty: entries.length > 0, entries };
+        return { branch, dirty: entries.length > 0, entries, merging };
       } catch (error) {
-        return { branch, dirty: null, entries: [], statusError: reasonFrom(error) };
+        return { branch, dirty: null, entries: [], merging, statusError: reasonFrom(error) };
       }
     },
 

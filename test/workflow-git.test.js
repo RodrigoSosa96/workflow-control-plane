@@ -397,7 +397,9 @@ test("checkoutState reports a clean checkout as not dirty", async () => {
 
   const state = await git.checkoutState({ cwd: "/repo" });
 
-  assert.deepEqual(state, { branch: "dev", dirty: false, entries: [] });
+  // `merging: null` here, not `false`: this fixture scripts no MERGE_HEAD probe, and an
+  // unanswerable probe must degrade to "cannot say" rather than to "not merging".
+  assert.deepEqual(state, { branch: "dev", dirty: false, entries: [], merging: null });
 });
 
 test("checkoutState reports dirty: null with a reason when git status cannot be read", async () => {
@@ -606,7 +608,7 @@ test("resolveHead and checkoutState read a real repository, detached HEAD includ
   assert.match(head.sha, /^[0-9a-f]{40}$/);
 
   const clean = await git.checkoutState({ cwd: repoPath });
-  assert.deepEqual(clean, { branch: "main", dirty: false, entries: [] });
+  assert.deepEqual(clean, { branch: "main", dirty: false, entries: [], merging: false });
 
   await writeFile(join(repoPath, "README.md"), "changed\n");
   const dirty = await git.checkoutState({ cwd: repoPath });
@@ -861,4 +863,64 @@ test("mergeBranch performs a real --no-ff merge and leaves a merge commit", asyn
   assert.equal(parents.length, 3, "--no-ff must produce a merge commit even when a fast-forward was available");
   assert.equal(await readFile(join(repoPath, "feature.txt"), "utf8"), "feature only\n");
   assert.equal((await git.checkoutState({ cwd: repoPath })).dirty, false);
+});
+
+// Roadmap item 2.4, task 3, step 5: a `git merge` that fails at commit time leaves the checkout
+// mid-merge, and `dirty: true` alone described that state only as "there are uncommitted paths" --
+// which reads as `git add`/`git stash` when the correct move is `git merge --abort`. Real git, a
+// real rejecting hook, and a real stopped merge, because the whole point is what git leaves behind.
+test("checkoutState distinguishes a checkout stuck mid-merge from an ordinarily dirty one", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  await gitExec(repoPath, ["checkout", "-b", "feature/work"]);
+  await writeFile(join(repoPath, "feature.txt"), "feature\n");
+  await gitExec(repoPath, ["add", "feature.txt"]);
+  await gitExec(repoPath, ["commit", "-m", "feature work"]);
+  await gitExec(repoPath, ["checkout", "main"]);
+
+  const beforeMerge = await git.checkoutState({ cwd: repoPath });
+  assert.equal(beforeMerge.dirty, false);
+  assert.equal(beforeMerge.merging, false, "a clean checkout is not mid-merge");
+
+  // A hook that rejects at commit time -- the exact shape found running the real CLI.
+  const hookPath = join(repoPath, ".git", "hooks", "pre-merge-commit");
+  await writeFile(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  await assert.rejects(() => gitExec(repoPath, ["merge", "--no-ff", "--no-edit", "feature/work"]));
+
+  const afterFailedMerge = await git.checkoutState({ cwd: repoPath });
+  assert.equal(afterFailedMerge.merging, true, "MERGE_HEAD is present; this checkout is mid-merge");
+  assert.equal(afterFailedMerge.dirty, true);
+  assert.equal(afterFailedMerge.branch, "main");
+
+  await gitExec(repoPath, ["merge", "--abort"]);
+  const afterAbort = await git.checkoutState({ cwd: repoPath });
+  assert.equal(afterAbort.merging, false, "the abort is what actually resolves it");
+  assert.equal(afterAbort.dirty, false);
+});
+
+// Node reports a missing `cwd` and a missing executable identically, as `spawn <cmd> ENOENT`. The
+// real CLI printed "Failed to start git: spawn git ENOENT" for a run whose worktree had been
+// deleted, sending the operator to check their git installation.
+test("a spawn into a directory that does not exist names the directory, not the binary", async (t) => {
+  const { root } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const missing = join(root, "worktree-that-was-removed");
+
+  await assert.rejects(
+    () => git.resolveHead({ cwd: missing }),
+    (error) => {
+      assert.match(error.message, /working directory does not exist/);
+      assert.ok(error.message.includes(missing), error.message);
+      assert.doesNotMatch(error.message, /spawn git ENOENT/, "the old message sent operators to check their git install");
+      return true;
+    },
+  );
+
+  // The binary case still reports the binary: the fix must not swallow a genuinely missing command.
+  const runner = createProcessRunner();
+  await assert.rejects(
+    () => runner.run("definitely-not-a-real-binary-xyz", [], { cwd: root }),
+    /Failed to start definitely-not-a-real-binary-xyz: spawn definitely-not-a-real-binary-xyz ENOENT/,
+  );
 });

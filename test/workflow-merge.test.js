@@ -1265,3 +1265,77 @@ test("executing a refused preview merges nothing and appends nothing", async (t)
   assert.deepEqual(fixture.calls, []);
   assert.deepEqual(store.appendEventCalls, []);
 });
+
+// Roadmap item 2.4, task 3, step 5 and its review. A merge that fails at commit time leaves the
+// base checkout mid-merge. The preview already refused (the dirty check is fail-closed and caught
+// it), but it described the checkout only as "has 1 uncommitted path(s)" -- whose natural reading
+// is `git add`/`git stash`, the wrong move -- and its ONLY next action was the dry-run that had
+// just printed it, a loop with no exit. Real git throughout, because what is being asserted is
+// what git actually leaves behind.
+test("a base checkout left mid-merge is named as mid-merge, and its next action is the abort rather than the dry-run that just printed it", async (t) => {
+  const store = await newStore(t);
+  const { basePath, worktreePath } = await realRepositoryPair(t);
+  const run = await store.create({
+    projectAlias: "solo",
+    primaryTicket: "A-1",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const deps = {
+    store,
+    loadRegistry: mergeLoadRegistry({ solo: { path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+  };
+
+  const clean = await mergeCommand({ runId: run.id }, deps);
+  assert.equal(clean.preview.mergeable, true);
+  assert.equal(clean.preview.repositories[0].baseMerging, false);
+
+  // A hook that rejects at commit time: merge-tree predicts clean, the real merge stops mid-way.
+  await realFs.writeFile(join(basePath, ".git", "hooks", "pre-merge-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const report = await clean.execute({ approvalDigest: clean.preview.approvalDigest });
+  assert.equal(report.status, "failed");
+  assert.equal(report.failed.length, 1);
+
+  const blocked = (await mergeCommand({ runId: run.id }, deps)).preview;
+  assert.equal(blocked.mergeable, false);
+  assert.equal(blocked.repositories[0].baseMerging, true, "MERGE_HEAD is present in the base checkout");
+
+  const reason = blocked.conflicts.map((conflict) => conflict.reason).join("\n");
+  assert.match(reason, /in the middle of a merge \(MERGE_HEAD is present\)/);
+  assert.match(reason, /merge --abort/);
+  assert.match(reason, /staging or stashing those paths is not the fix/);
+
+  // The loop-with-no-exit: the abort must come first, and the dry-run must not be the only action.
+  assert.deepEqual(blocked.nextActions, [
+    `git -C ${basePath} merge --abort`,
+    `workflow merge ${run.id} --dry-run`,
+  ]);
+
+  // And the abort really is what clears it.
+  await gitExec(basePath, ["merge", "--abort"]);
+  const recovered = (await mergeCommand({ runId: run.id }, deps)).preview;
+  assert.equal(recovered.repositories[0].baseMerging, false);
+  assert.equal(recovered.mergeable, true);
+});
+
+test("a mid-merge base checkout changes the approval digest, so an approval taken before it cannot execute", async (t) => {
+  const store = await newStore(t);
+  const { basePath, worktreePath } = await realRepositoryPair(t);
+  const run = await store.create({
+    projectAlias: "solo",
+    primaryTicket: "A-2",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const deps = {
+    store,
+    loadRegistry: mergeLoadRegistry({ solo: { path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+  };
+
+  const before = (await mergeCommand({ runId: run.id }, deps)).preview.approvalDigest;
+  await gitExec(basePath, ["merge", "--no-commit", "--no-ff", "feature/actual"]);
+  const after = (await mergeCommand({ runId: run.id }, deps)).preview;
+
+  assert.equal(after.repositories[0].baseMerging, true);
+  assert.notEqual(after.approvalDigest, before, "baseMerging blocks execution, so the digest must bind it");
+});

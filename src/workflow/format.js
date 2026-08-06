@@ -712,26 +712,40 @@ export function formatVerify(value = {}) {
 //      that no longer exists);
 //   4. the verification status, including `none`.
 
+// The last column is `MERGE-TREE`, not `MERGE`, and the name is load-bearing. It answers exactly
+// one question -- what `git merge-tree` predicted about CONTENT -- and a repository can be blocked
+// by something else entirely one column to its left (a dirty base checkout, a checkout on the wrong
+// branch). Under the old `MERGE` header a row reading `dev, DIRTY (2) | clean` invited "the merge
+// is clean, so this one is fine", which is a misread the header caused rather than the cell: the
+// cell was literally true. Naming the column after the oracle that produced it removes the promise
+// the header was making. Deliberately NOT a per-row blocked/ok column: ANY conflict blocks the
+// WHOLE run, so a per-row verdict would imply the genuinely-clean repositories are going to merge,
+// which is false and worse. The run-level truth lives in the headline and in `Conflicts:`.
 const MERGE_COLUMNS = [
   { key: "repo", label: "REPO" },
   { key: "source", label: "SOURCE" },
   { key: "base", label: "BASE" },
   { key: "checkout", label: "BASE CHECKOUT" },
-  { key: "merge", label: "MERGE" },
+  { key: "merge", label: "MERGE-TREE" },
 ];
 
 // Same convention verifyStatusLabel established: only the clean case stays lowercase, so anything
 // that blocks the merge stands out from the row above it without color or emoji. `baseDirty` is
 // tri-state (`true`/`false`/`null`) and only an explicit `false` may read as clean -- item 0.14's
-// lesson, applied here at the point where an operator actually reads it.
+// lesson, applied here at the point where an operator actually reads it. `MID-MERGE` outranks
+// `DIRTY` because it is the more specific fact and the one that changes what an operator should
+// do about it (see git.js's checkoutState).
 function mergeCheckoutLabel(record) {
   const branch = text(record.baseCheckedOutBranch, "DETACHED");
   const onBase = record.baseBranchCheckedOut === true ? branch : `${branch} (NOT ${text(record.baseBranch)})`;
-  const state = record.baseDirty === false
-    ? "clean"
-    : record.baseDirty === true
-      ? `DIRTY (${Number.isFinite(record.baseDirtyCount) ? record.baseDirtyCount : list(record.baseDirtyPaths).length})`
-      : "STATUS UNKNOWN";
+  const dirtyCount = Number.isFinite(record.baseDirtyCount) ? record.baseDirtyCount : list(record.baseDirtyPaths).length;
+  const state = record.baseMerging === true
+    ? `MID-MERGE (${dirtyCount})`
+    : record.baseDirty === false
+      ? "clean"
+      : record.baseDirty === true
+        ? `DIRTY (${dirtyCount})`
+        : "STATUS UNKNOWN";
   return `${onBase}, ${state}`;
 }
 
@@ -852,17 +866,37 @@ function appendMergeNextActions(lines, nextActions) {
   for (const action of actions) lines.push(`- ${action}`);
 }
 
+// `mergeable` is a THIRD input here, not decoration. Deriving the headline from
+// `conflicts.length` alone means a value of `{mergeable: false, exitCode: 11, conflicts: []}` --
+// a preview the CLI would exit 11 on -- renders as `Merge: mergeable`. Nothing produces that shape
+// today (commands.js computes `mergeable` as `conflicts.length === 0`), but a renderer that can
+// print "mergeable" over a response that says otherwise is the false-green shape this roadmap
+// keeps removing, and agreement costs one comparison. An unset `mergeable` is not read as clean
+// either: it gets its own line saying so.
+function mergeHeadline(value, conflicts) {
+  if (conflicts.length > 0) {
+    return `Merge: blocked by ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}`;
+  }
+  if (value.mergeable === true) return "Merge: mergeable";
+  return "Merge: NOT MERGEABLE (no conflicts were listed; refusing to read that as clean)";
+}
+
 function formatMergePreview(value) {
   const repositories = list(value.repositories);
   const conflicts = list(value.conflicts);
   const lines = [
     `Run: ${text(value.runId)}`,
     `Project: ${text(value.projectAlias)} (run state: ${text(value.runState)})`,
-    conflicts.length === 0
-      ? "Merge: mergeable"
-      : `Merge: blocked by ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}`,
+    mergeHeadline(value, conflicts),
     mergeVerificationLine(value.verification),
   ];
+  // Above the path-heavy sections, not below them, and for the same reason formatLaunchPreview puts
+  // its own `Approval digest:` line before `Assignment:`: everything after this point scales with
+  // repository and conflict count, and `bound()` truncates the TAIL. Measured at 6 repositories
+  // against the worst-case fixture, the compact view does reach OUTPUT_LIMIT -- with the digest
+  // last, the digest was the first thing lost. (That was fail-safe, since no digest means nothing
+  // can execute, but "the operator loses the one string they need" is a bad way to be safe.)
+  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
 
   if (repositories.length === 0) lines.push("Repositories: none");
   else lines.push(...renderTable(MERGE_COLUMNS, repositories.map(mergeRow)));
@@ -876,7 +910,6 @@ function formatMergePreview(value) {
   if (conflicts.length === 0) lines.push("Conflicts: none");
   else addConflicts(lines, conflicts);
 
-  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
   appendMergeNextActions(lines, value.nextActions);
   return bound(lines.join("\n"));
 }
@@ -1242,9 +1275,8 @@ function resultOverflowFallback(command, source, limit) {
 // display caps commands.js already ships (10 conflicted paths, 5 reason paths, and 5 uncommitted
 // paths per repository) and realistic sharyco-shaped path lengths (~95 characters):
 //
-//   clean 3-repository preview                                    3,598
-//   realistic 3-repository preview (2 conflicts each)             5,733
-//   3-repository preview at the display caps                     11,814   98.5% of budget
+//   clean 3-repository preview                                    3,628
+//   3-repository preview at the display caps                     11,763   98.0% of budget
 //   4-repository preview at the display caps                        200   COLLAPSED
 //
 // The 200 is the finding. The general fallback below keeps only `{command, runId, truncated,
@@ -1271,16 +1303,27 @@ function resultOverflowFallback(command, source, limit) {
 // instead of the general fallback's nothing. Measured with the same worst-case fixture, one
 // repository at a time (n = repositories, each at the display caps):
 //
-//   n = 1..3   no fallback needed             (n=1: 4,372 · n=3: 11,814)
-//   n = 4..5   tier 1                         (n=4: 9,084 · n=5: 11,038)
-//   n = 6..9   tier 2                         (n=6: 7,888 · n=9: 11,140)
+//   n = 1..3   no fallback needed             (n=1: 4,355 · n=3: 11,763)
+//   n = 4..5   tier 1                         (n=4: 9,282 · n=5: 11,228)
+//   n = 6..9   tier 2                         (n=6: 8,167 · n=9: 11,422)
 //   n >= 10    the general fallback below     (200 characters, no argv, no conflicts)
 //
-// Ten repositories is three times the largest group project on this machine and every one of them
-// at 900 conflicts; the general fallback is the honest answer there rather than a fourth tier that
-// would have to start dropping repositories. What the tiers buy is that the shape degrades
-// gradually instead of falling off a cliff one repository past a measured number -- which is
-// exactly what items 2.1 and 2.3 each shipped once and had to correct.
+// Every number above is from `worstCaseMergePreview` in test/workflow-format.test.js, so it is
+// reproducible rather than a remembered measurement -- and the boundaries are asserted there too
+// (`the merge JSON fallback tiers engage where they are documented to`). They ARE fixture-relative:
+// shorter repository paths push each boundary out by a repository or so, which is why the tests
+// pin the tiers rather than the byte counts.
+//
+// Two tiers and no third, and the reason is not that a third is impossible -- tier 2 still carries
+// plenty a third could take (`basePath`, `sourceSha`, `sourceBranch`, `baseBranch`,
+// `baseBranchCheckedOut`, `baseDirty`/`baseMerging`/`baseDirtyCount`, `branchMismatch`, and the
+// full aggregated conflicts list with 100-character reasons). It is that each additional tier is
+// another distinct response shape a consumer has to handle, bought against a case no data supports:
+// ten repositories is three times the largest group project on this machine, with every one of them
+// at 900 conflicts. Stopping here is a judgement about diminishing returns, not a claim that the
+// budget ran out. What the two tiers do buy is that the shape degrades gradually instead of falling
+// off a cliff one repository past a measured number -- exactly what items 2.1 and 2.3 each shipped
+// once and had to correct.
 //
 // The execute report never needed any of this and is measured too, since it flows through the same
 // path: three repositories with a failure carrying git's stderr at commands.js's own 2,000-character
@@ -1305,6 +1348,9 @@ function strippedMergeRepository(record, tier) {
       baseBranch: record.baseBranch,
       baseBranchCheckedOut: record.baseBranchCheckedOut,
       baseDirty: record.baseDirty ?? null,
+      // Kept even in the minimal tier: it blocks execution on its own and it is what tells an
+      // operator to reach for `git merge --abort` rather than for `git add`.
+      baseMerging: record.baseMerging ?? null,
       baseDirtyCount: record.baseDirtyCount ?? 0,
       sourceBranch: record.sourceBranch,
       sourceSha: record.sourceSha,
@@ -1340,10 +1386,15 @@ function mergeOverflowFallback(command, source, limit, tier) {
     ...(Object.hasOwn(source, "skipped") ? { skipped: list(source.skipped).map((entry) => boundedMergeReason(entry, tier)) } : {}),
     truncated: true,
   };
+  // A marker whose job is to enumerate the drops has to enumerate ALL of them, by field name. The
+  // first version of this text omitted `conflictReason` from tier 1 -- and for a repository whose
+  // `conflictStatus` is `"unknown"` that string is the ONLY explanation of why the conflicts could
+  // not be determined, so its silent disappearance was the one drop most worth naming. Tier 2's
+  // list was short by `baseCheckedOutBranch` and `sourceCommittedAt` for the same kind of reason.
   const dropped = tier.minimal
-    ? "every conflicted-path list and every base checkout's uncommitted-path list were dropped, along with each repository record's worktree path, base sha, and recorded branch"
-    : `each repository's conflicted-path list was cut to ${tier.conflictPaths} paths, and each base checkout's uncommitted-path list was dropped`;
-  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. The compact view (--format compact, the default) renders the same response bounded to ${OUTPUT_LIMIT} characters.`;
+    ? "every repository's conflicted-path list and `baseDirtyPaths` were dropped entirely, together with `conflictReason`, `worktreePath`, `recordedBranch`, `sourceCommittedAt`, `baseCheckedOutBranch`, and `baseSha`"
+    : `each repository's conflicted-path list was cut to ${tier.conflictPaths} paths, and \`baseDirtyPaths\` and \`conflictReason\` were dropped`;
+  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, its \`baseDirty\`/\`baseMerging\`/\`baseDirtyCount\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. The compact view (--format compact, the default) is not a fuller answer at this size -- it is bounded to ${OUTPUT_LIMIT} characters too, and it truncates its TAIL, so at a response this wide it loses \`Conflicts:\` and \`Next:\` while keeping the run header, the approval digest, the table, and \`Argv:\`.`;
   return degraded;
 }
 

@@ -1510,6 +1510,7 @@ function mergeRepository(overrides = {}) {
     baseCheckedOutBranch: "dev",
     baseBranchCheckedOut: true,
     baseDirty: false,
+    baseMerging: false,
     baseDirtyPaths: [],
     baseDirtyCount: 0,
     baseSha: "1f7d3c9b5a2e84670d1b6f3a9c5e2807b4d1a6f3",
@@ -1828,6 +1829,46 @@ test("a multi-line reason from git's own stderr stays attributed to its reposito
   );
 });
 
+test("the compact headline never says mergeable over a preview that says otherwise", () => {
+  // Nothing produces this shape today -- commands.js computes `mergeable` as
+  // `conflicts.length === 0` -- but a renderer that can print "mergeable" over a response the CLI
+  // exits 11 on is the false-green shape this roadmap keeps removing.
+  const divergent = mergePreview({ mergeable: false, exitCode: 11, conflicts: [] });
+  const compact = formatWorkflowResult("merge", divergent, "compact");
+  assert.doesNotMatch(compact, /^Merge: mergeable$/m);
+  assert.match(compact, /^Merge: NOT MERGEABLE \(no conflicts were listed; refusing to read that as clean\)$/m);
+
+  const unset = mergePreview();
+  delete unset.mergeable;
+  assert.doesNotMatch(formatWorkflowResult("merge", unset, "compact"), /^Merge: mergeable$/m);
+
+  assert.match(formatWorkflowResult("merge", mergePreview(), "compact"), /^Merge: mergeable$/m);
+});
+
+// The column answers exactly one question -- what `git merge-tree` predicted about CONTENT -- and
+// a repository can be blocked by something one column to its left. `gamma`'s real row in step 5
+// read `dev, DIRTY (2) | clean` under a header that said `MERGE`, which promised more than the
+// cell delivers.
+test("the conflict column is named after the oracle that produced it, not after the merge", () => {
+  const compact = formatWorkflowResult("merge", threeRepositoryPreview(), "compact");
+  const header = compact.split("\n").find((line) => line.startsWith("REPO"));
+  assert.ok(header, compact);
+  assert.match(header, /MERGE-TREE/);
+  assert.doesNotMatch(header, /\|\s*MERGE\s*$/, "a bare MERGE header promises a verdict this column does not give");
+});
+
+test("a base checkout stuck mid-merge is named as such, not merely as dirty", () => {
+  const preview = threeRepositoryPreview((repositoryId) => (repositoryId === "panel"
+    ? { baseDirty: true, baseMerging: true, baseDirtyPaths: ["two.txt"], baseDirtyCount: 1 }
+    : {}));
+  preview.mergeable = false;
+  preview.exitCode = 11;
+
+  const compact = formatWorkflowResult("merge", preview, "compact");
+  assert.match(compact, /MID-MERGE \(1\)/);
+  assert.doesNotMatch(compact, /DIRTY \(1\)/, "the more specific state must win; it is the one that changes what to do");
+});
+
 test("formatWorkflowResult dispatches \"merge\" to the compact merge renderer rather than raw JSON", () => {
   const compact = formatWorkflowResult("merge", mergePreview(), "compact");
   assert.match(compact, new RegExp(`^Run: ${MERGE_RUN_ID}$`, "m"));
@@ -1961,4 +2002,67 @@ test("--format json for merge carries a refusal's reason and next actions unchan
   assert.equal(parsed.reason, "Unknown workflow project: sharyco");
   assert.equal(parsed.approvalDigest, null);
   assert.deepEqual(parsed.nextActions, value.nextActions);
+});
+
+// The measured worst case was defended only by a comment. The realistic-fixture test above asserts
+// a bound the response clears by a wide margin; nothing pinned the number that actually matters --
+// a THREE-repository preview (the real sharyco group project) at commands.js's own display caps,
+// which sits at ~98% of budget. Raise MERGE_CONFLICT_DISPLAY_LIMIT from 10 to 15 there and the
+// real three-repository case starts silently degrading; this is the test that notices.
+test("--format json for a WORST-CASE three-repository preview still fits without any fallback", () => {
+  const worstCase = worstCaseMergePreview(["backend", "panel", "webapp"]);
+
+  const json = formatWorkflowResult("merge", worstCase, "json");
+  assert.ok(json.length <= 12000, `the worst-case three-repository preview was ${json.length} characters`);
+
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, undefined, "the real three-repository project must not need a fallback at all");
+  assert.equal(parsed.repositories.length, 3);
+  for (const [index, repository] of parsed.repositories.entries()) {
+    // Unabridged: the full display-capped conflict list and the dirty paths both survive here,
+    // which is exactly what the fallback tiers give up.
+    assert.equal(repository.conflicts.length, 10);
+    assert.equal(repository.baseDirtyPaths.length, 5);
+    assert.equal(repository.conflictReason, worstCase.repositories[index].conflictReason);
+  }
+});
+
+// The tier boundary itself, pinned one repository either side, so a change that moves it is a test
+// failure rather than a comment that quietly goes stale.
+test("the merge JSON fallback tiers engage where they are documented to", () => {
+  const tierOf = (repositoryIds) => {
+    const parsed = JSON.parse(formatWorkflowResult("merge", worstCaseMergePreview(repositoryIds), "json"));
+    if (!parsed.truncated) return "none";
+    if (!Array.isArray(parsed.repositories) || parsed.repositories.length === 0) return "general";
+    return parsed.repositories[0].worktreePath ? "1" : "2";
+  };
+  const names = ["backend", "panel", "webapp", "admin", "mobile", "docs", "infra", "edge", "cms", "api"];
+
+  assert.equal(tierOf(names.slice(0, 3)), "none");
+  assert.equal(tierOf(names.slice(0, 4)), "1");
+  assert.equal(tierOf(names.slice(0, 5)), "1");
+  assert.equal(tierOf(names.slice(0, 6)), "2");
+  assert.equal(tierOf(names.slice(0, 9)), "2");
+  assert.equal(tierOf(names.slice(0, 10)), "general", "past the tiers, the general fallback is the honest answer and the marker says so");
+});
+
+// The compact view is not a fuller answer at this size -- it is bounded to the same 12,000
+// characters and it truncates its TAIL. Measured: at six repositories on the worst-case fixture it
+// reaches the limit and loses `Conflicts:` and `Next:`. That is fail-safe (nothing can execute
+// without a digest, and a mergeable preview never gets near this size), but the digest itself must
+// survive, which is why it is rendered above the path-heavy sections rather than below them.
+test("the compact preview keeps the approval digest even when it is truncated", () => {
+  const wide = worstCaseMergePreview(["backend", "panel", "webapp", "admin", "mobile", "docs"]);
+  const compact = formatWorkflowResult("merge", wide, "compact");
+
+  assert.equal(compact.length, 12000);
+  assert.match(compact, /\[output truncated at 12000 characters\]$/);
+  assert.match(compact, new RegExp(`^Approval digest: ${MERGE_DIGEST}$`, "m"), "the one string an operator needs must not be what truncation takes first");
+  assert.match(compact, /^Merge: blocked by 12 conflicts$/m);
+  assert.match(compact, /^Argv:$/m);
+  assert.doesNotMatch(compact, /^Next:$/m, "the tail is what is lost; the marker in the JSON fallback says so explicitly");
+
+  // A mergeable preview -- the case an operator actually acts on -- is nowhere near the limit.
+  const mergeable = threeRepositoryPreview();
+  assert.ok(formatWorkflowResult("merge", mergeable, "compact").length < 12000 * 0.6);
 });

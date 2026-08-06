@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { WorkflowError } from "./errors.js";
 
 // Exported so a parser of a captured stream can say that its input was cut off here, rather
@@ -11,6 +12,24 @@ function appendBounded(current, chunk) {
   const text = String(chunk);
   const remaining = OUTPUT_LIMIT - current.length;
   return current + text.slice(0, remaining);
+}
+
+// Node reports a missing `cwd` and a missing executable with the SAME error: `spawn <cmd> ENOENT`,
+// with no field distinguishing them. That collapse is actively misleading for this codebase, whose
+// commands run `git` inside operator-supplied directories: `workflow merge` against a run whose
+// worktree has been deleted printed "Failed to start git: spawn git ENOENT", which sends an
+// operator to check their git installation when what is actually missing is the directory named
+// two words earlier in the same refusal. Found running the real CLI (roadmap item 2.4, task 3,
+// step 5).
+//
+// ENOENT is the only code that is ambiguous this way, and the `existsSync` only ever runs on that
+// already-failed path -- never in the success path of any spawn. `cwd` is re-checked rather than
+// assumed: by the time the error arrives, the directory really is the thing to ask about.
+function startFailureMessage(command, cwd, error) {
+  if (error?.code === "ENOENT" && typeof cwd === "string" && cwd && !existsSync(cwd)) {
+    return `Failed to start ${command}: working directory does not exist: ${cwd}`;
+  }
+  return `Failed to start ${command}: ${error.message}`;
 }
 
 function toProcessError(message, details) {
@@ -34,7 +53,7 @@ export function createProcessRunner({ spawnImpl = spawn } = {}) {
             shell: false,
           });
         } catch (error) {
-          reject(toProcessError(`Failed to start ${command}: ${error.message}`, {
+          reject(toProcessError(startFailureMessage(command, cwd, error), {
             reason: "spawn",
             command,
             args,
@@ -66,7 +85,7 @@ export function createProcessRunner({ spawnImpl = spawn } = {}) {
         });
 
         child.on("error", (error) => {
-          settle(() => reject(toProcessError(`Failed to start ${command}: ${error.message}`, {
+          settle(() => reject(toProcessError(startFailureMessage(command, cwd, error), {
             reason: "spawn",
             command,
             args,

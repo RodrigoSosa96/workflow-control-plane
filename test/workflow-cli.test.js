@@ -2863,7 +2863,7 @@ test("workflow merge end-to-end against real git: the dry-run's digest merges, t
   const afterBaseSha = gitRun(basePath, ["rev-parse", "dev"]);
   assert.notEqual(afterBaseSha, beforeBaseSha, "dev must have advanced");
   assert.equal(gitRun(basePath, ["rev-list", "--parents", "-n", "1", "dev"]).split(" ").length, 3, "--no-ff must leave a two-parent merge commit");
-  assert.deepEqual(worktreeFingerprint(worktreePath), beforeWorktree, "the run worktree must be byte-identical after the merge");
+  assert.deepEqual(worktreeFingerprint(worktreePath), beforeWorktree, "the run worktree's HEAD, branch, porcelain status and index must be unchanged after the merge");
 
   // Replaying the same digest is refused: the base sha moved, so the preview it approved is gone.
   const replay = io();

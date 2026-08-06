@@ -2065,7 +2065,21 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   const conflictPaths = list(preview.conflicts).map(String);
   const conflicts = [];
 
-  if (baseState.dirty === null) {
+  // Checked BEFORE `dirty`, and independently of it, because "mid-merge" is the more specific and
+  // more actionable fact and it must block even in the exotic case where a stopped merge staged
+  // nothing. See git.js's checkoutState for where this came from: naming only the uncommitted
+  // paths points an operator at `git add`/`git stash`, which is the wrong move for a checkout that
+  // is actually sitting inside a failed merge.
+  if (baseState.merging === true) {
+    const paths = dirtyPaths.length > 0
+      ? ` with ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`
+      : "";
+    conflicts.push(mergeConflict(
+      repositoryId,
+      `base:${basePath}`,
+      `Base checkout ${basePath} is in the middle of a merge (MERGE_HEAD is present)${paths}; most likely a previous merge that failed at commit time. Resolve it with \`git -C ${basePath} merge --abort\` (or finish it by hand) — staging or stashing those paths is not the fix.`,
+    ));
+  } else if (baseState.dirty === null) {
     // Item 0.14's direction applied to a heavier operation: an unreadable status is a conflict,
     // never clean.
     conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} status could not be read (${baseState.statusError ?? "reason unknown"}); an unreadable status is a conflict, never clean.`));
@@ -2099,6 +2113,7 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
       baseCheckedOutBranch: baseState.branch ?? null,
       baseBranchCheckedOut: baseState.branch === baseBranch,
       baseDirty: baseState.dirty ?? null,
+      baseMerging: baseState.merging ?? null,
       dirtyPaths,
       baseSha: typeof baseHead?.sha === "string" ? baseHead.sha : null,
       // From the adapter, never rebuilt here: the string an operator approves has to be the string
@@ -2177,6 +2192,10 @@ function mergeDigestPayload({ runId, run, records, verification }) {
       baseCheckedOutBranch: record.baseCheckedOutBranch,
       baseBranchCheckedOut: record.baseBranchCheckedOut,
       baseDirty: record.baseDirty,
+      // Bound because it now blocks execution on its own (see inspectRepositoryForMerge): a
+      // checkout that stops being mid-merge between preview and approval is a materially
+      // different world, and the digest has to notice.
+      baseMerging: record.baseMerging,
       baseSha: record.baseSha,
       argv: record.argv,
       conflictStatus: record.conflictStatus,
@@ -2202,6 +2221,7 @@ function publicMergeRepository(record) {
     baseCheckedOutBranch: record.baseCheckedOutBranch,
     baseBranchCheckedOut: record.baseBranchCheckedOut,
     baseDirty: record.baseDirty,
+    baseMerging: record.baseMerging,
     baseDirtyPaths,
     baseDirtyCount: record.dirtyPaths.length,
     baseSha: record.baseSha,
@@ -2266,9 +2286,15 @@ async function buildMergePreview(runId, run, options, deps) {
     exitCode: mergeable ? MERGE_EXIT_CODES.merged : MERGE_EXIT_CODES.conflicted,
     nextActions: [],
   };
+  // A blocked preview whose only next action is the dry-run that just printed it is a loop with no
+  // exit, and that is exactly what a checkout stuck mid-merge used to get (task 3, step 5). The
+  // abort is named first, per repository actually in that state, so the loop has a way out.
+  const abortActions = [...new Set(
+    records.filter((record) => record.baseMerging === true).map((record) => `git -C ${record.basePath} merge --abort`),
+  )];
   preview.nextActions = mergeable
     ? [`workflow merge ${runId} --yes --approval-digest ${preview.approvalDigest}`]
-    : [mergeCommandFor(runId)];
+    : [...abortActions, mergeCommandFor(runId)];
   return { preview, records };
 }
 
