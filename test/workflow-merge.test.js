@@ -78,11 +78,16 @@ function scriptedGit(script = {}) {
         calls.push({ method: "checkoutState", cwd });
         const entry = entryFor(cwd);
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
+        // `merging` is part of the adapter's contract (git.js's checkoutState), so the double
+        // answers it like the real thing does: an explicit `false` unless a test scripts
+        // otherwise. Leaving it `undefined` would let these tests pass against a commands.js that
+        // fails OPEN on an unanswerable MERGE_HEAD probe, which is the exact bug this models.
+        const merging = Object.hasOwn(entry, "merging") ? entry.merging : false;
         if (entry.dirty === null) {
-          return { branch: entry.branch ?? null, dirty: null, entries: [], statusError: entry.statusError ?? "git status failed" };
+          return { branch: entry.branch ?? null, dirty: null, entries: [], merging, statusError: entry.statusError ?? "git status failed" };
         }
         const entries = (entry.dirtyPaths ?? []).map((path) => ({ x: " ", y: "M", path }));
-        return { branch: entry.branch ?? null, dirty: Boolean(entry.dirty) || entries.length > 0, entries };
+        return { branch: entry.branch ?? null, dirty: Boolean(entry.dirty) || entries.length > 0, entries, merging };
       },
       // Models the ref namespace of ONE checkout. `refsFrom` is the ordinary linked-worktree
       // topology -- base checkout and run worktree share a ref store, so the branch resolves to
@@ -1338,4 +1343,68 @@ test("a mid-merge base checkout changes the approval digest, so an approval take
 
   assert.equal(after.repositories[0].baseMerging, true);
   assert.notEqual(after.approvalDigest, before, "baseMerging blocks execution, so the digest must bind it");
+});
+
+// Fix round 2. `merging` is tri-state and git.js's checkoutState documents an unanswerable
+// MERGE_HEAD probe as "cannot say" rather than "not merging" -- but commands.js was treating
+// `null` exactly like `false`, so it neither blocked nor appeared anywhere. That is item 0.14's
+// rule (an unreadable state is a conflict, never clean) applied to `dirty` right beside it and not
+// to this. The residual window is narrow -- a `--no-commit` merge that staged nothing, plus a probe
+// that failed while `git status` still worked -- but the direction is the binding constraint.
+test("a base checkout whose in-progress-merge state cannot be read is a conflict, never clean", async (t) => {
+  const store = await newStore(t);
+  const script = groupFixture();
+  // Clean in every other respect: on base_branch, no uncommitted paths, merge-tree says clean.
+  script["/base/panel"] = { ...script["/base/panel"], merging: null };
+  const fixture = scriptedGit(script);
+  const run = await groupRun(store);
+
+  const { preview } = await mergeCommand({ runId: run.id }, {
+    store,
+    loadRegistry: mergeLoadRegistry(GROUP_PROJECT),
+    git: fixture.git,
+  });
+
+  assert.equal(preview.refused, false);
+  assert.equal(preview.mergeable, false, "an unknown merge state must block; it must never fall through as clean");
+  assert.equal(preview.exitCode, MERGE_EXIT_CODES.conflicted);
+  assert.equal(preview.repositories[1].baseMerging, null);
+
+  const conflict = preview.conflicts.find((entry) => entry.repositoryId === "panel");
+  assert.ok(conflict, `panel must contribute a conflict: ${JSON.stringify(preview.conflicts)}`);
+  assert.match(conflict.reason, /could not be checked for an in-progress merge \(MERGE_HEAD is unreadable\)/);
+  assert.match(conflict.reason, /an unknown merge state is a conflict, never clean/);
+
+  // And it really blocks: execute refuses rather than merging into a checkout it could not read.
+  const command = await mergeCommand({ runId: run.id }, {
+    store,
+    loadRegistry: mergeLoadRegistry(GROUP_PROJECT),
+    git: fixture.git,
+  });
+  await assert.rejects(
+    () => command.execute({ approvalDigest: command.preview.approvalDigest }),
+    (error) => {
+      assert.equal(error.category, "CONFLICT");
+      return true;
+    },
+  );
+  assert.equal(fixture.calls.filter((call) => call.method === "mergeBranch").length, 0, "nothing may merge");
+});
+
+test("an unknown in-progress-merge state still names the uncommitted paths it did manage to read", async (t) => {
+  const store = await newStore(t);
+  const script = groupFixture();
+  script["/base/panel"] = { ...script["/base/panel"], merging: null, dirty: true, dirtyPaths: ["src/a.ts", "src/b.ts"] };
+  const fixture = scriptedGit(script);
+  const run = await groupRun(store);
+
+  const { preview } = await mergeCommand({ runId: run.id }, {
+    store,
+    loadRegistry: mergeLoadRegistry(GROUP_PROJECT),
+    git: fixture.git,
+  });
+
+  const conflict = preview.conflicts.find((entry) => entry.repositoryId === "panel");
+  assert.match(conflict.reason, /MERGE_HEAD is unreadable/);
+  assert.match(conflict.reason, /with 2 uncommitted path\(s\): src\/a\.ts, src\/b\.ts/);
 });

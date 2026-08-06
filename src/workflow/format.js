@@ -741,11 +741,16 @@ function mergeCheckoutLabel(record) {
   const dirtyCount = Number.isFinite(record.baseDirtyCount) ? record.baseDirtyCount : list(record.baseDirtyPaths).length;
   const state = record.baseMerging === true
     ? `MID-MERGE (${dirtyCount})`
-    : record.baseDirty === false
-      ? "clean"
-      : record.baseDirty === true
-        ? `DIRTY (${dirtyCount})`
-        : "STATUS UNKNOWN";
+    : record.baseMerging !== false
+      // Tri-state, like `baseDirty`: only an explicit `false` may reach the "clean" branch below.
+      // A `null` merge state with a clean status would otherwise render as `clean` -- the false
+      // green commands.js now refuses to compute (see its `merging !== false` conflict).
+      ? "MERGE STATE UNKNOWN"
+      : record.baseDirty === false
+        ? "clean"
+        : record.baseDirty === true
+          ? `DIRTY (${dirtyCount})`
+          : "STATUS UNKNOWN";
   return `${onBase}, ${state}`;
 }
 
@@ -1394,7 +1399,16 @@ function mergeOverflowFallback(command, source, limit, tier) {
   const dropped = tier.minimal
     ? "every repository's conflicted-path list and `baseDirtyPaths` were dropped entirely, together with `conflictReason`, `worktreePath`, `recordedBranch`, `sourceCommittedAt`, `baseCheckedOutBranch`, and `baseSha`"
     : `each repository's conflicted-path list was cut to ${tier.conflictPaths} paths, and \`baseDirtyPaths\` and \`conflictReason\` were dropped`;
-  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, its \`baseDirty\`/\`baseMerging\`/\`baseDirtyCount\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. The compact view (--format compact, the default) is not a fuller answer at this size -- it is bounded to ${OUTPUT_LIMIT} characters too, and it truncates its TAIL, so at a response this wide it loses \`Conflicts:\` and \`Next:\` while keeping the run header, the approval digest, the table, and \`Argv:\`.`;
+  // Scoped to the tier, because the two tiers fire at different sizes and the compact view behaves
+  // differently at each. Measured against the same fixture: at the sizes that reach tier 1 (n=4:
+  // 8,776 · n=5: 10,865) compact is not truncated at all, so the earlier blanket claim that it
+  // "loses `Conflicts:` and `Next:`" was false everywhere tier 1 is emitted. At tier 2 sizes it
+  // does hit the limit -- and even there `Conflicts:` is not lost wholesale: the header and the
+  // first entries render, and the list is cut mid-entry.
+  const compactNote = tier.minimal
+    ? `The compact view (--format compact, the default) is not a fuller answer at this size -- it is bounded to ${OUTPUT_LIMIT} characters too and truncates its TAIL, so at a response this wide it loses \`Next:\` and the tail of \`Conflicts:\` while keeping the run header, the approval digest, the table, \`Argv:\`, and the first conflict entries.`
+    : `The compact view (--format compact, the default) is bounded to ${OUTPUT_LIMIT} characters too and truncates its TAIL; at the response sizes that reach this tier it has measured under that limit, but it is not an unbounded alternative.`;
+  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, its \`baseDirty\`/\`baseMerging\`/\`baseDirtyCount\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. ${compactNote}`;
   return degraded;
 }
 

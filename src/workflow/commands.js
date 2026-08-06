@@ -1854,6 +1854,17 @@ const MERGE_TIMEOUT_MS = 5 * 60 * 1000;
 const MERGE_CONFLICT_DISPLAY_LIMIT = 10;
 const MERGE_REASON_PATH_LIMIT = 5;
 const MERGE_DIRTY_DISPLAY_LIMIT = 5;
+// Exported so the JSON size discipline in test/workflow-format.test.js can be measured against the
+// caps that actually ship rather than against numbers copied out of this file. That test builds a
+// worst-case preview and asserts the real three-repository project still fits without a fallback;
+// with the limits hardcoded there, raising one HERE changed the shipped payload while every test
+// kept passing -- which is precisely the silent degradation the test exists to catch, and it went
+// unnoticed once already (task 3, fix round 1). Reading them from one place makes the coupling real.
+export const MERGE_DISPLAY_LIMITS = Object.freeze({
+  conflicts: MERGE_CONFLICT_DISPLAY_LIMIT,
+  reasonPaths: MERGE_REASON_PATH_LIMIT,
+  dirtyPaths: MERGE_DIRTY_DISPLAY_LIMIT,
+});
 const MERGE_FAILURE_TEXT_LIMIT = 2000;
 const MERGE_DIGEST_VERSION = 1;
 
@@ -2070,14 +2081,28 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   // nothing. See git.js's checkoutState for where this came from: naming only the uncommitted
   // paths points an operator at `git add`/`git stash`, which is the wrong move for a checkout that
   // is actually sitting inside a failed merge.
+  const uncommitted = dirtyPaths.length > 0
+    ? ` with ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`
+    : "";
   if (baseState.merging === true) {
-    const paths = dirtyPaths.length > 0
-      ? ` with ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`
-      : "";
     conflicts.push(mergeConflict(
       repositoryId,
       `base:${basePath}`,
-      `Base checkout ${basePath} is in the middle of a merge (MERGE_HEAD is present)${paths}; most likely a previous merge that failed at commit time. Resolve it with \`git -C ${basePath} merge --abort\` (or finish it by hand) — staging or stashing those paths is not the fix.`,
+      `Base checkout ${basePath} is in the middle of a merge (MERGE_HEAD is present)${uncommitted}; most likely a previous merge that failed at commit time. Resolve it with \`git -C ${basePath} merge --abort\` (or finish it by hand) — staging or stashing those paths is not the fix.`,
+    ));
+  } else if (baseState.merging !== false) {
+    // `merging` is tri-state and only an explicit `false` may pass. git.js's checkoutState
+    // documents an unanswerable MERGE_HEAD probe as "cannot say" rather than "not merging", and
+    // item 0.14's rule -- an unreadable state is a conflict, never clean -- is the same rule
+    // already applied to `dirty` immediately below. Treating `null` as `false` here made the code
+    // fail OPEN against its own doc comment: a checkout that might be sitting inside a stopped
+    // merge would have been merged into. The residual case is narrow (a `--no-commit` merge that
+    // staged nothing, plus a probe that failed while `git status` still worked) but the direction
+    // is the binding constraint, not the size of the window.
+    conflicts.push(mergeConflict(
+      repositoryId,
+      `base:${basePath}`,
+      `Base checkout ${basePath} could not be checked for an in-progress merge (MERGE_HEAD is unreadable)${uncommitted}; an unknown merge state is a conflict, never clean. Confirm with \`git -C ${basePath} status\` before approving anything.`,
     ));
   } else if (baseState.dirty === null) {
     // Item 0.14's direction applied to a heavier operation: an unreadable status is a conflict,

@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { formatInbox, formatRuns, formatVerify, formatWorkflowResult } from "../src/workflow/format.js";
+// The display caps that actually ship, read from commands.js rather than copied here. The
+// worst-case fixture below is built FROM them, so raising one there makes the size assertions
+// in this file measure the payload that would really be emitted -- which is the whole point of
+// the worst-case test, and was not true when the counts were hardcoded.
+import { MERGE_DISPLAY_LIMITS } from "../src/workflow/commands.js";
 
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -1869,6 +1874,22 @@ test("a base checkout stuck mid-merge is named as such, not merely as dirty", ()
   assert.doesNotMatch(compact, /DIRTY \(1\)/, "the more specific state must win; it is the one that changes what to do");
 });
 
+test("a base checkout whose merge state could not be read never renders as clean", () => {
+  // The tri-state twin of `baseDirty`: a `null` merge state on an otherwise spotless checkout used
+  // to reach the "clean" branch, which is the false green commands.js now refuses to compute.
+  const preview = threeRepositoryPreview((repositoryId) => (repositoryId === "webapp"
+    ? { baseMerging: null, baseDirty: false, baseDirtyPaths: [], baseDirtyCount: 0 }
+    : {}));
+  preview.mergeable = false;
+  preview.exitCode = 11;
+
+  const compact = formatWorkflowResult("merge", preview, "compact");
+  const webappRow = compact.split("\n").find((line) => line.startsWith("webapp "));
+  assert.ok(webappRow, compact);
+  assert.match(webappRow, /MERGE STATE UNKNOWN/);
+  assert.doesNotMatch(webappRow, /clean\s*\|/, "an unreadable merge state must not render as a clean checkout");
+});
+
 test("formatWorkflowResult dispatches \"merge\" to the compact merge renderer rather than raw JSON", () => {
   const compact = formatWorkflowResult("merge", mergePreview(), "compact");
   assert.match(compact, new RegExp(`^Run: ${MERGE_RUN_ID}$`, "m"));
@@ -1890,27 +1911,28 @@ const MERGE_DIRTY_PATH = (repositoryId, index) =>
 
 function worstCaseMergePreview(repositoryIds) {
   const repositories = repositoryIds.map((repositoryId) => {
-    const conflicts = Array.from({ length: 10 }, (_, index) => MERGE_CONFLICT_PATH(repositoryId, index));
-    const dirty = Array.from({ length: 5 }, (_, index) => MERGE_DIRTY_PATH(repositoryId, index));
+    const conflicts = Array.from({ length: MERGE_DISPLAY_LIMITS.conflicts }, (_, index) => MERGE_CONFLICT_PATH(repositoryId, index));
+    const dirty = Array.from({ length: MERGE_DISPLAY_LIMITS.dirtyPaths }, (_, index) => MERGE_DIRTY_PATH(repositoryId, index));
+    const reasonPaths = conflicts.slice(0, MERGE_DISPLAY_LIMITS.reasonPaths);
     return mergeRepository({
       repositoryId,
       worktreePath: `/home/op/projects/work/sharyco/worktrees/1216110941098331-registro-impl/${repositoryId}`,
       basePath: `/home/op/projects/work/sharyco/${repositoryId}`,
       baseDirty: true,
       baseDirtyPaths: dirty,
-      baseDirtyCount: 5,
+      baseDirtyCount: dirty.length,
       conflictStatus: "conflicted",
       conflicts,
       conflictCount: 900,
       conflictsTruncated: true,
-      conflictReason: `Merging feature/registro-impl into dev conflicts in 900 file(s): ${conflicts.slice(0, 5).join(", ")} (+895 more)`,
+      conflictReason: `Merging feature/registro-impl into dev conflicts in 900 file(s): ${reasonPaths.join(", ")} (+${900 - reasonPaths.length} more)`,
     });
   });
   const conflicts = repositories.flatMap((repository) => [
     {
       repositoryId: repository.repositoryId,
       resource: `base:${repository.basePath}`,
-      reason: `Base checkout ${repository.basePath} has 5 uncommitted path(s): ${repository.baseDirtyPaths.join(", ")}`,
+      reason: `Base checkout ${repository.basePath} has ${repository.baseDirtyPaths.length} uncommitted path(s): ${repository.baseDirtyPaths.join(", ")}`,
     },
     {
       repositoryId: repository.repositoryId,
@@ -2020,9 +2042,10 @@ test("--format json for a WORST-CASE three-repository preview still fits without
   assert.equal(parsed.repositories.length, 3);
   for (const [index, repository] of parsed.repositories.entries()) {
     // Unabridged: the full display-capped conflict list and the dirty paths both survive here,
-    // which is exactly what the fallback tiers give up.
-    assert.equal(repository.conflicts.length, 10);
-    assert.equal(repository.baseDirtyPaths.length, 5);
+    // which is exactly what the fallback tiers give up. Both counts come from commands.js's own
+    // exported caps, so this assertion measures what ships rather than what was once typed here.
+    assert.equal(repository.conflicts.length, MERGE_DISPLAY_LIMITS.conflicts);
+    assert.equal(repository.baseDirtyPaths.length, MERGE_DISPLAY_LIMITS.dirtyPaths);
     assert.equal(repository.conflictReason, worstCase.repositories[index].conflictReason);
   }
 });
@@ -2065,4 +2088,35 @@ test("the compact preview keeps the approval digest even when it is truncated", 
   // A mergeable preview -- the case an operator actually acts on -- is nowhere near the limit.
   const mergeable = threeRepositoryPreview();
   assert.ok(formatWorkflowResult("merge", mergeable, "compact").length < 12000 * 0.6);
+});
+
+// Fix round 2. The marker's closing sentence about the compact view used to be a single blanket
+// claim -- "at a response this wide it loses `Conflicts:` and `Next:`" -- emitted by BOTH tiers.
+// It was false at every size where tier 1 fires (measured: n=4 is 8,776 compact characters and
+// n=5 is 10,865, neither truncated at all), and overstated at tier 2, where the `Conflicts:` header
+// and the first entries do survive and the list is cut mid-entry. A marker whose job is accuracy
+// has to be accurate about the format it is describing.
+test("each JSON fallback tier's marker describes the compact view accurately for its own size range", () => {
+  const names = ["backend", "panel", "webapp", "admin", "mobile", "docs", "infra", "edge", "cms"];
+  const markerFor = (count) => JSON.parse(formatWorkflowResult("merge", worstCaseMergePreview(names.slice(0, count)), "json")).truncationMarker;
+
+  const tierOne = markerFor(5);
+  assert.match(tierOne, /has measured under that limit/);
+  assert.doesNotMatch(tierOne, /it loses/, "tier 1 fires at sizes where the compact view loses nothing");
+
+  const tierTwo = markerFor(9);
+  assert.match(tierTwo, /loses `Next:` and the tail of `Conflicts:`/);
+  assert.match(tierTwo, /keeping the run header, the approval digest, the table, `Argv:`, and the first conflict entries/);
+
+  // And the claims are true of the actual compact rendering, not just internally consistent.
+  const compactAtTierOne = formatWorkflowResult("merge", worstCaseMergePreview(names.slice(0, 5)), "compact");
+  assert.ok(compactAtTierOne.length < 12000);
+  assert.doesNotMatch(compactAtTierOne, /\[output truncated at/);
+  assert.match(compactAtTierOne, /^Next:$/m);
+
+  const compactAtTierTwo = formatWorkflowResult("merge", worstCaseMergePreview(names.slice(0, 9)), "compact");
+  assert.equal(compactAtTierTwo.length, 12000);
+  assert.doesNotMatch(compactAtTierTwo, /^Next:$/m);
+  assert.match(compactAtTierTwo, /^Conflicts:$/m, "the header survives; it is the tail of the list that is cut");
+  assert.ok(compactAtTierTwo.split("\n").some((line) => line.startsWith("- ")), "and so do the first entries");
 });
