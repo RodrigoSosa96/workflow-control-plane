@@ -168,6 +168,28 @@ repositories merged and which were never attempted. A real merge can still fail 
 `merge-tree` predicted success — a `pre-merge-commit` hook, a read-only filesystem — so the
 report is written to be honest about partial completion rather than to avoid admitting it.
 
+### Exit 0 does not prove an integration happened
+
+*(Added after implementation, from the branch review. It follows directly from `--no-ff, always`
+above, and the original spec did not say it.)*
+
+`git merge --no-ff --no-edit <source>` against a branch the base already contains prints
+`Already up to date.`, exits **0**, and creates **no commit**. Recording that as `merged` would put
+an integration in the run's event log that never occurred — which is exactly what the `--no-ff`
+argument above exists to prevent, since that argument is that the merge commit *is* the audit
+trail. A report whose audit trail asserts a commit that does not exist is the same class of false
+green as a preview that renders a truncated conflict list as complete.
+
+So execution reads the base checkout's `HEAD` back after each successful merge and compares it
+against the sha the digest bound. Each repository carries `integrated`: `true`, `false`, or `null`
+when the read-back itself failed. When nothing integrated, the report's status is
+**`already-up-to-date`** rather than `merged`. A run mixing real merges with no-ops still reports
+`merged`, and the per-repository flag is what distinguishes them.
+
+The exit code stays `0` in both cases: the desired state holds, so this is not a failure. The sha
+is read rather than git's stdout parsed, because `Already up to date.` is localizable and a
+control plane must not depend on the operator's `LANG`.
+
 ### Everything else it deliberately does not do
 
 - **No push.** Publishing to a remote is an outward-facing act with its own approval question.
@@ -248,7 +270,9 @@ workflow merge <run-id> --yes --approval-digest <digest>
    appendEvent(runId, { type: "merge", … })      ← evidence; a failure to persist degrades, never discards
       │
       v
-   { command: "merge", merged[], skipped[], passed, exitCode }
+   { command: "merge", status, merged[], failed[], skipped[], passed, exitCode }
+        status: "merged" | "already-up-to-date" | "partial" | "failed"
+        merged[].integrated: true | false | null   ← did the base branch actually move?
 ```
 
 ## Error Handling
@@ -293,7 +317,8 @@ workflow merge <run-id> --yes --approval-digest <digest>
 11. The run worktree is untouched after a successful merge: same branch, same HEAD, same status.
 12. Evidence lands in the run's event log; a persistence failure degrades to `evidenceError`
     without discarding the report of merges that really happened.
-13. Exit codes: `0` merged, nonzero for failure, `10` for a refusal.
+13. Exit codes: `0` merged — and also `0` for `already-up-to-date`, the status a merge that
+    created no commit reports — nonzero for failure, `10` for a refusal.
 14. JSON output for a realistic three-repository preview is measured against the 12,000-character
     limit rather than assumed to fit.
 15. `npm test` and `npm run test:ci-like` green, zero skips.
@@ -304,6 +329,7 @@ workflow merge <run-id> --yes --approval-digest <digest>
   anything is mutated.
 - Approving a merge and then having anything material change means the approval is refused.
 - A group project's partial merge is reported as partial, never as success.
+- A merge that created no commit is reported as `already-up-to-date`, never as `merged`.
 - The run's worktree, branch, and evidence survive the merge intact.
 - A run whose recorded branch is stale — the common case in real data — merges the work that
   actually exists, and says that is what it is doing.
