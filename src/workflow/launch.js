@@ -35,12 +35,16 @@ function canonicalize(value) {
   }, {});
 }
 
-function canonicalText(value) {
+// Exported so `mergeCommand` (commands.js, roadmap item 2.4) digests its preview through the SAME
+// canonicalization this file's approval digest uses, rather than a second copy that could drift in
+// how it orders keys or drops undefined values. Same reason APPROVAL_DIGEST_PATTERN is exported:
+// there is one grammar for an approval digest in this control plane, not one per command.
+export function canonicalText(value) {
   return JSON.stringify(canonicalize(value));
 }
 
 const EXECUTION_INPUT_VERSION = 1;
-const APPROVAL_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+export const APPROVAL_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const VOLATILE_EXECUTION_OPTION_KEYS = new Set([
   "approvalDigest",
   "command",

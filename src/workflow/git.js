@@ -119,6 +119,11 @@ function parseMergeTree(output) {
   return { tree: TREE_OID.test(tree) ? tree : "", conflicts, complete };
 }
 
+// `git log -1 --format=%cI` emits a strict ISO-8601 committer date. Validated rather than trusted
+// for the same reason TREE_OID is: a value that is not a timestamp is not an answer, and the one
+// caller compares it against verification evidence to decide whether that evidence is stale.
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
 // `rev-parse --abbrev-ref HEAD` answers the literal string "HEAD" on a detached HEAD, which is
 // not a branch name and must never be compared against one.
 function normalizeHeadBranch(value) {
@@ -355,6 +360,22 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
       } catch (error) {
         return { branch, dirty: null, entries: [], statusError: reasonFrom(error) };
       }
+    },
+
+    // When a commit came to exist, so a caller can say whether verification evidence predates the
+    // work it claims to cover. Read-only and never throws: an unreadable, missing, or unparseable
+    // date answers `null`, which the caller must report as "unknown" rather than as "not stale" --
+    // the same fail-closed direction as `checkoutState`'s `dirty: null`.
+    async commitTimestamp({ cwd, ref, timeoutMs }) {
+      let result;
+      try {
+        result = await runner.run("git", ["log", "-1", "--format=%cI", ref], { cwd, timeoutMs, allowFailure: true });
+      } catch {
+        return null;
+      }
+      if (result.code !== 0) return null;
+      const value = trimText(result.stdout);
+      return ISO_TIMESTAMP.test(value) ? value : null;
     },
 
     // The non-mutating conflict oracle: real merge machinery, no ref, no index, no working tree.

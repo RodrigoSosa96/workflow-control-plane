@@ -16,7 +16,7 @@ import {
   CONTROL_PLANE_ROOT,
   runEnv,
 } from "./harnesses.js";
-import { launchCommand as createWorkflowLaunchCommand } from "./launch.js";
+import { APPROVAL_DIGEST_PATTERN, canonicalText, launchCommand as createWorkflowLaunchCommand } from "./launch.js";
 import { classifyOwnership, isPlainMarker, OBSERVATION_FAILED } from "./ownership.js";
 import { createSessionTransport as buildSessionTransport } from "./session-transport.js";
 import { planWorkflow } from "./planner.js";
@@ -47,6 +47,21 @@ export const VERIFY_EXIT_CODES = Object.freeze({
   passed: 0,
   failed: 1,
   refused: 10,
+});
+
+// mergeCommand's own exit codes (roadmap item 2.4). `refused` and `conflicted` deliberately reuse
+// the values bin/workflow.js already maps WorkflowError's PREFLIGHT and CONFLICT categories to
+// (10 and 11), because merge produces both shapes: a refusal the dry-run PRINTS as a preview, and
+// a refusal it THROWS from execute -- and an operator scripting against the exit code must not
+// have to know which path produced it. `partial` reuses launch's own 13 (bin/workflow.js:840) for
+// the same meaning: some of the work happened and some did not. A partial group merge is never
+// reported as `merged`, and its exit code is never 0.
+export const MERGE_EXIT_CODES = Object.freeze({
+  merged: 0,
+  failed: 1,
+  refused: 10,
+  conflicted: 11,
+  partial: 13,
 });
 
 const EMPTY_HERDR_READ_MODEL = {
@@ -1798,6 +1813,591 @@ export async function verifyCommand(options = {}, deps = {}) {
     passed,
     exitCode,
     ...(evidenceError ? { evidenceError } : {}),
+  };
+}
+
+// --- workflow merge (roadmap item 2.4) ---------------------------------------
+//
+// The arc's last ungoverned step, put under the same preview -> digest -> execute envelope as its
+// first one. `--dry-run` computes, per repository the run recorded, the exact shell-free
+// `git merge` argv and the conflicts that merge would produce -- without touching any working
+// tree, index, or ref -- and prints an approval digest binding all of it. `--yes
+// --approval-digest <digest>` recomputes the whole preview and merges only if nothing material
+// moved in between.
+//
+// Two things shape everything below, both from the design doc:
+//
+//   1. The source branch is read from the WORKTREE, never trusted from `repositories[].branch`.
+//      That field is a launch-time intention: two of the eight real runs on this machine record a
+//      ref that no longer exists (run 0b2612a8 records `feature/1216110941098331/registro-impl`
+//      while its worktree is on `feature/registro-impl`). A record-driven merge would fail on a
+//      nonexistent ref at best and integrate a stale branch at worst. The disagreement is named
+//      (`branchMismatch`) and digested -- never silently substituted, and never treated as a
+//      blocking conflict, which would make the command unusable against every real completed
+//      multi-repository run that exists today.
+//   2. The merge runs in the BASE CHECKOUT, not the run worktree. The goal is to advance
+//      `base_branch`, which is checked out there; merging into the worktree would advance the
+//      feature branch instead. Git also forbids checking out a branch already checked out in
+//      another worktree, so there is no third option.
+
+const MERGE_PREVIEW_TIMEOUT_MS = 2 * 60 * 1000;
+const MERGE_TIMEOUT_MS = 5 * 60 * 1000;
+// The full conflict list is what the digest binds; these bound only what is PRINTED, so a
+// pathological conflict does not blow the shared 12,000-character output budget a three-repository
+// preview has to fit inside. Measured rather than estimated -- items 2.1 and 2.3 both shipped a
+// collapse that only measurement caught. Measured on a synthetic worst case -- three repositories
+// x 900 conflicted paths x 40 uncommitted paths, every path ~95 characters -- the pretty-printed
+// JSON preview was 33,511 characters at (50, 50, 10) and is 11,641 at these values, inside the
+// 12,000 budget. A realistic three-repository preview is 3,617 clean / 5,109 with two conflicts
+// each. The reason strings get their own, much smaller cap because they otherwise restate a list
+// that is already printed in full beside them.
+const MERGE_CONFLICT_DISPLAY_LIMIT = 10;
+const MERGE_REASON_PATH_LIMIT = 5;
+const MERGE_DIRTY_DISPLAY_LIMIT = 5;
+const MERGE_FAILURE_TEXT_LIMIT = 2000;
+const MERGE_DIGEST_VERSION = 1;
+
+function mergeError(category, message, exitCode, details) {
+  throw new WorkflowError(category, message, { exitCode, ...(details ? { details } : {}) });
+}
+
+function mergeErrorText(error) {
+  return String(error?.message ?? error).slice(0, 256);
+}
+
+function mergeCommandFor(runId) {
+  return `workflow merge ${runId} --dry-run`;
+}
+
+// The refusal shape, mirroring verifyRefusal: structured evidence that nothing ran, not a stack
+// trace. A refused preview carries `approvalDigest: null`, so there is nothing an operator could
+// pass back to execute -- and execute rebuilds this same preview and refuses again rather than
+// trusting a digest from a previous, non-refused run.
+function mergeRefusal(runId, run, reason) {
+  return {
+    command: "merge",
+    runId,
+    projectAlias: run?.projectAlias ?? null,
+    runState: run?.state ?? null,
+    refused: true,
+    reason,
+    repositories: [],
+    verification: null,
+    conflicts: [],
+    mergeable: false,
+    approvalDigest: null,
+    exitCode: MERGE_EXIT_CODES.refused,
+    nextActions: [],
+  };
+}
+
+function mergeGitAdapter(deps) {
+  const git = deps.git;
+  for (const method of ["resolveHead", "checkoutState", "refExists", "previewMerge", "mergeArgv", "mergeBranch"]) {
+    if (typeof git?.[method] !== "function") {
+      mergeError("PREFLIGHT", `workflow merge requires a git adapter with ${method}()`, 10);
+    }
+  }
+  return git;
+}
+
+// The five shapes item 2.3's C1 finding enumerated -- field missing, `path: null`, `path: ""`, a
+// bare string entry, an empty object -- all land here as `null`. run-store.js does not validate
+// `repositories[]` at all, and both producers (`runLikeFromLaunchPreview`, `repositoriesForDigest`)
+// round-trip a missing path through to a bare `null` without complaint.
+function recordedRepositoryPath(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  return typeof entry.path === "string" && entry.path.length > 0 ? entry.path : null;
+}
+
+function recordedRepositoryId(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  return typeof entry.id === "string" && entry.id.trim() ? entry.id.trim() : null;
+}
+
+function recordedRepositoryBranch(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  return typeof entry.branch === "string" && entry.branch ? entry.branch : null;
+}
+
+function repositoryLabel(repositoryId, index) {
+  return repositoryId ? `"${repositoryId}"` : `at index ${index}`;
+}
+
+// Where `base_branch` actually lives, discriminated on `project.repository === "group"` rather
+// than on the presence of a `repositories` map:
+//
+//   group    -> `project.repositories[<id>]` (a required `path` + `base_branch` per repository).
+//               A group ALSO has a top-level `path`, and it is the group's META-repository
+//               (`coordination.meta_repository`) -- so falling through to it for an id the
+//               registry no longer knows would merge into the wrong repository entirely, silently.
+//               That is a refusal, never a fallback.
+//   ordinary -> `project.path` + `project.base_branch`. Its single run entry gets `id: "primary"`
+//               (launch.js's runRepositories), which is deliberately NOT a registry key, so an
+//               id lookup would fail here for the ordinary case and must not be attempted.
+function baseCheckoutFor(project, projectAlias, repositoryId, label) {
+  if (project.repository === "group") {
+    const entry = project.repositories?.[repositoryId];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return {
+        error: `Group project ${projectAlias} has no repository ${label} in the current registry; refusing rather than merging into the group's meta-repository.`,
+      };
+    }
+    return { path: entry.path, baseBranch: entry.base_branch };
+  }
+  return { path: project.path, baseBranch: project.base_branch };
+}
+
+async function safeCommitTimestamp(git, cwd, ref, timeoutMs) {
+  if (typeof git.commitTimestamp !== "function") return null;
+  try {
+    const value = await git.commitTimestamp({ cwd, ref, timeoutMs });
+    return typeof value === "string" && value ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeConflict(repositoryId, resource, reason) {
+  return { repositoryId, resource, reason };
+}
+
+function joinPaths(paths, limit) {
+  const shown = paths.slice(0, limit);
+  const rest = paths.length - shown.length;
+  return rest > 0 ? `${shown.join(", ")} (+${rest} more)` : shown.join(", ");
+}
+
+// Reads one repository into either a refusal (which aborts the whole preview) or a record. The
+// split is the design doc's: a refusal means the preview could not be COMPUTED honestly, while a
+// conflict means it was computed and says the merge must not run. Conflicts therefore stay on the
+// record and are reported for every repository -- `merge-tree` mutates nothing, so a complete
+// prediction is free, and an operator seeing only the first of three problems would fix one and
+// come straight back.
+async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, index, git, timeoutMs }) {
+  const repositoryId = recordedRepositoryId(entry);
+  const label = repositoryLabel(repositoryId, index);
+  const worktreePath = recordedRepositoryPath(entry);
+
+  if (!worktreePath) {
+    return { refusal: `Run ${runId} repository ${label} has no worktree path recorded; refusing rather than merging from an unknown directory.` };
+  }
+  if (!isAbsolute(worktreePath)) {
+    // Same false-green class item 2.3's R2 finding removed for verify: a relative path resolves
+    // against THIS process's own cwd (the control plane's own checkout), not against any run
+    // worktree -- and here that would mean reading a source branch out of the control plane itself.
+    return { refusal: `Run ${runId} repository ${label} records a relative worktree path (${worktreePath}); refusing rather than resolving it against the control plane's own directory.` };
+  }
+
+  const base = baseCheckoutFor(project, projectAlias, repositoryId, label);
+  if (base.error) return { refusal: base.error };
+  if (typeof base.path !== "string" || !base.path || !isAbsolute(base.path)) {
+    return { refusal: `Project ${projectAlias} has no absolute base checkout path for repository ${label}; there is nothing to merge into.` };
+  }
+  if (typeof base.baseBranch !== "string" || !base.baseBranch.trim()) {
+    return { refusal: `Project ${projectAlias} has no base_branch configured for repository ${label}; there is nothing to merge into.` };
+  }
+  const basePath = base.path;
+  const baseBranch = base.baseBranch.trim();
+
+  // Task 1's resolveHead/checkoutState THROW when rev-parse itself fails -- a worktree that was
+  // removed, a path that is not a repository. That is the spec's own named refusal, so it is
+  // wrapped here rather than allowed to surface as an uncaught WorkflowError.
+  let head;
+  try {
+    head = await git.resolveHead({ cwd: worktreePath });
+  } catch (error) {
+    return { refusal: `Run ${runId} repository ${label} worktree HEAD could not be resolved at ${worktreePath}: ${mergeErrorText(error)}` };
+  }
+  if (!head?.branch) {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is on a detached HEAD; there is no source branch to merge.` };
+  }
+  if (typeof head.sha !== "string" || !head.sha) {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} reported no HEAD commit; there is nothing to merge.` };
+  }
+
+  let baseState;
+  let baseHead;
+  try {
+    baseState = await git.checkoutState({ cwd: basePath });
+    baseHead = await git.resolveHead({ cwd: basePath });
+  } catch (error) {
+    return { refusal: `Project ${projectAlias} base checkout for repository ${label} could not be read at ${basePath}: ${mergeErrorText(error)}` };
+  }
+
+  let reachable;
+  try {
+    reachable = await git.refExists({ cwd: basePath, ref: head.sha, kind: "commit" });
+  } catch (error) {
+    return { refusal: `Run ${runId} repository ${label} source commit ${head.sha} could not be checked against the base checkout at ${basePath}: ${mergeErrorText(error)}` };
+  }
+  if (!reachable) {
+    // A separate clone rather than a linked worktree of the same repository. `git merge` would
+    // resolve the branch NAME locally and merge something else, or fail -- either way the preview
+    // would have predicted a merge that cannot be the one that runs.
+    return { refusal: `Run ${runId} repository ${label} source commit ${head.sha} is not reachable from the base checkout at ${basePath}; refusing rather than merging a commit that checkout does not have.` };
+  }
+
+  const preview = await git.previewMerge({ cwd: basePath, base: baseBranch, source: head.sha, timeoutMs });
+  const sourceCommittedAt = await safeCommitTimestamp(git, worktreePath, head.sha, timeoutMs);
+
+  const recordedBranch = recordedRepositoryBranch(entry);
+  const dirtyPaths = list(baseState.entries).map((statusEntry) => statusEntry?.path).filter((path) => typeof path === "string");
+  const conflictPaths = list(preview.conflicts).map(String);
+  const conflicts = [];
+
+  if (baseState.dirty === null) {
+    // Item 0.14's direction applied to a heavier operation: an unreadable status is a conflict,
+    // never clean.
+    conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} status could not be read (${baseState.statusError ?? "reason unknown"}); an unreadable status is a conflict, never clean.`));
+  } else if (baseState.dirty) {
+    conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} has ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`));
+  }
+  if (baseState.branch !== baseBranch) {
+    conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} is on ${baseState.branch ?? "a detached HEAD"}, not ${baseBranch}; git merge would advance the wrong branch.`));
+  }
+  if (preview.status === "conflicted") {
+    const suffix = preview.truncated ? ` -- ${preview.reason}` : "";
+    conflicts.push(mergeConflict(repositoryId, `merge:${basePath}`, `Merging ${head.branch} into ${baseBranch} conflicts in ${conflictPaths.length} file(s): ${joinPaths(conflictPaths, MERGE_REASON_PATH_LIMIT)}${suffix}`));
+  }
+  if (preview.status !== "conflicted" && preview.status !== "clean") {
+    conflicts.push(mergeConflict(repositoryId, `merge:${basePath}`, `Conflicts could not be predicted for ${head.branch} into ${baseBranch}: ${preview.reason ?? "git merge-tree gave no answer"}`));
+  }
+
+  return {
+    record: {
+      repositoryId,
+      worktreePath,
+      recordedBranch,
+      sourceBranch: head.branch,
+      sourceSha: head.sha,
+      sourceCommittedAt,
+      // Literally `recordedBranch !== sourceBranch`, per the design: a run that recorded no branch
+      // at all also disagrees with the worktree, and that is worth naming rather than hiding.
+      branchMismatch: recordedBranch !== head.branch,
+      basePath,
+      baseBranch,
+      baseCheckedOutBranch: baseState.branch ?? null,
+      baseBranchCheckedOut: baseState.branch === baseBranch,
+      baseDirty: baseState.dirty ?? null,
+      dirtyPaths,
+      baseSha: typeof baseHead?.sha === "string" ? baseHead.sha : null,
+      // From the adapter, never rebuilt here: the string an operator approves has to be the string
+      // that runs, and `mergeBranch` destructures its child-process argv from this same expression.
+      argv: git.mergeArgv({ source: head.branch }),
+      conflictStatus: preview.status,
+      conflictPaths,
+      conflictsTruncated: Boolean(preview.truncated),
+      conflictReason: preview.reason,
+      conflicts,
+    },
+  };
+}
+
+// True when any source commit is newer than the evidence; false when every one of them is older;
+// null when it cannot be known -- no evidence, an unparseable `verifiedAt`, or a commit date that
+// could not be read. Fail closed: a single unknown commit date makes the whole answer unknown
+// rather than letting the known-older ones report "not stale".
+function staleRelativeToSource(verifiedAt, records) {
+  const verifiedAtMs = Date.parse(verifiedAt ?? "");
+  if (!Number.isFinite(verifiedAtMs)) return null;
+
+  let sawUnknown = false;
+  for (const record of records) {
+    const committedAtMs = Date.parse(record.sourceCommittedAt ?? "");
+    if (!Number.isFinite(committedAtMs)) {
+      sawUnknown = true;
+      continue;
+    }
+    if (committedAtMs > verifiedAtMs) return true;
+  }
+  return sawUnknown ? null : false;
+}
+
+// `workflow verify`'s evidence, surfaced and digested but never gated (design doc, open decision
+// 2). Approving a merge therefore means approving the merge of THESE commits WITH THIS
+// verification status: rerun verify, or push another commit, and the digest changes and the
+// previous approval is refused as stale. The honest limit, stated in the spec and true here: an
+// operator who never ran `workflow verify` gets `status: "none"` and can approve that.
+function verificationForMerge(evidence, records) {
+  if (!evidence) {
+    return { status: "none", verifiedAt: null, passed: null, exitCode: null, staleRelativeToSource: null };
+  }
+  return {
+    status: "recorded",
+    verifiedAt: evidence.verifiedAt ?? null,
+    passed: typeof evidence.passed === "boolean" ? evidence.passed : null,
+    exitCode: Number.isInteger(evidence.exitCode) ? evidence.exitCode : null,
+    staleRelativeToSource: staleRelativeToSource(evidence.verifiedAt, records),
+  };
+}
+
+// The digest binds the resolved COMMIT SHAS -- source and base -- not just branch names, plus the
+// checkout state that decides whether the merge may run at all, plus the verification status.
+// Anything that moves between preview and execution changes it. The FULL conflict list goes in
+// here (the public preview caps its own for printing) together with `conflictsTruncated`:
+// approving "these 298 conflicts" when there are 900 is the wrong approval.
+function mergeDigestPayload({ runId, run, records, verification }) {
+  return {
+    version: MERGE_DIGEST_VERSION,
+    command: "merge",
+    runId,
+    projectAlias: run?.projectAlias ?? null,
+    runState: run?.state ?? null,
+    verification,
+    repositories: records.map((record) => ({
+      repositoryId: record.repositoryId,
+      worktreePath: record.worktreePath,
+      recordedBranch: record.recordedBranch,
+      sourceBranch: record.sourceBranch,
+      sourceSha: record.sourceSha,
+      sourceCommittedAt: record.sourceCommittedAt,
+      branchMismatch: record.branchMismatch,
+      basePath: record.basePath,
+      baseBranch: record.baseBranch,
+      baseCheckedOutBranch: record.baseCheckedOutBranch,
+      baseBranchCheckedOut: record.baseBranchCheckedOut,
+      baseDirty: record.baseDirty,
+      baseSha: record.baseSha,
+      argv: record.argv,
+      conflictStatus: record.conflictStatus,
+      conflicts: record.conflictPaths,
+      conflictsTruncated: record.conflictsTruncated,
+    })),
+  };
+}
+
+function publicMergeRepository(record) {
+  const conflicts = record.conflictPaths.slice(0, MERGE_CONFLICT_DISPLAY_LIMIT);
+  const baseDirtyPaths = record.dirtyPaths.slice(0, MERGE_DIRTY_DISPLAY_LIMIT);
+  return {
+    repositoryId: record.repositoryId,
+    worktreePath: record.worktreePath,
+    recordedBranch: record.recordedBranch,
+    sourceBranch: record.sourceBranch,
+    sourceSha: record.sourceSha,
+    sourceCommittedAt: record.sourceCommittedAt,
+    branchMismatch: record.branchMismatch,
+    basePath: record.basePath,
+    baseBranch: record.baseBranch,
+    baseCheckedOutBranch: record.baseCheckedOutBranch,
+    baseBranchCheckedOut: record.baseBranchCheckedOut,
+    baseDirty: record.baseDirty,
+    baseDirtyPaths,
+    baseDirtyCount: record.dirtyPaths.length,
+    baseSha: record.baseSha,
+    argv: [...record.argv],
+    conflictStatus: record.conflictStatus,
+    conflicts,
+    conflictCount: record.conflictPaths.length,
+    // True for either reason the list can be short: git's own capture limit, or this projection's
+    // display cap. Both mean "what you are reading is a prefix of the truth".
+    conflictsTruncated: record.conflictsTruncated || conflicts.length < record.conflictPaths.length,
+    ...(record.conflictReason ? { conflictReason: record.conflictReason } : {}),
+  };
+}
+
+async function buildMergePreview(runId, run, options, deps) {
+  const repositories = list(run.repositories);
+  if (repositories.length === 0) {
+    return { preview: mergeRefusal(runId, run, `Run ${runId} has no repositories[] recorded; nothing to merge.`), records: [] };
+  }
+
+  const injectedLoadRegistry = deps.loadRegistry ?? loadRegistry;
+  const registry = await injectedLoadRegistry(options.registryPath);
+  const project = registry?.projects?.[run.projectAlias];
+  if (!project) {
+    return { preview: mergeRefusal(runId, run, `Unknown workflow project: ${run.projectAlias}`), records: [] };
+  }
+
+  const git = mergeGitAdapter(deps);
+  const fs = deps.fs ?? defaultFs;
+  const timeoutMs = Number.isFinite(deps.previewTimeoutMs) ? deps.previewTimeoutMs : MERGE_PREVIEW_TIMEOUT_MS;
+
+  const records = [];
+  for (const [index, entry] of repositories.entries()) {
+    const outcome = await inspectRepositoryForMerge({
+      runId,
+      projectAlias: run.projectAlias,
+      project,
+      entry,
+      index,
+      git,
+      timeoutMs,
+    });
+    if (outcome.refusal) return { preview: mergeRefusal(runId, run, outcome.refusal), records: [] };
+    records.push(outcome.record);
+  }
+
+  const verification = verificationForMerge(await readLatestVerificationEvidence(run, fs), records);
+  const conflicts = records.flatMap((record) => record.conflicts);
+  const mergeable = conflicts.length === 0;
+
+  const preview = {
+    command: "merge",
+    runId,
+    projectAlias: run.projectAlias ?? null,
+    runState: run.state ?? null,
+    refused: false,
+    repositories: records.map(publicMergeRepository),
+    verification,
+    conflicts,
+    mergeable,
+    approvalDigest: sha256Digest(canonicalText(mergeDigestPayload({ runId, run, records, verification }))),
+    exitCode: mergeable ? MERGE_EXIT_CODES.merged : MERGE_EXIT_CODES.conflicted,
+    nextActions: [],
+  };
+  preview.nextActions = mergeable
+    ? [`workflow merge ${runId} --yes --approval-digest ${preview.approvalDigest}`]
+    : [mergeCommandFor(runId)];
+  return { preview, records };
+}
+
+async function mergeContext(options, deps) {
+  const store = await storeForCommand(options, deps);
+  const runId = assertRunId(options.runId);
+  const run = await store.read(runId);
+  const { preview, records } = await buildMergePreview(runId, run, options, deps);
+  return { store, runId, run, preview, records };
+}
+
+function assertSuppliedMergeDigest(supplied) {
+  if (typeof supplied !== "string" || !supplied) {
+    mergeError("PREFLIGHT", "Missing approval digest; rerun workflow merge --dry-run and approve the current digest", MERGE_EXIT_CODES.refused);
+  }
+  if (!APPROVAL_DIGEST_PATTERN.test(supplied)) {
+    mergeError("PREFLIGHT", "Invalid approval digest; rerun workflow merge --dry-run and approve the current digest", MERGE_EXIT_CODES.refused);
+  }
+}
+
+function mergeFailureText(result) {
+  // Task 1's interface note: on a timeout, a signal, or a failed spawn there is no stderr and the
+  // message lives on `error`. Reading only stderr would report a nameless failure.
+  const text = result.error ?? result.stderr ?? "";
+  return String(text).trim().slice(0, MERGE_FAILURE_TEXT_LIMIT) || `git merge exited with code ${result.code}`;
+}
+
+function mergeReportEntry(record, extra = {}) {
+  return {
+    repositoryId: record.repositoryId,
+    basePath: record.basePath,
+    baseBranch: record.baseBranch,
+    sourceBranch: record.sourceBranch,
+    sourceSha: record.sourceSha,
+    ...extra,
+  };
+}
+
+// Sequential, stopping at the first failure. There is no cross-repository transaction for a group
+// project -- it is several independent git repositories -- so the report is written to admit
+// partial completion rather than to avoid admitting it: what merged, what failed with git's own
+// output, and what was never attempted, each in its own list.
+async function runMergeSequence(records, git, timeoutMs) {
+  const merged = [];
+  const failed = [];
+  const skipped = [];
+
+  for (const record of records) {
+    if (failed.length > 0) {
+      skipped.push(mergeReportEntry(record, {
+        argv: [...record.argv],
+        reason: "never attempted: an earlier repository's merge failed",
+      }));
+      continue;
+    }
+
+    const result = await git.mergeBranch({ cwd: record.basePath, source: record.sourceBranch, timeoutMs });
+    // The EXECUTED argv is reported, not the approved one. They are the same expression by
+    // construction (git.js builds both from mergeArgvFor), and reporting the approved one would be
+    // the false green if they ever were not.
+    const entry = mergeReportEntry(record, {
+      argv: [...(result.argv ?? record.argv)],
+      code: result.code,
+    });
+    if (result.ok) merged.push(entry);
+    else failed.push({ ...entry, reason: mergeFailureText(result) });
+  }
+
+  return { merged, failed, skipped };
+}
+
+async function executeMerge(options, deps, supplied) {
+  assertSuppliedMergeDigest(supplied);
+
+  // recomputeApprovedPreview's shape: the preview is rebuilt from scratch and the supplied digest
+  // is compared against the FRESH one, so anything that moved between preview and approval --
+  // a new commit, a base branch that advanced, a checkout that went dirty, a rerun verify --
+  // refuses instead of merging something the operator never saw.
+  const fresh = await mergeContext(options, deps);
+  if (fresh.preview.refused) {
+    mergeError("PREFLIGHT", `workflow merge refused: ${fresh.preview.reason}`, MERGE_EXIT_CODES.refused);
+  }
+  if (supplied !== fresh.preview.approvalDigest) {
+    mergeError(
+      "PREFLIGHT",
+      `Stale approval digest; rerun ${mergeCommandFor(fresh.runId)} before executing. Current digest: ${fresh.preview.approvalDigest}`,
+      MERGE_EXIT_CODES.refused,
+      { expected: fresh.preview.approvalDigest, supplied },
+    );
+  }
+  if (fresh.preview.conflicts.length > 0) {
+    const first = fresh.preview.conflicts[0];
+    mergeError("CONFLICT", `${first.resource}: ${first.reason}`, MERGE_EXIT_CODES.conflicted, { conflicts: fresh.preview.conflicts });
+  }
+
+  const git = mergeGitAdapter(deps);
+  const timeoutMs = Number.isFinite(deps.mergeTimeoutMs) ? deps.mergeTimeoutMs : MERGE_TIMEOUT_MS;
+  const { merged, failed, skipped } = await runMergeSequence(fresh.records, git, timeoutMs);
+
+  const passed = failed.length === 0;
+  const status = passed ? "merged" : merged.length > 0 ? "partial" : "failed";
+  const exitCode = passed
+    ? MERGE_EXIT_CODES.merged
+    : status === "partial" ? MERGE_EXIT_CODES.partial : MERGE_EXIT_CODES.failed;
+
+  // Item 2.3's I4 finding, and it matters more here than it did there: by this line real merge
+  // commits exist in real repositories, and rerunning the command cannot undo them. A persistence
+  // failure (a run lock held by another in-flight command, most likely) must therefore degrade to
+  // a field on the response rather than throw away the only report of what actually happened.
+  let evidenceError;
+  try {
+    await fresh.store.appendEvent(fresh.runId, {
+      type: "merge",
+      approvalDigest: supplied,
+      status,
+      passed,
+      exitCode,
+      merged,
+      failed,
+      skipped,
+    });
+  } catch (error) {
+    evidenceError = `evidence could not be persisted: ${error?.message ?? String(error)}`;
+  }
+
+  return {
+    command: "merge",
+    runId: fresh.runId,
+    projectAlias: fresh.run.projectAlias ?? null,
+    approvalDigest: supplied,
+    status,
+    merged,
+    failed,
+    skipped,
+    passed,
+    exitCode,
+    ...(evidenceError ? { evidenceError } : {}),
+    nextActions: passed ? [] : [mergeCommandFor(fresh.runId)],
+  };
+}
+
+export async function mergeCommand(options = {}, deps = {}) {
+  const { preview } = await mergeContext(options, deps);
+  return {
+    preview,
+    async execute(executeOptions = {}) {
+      return await executeMerge(options, deps, executeOptions.approvalDigest);
+    },
   };
 }
 
