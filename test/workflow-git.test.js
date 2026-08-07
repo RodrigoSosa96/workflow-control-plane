@@ -1198,7 +1198,7 @@ test("removeWorktree accepts an ordinary relative path and a path that merely co
 
 test("countCommitsNotIn counts what the base branch does not have", async () => {
   const fixture = fixtureRunner({
-    "git rev-list --count main..feature/task": async () => ({ code: 0, stdout: "7\n", stderr: "" }),
+    "git rev-list --count main..feature/task --": async () => ({ code: 0, stdout: "7\n", stderr: "" }),
   });
   const git = createGitAdapter({ runner: fixture.runner });
 
@@ -1210,6 +1210,8 @@ test("countCommitsNotIn counts what the base branch does not have", async () => 
   });
 
   assert.equal(count, 7);
+  assert.deepEqual(fixture.calls[0].args, ["rev-list", "--count", "main..feature/task", "--"],
+    "the trailing -- keeps a ref that looks like a filename from being read as a pathspec");
   assert.equal(fixture.calls[0].options.cwd, "/repo/main");
   assert.equal(fixture.calls[0].options.timeoutMs, 30000);
   assert.equal(fixture.calls[0].options.allowFailure, true);
@@ -1217,7 +1219,7 @@ test("countCommitsNotIn counts what the base branch does not have", async () => 
 
 test("countCommitsNotIn reports a fully merged branch as 0", async () => {
   const fixture = fixtureRunner({
-    "git rev-list --count main..feature/task": async () => ({ code: 0, stdout: "0\n", stderr: "" }),
+    "git rev-list --count main..feature/task --": async () => ({ code: 0, stdout: "0\n", stderr: "" }),
   });
   const git = createGitAdapter({ runner: fixture.runner });
 
@@ -1241,7 +1243,7 @@ test("countCommitsNotIn answers null, never 0, when the count cannot be determin
 
   for (const outcome of unreadable) {
     const fixture = fixtureRunner({
-      "git rev-list --count main..feature/task": async () => outcome,
+      "git rev-list --count main..feature/task --": async () => outcome,
     });
     const git = createGitAdapter({ runner: fixture.runner });
     const count = await git.countCommitsNotIn({ cwd: "/repo/main", base: "main", branch: "feature/task" });
@@ -1253,7 +1255,7 @@ test("countCommitsNotIn answers null, never 0, when the count cannot be determin
 
 test("countCommitsNotIn answers null instead of throwing when rev-list cannot be spawned", async () => {
   const fixture = fixtureRunner({
-    "git rev-list --count main..feature/task": async () => {
+    "git rev-list --count main..feature/task --": async () => {
       throw new WorkflowError("PROCESS", "Failed to start git: working directory does not exist: /gone", { exitCode: 12 });
     },
   });
@@ -1373,4 +1375,169 @@ test("countCommitsNotIn against real git counts, reaches 0 on a merge, and answe
   assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "main", branch: "feature/does-not-exist" }), null,
     "an unreadable range is unknown, and unknown is not 0");
   assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "no-such-base", branch: "main" }), null);
+});
+
+// --- Review round 1: the INPUT axis, which the first round's tests never varied ----------------
+//
+// The output-axis tests above vary what git says back. They cannot catch the failure that matters
+// most here, because on this axis git does not fail: an option-shaped or empty ref exits 0 with
+// clean digit output, and the caller is handed a `0` -- "fully merged, nothing to warn about" --
+// for a range that was never measured.
+test("countCommitsNotIn refuses a ref git would parse as an option, before anything spawns", async () => {
+  // Measured, git 2.43: each of these exits 0 and prints "0" against a branch genuinely ahead.
+  const optionShaped = ["--branches=*", "--glob=*", "--remotes=*", "--all", "-f", "--"];
+
+  for (const hostile of optionShaped) {
+    for (const [base, branch] of [[hostile, "feature/task"], ["main", hostile]]) {
+      const fixture = fixtureRunner({});
+      const git = createGitAdapter({ runner: fixture.runner });
+
+      const count = await git.countCommitsNotIn({ cwd: "/repo/main", base, branch });
+
+      assert.equal(count, null, `accepted ${JSON.stringify({ base, branch })}`);
+      assert.notEqual(count, 0, "0 would be a measurement that never happened");
+      assert.deepEqual(fixture.calls, [], "nothing may spawn for a ref git would read as a flag");
+    }
+  }
+});
+
+// An empty side of a range silently substitutes HEAD, so git measures a DIFFERENT range and
+// reports its count as the answer -- exit 0, clean digits, no error anywhere.
+test("countCommitsNotIn refuses an absent or non-string ref rather than letting git substitute HEAD", async () => {
+  for (const missing of ["", null, undefined, 42, {}, []]) {
+    for (const [base, branch] of [[missing, "feature/task"], ["main", missing]]) {
+      const fixture = fixtureRunner({});
+      const git = createGitAdapter({ runner: fixture.runner });
+
+      const count = await git.countCommitsNotIn({ cwd: "/repo/main", base, branch });
+
+      assert.equal(count, null, `accepted ${JSON.stringify({ base, branch })}`);
+      assert.deepEqual(fixture.calls, []);
+    }
+  }
+});
+
+// --- Review round 1: the never-throws contract, probed rather than assumed --------------------
+test("the git primitives never throw, whatever the runner or the caller does", async () => {
+  const runners = {
+    "resolves undefined": { async run() { return undefined; } },
+    "resolves an empty object": { async run() { return {}; } },
+    "resolves a string": { async run() { return "not a result"; } },
+    "resolves null": { async run() { return null; } },
+    "throws a plain Error": { async run() { throw new Error("boom"); } },
+    "throws a non-Error": { async run() { throw "boom"; } },
+  };
+
+  for (const [label, runner] of Object.entries(runners)) {
+    const git = createGitAdapter({ runner });
+
+    const removal = await git.removeWorktree({ cwd: "/repo/main", path: "/repo/.worktrees/task" });
+    assert.equal(removal.ok, false, `${label}: a runner that says nothing must never read as a removal`);
+    assert.ok(Number.isInteger(removal.code) && removal.code !== 0, `${label}: code must be a nonzero integer, got ${removal.code}`);
+    assert.equal(typeof removal.stdout, "string", `${label}: stdout must be a string`);
+    assert.equal(typeof removal.stderr, "string", `${label}: stderr must be a string`);
+    assert.deepEqual(removal.argv, ["git", "worktree", "remove", "/repo/.worktrees/task"]);
+    assert.notEqual(removal.reason, "dirty", `${label}: an unreadable result is not a diagnosis`);
+
+    assert.equal(
+      await git.countCommitsNotIn({ cwd: "/repo/main", base: "main", branch: "feature/task" }),
+      null,
+      `${label}: an unreadable count is null, never 0`,
+    );
+  }
+});
+
+test("the git primitives never throw when called with no arguments at all", async () => {
+  const git = createGitAdapter({ runner: fixtureRunner({}).runner });
+
+  const removal = await git.removeWorktree();
+  assert.equal(removal.ok, false);
+  assert.equal(removal.reason, "unsafe-path");
+  assert.equal(typeof removal.stderr, "string");
+
+  assert.equal(await git.countCommitsNotIn(), null);
+});
+
+// --- Review round 1: a path whose own name spoofs git's dirty clause --------------------------
+//
+// Measured: a directory literally named `contains modified or untracked files`, which was never a
+// worktree, makes git print `fatal: '<path>' is not a working tree` -- and an unanchored pattern
+// finds the dirty clause inside the path git echoed back.
+test("removeWorktree is not fooled by a path whose own name contains git's dirty clause", async () => {
+  const path = "/repo/.worktrees/contains modified or untracked files";
+  const fixture = fixtureRunner({
+    [`git worktree remove ${path}`]: async () => ({
+      code: 128,
+      stdout: "",
+      stderr: `fatal: '${path}' is not a working tree\n`,
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path });
+
+  assert.equal(result.reason, "not-a-worktree",
+    "the clause belongs to the path, not to git's verdict; reporting 'dirty' would send Task 2 to the wrong remedy");
+});
+
+test("removeWorktree still classifies the real dirty refusal when the path is ordinary", async () => {
+  // The anchor must not be so tight that the genuine message stops matching.
+  const path = "/repo/.worktrees/task";
+  const fixture = fixtureRunner({
+    [`git worktree remove ${path}`]: async () => ({
+      code: 128,
+      stdout: "",
+      stderr: `fatal: '${path}' contains modified or untracked files, use --force to delete it\n`,
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  assert.equal((await git.removeWorktree({ cwd: "/repo/main", path })).reason, "dirty");
+});
+
+// --- Review round 1, against real git ----------------------------------------------------------
+test("countCommitsNotIn against real git: the guarded refs are the ones git answers 0 for", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const runner = createProcessRunner();
+  const git = createGitAdapter({ runner });
+
+  await gitExec(repoPath, ["checkout", "-b", "feature/task"]);
+  for (const name of ["one", "two"]) {
+    await writeFile(join(repoPath, `${name}.txt`), `${name}\n`);
+    await gitExec(repoPath, ["add", `${name}.txt`]);
+    await gitExec(repoPath, ["commit", "-m", name]);
+  }
+  await gitExec(repoPath, ["checkout", "main"]);
+
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "main", branch: "feature/task" }), 2,
+    "the truth this branch is worth");
+
+  // What real git does with the hostile refs, proving the guard is not defending against a
+  // hypothetical: each is a silent 0, not an error.
+  for (const range of ["--branches=*..feature/task", "--glob=*..feature/task", "..main", "main.."]) {
+    const raw = await runner.run("git", ["rev-list", "--count", range, "--"], { cwd: repoPath, allowFailure: true });
+    assert.equal(raw.code, 0, `${range} was expected to be a SILENT failure`);
+    assert.equal(raw.stdout.trim(), "0", `${range} was expected to answer a bare 0`);
+  }
+
+  // And what this adapter does with the same inputs: null, every time.
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "--branches=*", branch: "feature/task" }), null);
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "--glob=*", branch: "feature/task" }), null);
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "", branch: "main" }), null);
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "main", branch: "" }), null);
+});
+
+test("removeWorktree against real git is not fooled by a directory named like git's dirty clause", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const spoofPath = join(root, "contains modified or untracked files");
+  await mkdir(spoofPath);
+
+  const result = await git.removeWorktree({ cwd: repoPath, path: spoofPath, timeoutMs: 60000 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 128);
+  assert.match(result.stderr, /is not a working tree/);
+  assert.equal(result.reason, "not-a-worktree", "real git, real spoofing path name, right verdict");
+  assert.equal(existsSync(spoofPath), true);
 });

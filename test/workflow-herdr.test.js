@@ -1453,7 +1453,7 @@ test("closeTab closes the recorded tab, passing the id as a positional", async (
     {
       assert: ({ args, options }) => {
         assert.deepEqual(args, ["tab", "close", "w2M:t1"]);
-        assert.deepEqual(options, { allowFailure: true });
+        assert.equal(options.allowFailure, true);
       },
       stdout: cliResult({ closed: true }, "cli:tab:close"),
     },
@@ -1527,4 +1527,65 @@ test("closeTab never throws, even for a missing or malformed tab id", async () =
   const bare = createHerdrAdapter({ runner: fixtureRunner([]).runner });
   assert.deepEqual(await bare.closeTab(), { closed: false, reason: "closeTab requires a tab id" });
   assert.deepEqual(await bare.closeTab({}), { closed: false, reason: "closeTab requires a tab id" });
+});
+
+// --- Review round 1: closeTab is the one call in this adapter that must be bounded -------------
+//
+// "Always returns after irreversible removals" is not a property a caller can have if the process
+// can block forever, and herdr's shared run() never armed a timer.
+test("closeTab bounds the CLI call so a wedged herdr cannot hang the archive", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["tab", "close", "w2M:t1"]);
+        assert.equal(options.allowFailure, true);
+        assert.equal(typeof options.timeoutMs, "number");
+        assert.ok(options.timeoutMs > 0, "a nonpositive timeout would arm no timer at all");
+      },
+      stdout: cliResult({ closed: true }, "cli:tab:close"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(await herdr.closeTab({ tabId: "w2M:t1" }), { closed: true });
+});
+
+test("closeTab lets the caller choose the bound, and drops an unusable one", async () => {
+  const fixture = fixtureRunner([
+    { assert: ({ options }) => { assert.equal(options.timeoutMs, 250); }, stdout: cliResult({ closed: true }) },
+    { assert: ({ options }) => { assert.ok(!("timeoutMs" in options), "an unusable timeout must not become a timer"); }, stdout: cliResult({ closed: true }) },
+    { assert: ({ options }) => { assert.ok(!("timeoutMs" in options)); }, stdout: cliResult({ closed: true }) },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: 250 });
+  await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: 0 });
+  await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: Number.NaN });
+});
+
+test("a closeTab timeout is a reported failure, never already-archived", async () => {
+  const fixture = fixtureRunner([
+    { error: new WorkflowError("PROCESS", "herdr timed out after 10000ms", { exitCode: 12, details: { reason: "timeout" } }) },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.closeTab({ tabId: "w2M:t1" });
+
+  assert.equal(result.closed, false);
+  assert.notEqual(result.reason, "not-found", "a tab we could not reach is not a tab that is gone");
+  assert.match(result.reason, /timed out/);
+});
+
+// The timeout is threaded for closeTab ALONE; every other method keeps spawning exactly as before.
+test("bounding closeTab did not put a timeout on any other herdr call", async () => {
+  const fixture = fixtureRunner([
+    { assert: ({ options }) => { assert.deepEqual(options, { allowFailure: true }); }, stdout: cliResult({ focused: true }) },
+    { assert: ({ options }) => { assert.deepEqual(options, { allowFailure: true }); }, stdout: cliResult({ tab_id: "w2:t2" }) },
+    { assert: ({ options }) => { assert.deepEqual(options, { allowFailure: true }); }, stdout: cliResult([]) },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  await herdr.focusTab({ tabId: "w2:t1" });
+  await herdr.renameTab({ tabId: "w2:t2", label: "x" });
+  await herdr.listAgents();
 });

@@ -111,12 +111,46 @@ function removeWorktreeArgvPrefix() {
 // with a completely different remedy. A message this does NOT recognize (a future rewording, a
 // localized git) degrades to the generic `failed`, which still refuses; it can never degrade to
 // `ok`, and it can never make this pass a flag.
-const WORKTREE_DIRTY = /contains modified or untracked files/;
-const WORKTREE_NOT_A_WORKTREE = /is not a working tree/;
+//
+// Both patterns are anchored on the CLOSING quote of the path git echoes back, because the path is
+// attacker-adjacent text sitting inside the same sentence. Measured: a directory literally named
+// `contains modified or untracked files`, which was never a worktree, produces
+// `fatal: '<path>' is not a working tree` -- and an unanchored dirty pattern matches the path's own
+// name, reporting `dirty` for a path git does not even know about. `not-a-worktree` is additionally
+// anchored to the END of the message and tested FIRST, because it is the more specific of the two:
+// the dirty refusal always ends in `to delete it`, so it can never satisfy the end anchor, while a
+// spoofing path can still satisfy the dirty one. Not unspoofable -- a path containing a quote
+// followed by the clause verbatim would still match -- but substantially harder, and the residual
+// misclassification is between two refusals, never into `ok`.
+const WORKTREE_DIRTY = /' contains modified or untracked files/;
+const WORKTREE_NOT_A_WORKTREE = /' is not a working tree\s*$/;
 
 // `git rev-list --count` prints a bare count and nothing else. Anything that is not a run of
 // digits is not an answer -- same rule as OBJECT_ID and ISO_TIMESTAMP.
 const COUNT = /^\d+$/;
+
+// One side of the range `countCommitsNotIn` hands to git. Validated BEFORE spawning, because on
+// this axis git's failures are silent successes rather than errors. Measured, git 2.43, against a
+// branch genuinely 2 commits ahead of main:
+//
+//   rev-list --count 'main..feature/task'            exit 0, "2"   <- the truth
+//   rev-list --count '--branches=*..feature/task'    exit 0, "0"
+//   rev-list --count '--glob=*..feature/task'        exit 0, "0"
+//   rev-list --count '--remotes=*..feature/task'     exit 0, "0"
+//   rev-list --count '..main'                        exit 0, "0"
+//   rev-list --count 'main..'                        exit 0, "0"
+//
+// An option taking a `=`-value is matched on its PREFIX, so a `..` inside the token does not stop
+// git parsing the whole thing as an option; and an EMPTY side of a range silently substitutes
+// HEAD, so a missing ref measures a different range and reports that count as the answer. All of
+// them exit 0 with clean digit output, so validating the OUTPUT cannot catch any of it -- the
+// caller is handed `0`, "fully merged, nothing to warn about", for a measurement that never
+// happened. That is precisely the false green the null-versus-zero rule exists to prevent, and it
+// is reachable from the same absent/empty/non-string record shapes item 2.3's C1 finding proved
+// reachable. Same guard, same reasoning, as removeWorktree's path.
+function isUsableRev(value) {
+  return typeof value === "string" && value.length > 0 && !value.startsWith("-");
+}
 
 // `git merge-tree --write-tree --name-only -z <base> <source>` (measured on git 2.43) writes
 // the merged tree OID first, then one field per conflicted path, then an EMPTY field, then
@@ -588,22 +622,34 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     //
     // `null` is "could not be determined", and keeping it distinct from `0` is the whole point:
     // `0` means "fully merged, nothing to warn about", so an unreadable repository, a ref that no
-    // longer exists, or a spawn that failed must never render as that. The output is validated
-    // rather than trusted for the same reason -- a value that is not a count is not an answer.
-    async countCommitsNotIn({ cwd, base, branch, timeoutMs }) {
-      let result;
+    // longer exists, or a spawn that failed must never render as that. BOTH axes are validated,
+    // because both can produce a wrong `0`: the input (see isUsableRev, where git answers 0 with
+    // exit 0 for a ref it never measured) and the output (a value that is not a count is not an
+    // answer).
+    //
+    // The parameter object defaults and the single enclosing `try` are the never-throws contract,
+    // not incidental placement: EVERY read of the runner's result sits inside it, so a runner that
+    // resolves a non-object degrades to `null` like every other unknown rather than escaping as a
+    // TypeError. The caller runs this while gathering evidence for an irreversible operation.
+    async countCommitsNotIn({ cwd, base, branch, timeoutMs } = {}) {
+      if (!isUsableRev(base) || !isUsableRev(branch)) return null;
+
       try {
-        result = await runner.run("git", ["rev-list", "--count", `${base}..${branch}`], { cwd, timeoutMs, allowFailure: true });
+        // The trailing `--` tells git the range is a revision and not a pathspec. It does NOT fix
+        // the option-shaped ref above -- options are parsed before the separator is reached, and
+        // `--branches=*..x --` still exits 0 with "0", which is why isUsableRev has to exist -- but
+        // it does turn `ambiguous argument 'README.md..main'` into a plain bad-revision refusal.
+        const result = await runner.run("git", ["rev-list", "--count", `${base}..${branch}`, "--"], { cwd, timeoutMs, allowFailure: true });
+        if (!result || result.code !== 0) return null;
+
+        const value = trimText(result.stdout);
+        if (!COUNT.test(value)) return null;
+
+        const count = Number.parseInt(value, 10);
+        return Number.isSafeInteger(count) ? count : null;
       } catch {
         return null;
       }
-      if (result.code !== 0) return null;
-
-      const value = trimText(result.stdout);
-      if (!COUNT.test(value)) return null;
-
-      const count = Number.parseInt(value, 10);
-      return Number.isSafeInteger(count) ? count : null;
     },
 
     // The one destructive operation in the archive path, and it NEVER forces.
@@ -618,7 +664,11 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     // still have to be reported. `reason` is absent on success and is one of `dirty`,
     // `not-a-worktree`, `unsafe-path` or `failed` otherwise -- `failed` being the fail-closed
     // landing spot for anything unrecognized. `argv` comes from the same expression that runs.
-    async removeWorktree({ cwd, path, timeoutMs }) {
+    //
+    // The parameter object default is part of that contract: a call with no arguments at all must
+    // return a refusal, not a destructuring TypeError, because this runs where a throw could
+    // discard the report of removals that already happened.
+    async removeWorktree({ cwd, path, timeoutMs } = {}) {
       // git parses a leading `-` as an option, so a path shaped like one is the single input
       // through which `--force` could reach this argv at all. Refused before anything spawns:
       // that is what makes the flag unreachable by construction rather than by convention. An
@@ -639,19 +689,29 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
 
       try {
         const result = await runner.run(command, args, { cwd, timeoutMs, allowFailure: true });
-        const stderr = typeof result.stderr === "string" ? result.stderr : "";
+
+        // Every field is normalized to the documented shape rather than forwarded as-is, so a
+        // runner that answers with a partial object cannot produce a result the interface does not
+        // admit -- and, more importantly, a missing exit code fails CLOSED to 1 rather than being
+        // compared loosely against 0 and reading as a successful removal.
+        const code = Number.isInteger(result?.code) ? result.code : 1;
+        const stdout = typeof result?.stdout === "string" ? result.stdout : "";
+        const stderr = typeof result?.stderr === "string" ? result.stderr : "";
 
         // Measured on git 2.43: a worktree whose directory has already been deleted exits 0 and is
         // deregistered. That is residue this command exists to reclaim, not an error.
-        if (result.code === 0) {
-          return { ok: true, code: 0, stdout: result.stdout, stderr, argv };
+        if (code === 0) {
+          return { ok: true, code, stdout, stderr, argv };
         }
 
+        // Order matters: the end-anchored `not-a-worktree` message is the more specific of the two
+        // and cannot be produced by a dirty refusal, so testing it first resolves the one case a
+        // hostile path name can make ambiguous. See WORKTREE_DIRTY.
         let reason = "failed";
-        if (WORKTREE_DIRTY.test(stderr)) reason = "dirty";
-        else if (WORKTREE_NOT_A_WORKTREE.test(stderr)) reason = "not-a-worktree";
+        if (WORKTREE_NOT_A_WORKTREE.test(stderr)) reason = "not-a-worktree";
+        else if (WORKTREE_DIRTY.test(stderr)) reason = "dirty";
 
-        return { ok: false, code: result.code, stdout: result.stdout, stderr, argv, reason };
+        return { ok: false, code, stdout, stderr, argv, reason };
       } catch (error) {
         // A timeout, a signal, or a failed spawn. Nothing is known about whether the removal
         // happened, so this is `failed` -- never `dirty`, and never `ok`.

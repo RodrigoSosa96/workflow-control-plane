@@ -361,16 +361,25 @@ function normalizePaneProcessInfo(value) {
 const PANE_READY_TIMEOUT_MS = 10000;
 const PANE_READY_POLL_MS = 250;
 
+// Closing a tab is a local, near-instant operation, so a bound this generous only ever fires on a
+// genuinely wedged CLI or server. See closeTab for why it is the one bounded call in this adapter.
+const TAB_CLOSE_TIMEOUT_MS = 10000;
+
 function defaultSleep(ms) {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
 export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSleep }) {
-  async function run(area, command, args = [], { cwd } = {}) {
+  // `timeoutMs` is forwarded only when a caller asks for one, so every existing method keeps
+  // spawning with exactly `{ allowFailure: true }` and its unbounded behaviour. `runner.run` arms
+  // its timer only for a finite positive value, so an unusable one is dropped here rather than
+  // silently becoming "no timeout" further down.
+  async function run(area, command, args = [], { cwd, timeoutMs } = {}) {
     const fullArgs = command ? [area, command, ...args] : [area, ...args];
     const result = await runner.run(binary, fullArgs, {
       allowFailure: true,
       ...(cwd ? { cwd } : {}),
+      ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
     });
 
     return {
@@ -605,13 +614,18 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
     // It means *already archived*, so it is reported as `not-found` and must never be confused with
     // a real failure -- an unreachable server, or a tab id we never even sent, is not proof that a
     // tab is gone.
-    async closeTab({ tabId } = {}) {
+    // It is also the one method here that is BOUNDED by default. The rest of this adapter spawns
+    // without a timeout, which is survivable for them; it is not survivable here, because a hung
+    // `herdr` CLI would hang the step that runs after worktree removals that cannot be undone --
+    // "always returns" is not a property a caller can have if the process can block forever. A
+    // timeout surfaces as an ordinary reported failure, never as `not-found`.
+    async closeTab({ tabId, timeoutMs = TAB_CLOSE_TIMEOUT_MS } = {}) {
       if (typeof tabId !== "string" || !tabId) {
         return { closed: false, reason: "closeTab requires a tab id" };
       }
 
       try {
-        await invoke("tab", "close", [tabId]);
+        await invoke("tab", "close", [tabId], { timeoutMs });
         return { closed: true };
       } catch (error) {
         if (error?.details?.code === "tab_not_found") {
