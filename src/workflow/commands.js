@@ -1952,17 +1952,23 @@ function repositoryLabel(repositoryId, index) {
 //   group    -> `project.repositories[<id>]` (a required `path` + `base_branch` per repository).
 //               A group ALSO has a top-level `path`, and it is the group's META-repository
 //               (`coordination.meta_repository`) -- so falling through to it for an id the
-//               registry no longer knows would merge into the wrong repository entirely, silently.
+//               registry no longer knows would act on the wrong repository entirely, silently.
 //               That is a refusal, never a fallback.
 //   ordinary -> `project.path` + `project.base_branch`. Its single run entry gets `id: "primary"`
 //               (launch.js's runRepositories), which is deliberately NOT a registry key, so an
 //               id lookup would fail here for the ordinary case and must not be attempted.
-function baseCheckoutFor(project, projectAlias, repositoryId, label) {
+//
+// `consequence` is what falling through would have DONE, and it is a required argument rather than
+// a defaulted one: this discrimination is now shared by `merge` (which would merge into the meta
+// repository) and `archive` (which would measure this run's unmerged work against it), and each
+// has to name its own harm. Defaulting it would let a third caller inherit merge's wording
+// silently -- the same drift the single implementation exists to prevent.
+function baseCheckoutFor(project, projectAlias, repositoryId, label, consequence) {
   if (project.repository === "group") {
     const entry = project.repositories?.[repositoryId];
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       return {
-        error: `Group project ${projectAlias} has no repository ${label} in the current registry; refusing rather than merging into the group's meta-repository.`,
+        error: `Group project ${projectAlias} has no repository ${label} in the current registry; refusing rather than ${consequence}.`,
       };
     }
     return { path: entry.path, baseBranch: entry.base_branch };
@@ -2011,7 +2017,7 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
     return { refusal: `Run ${runId} repository ${label} records a relative worktree path (${worktreePath}); refusing rather than resolving it against the control plane's own directory.`, actions: [reconcileCommandFor(runId)] };
   }
 
-  const base = baseCheckoutFor(project, projectAlias, repositoryId, label);
+  const base = baseCheckoutFor(project, projectAlias, repositoryId, label, "merging into the group's meta-repository");
   if (base.error) return { refusal: base.error, actions: [doctorCommandFor(projectAlias)] };
   if (typeof base.path !== "string" || !base.path || !isAbsolute(base.path)) {
     return { refusal: `Project ${projectAlias} has no absolute base checkout path for repository ${label}; there is nothing to merge into.`, actions: [doctorCommandFor(projectAlias)] };
@@ -2532,6 +2538,809 @@ export async function mergeCommand(options = {}, deps = {}) {
     preview,
     async execute(executeOptions = {}) {
       return await executeMerge(options, deps, executeOptions.approvalDigest);
+    },
+  };
+}
+
+// --- workflow archive (roadmap item 2.5) -------------------------------------
+//
+// The second exception to this repo's no-cleanup policy, and the only one that can destroy
+// something irreplaceable if it is wrong. It removes each `run.repositories[]` worktree and the
+// run's Herdr tab; it preserves the run directory, the branch and every commit.
+//
+// Four things shape everything below, all from the design doc, all measured:
+//
+//   1. **It never forces.** git's refusal to delete a worktree holding modified or untracked files
+//      is the last line of defence, and this command's job is to refuse BEFORE reaching it -- in
+//      the preview, for the whole run, naming the files. `git.removeWorktree` has no `force`
+//      parameter to pass; nothing here may reintroduce one.
+//   2. **The worktree is the durable residue; the tab is usually already gone.** Every recorded
+//      tabId on this machine is stale. Tab closure is best-effort, runs AFTER the removals, and
+//      `not-found` means already-archived rather than failed.
+//   3. **Uncommitted changes refuse; unmerged commits only warn.** The line is recoverability:
+//      uncommitted work has no other copy, unmerged commits are still on a branch. Making unmerged
+//      commits a hard gate would need a `--force` the first time an operator legitimately archives
+//      an abandoned experiment -- an escape hatch on the destructive step is a governance hole
+//      with a flag on it.
+//   4. **Unknown fails closed, everywhere.** An unreadable `git status`, an unreadable lock, an
+//      `unprovable` owner verdict, a Herdr that cannot answer: each refuses. Item 0.14's rule, on
+//      the most destructive command in the CLI.
+
+// archiveCommand's own exit codes, mirroring MERGE_EXIT_CODES. There is no `conflicted` value:
+// archive has no "computed, and it says do not run" class -- every blocking condition is a
+// refusal. `partial` reuses 13 for the same meaning launch and merge give it: some of the work
+// happened and some did not. A partial archive is never reported as `archived` and its exit code
+// is never 0.
+export const ARCHIVE_EXIT_CODES = Object.freeze({
+  archived: 0,
+  failed: 1,
+  refused: 10,
+  partial: 13,
+});
+
+const ARCHIVE_PREVIEW_TIMEOUT_MS = 2 * 60 * 1000;
+const ARCHIVE_REMOVE_TIMEOUT_MS = 5 * 60 * 1000;
+// These bound what is PRINTED, never what is digested (see archiveDigestPayload versus
+// publicArchiveRepository below). Exported for the same reason MERGE_DISPLAY_LIMITS is: the JSON
+// size discipline in the formatter's tests must measure the caps that actually ship rather than
+// numbers copied out of this file, or raising one here silently changes the shipped payload while
+// every test keeps passing.
+const ARCHIVE_DIRTY_DISPLAY_LIMIT = 10;
+const ARCHIVE_REASON_PATH_LIMIT = 5;
+const ARCHIVE_REASON_REPOSITORY_LIMIT = 5;
+export const ARCHIVE_DISPLAY_LIMITS = Object.freeze({
+  dirtyPaths: ARCHIVE_DIRTY_DISPLAY_LIMIT,
+  reasonPaths: ARCHIVE_REASON_PATH_LIMIT,
+  reasonRepositories: ARCHIVE_REASON_REPOSITORY_LIMIT,
+});
+const ARCHIVE_FAILURE_TEXT_LIMIT = 2000;
+const ARCHIVE_DIGEST_VERSION = 1;
+
+function archiveError(category, message, exitCode, details) {
+  throw new WorkflowError(category, message, { exitCode, ...(details ? { details } : {}) });
+}
+
+function archiveErrorText(error) {
+  return String(error?.message ?? error).slice(0, 256);
+}
+
+function archiveCommandFor(runId) {
+  return `workflow archive ${runId} --dry-run`;
+}
+
+function unlockCommandFor(runId) {
+  return `workflow unlock ${runId} --yes`;
+}
+
+// Mirrors mergeRefusal: structured evidence that nothing ran, not a stack trace. A refused preview
+// carries `approvalDigest: null`, so there is nothing an operator could pass back to execute -- and
+// execute rebuilds this same preview and refuses again rather than trusting a digest from an
+// earlier, non-refused run. Every refusal ends with the dry-run to come back to once the named
+// problem is fixed.
+//
+// `evidence` is whatever the refusing gate had already established -- most usefully the lock's own
+// ownership verdict, which is the thing an operator has to look at to decide whether `workflow
+// unlock` is even applicable. Defaults to nulls so every refusal has the SAME key set regardless of
+// how far the preview got: a renderer must never have to test for a field's presence to know which
+// refusal it is holding.
+function archiveRefusal(runId, run, reason, diagnostics = [], evidence = {}) {
+  return {
+    command: "archive",
+    runId,
+    projectAlias: run?.projectAlias ?? null,
+    runState: run?.state ?? null,
+    refused: true,
+    reason,
+    tabId: run?.tabId ?? null,
+    agent: evidence.agent ?? null,
+    lock: evidence.lock ?? null,
+    repositories: [],
+    losses: [],
+    removable: false,
+    approvalDigest: null,
+    exitCode: ARCHIVE_EXIT_CODES.refused,
+    nextActions: [...diagnostics, archiveCommandFor(runId)],
+  };
+}
+
+function archiveGitAdapter(deps) {
+  const git = deps.git;
+  for (const method of ["checkoutState", "resolveHead", "countCommitsNotIn", "removeWorktree"]) {
+    if (typeof git?.[method] !== "function") {
+      archiveError("PREFLIGHT", `workflow archive requires a git adapter with ${method}()`, ARCHIVE_EXIT_CODES.refused);
+    }
+  }
+  return git;
+}
+
+// --- gate 1: the run state ---------------------------------------------------
+//
+// Item 2.1 established that NO run state is terminal in the state machine -- completed, failed and
+// interrupted all transition back to running via resume. So "only terminal runs" cannot be read off
+// `run-state.js`'s ALLOWED. Rather than invent a second classification, this archives exactly the
+// complement of LIVE_RUN_STATES, the set 2.1 already defined and documented as a presentation
+// decision requiring a new state to be classified deliberately.
+function liveStateRefusal(runId, run) {
+  if (!LIVE_RUN_STATES.has(run.state)) return null;
+  return archiveRefusal(
+    runId,
+    run,
+    `Run ${runId} is in ${run.state}, which is still live; only a completed, failed or interrupted run can be archived.`,
+    [resultCommandFor(runId)],
+  );
+}
+
+// --- gate 2: the run lock ----------------------------------------------------
+//
+// Item 1.1's machinery, used the way reconcileLockDiagnostic uses it -- observe and classify,
+// never remove. Archive does NOT remove the lock: that stays `workflow unlock`'s job, and the
+// refusal names it.
+//
+// The one place this deliberately differs from reconcile's diagnostic is the failure direction.
+// Reconcile fails OPEN (a diagnostic must never break reconcile); archive fails CLOSED. A store
+// that cannot say whether a lock is held, or that predates inspectLock entirely, has not proven
+// that nobody else is mid-write against this run -- and this command is about to delete
+// directories. "Could not ask" is not "no lock".
+async function inspectArchiveLock(store, runId, inspectProcess) {
+  if (typeof store.inspectLock !== "function") {
+    return { error: "this run store cannot report whether the run lock is held; refusing rather than archiving a run that may be mid-write." };
+  }
+  let inspected;
+  try {
+    inspected = await store.inspectLock(runId);
+  } catch (error) {
+    return { error: `the run lock could not be inspected (${archiveErrorText(error)}); an unreadable lock is a refusal, never an absent one.` };
+  }
+  if (!inspected) return { lock: { held: false, ageMs: null, stale: null, ownership: null } };
+
+  const ownership = withAmbiguousMarkerReason(inspected, await classifyMarkerOwnership(inspected.marker, inspectProcess));
+  return { lock: { held: true, ageMs: inspected.ageMs ?? null, stale: inspected.stale ?? null, ownership } };
+}
+
+function lockRefusal(runId, run, lock) {
+  if (!lock.held || lock.ownership?.removable) return null;
+  return archiveRefusal(
+    runId,
+    run,
+    `Run ${runId} still holds its run lock and its owner is not provably gone (${lock.ownership?.verdict ?? "unknown"}: ${lock.ownership?.reason ?? "no verdict"}); refusing rather than archiving a run something may still be writing to.`,
+    [unlockCommandFor(runId)],
+    { lock },
+  );
+}
+
+// --- gate 3: the agent -------------------------------------------------------
+//
+// `agentsByPaneFromHerdr` is the same single, indexed listAgents() call `workflow inbox` makes, and
+// `correlationPaneId` is the same correlation order -- transportIdentity.paneId FIRST, because
+// executeResume leaves the top-level one naming the pane Herdr already closed.
+//
+// Where inbox reports an unreachable Herdr as `unresolved` and carries on, archive refuses: an
+// answer is the proof, and no answer is not proof of absence. The one shape that needs no answer at
+// all is a run that never recorded a pane (real run 273432a7, `failed`, died before agent
+// creation) -- there is no agent to prove gone, so Herdr is never even asked.
+async function inspectArchiveAgent(run, herdr) {
+  const pane = correlationPaneId(run);
+  if (!pane) return { agent: { paneId: null, resolved: false, reason: "the run records no pane id, so it has no agent to resolve" } };
+
+  const { agentsByPane, herdrAvailable } = await agentsByPaneFromHerdr(herdr);
+  if (!herdrAvailable) {
+    return { error: `Herdr could not be asked whether pane ${pane} still has a live agent; refusing rather than archiving a run that may still be being worked on.` };
+  }
+  const agent = agentsByPane.get(pane);
+  if (agent) {
+    return { error: `Run's agent is still live in Herdr on pane ${pane} (agent_status: ${agentStatus(agent) ?? "not reported"}); refusing to archive a run someone is still working on.` };
+  }
+  return { agent: { paneId: pane, resolved: false, reason: `Herdr reports no agent on pane ${pane}` } };
+}
+
+// --- the losses --------------------------------------------------------------
+
+// `--porcelain=v1` lists untracked files by default, and that is the right behaviour here: git
+// refuses to remove a worktree for untracked files exactly as it does for modified ones. But the
+// operator's remedy is NOT the same -- untracked files are cleaned, tracked edits are committed or
+// stashed -- so the two are counted separately and the refusal names which it is. Reporting "2
+// uncommitted paths" for two stray build artifacts points at `git add`/`git stash`, which does the
+// wrong thing to both.
+function splitDirtyPaths(entries) {
+  const tracked = [];
+  const untracked = [];
+  for (const entry of list(entries)) {
+    const path = typeof entry?.path === "string" ? entry.path : null;
+    if (!path) continue;
+    if (entry.x === "?" && entry.y === "?") untracked.push(path);
+    else tracked.push(path);
+  }
+  return { tracked, untracked, all: [...tracked, ...untracked] };
+}
+
+// Positive proof of absence, which is what separates "this is exactly the residue archive exists to
+// reclaim" from "this directory could not be inspected". `git worktree remove` on a vanished
+// directory exits 0 and deregisters it (measured, git 2.43), so a missing worktree is archivable --
+// but only an ENOENT/ENOTDIR from stat proves it is missing. Every other stat outcome, including a
+// path that is not a directory, is unknown and therefore a refusal.
+async function probeWorktreePresence(fs, path) {
+  try {
+    const stat = await fs.stat(path);
+    if (!stat.isDirectory()) return { error: `${path} exists but is not a directory` };
+    return { present: true };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { present: false };
+    return { error: `${path} could not be inspected (${archiveErrorText(error)})` };
+  }
+}
+
+// Reads one repository into either a refusal (which aborts the whole preview, because the preview
+// could not be COMPUTED honestly) or a record. A DIRTY worktree is not a refusal here: it lands on
+// the record and is refused after the loop, so an operator with two dirty repositories sees both
+// rather than fixing one and coming straight back -- the lesson mergeCommand's conflict list
+// already learned.
+async function inspectRepositoryForArchive({ runId, projectAlias, project, entry, index, git, fs, timeoutMs }) {
+  const repositoryId = recordedRepositoryId(entry);
+  const label = repositoryLabel(repositoryId, index);
+  const worktreePath = recordedRepositoryPath(entry);
+  const recordedBranch = recordedRepositoryBranch(entry);
+
+  // The five shapes item 2.3's C1 finding enumerated: field missing, `path: null`, `path: ""`, a
+  // bare string entry, an empty object. git.removeWorktree's own `unsafe-path` guard is a backstop
+  // for these; refusing here, with the run id and the entry named, is the real fix.
+  if (!worktreePath) {
+    return { refusal: `Run ${runId} repository ${label} has no worktree path recorded; refusing rather than removing an unknown directory.`, actions: [reconcileCommandFor(runId)] };
+  }
+  if (!isAbsolute(worktreePath)) {
+    // Item 2.3's R2 finding, and it is far worse here than it was for verify: a relative path
+    // resolves against THIS process's own cwd -- the control plane's own checkout -- so a removal
+    // would be aimed at the control plane rather than at any run worktree.
+    return { refusal: `Run ${runId} repository ${label} records a relative worktree path (${worktreePath}); refusing rather than resolving it against the control plane's own directory.`, actions: [reconcileCommandFor(runId)] };
+  }
+
+  const base = baseCheckoutFor(project, projectAlias, repositoryId, label, "measuring this run's unmerged work against the group's meta-repository");
+  if (base.error) return { refusal: base.error, actions: [doctorCommandFor(projectAlias)] };
+  const basePath = typeof base.path === "string" && base.path && isAbsolute(base.path) ? base.path : null;
+  if (!basePath) {
+    // `git worktree remove` has to run inside the repository that registered the worktree, and the
+    // base checkout is the only path known to be that repository. It cannot be run from inside the
+    // worktree instead: that works for a present directory (measured, git 2.43) but not for a
+    // VANISHED one, which is precisely the residue this command exists to reclaim -- there is no
+    // directory left to spawn in. The registry already validates `path` as a required absolute
+    // path for every project shape, so this is a fail-closed backstop, not an expected shape.
+    return { refusal: `Project ${projectAlias} has no absolute base checkout path for repository ${label}; there is no repository to run the worktree removal from.`, actions: [doctorCommandFor(projectAlias)] };
+  }
+  // A missing base_BRANCH, unlike a missing base path, is NOT a refusal: archiving does not need
+  // one, it only needs one to MEASURE what archiving would leave behind. An unmeasurable loss is
+  // reported as unknown (never as 0) and the archive proceeds -- see unmergedCommitsFor.
+  const baseBranch = typeof base.baseBranch === "string" && base.baseBranch.trim() ? base.baseBranch.trim() : null;
+
+  const presence = await probeWorktreePresence(fs, worktreePath);
+  if (presence.error) {
+    return { refusal: `Run ${runId} repository ${label} worktree ${presence.error}; an uninspectable worktree is a refusal, never an empty one.`, actions: [reconcileCommandFor(runId)] };
+  }
+
+  if (!presence.present) {
+    // The most archivable case, and the one whose loss cannot be measured: there is no checkout to
+    // read a branch or a HEAD out of, so the unmerged count is `null` (unknown) rather than 0.
+    return {
+      record: {
+        repositoryId, worktreePath, recordedBranch, present: false,
+        branch: null, headSha: null, dirty: false, dirtyPaths: [], trackedPaths: [], untrackedPaths: [],
+        basePath, baseBranch, unmergedCommits: null,
+        unmergedReason: `the worktree directory at ${worktreePath} no longer exists, so its branch cannot be read`,
+      },
+    };
+  }
+
+  // checkoutState and resolveHead THROW when rev-parse itself fails -- a path that is not a
+  // repository, a repository whose object store is gone. That is unknown, and unknown refuses.
+  let state;
+  let head;
+  try {
+    state = await git.checkoutState({ cwd: worktreePath });
+    head = await git.resolveHead({ cwd: worktreePath });
+  } catch (error) {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be read: ${archiveErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
+  }
+
+  // Checked BEFORE `dirty`, and independently of it, for the reason git.js's checkoutState records:
+  // a worktree sitting inside a stopped merge holds resolution work that deleting the directory
+  // destroys, and naming only the uncommitted paths points at `git add`/`git stash`, which is the
+  // wrong move. `merging` is tri-state and only an explicit `false` may pass -- `null` means the
+  // MERGE_HEAD probe could not be answered, and an unknown merge state fails closed like every
+  // other unknown here.
+  if (state.merging === true) {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is in the middle of a merge (MERGE_HEAD is present); finish it or run \`git -C ${worktreePath} merge --abort\` before archiving.`, actions: [`git -C ${worktreePath} status`] };
+  }
+  if (state.merging !== false) {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be checked for an in-progress merge (MERGE_HEAD is unreadable); an unknown merge state is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
+  }
+  if (state.dirty !== true && state.dirty !== false) {
+    // Item 0.14's direction: an unreadable status is never clean. `!== true && !== false` rather
+    // than `=== null` so an adapter that omits `dirty` entirely fails closed too.
+    return { refusal: `Run ${runId} repository ${label} worktree status at ${worktreePath} could not be read (${state.statusError ?? "reason unknown"}); an unreadable status is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
+  }
+
+  const dirtyPaths = splitDirtyPaths(state.entries);
+  const branch = state.branch ?? null;
+  const headSha = typeof head?.sha === "string" && head.sha ? head.sha : null;
+  const unmerged = await unmergedCommitsFor({ git, basePath, baseBranch, branch, worktreePath, timeoutMs });
+
+  return {
+    record: {
+      repositoryId, worktreePath, recordedBranch, present: true,
+      branch, headSha,
+      dirty: state.dirty === true,
+      dirtyPaths: dirtyPaths.all,
+      trackedPaths: dirtyPaths.tracked,
+      untrackedPaths: dirtyPaths.untracked,
+      basePath, baseBranch,
+      unmergedCommits: unmerged.count,
+      ...(unmerged.reason ? { unmergedReason: unmerged.reason } : {}),
+    },
+  };
+}
+
+// How much work archiving this repository would leave behind on a branch nobody is looking at any
+// more. Counted in the BASE checkout, the only place both refs resolve -- not in the worktree.
+//
+// Every branch that cannot answer returns `count: null` WITH a reason, never 0. Task 1's
+// countCommitsNotIn already refuses an absent, empty or option-shaped ref before spawning, which is
+// reachable from a run record whose project has no `base_branch` at all; the guards here exist so
+// the preview can say WHY it is unknown rather than printing a bare null.
+async function unmergedCommitsFor({ git, basePath, baseBranch, branch, worktreePath, timeoutMs }) {
+  if (!branch) {
+    return { count: null, reason: `the worktree at ${worktreePath} is on a detached HEAD, so there is no branch to measure` };
+  }
+  if (!baseBranch) {
+    return { count: null, reason: "the project has no base_branch configured, so the unmerged count cannot be measured" };
+  }
+  // Documented never to throw, and does not. Guarded anyway, for the same reason runMergeSequence
+  // guards mergeBranch: a read that turns a read-only `--dry-run` into a stack trace instead of a
+  // preview is a contract this file must not depend on another module keeping.
+  let count;
+  try {
+    count = await git.countCommitsNotIn({ cwd: basePath, base: baseBranch, branch, timeoutMs });
+  } catch (error) {
+    return { count: null, reason: `the unmerged count could not be read in ${basePath}: ${archiveErrorText(error)}` };
+  }
+  if (!Number.isInteger(count)) {
+    return { count: null, reason: `git could not count commits on ${branch} that ${baseBranch} does not have, in ${basePath}` };
+  }
+  return { count };
+}
+
+// What would be LOST, as opposed to what would be removed -- the distinction the design doc puts
+// at the centre of this command. Removals are `repositories[]`; these are the things that outlive
+// the removal only in a place nobody is looking at.
+//
+// Derived from the records rather than digested separately: every field these are computed from
+// (branch, headSha, unmergedCommits, present) is already in the digest, so a second copy here could
+// only ever drift from it.
+function archiveLosses(records) {
+  const losses = [];
+  for (const record of records) {
+    if (record.present && !record.branch) {
+      // Nothing but this worktree's own HEAD references those commits. `git worktree remove` never
+      // deletes a ref -- but there is no ref here to keep, so removing the directory is the point
+      // at which they become unreachable. Named, digested through `branch: null`, never refused:
+      // the design's own line is that this command surfaces losses and gates only on
+      // irrecoverability.
+      losses.push({
+        repositoryId: record.repositoryId,
+        kind: "detached-head",
+        worktreePath: record.worktreePath,
+        branch: null,
+        baseBranch: record.baseBranch,
+        count: null,
+        detail: `the worktree at ${record.worktreePath} is on a detached HEAD at ${record.headSha ?? "an unknown commit"}; no branch references its commits`,
+      });
+    }
+    if (record.unmergedCommits === null) {
+      losses.push({
+        repositoryId: record.repositoryId,
+        kind: "unmerged-commits-unknown",
+        worktreePath: record.worktreePath,
+        branch: record.branch,
+        baseBranch: record.baseBranch,
+        count: null,
+        detail: `how much of this work is unmerged could not be determined: ${record.unmergedReason ?? "reason unknown"}`,
+      });
+      continue;
+    }
+    if (record.unmergedCommits > 0) {
+      losses.push({
+        repositoryId: record.repositoryId,
+        kind: "unmerged-commits",
+        worktreePath: record.worktreePath,
+        branch: record.branch,
+        baseBranch: record.baseBranch,
+        count: record.unmergedCommits,
+        detail: `${record.unmergedCommits} commit(s) on ${record.branch} are not in ${record.baseBranch}; the branch survives, but nothing will point at this work any more`,
+      });
+    }
+  }
+  return losses;
+}
+
+// The whole run refuses, not just the dirty repository: a group project is archived whole or not at
+// all, because a half-archived group leaves residue that is harder to reason about than the
+// original. This is enforced HERE, in the preview, before the first removal -- a mid-loop discovery
+// leaves a partial archive that re-running cannot fix.
+function dirtyRefusal(runId, run, records, evidence) {
+  const dirty = records.filter((record) => record.dirty);
+  if (dirty.length === 0) return null;
+
+  const shown = dirty.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT);
+  const rest = dirty.length - shown.length;
+  const described = shown.map((record) => {
+    const parts = [];
+    if (record.trackedPaths.length > 0) {
+      parts.push(`${record.trackedPaths.length} uncommitted change(s): ${joinPaths(record.trackedPaths, ARCHIVE_REASON_PATH_LIMIT)}`);
+    }
+    if (record.untrackedPaths.length > 0) {
+      parts.push(`${record.untrackedPaths.length} untracked file(s): ${joinPaths(record.untrackedPaths, ARCHIVE_REASON_PATH_LIMIT)}`);
+    }
+    // `dirty: true` with nothing enumerable -- a status entry with no path, an adapter that
+    // reports the flag without the list. Still a refusal (the flag is the fail-closed signal), but
+    // it must not render as "<path> has ", which reads like a truncation bug rather than a reason.
+    if (parts.length === 0) parts.push("changes git reported but did not enumerate");
+    return `${record.worktreePath} has ${parts.join(" and ")}`;
+  });
+
+  const actions = dirty.flatMap((record) => [
+    `git -C ${record.worktreePath} status`,
+    // Only ever `-n` (dry run). This command refuses to destroy untracked work; it must not hand
+    // an operator a one-liner that destroys it either.
+    ...(record.untrackedPaths.length > 0 && record.trackedPaths.length === 0 ? [`git -C ${record.worktreePath} clean -nd`] : []),
+  ]);
+
+  return archiveRefusal(
+    runId,
+    run,
+    `Run ${runId} cannot be archived: ${described.join("; ")}${rest > 0 ? ` (+${rest} more repositor${rest === 1 ? "y" : "ies"})` : ""}. Uncommitted and untracked work exists nowhere else, so this refuses for the whole run and never forces.`,
+    [...new Set(actions)],
+    evidence,
+  );
+}
+
+// The digest binds run state, tab id, and per repository the worktree path, the branch and HEAD it
+// is at, whether it is dirty and how many paths, and the unmerged-commit count -- with `null`
+// (unknown) kept DISTINCT from 0 (fully merged), which canonicalText preserves. Anything material
+// that moves between preview and approval changes this and the approval goes stale.
+//
+// The FULL dirty path count goes in here; the public projection caps only what it PRINTS. Approving
+// "these 3 dirty paths" when there are 300 is the wrong approval.
+function archiveDigestPayload({ runId, run, records }) {
+  return {
+    version: ARCHIVE_DIGEST_VERSION,
+    command: "archive",
+    runId,
+    projectAlias: run?.projectAlias ?? null,
+    runState: run?.state ?? null,
+    tabId: run?.tabId ?? null,
+    repositories: records.map((record) => ({
+      repositoryId: record.repositoryId,
+      worktreePath: record.worktreePath,
+      recordedBranch: record.recordedBranch,
+      present: record.present,
+      branch: record.branch,
+      headSha: record.headSha,
+      dirty: record.dirty,
+      dirtyCount: record.dirtyPaths.length,
+      trackedCount: record.trackedPaths.length,
+      untrackedCount: record.untrackedPaths.length,
+      basePath: record.basePath,
+      baseBranch: record.baseBranch,
+      unmergedCommits: record.unmergedCommits,
+    })),
+  };
+}
+
+function publicArchiveRepository(record) {
+  const dirtyPaths = record.dirtyPaths.slice(0, ARCHIVE_DIRTY_DISPLAY_LIMIT);
+  return {
+    repositoryId: record.repositoryId,
+    worktreePath: record.worktreePath,
+    recordedBranch: record.recordedBranch,
+    present: record.present,
+    branch: record.branch,
+    // Literally `recordedBranch !== branch`, per merge's own precedent: a run that recorded no
+    // branch at all also disagrees with the worktree, and that is worth naming rather than hiding.
+    branchMismatch: record.recordedBranch !== record.branch,
+    headSha: record.headSha,
+    dirty: record.dirty,
+    dirtyPaths,
+    dirtyCount: record.dirtyPaths.length,
+    trackedCount: record.trackedPaths.length,
+    untrackedCount: record.untrackedPaths.length,
+    dirtyPathsTruncated: dirtyPaths.length < record.dirtyPaths.length,
+    basePath: record.basePath,
+    baseBranch: record.baseBranch,
+    unmergedCommits: record.unmergedCommits,
+    ...(record.unmergedReason ? { unmergedReason: record.unmergedReason } : {}),
+  };
+}
+
+async function buildArchivePreview(runId, run, options, deps) {
+  // The three gates, all of them before ANY worktree is inspected. Ordered cheapest and most
+  // definite first: a live run is refused without spawning a single subprocess.
+  const stateRefusal = liveStateRefusal(runId, run);
+  if (stateRefusal) return { preview: stateRefusal, records: [] };
+
+  const store = deps.store;
+  const lockResult = await inspectArchiveLock(store, runId, deps.inspectProcess);
+  if (lockResult.error) return { preview: archiveRefusal(runId, run, `Run ${runId} cannot be archived: ${lockResult.error}`, [unlockCommandFor(runId)]), records: [] };
+  const lock = lockResult.lock;
+  const heldRefusal = lockRefusal(runId, run, lock);
+  if (heldRefusal) return { preview: heldRefusal, records: [] };
+
+  const agentResult = await inspectArchiveAgent(run, deps.herdr);
+  if (agentResult.error) return { preview: archiveRefusal(runId, run, agentResult.error, [resultCommandFor(runId)], { lock }), records: [] };
+  const agent = agentResult.agent;
+  // Everything from here on refuses with the two gates it already passed attached, so a refusal
+  // about a dirty worktree still shows that the lock and the agent were checked and cleared.
+  const evidence = { lock, agent };
+
+  const repositories = list(run.repositories);
+  if (repositories.length === 0) {
+    return { preview: archiveRefusal(runId, run, `Run ${runId} has no repositories[] recorded; there is nothing to archive.`, [reconcileCommandFor(runId)], evidence), records: [] };
+  }
+
+  const injectedLoadRegistry = deps.loadRegistry ?? loadRegistry;
+  const registry = await injectedLoadRegistry(options.registryPath);
+  const project = registry?.projects?.[run.projectAlias];
+  if (!project) {
+    return { preview: archiveRefusal(runId, run, `Unknown workflow project: ${run.projectAlias}`, [doctorCommandFor(run.projectAlias)], evidence), records: [] };
+  }
+
+  const git = archiveGitAdapter(deps);
+  const fs = deps.fs ?? defaultFs;
+  const timeoutMs = Number.isFinite(deps.previewTimeoutMs) ? deps.previewTimeoutMs : ARCHIVE_PREVIEW_TIMEOUT_MS;
+
+  const records = [];
+  for (const [index, entry] of repositories.entries()) {
+    const outcome = await inspectRepositoryForArchive({ runId, projectAlias: run.projectAlias, project, entry, index, git, fs, timeoutMs });
+    if (outcome.refusal) return { preview: archiveRefusal(runId, run, outcome.refusal, list(outcome.actions), evidence), records: [] };
+    records.push(outcome.record);
+  }
+
+  const dirty = dirtyRefusal(runId, run, records, evidence);
+  if (dirty) return { preview: dirty, records: [] };
+
+  const preview = {
+    command: "archive",
+    runId,
+    projectAlias: run.projectAlias ?? null,
+    runState: run.state ?? null,
+    refused: false,
+    reason: null,
+    tabId: run.tabId ?? null,
+    agent,
+    lock,
+    repositories: records.map(publicArchiveRepository),
+    losses: archiveLosses(records),
+    removable: true,
+    approvalDigest: sha256Digest(canonicalText(archiveDigestPayload({ runId, run, records }))),
+    exitCode: ARCHIVE_EXIT_CODES.archived,
+    nextActions: [],
+  };
+  preview.nextActions = [
+    `workflow archive ${runId} --yes --approval-digest ${preview.approvalDigest}`,
+    // A lock whose owner is proven gone does not block the archive -- but store.update and
+    // appendEvent both take that same lock, so the persistence step below WILL fail against it.
+    // Naming the way out here means the operator does not discover it only after the removals.
+    ...(lock.held ? [unlockCommandFor(runId)] : []),
+  ];
+  return { preview, records };
+}
+
+async function archiveContext(options, deps) {
+  const store = await storeForCommand(options, deps);
+  const runId = assertRunId(options.runId);
+  const run = await store.read(runId);
+  const { preview, records } = await buildArchivePreview(runId, run, options, { ...deps, store });
+  return { store, runId, run, preview, records };
+}
+
+function assertSuppliedArchiveDigest(supplied) {
+  if (typeof supplied !== "string" || !supplied) {
+    archiveError("PREFLIGHT", "Missing approval digest; rerun workflow archive --dry-run and approve the current digest", ARCHIVE_EXIT_CODES.refused);
+  }
+  if (!APPROVAL_DIGEST_PATTERN.test(supplied)) {
+    archiveError("PREFLIGHT", "Invalid approval digest; rerun workflow archive --dry-run and approve the current digest", ARCHIVE_EXIT_CODES.refused);
+  }
+}
+
+function archiveFailureText(result) {
+  const text = result?.error ?? result?.stderr ?? "";
+  return String(text).trim().slice(0, ARCHIVE_FAILURE_TEXT_LIMIT) || `git worktree remove exited with code ${result?.code}`;
+}
+
+function archiveReportEntry(record, extra = {}) {
+  return {
+    repositoryId: record.repositoryId,
+    worktreePath: record.worktreePath,
+    branch: record.branch,
+    ...extra,
+  };
+}
+
+// Sequential, and deliberately NOT stopping at the first failure -- the one place this diverges
+// from runMergeSequence, and the reason is that the operations differ in kind. Merge's repositories
+// share an intent (one integration, several repositories), so continuing past a failure risks a
+// half-integrated feature. Removals are independent reclamations of residue: the preview has
+// already refused the whole run if any worktree was dirty, so by this line every removal is
+// individually approved, and stopping early would leave MORE residue behind for no benefit.
+//
+// `kept[]` is every worktree still on disk afterwards, each with git's own reason. `removed[]` is
+// what is really gone. Neither is undoable by re-running, which is why the report is written to
+// admit partial completion rather than to avoid admitting it.
+async function runArchiveRemovals(records, git, timeoutMs) {
+  const removed = [];
+  const kept = [];
+
+  for (const record of records) {
+    // git.js's removeWorktree is documented never to throw, and does not. Guarded anyway: one
+    // thrown error from repository 2 would otherwise unwind past repository 1's real, already
+    // completed removal and leave the operator with a stack trace instead of the only record that
+    // it happened.
+    let result;
+    try {
+      // `cwd` is the BASE checkout, never the worktree: a vanished worktree is the case this
+      // command exists for, and there would be no directory left to spawn in. The preview refuses
+      // any repository with no absolute base path for exactly this reason.
+      result = await git.removeWorktree({ cwd: record.basePath, path: record.worktreePath, timeoutMs });
+    } catch (error) {
+      result = { ok: false, code: 1, stdout: "", stderr: "", reason: "failed", error: archiveErrorText(error) };
+    }
+
+    if (!result?.ok) {
+      kept.push(archiveReportEntry(record, {
+        code: result?.code ?? null,
+        reason: result?.reason ?? "failed",
+        detail: archiveFailureText(result),
+      }));
+      continue;
+    }
+    // The EXECUTED argv is reported, not one rebuilt here. `unsafe-path` and a failed spawn both
+    // report an argv that never ran, which is why it is only carried on the SUCCESS side.
+    removed.push(archiveReportEntry(record, { code: result.code, argv: [...list(result.argv)] }));
+  }
+
+  return { removed, kept };
+}
+
+// Best-effort and last, after removals that cannot be undone. Three outcomes an operator has to be
+// able to tell apart, so all three are on the response:
+//   - no tab was ever recorded         -> nothing was asked, and that is not a failure
+//   - `not-found`                      -> already archived (the COMMON case; every recorded tabId
+//                                         on this machine is stale)
+//   - anything else                    -> reported, never thrown, never a rollback
+async function closeArchiveTab(herdr, tabId) {
+  if (typeof tabId !== "string" || !tabId) {
+    return { tabId: null, closed: false, alreadyGone: false, reason: "no-tab-recorded" };
+  }
+  if (!herdr || typeof herdr.closeTab !== "function") {
+    return { tabId, closed: false, alreadyGone: false, reason: "no Herdr adapter available to close the tab" };
+  }
+  let result;
+  try {
+    result = await herdr.closeTab({ tabId });
+  } catch (error) {
+    // herdr.js's closeTab is documented never to throw. Guarded for the same reason the removals
+    // are: by this line real directories are already gone, and a throw here would discard the only
+    // report that they went.
+    return { tabId, closed: false, alreadyGone: false, reason: archiveErrorText(error) };
+  }
+  if (result?.closed) return { tabId, closed: true, alreadyGone: false, reason: null };
+  const reason = typeof result?.reason === "string" ? result.reason : "the tab could not be closed";
+  return { tabId, closed: false, alreadyGone: reason === "not-found", reason };
+}
+
+// What the run's own event log keeps once the worktree is gone -- the design's "the run's evidence
+// outlives its worktree", made concrete. After the removal this is the only surviving record of
+// which branch each worktree was on, at which commit, and how much of it was never merged.
+function archivedRepositoryEvidence(record) {
+  return {
+    repositoryId: record.repositoryId,
+    worktreePath: record.worktreePath,
+    branch: record.branch,
+    headSha: record.headSha,
+    basePath: record.basePath,
+    baseBranch: record.baseBranch,
+    unmergedCommits: record.unmergedCommits,
+  };
+}
+
+async function executeArchive(options, deps, supplied) {
+  assertSuppliedArchiveDigest(supplied);
+
+  // The whole preview is rebuilt from scratch and the supplied digest compared against the FRESH
+  // one, so anything that moved between preview and approval -- a new commit, a worktree that went
+  // dirty, a resumed run, an agent that came back -- refuses instead of removing something the
+  // operator never saw. All three gates are therefore re-evaluated here, not just the digest.
+  const fresh = await archiveContext(options, deps);
+  if (fresh.preview.refused) {
+    archiveError("PREFLIGHT", `workflow archive refused: ${fresh.preview.reason}`, ARCHIVE_EXIT_CODES.refused);
+  }
+  if (supplied !== fresh.preview.approvalDigest) {
+    archiveError(
+      "PREFLIGHT",
+      `Stale approval digest; rerun ${archiveCommandFor(fresh.runId)} before executing. Current digest: ${fresh.preview.approvalDigest}`,
+      ARCHIVE_EXIT_CODES.refused,
+      { expected: fresh.preview.approvalDigest, supplied },
+    );
+  }
+
+  const git = archiveGitAdapter(deps);
+  const timeoutMs = Number.isFinite(deps.archiveTimeoutMs) ? deps.archiveTimeoutMs : ARCHIVE_REMOVE_TIMEOUT_MS;
+  const { removed, kept } = await runArchiveRemovals(fresh.records, git, timeoutMs);
+  const tab = await closeArchiveTab(deps.herdr, fresh.run.tabId);
+
+  const status = kept.length === 0 ? "archived" : removed.length > 0 ? "partial" : "failed";
+  const exitCode = status === "archived"
+    ? ARCHIVE_EXIT_CODES.archived
+    : status === "partial" ? ARCHIVE_EXIT_CODES.partial : ARCHIVE_EXIT_CODES.failed;
+  const archivedAt = typeof deps.now === "function" ? String(deps.now()) : new Date().toISOString();
+
+  // Only a COMPLETE archive marks the record. A partial one still has residue on disk, and the
+  // board hiding the run (item 2.1's relief, wired in the next task) would hide the residue with
+  // it. Re-running after a partial archive re-previews the worktrees that are now gone as absent
+  // and the kept ones as they are -- a fresh digest, and a way to finish.
+  let recordError;
+  if (status === "archived") {
+    try {
+      await fresh.store.update(fresh.runId, () => ({ archivedAt }));
+    } catch (error) {
+      // Item 2.3's I4 finding, and it matters more here than anywhere it has mattered before: by
+      // this line real directories are gone from a real filesystem, and re-running cannot undo it.
+      // The most likely cause is the run lock being held -- possibly by the proven-dead owner gate
+      // 2 deliberately allowed through -- which is why the response names `workflow unlock`.
+      recordError = `the run could not be marked archived: ${archiveErrorText(error)}`;
+    }
+  }
+
+  let evidenceError;
+  try {
+    await fresh.store.appendEvent(fresh.runId, {
+      type: "archive",
+      approvalDigest: supplied,
+      status,
+      exitCode,
+      archivedAt: status === "archived" ? archivedAt : null,
+      removed,
+      kept,
+      tab,
+      repositories: fresh.records.map(archivedRepositoryEvidence),
+    });
+  } catch (error) {
+    evidenceError = `evidence could not be persisted: ${archiveErrorText(error)}`;
+  }
+
+  return {
+    command: "archive",
+    runId: fresh.runId,
+    projectAlias: fresh.run.projectAlias ?? null,
+    approvalDigest: supplied,
+    status,
+    archivedAt: status === "archived" ? archivedAt : null,
+    removed,
+    kept,
+    tab,
+    losses: fresh.preview.losses,
+    exitCode,
+    ...(recordError ? { recordError } : {}),
+    ...(evidenceError ? { evidenceError } : {}),
+    nextActions: [
+      ...(status === "archived" ? [] : [archiveCommandFor(fresh.runId)]),
+      ...(recordError || evidenceError ? [unlockCommandFor(fresh.runId)] : []),
+    ],
+  };
+}
+
+export async function archiveCommand(options = {}, deps = {}) {
+  const { preview } = await archiveContext(options, deps);
+  return {
+    preview,
+    async execute(executeOptions = {}) {
+      return await executeArchive(options, deps, executeOptions.approvalDigest);
     },
   };
 }
