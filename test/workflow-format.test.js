@@ -2672,6 +2672,15 @@ test("the archive JSON fallback tiers engage where they are documented to, and e
   assert.equal(tierOf(16), "tier2");
   assert.equal(tierOf(17), "general");
 
+  // The compact claim in the same comment, pinned rather than asserted in prose: compact stays
+  // under budget far longer than JSON does, and the first width at which it truncates is n=22, not
+  // n=21. The earlier comment said 21 and was off by one -- a number nothing checked.
+  const compactAt = (n) => formatWorkflowResult("archive", worstCaseArchivePreview(
+    Array.from({ length: n }, (_, index) => `repo-${String(index).padStart(2, "0")}`),
+  ), "compact");
+  assert.doesNotMatch(compactAt(21), /\[output truncated at/, "n=21 must still fit");
+  assert.match(compactAt(22), /\[output truncated at 12000 characters\]$/);
+
   // And at every tier that is not the general one, the two things this fallback exists to protect
   // survive: the path that would be removed, and the count that would be lost.
   for (const n of [11, 12, 16]) {
@@ -2707,9 +2716,29 @@ test("a preview of a run whose worktrees are already gone never promises removal
   assert.doesNotMatch(compact, /^Archive: 2 worktree\(s\) would be removed$/m);
   assert.match(compact, /^Archive: nothing left on disk — all 2 recorded worktree\(s\) are already gone/m);
 
-  // 2. `the worktree <path> is on -` was not a branch mismatch; it was a missing worktree.
+  // 2. `the worktree <path> is on -` was not a branch mismatch; it was a missing worktree. And --
+  //    the review correction on top of that -- neither is the HEADING: an absent worktree always has
+  //    `branch: null !== recordedBranch`, so every one of them landed under `Branch mismatch:` even
+  //    though nothing disagreed with anything. Fixing the sentence and leaving the heading that
+  //    frames it is the same mistake one level up.
   assert.doesNotMatch(compact, /is on - —/);
+  assert.match(compact, /^Branch mismatch: none$/m, "nothing here disagrees about a branch; the worktrees are simply gone");
+  assert.match(compact, /^Branch not readable \(worktree already gone\):$/m);
   assert.match(compact, /^backend: the run recorded feature\/1216110941098331\/registro-impl; that worktree is already gone/m);
+
+  // A real mismatch still reports as one, and a mixed run reports both groups under their own
+  // headings rather than collapsing into whichever came first.
+  const mixed = formatWorkflowResult("archive", archivePreview({
+    repositories: [
+      archiveRepository({ repositoryId: "backend" }),
+      archiveRepository({ repositoryId: "panel", present: false, branch: null, headSha: null, unmergedCommits: null }),
+    ],
+    losses: [],
+  }), "compact");
+  assert.match(mixed, /^Branch mismatch:$/m);
+  assert.match(mixed, /^backend: the run recorded .*is on feature\/registro-impl — the worktree's own state is what was measured$/m);
+  assert.match(mixed, /^Branch not readable \(worktree already gone\):$/m);
+  assert.match(mixed, /^panel: the run recorded .*that worktree is already gone/m);
 
   // 3. `no live agent (panes checked: none recorded)` claimed a check and denied it in the same
   //    breath. A run with no pane has no agent to resolve and Herdr is never asked.
@@ -2732,4 +2761,49 @@ test("a loss label is a scannable classifier, not a paraphrase of the sentence b
   // The count and the branch appear once each in the label's slot; the sentence is not restated.
   assert.equal(line.match(/not in dev/g).length, 1);
   assert.equal(line.match(/feature\/registro-impl/g).length, 1);
+});
+
+// The execute report flows through the same tiers, and its boundaries differ from the preview's
+// (measured in review, reproduced here): a report entry is cheaper than a repository record, so it
+// gets further before degrading. The property that matters is the last assertion: the EXECUTED argv
+// -- the audit trail of directories that re-running cannot restore -- survives every tier that is
+// not the general fallback.
+function worstCaseArchiveReport(repositoryIds) {
+  return archiveReport({
+    removed: repositoryIds.map((repositoryId) => ({
+      repositoryId,
+      worktreePath: ARCHIVE_WORKTREE(repositoryId),
+      branch: "feature/registro-impl",
+      code: 0,
+      argv: ["git", "worktree", "remove", ARCHIVE_WORKTREE(repositoryId)],
+    })),
+    losses: repositoryIds.map((repositoryId) => ({ ...unmergedLoss(repositoryId, 900), removed: true })),
+  });
+}
+
+test("an archive report degrades through the same tiers, and every executed argv survives all of them", () => {
+  const idsFor = (n) => Array.from({ length: n }, (_, index) => `repo-${String(index).padStart(2, "0")}`);
+  const tierOf = (n) => {
+    const parsed = JSON.parse(formatWorkflowResult("archive", worstCaseArchiveReport(idsFor(n)), "json"));
+    if (!parsed.truncated) return "none";
+    if (parsed.removed === undefined) return "general";
+    return Object.hasOwn(parsed.losses[0], "branch") ? "tier1" : "tier2";
+  };
+
+  assert.equal(tierOf(14), "none");
+  assert.equal(tierOf(15), "tier1");
+  assert.equal(tierOf(16), "tier2");
+  assert.equal(tierOf(17), "tier2");
+  assert.equal(tierOf(18), "general");
+
+  for (const n of [14, 15, 16, 17]) {
+    const report = worstCaseArchiveReport(idsFor(n));
+    const parsed = JSON.parse(formatWorkflowResult("archive", report, "json"));
+    assert.deepEqual(
+      parsed.removed.map((entry) => entry.argv),
+      report.removed.map((entry) => entry.argv),
+      `every executed argv must survive at n=${n}`,
+    );
+    assert.deepEqual(parsed.losses.map((loss) => loss.removed), report.losses.map((loss) => loss.removed), "a loss that happened must stay distinguishable from one that did not");
+  }
 });

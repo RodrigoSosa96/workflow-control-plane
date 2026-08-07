@@ -1182,22 +1182,35 @@ function archiveLossHeadline(losses) {
 // branch at all lands here too -- the same call formatMerge makes, and worth naming for the same
 // reason: on the machine this was built against, two of eight real runs record a branch that no
 // longer exists. Rendered only for a preview; the execute report has already acted on it.
-// **Corrected against real CLI output (step 5).** An ALREADY GONE worktree has `branch: null`, so
-// `branchMismatch` (literally `recordedBranch !== branch`) is true for every one of them -- and the
-// line rendered as "the worktree <path> is on -", which is not a mismatch, it is a missing
-// worktree. A vanished directory is reported as vanished; only a worktree that is really there can
+// **Corrected against real CLI output (step 5), then corrected again in review.** An ALREADY GONE
+// worktree has `branch: null`, so `branchMismatch` -- literally `recordedBranch !== branch`
+// (commands.js) -- is true for every single one of them. The first correction fixed the entry TEXT
+// but left them in the `mismatched` list, so a re-preview of a fully archived run still printed a
+// `Branch mismatch:` header with one entry per repository when nothing disagreed with anything: the
+// worktrees were simply gone. Fixing the sentence and leaving the heading that frames it is the
+// same check-the-clause-not-the-claim mistake one level up.
+//
+// The two are now separate groups with separate headings, and the empty case of each is stated
+// explicitly rather than inferred from an absence (formatMerge's own discipline). A vanished
+// worktree is reported as vanished under its own label; only a worktree that is really there can
 // disagree with the record about its branch.
 function appendArchiveBranchMismatch(lines, repositories) {
-  const mismatched = repositories.filter((record) => record.branchMismatch);
+  const absent = repositories.filter((record) => record.present === false);
+  const mismatched = repositories.filter((record) => record.present !== false && record.branchMismatch);
+
   if (mismatched.length === 0) {
     lines.push("Branch mismatch: none");
-    return;
+  } else {
+    lines.push("Branch mismatch:");
+    for (const record of mismatched) {
+      lines.push(`${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; the worktree ${text(record.worktreePath)} is on ${archiveBranchCell(record)} — the worktree's own state is what was measured`);
+    }
   }
-  lines.push("Branch mismatch:");
-  for (const record of mismatched) {
-    lines.push(record.present === false
-      ? `${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; that worktree is already gone, so no branch could be read from it`
-      : `${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; the worktree ${text(record.worktreePath)} is on ${archiveBranchCell(record)} — the worktree's own state is what was measured`);
+
+  if (absent.length === 0) return;
+  lines.push("Branch not readable (worktree already gone):");
+  for (const record of absent) {
+    lines.push(`${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; that worktree is already gone, so no branch could be read from it`);
   }
 }
 
@@ -1798,21 +1811,33 @@ function mergeOverflowFallback(command, source, limit, tier) {
 // fixed-size per repository. So this degrades exactly the prose and keeps every field a decision
 // rests on.
 //
-// Two tiers, tried in order, and every boundary below is MEASURED against the fixture in
-// test/workflow-format.test.js rather than reasoned about. n = repositories, each with a full loss
-// entry at realistic sharyco-shaped path lengths (~80-character worktree paths):
+// Two tiers, tried in order, and every number below is MEASURED against exactly one fixture:
+// `worstCaseArchivePreview` in test/workflow-format.test.js, called with the `repo-NN` ids its own
+// tier test uses. That precision is not pedantry -- these numbers were first published from a
+// DIFFERENT id list (`backend`/`panel`/`webapp`/...), and every count was off by 5 x the
+// name-length difference while being cited to a fixture that could not reproduce them. The
+// boundaries were right under both; the byte counts were unreproducible from the source named.
+// n = repositories, each with a full loss entry at realistic sharyco-shaped path lengths
+// (~80-character worktree paths):
 //
-//   n = 1..10   no fallback needed          (n=1: 1,865 · n=10: 11,009)
-//   n = 11      tier 1                      (11,443)
-//   n = 12..16  tier 2                      (n=12: 9,022 · n=16: 11,421)
+//   n = 1..10   no fallback needed          (n=8: 9,047 · n=10: 11,099)
+//   n = 11      tier 1                      (11,533)
+//   n = 12..16  tier 2                      (n=12: 9,117 · n=16: 11,501)
 //   n >= 17     the general fallback below  (202 characters, no paths, no counts)
+//
+// The execute report flows through the same tiers and is measured too, with the same ids (a
+// successful report, one `removed[]` entry and one loss per repository): no fallback to n=14
+// (11,823), tier 1 at n=15 (11,482), tier 2 at n=16..17 (11,243 / 11,846), the general fallback
+// from n=18 (226 characters). Every executed `argv` survives through tier 2 and is gone at the
+// general one -- which is the whole reason the tiers exist for this command.
 //
 // The tiers ARE fixture-relative -- shorter worktree paths push every boundary out -- which is why
 // the tests pin which tier engages rather than the byte counts. Tier 1 covering exactly one width
-// is not an oversight: the two tiers exist so the shape degrades gradually instead of falling off a
-// cliff one repository past a measured number, and the gradual step happens to be narrow at these
-// path lengths. The compact view stays under budget considerably longer (measured: it first
-// truncates at n=21), which is the opposite of `merge`, where compact was the first to go.
+// on the preview is not an oversight: the two tiers exist so the shape degrades gradually instead
+// of falling off a cliff one repository past a measured number, and the gradual step happens to be
+// narrow at these path lengths. The compact view stays under budget considerably longer (measured
+// on the same fixture: 11,790 characters at n=21, first truncating at n=22), which is the opposite
+// of `merge`, where compact was the first to go.
 //
 // A first attempt at this shipped ONE tier that bounded each `detail` to 120 characters. Measuring
 // it is what caught the defect: the real detail sentence is 119 characters, so `bound()` returned
