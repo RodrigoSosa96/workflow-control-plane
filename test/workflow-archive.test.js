@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { archiveCommand, ARCHIVE_EXIT_CODES } from "../src/workflow/commands.js";
+import { archiveCommand, ARCHIVE_DISPLAY_LIMITS, ARCHIVE_EXIT_CODES } from "../src/workflow/commands.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
@@ -112,6 +112,19 @@ function scriptedGit(script = {}) {
         ];
         return { branch: entry.branch ?? null, dirty: entries.length > 0, entries, merging };
       },
+      async pendingOperation({ cwd, timeoutMs }) {
+        calls.push({ method: "pendingOperation", cwd, timeoutMs });
+        const entry = entryFor(cwd);
+        if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
+        return entry.pending ?? { status: "none" };
+      },
+      async isCommitReachable({ cwd, sha, timeoutMs }) {
+        calls.push({ method: "isCommitReachable", cwd, sha, timeoutMs });
+        // The real adapter answers `true` only on positive proof; a double that defaulted to true
+        // would let the caller's fail-closed branch go untested forever.
+        const entry = entryFor(cwd);
+        return Array.isArray(entry.reachable) ? entry.reachable.includes(sha) : false;
+      },
       async countCommitsNotIn({ cwd, base, branch, timeoutMs }) {
         calls.push({ method: "countCommitsNotIn", cwd, base, branch, timeoutMs });
         const entry = entryFor(cwd);
@@ -173,11 +186,20 @@ const OWNER_UNPROVABLE = async () => {
   throw new Error("ps failed");
 };
 
+// The lock double also SPIES on removeLock, because "archive must not remove the lock itself" is a
+// gate property no other assertion covers: an earlier round asserted `typeof store.removeLock ===
+// "function"`, which is true of every store and says nothing about whether archive called it.
 function withLockHeld(store, marker, extra = {}) {
+  const removeLockCalls = [];
   return {
     ...store,
+    removeLockCalls,
     async inspectLock() {
       return { activePath: "/state/lock/active", markerPath: "/state/lock/active/owner-1.json", marker, ageMs: 1000, stale: false, markerAmbiguous: false, ...extra };
+    },
+    async removeLock(runId, options) {
+      removeLockCalls.push({ runId, options });
+      return await store.removeLock(runId, options);
     },
   };
 }
@@ -427,18 +449,47 @@ test("a worktree reported dirty with no enumerable paths still refuses, with a l
   assertNothingHappened(fixture);
 });
 
-test("a worktree sitting inside an unfinished merge refuses, and an unreadable merge state refuses too", async (t) => {
-  for (const merging of [true, null]) {
+test("a worktree stopped inside any unfinished operation refuses, naming that operation's own remedy", async (t) => {
+  const operations = [
+    ["rebase", "git rebase --abort"],
+    ["am", "git am --abort"],
+    ["merge", "git merge --abort"],
+    ["cherry-pick", "git cherry-pick --abort"],
+    ["revert", "git revert --abort"],
+    ["bisect", "git bisect reset"],
+  ];
+  for (const [operation, remedy] of operations) {
     const store = await newStore(t);
     const run = await acmeRun(store);
-    const fixture = scriptedGit(acmeFixture({ "/wt/acme": { merging } }));
+    const fixture = scriptedGit(acmeFixture({
+      "/wt/acme": { pending: { status: "in-progress", operation, path: `/wt/acme/.git/${operation}`, remedy } },
+    }));
 
     const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
 
-    assert.equal(command.preview.refused, true, `merging: ${merging} must refuse`);
-    assert.match(command.preview.reason, /merge/i);
+    assert.equal(command.preview.refused, true, `${operation} must refuse`);
+    assert.match(command.preview.reason, new RegExp(operation.replace("-", "\\-")), operation);
+    assert.ok(
+      command.preview.nextActions.some((action) => action === `git -C /wt/acme ${remedy.replace(/^git /, "")}`),
+      `${operation} must name its own remedy, not the merge one: ${JSON.stringify(command.preview.nextActions)}`,
+    );
     assertNothingHappened(fixture);
   }
+});
+
+test("an unknown in-progress-operation state refuses, because unknown is never idle", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+  const fixture = scriptedGit(acmeFixture({
+    "/wt/acme": { pending: { status: "unknown", reason: "EACCES: permission denied" } },
+  }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+
+  assert.equal(command.preview.refused, true);
+  assert.match(command.preview.reason, /unfinished git operation/);
+  assert.match(command.preview.reason, /EACCES/);
+  assertNothingHappened(fixture);
 });
 
 // --- gate 1: run state ------------------------------------------------------
@@ -499,7 +550,7 @@ test("a lock whose owner is alive refuses and names workflow unlock, and archive
     command.preview.nextActions.some((action) => action === `workflow unlock ${run.id} --yes`),
     `the refusal must name workflow unlock: ${JSON.stringify(command.preview.nextActions)}`,
   );
-  assert.equal(typeof store.removeLock, "function", "the store still has removeLock");
+  assert.deepEqual(store.removeLockCalls, [], "archive must never remove a lock, refused or not");
   assert.deepEqual(fixture.calls, [], "the lock gate runs before any git call");
   assertNothingHappened(fixture);
 });
@@ -529,11 +580,12 @@ test("an unprovable ownership verdict refuses; elapsed time alone authorizes not
     assert.equal(command.preview.refused, true, `marker ${JSON.stringify(marker)} must refuse`);
     assert.match(command.preview.reason, /lock/i);
     assert.equal(command.preview.lock.ownership.verdict, "unprovable");
+    assert.deepEqual(store.removeLockCalls, [], "an unprovable verdict must not lead to a removal either");
     assertNothingHappened(fixture);
   }
 });
 
-test("a lock whose owner is proven gone does not block the archive, and is still not removed", async (t) => {
+test("a lock whose owner is proven gone does not block the archive, and a SUCCESSFUL archive still never removes it", async (t) => {
   const base = await newStore(t);
   const run = await acmeRun(base, {});
   const store = withLockHeld(base, { version: 2, pid: 4242, startedAt: "2026-08-07T00:00:00Z" });
@@ -554,6 +606,15 @@ test("a lock whose owner is proven gone does not block the archive, and is still
     command.preview.nextActions.some((action) => action === `workflow unlock ${run.id} --yes`),
     `a held lock must still name the command that clears it: ${JSON.stringify(command.preview.nextActions)}`,
   );
+
+  // The gate property, asserted across the path that actually removes things: a run whose lock is
+  // provably recoverable is the ONE case where an implementation might be tempted to clear it on
+  // the way past, and it must not.
+  const report = await command.execute({ approvalDigest: command.preview.approvalDigest });
+  assert.equal(report.status, "archived");
+  assert.deepEqual(fixture.removals().map((call) => call.path), ["/wt/acme"]);
+  assert.deepEqual(store.removeLockCalls, [], "a successful archive must still leave the lock alone");
+  assert.notEqual(await store.inspectLock(run.id), null, "the lock is still there for `workflow unlock`");
 });
 
 test("a store that cannot answer whether a lock is held refuses rather than assuming none", async (t) => {
@@ -616,6 +677,39 @@ test("the agent is correlated by transportIdentity.paneId first, the order workf
 
   assert.equal(command.preview.refused, true, "reading run.paneId first would have missed the live agent");
   assert.match(command.preview.reason, /w2W:live/);
+});
+
+test("BOTH the transport pane and the top-level pane are checked, not just the correlated one", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store, {
+    paneId: "w2W:original",
+    transportIdentity: { kind: "pi-session", sessionId: "s2", paneId: "w2W:relaunched", harness: "pi" },
+  });
+  const fixture = scriptedGit(acmeFixture());
+  // Correlation resolves to the transport pane, which has no agent -- but the ORIGINAL pane still
+  // hosts a live one. Checking only the correlated pane would archive a run someone is working in.
+  const herdr = scriptedHerdr({ agents: [{ pane_id: "w2W:original", agent_status: "working" }] });
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, {
+    git: fixture.git,
+    herdr: herdr.herdr,
+    present: ["/wt/acme"],
+  }));
+
+  assert.equal(command.preview.refused, true, "a live agent on the stale pane is still a live agent");
+  assert.match(command.preview.reason, /w2W:original/);
+  assertNothingHappened(fixture, herdr);
+
+  // With neither pane hosting an agent, both are named as having been checked.
+  const quiet = scriptedHerdr({ agents: [] });
+  const allowed = await archiveCommand({ runId: run.id }, archiveDeps(store, {
+    git: fixture.git,
+    herdr: quiet.herdr,
+    present: ["/wt/acme"],
+  }));
+  assert.equal(allowed.preview.refused, false);
+  assert.deepEqual(allowed.preview.agent.checkedPaneIds, ["w2W:relaunched", "w2W:original"]);
+  assert.equal(allowed.preview.agent.paneId, "w2W:relaunched", "the reported pane stays the correlated one");
 });
 
 test("a Herdr that cannot answer refuses; a Herdr that answers and knows the pane not is proof of absence", async (t) => {
@@ -743,21 +837,221 @@ test("a vanished worktree archives cleanly, and its unmeasurable loss is reporte
   assert.deepEqual(fixture.removals().map((call) => call.path), ["/wt/acme"], "git still deregisters it");
 });
 
-test("a detached-HEAD worktree is named as a loss, because nothing else references its commits", async (t) => {
+// --- the detached-HEAD split: reachability decides ---------------------------
+//
+// The design's acceptance criterion is unconditional: "Archiving a run never destroys a commit."
+// A detached HEAD is two different situations under that criterion, and only reachability tells
+// them apart -- so the rule is keyed on reachability rather than on detachment.
+
+test("a detached HEAD whose commit some ref contains is a warning, not a refusal", async (t) => {
   const store = await newStore(t);
   const run = await acmeRun(store);
-  const fixture = scriptedGit(acmeFixture({ "/wt/acme": { branch: null, sha: "d3ta(hed" } }));
+  const fixture = scriptedGit(acmeFixture({
+    "/wt/acme": { branch: null, sha: "aaaa111" },
+    "/base/acme": { reachable: ["aaaa111"] },
+  }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+
+  assert.equal(command.preview.refused, false, "the commit survives on a ref; nothing is destroyed");
+  assert.equal(command.preview.repositories[0].branch, null);
+  assert.equal(command.preview.repositories[0].headReachable, true);
+  assert.ok(command.preview.losses.some((loss) => loss.kind === "detached-head"));
+  // Reachability is asked in the BASE checkout, which is where the ref store lives.
+  assert.deepEqual(
+    fixture.calls.filter((call) => call.method === "isCommitReachable").map((call) => ({ cwd: call.cwd, sha: call.sha })),
+    [{ cwd: "/base/acme", sha: "aaaa111" }],
+  );
+  assert.deepEqual(fixture.calls.filter((call) => call.method === "countCommitsNotIn"), [], "there is no branch to measure against");
+});
+
+test("a detached HEAD no ref contains refuses, and names giving those commits a branch", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const run = await acmeRun(store);
+  const fixture = scriptedGit(acmeFixture({ "/wt/acme": { branch: null, sha: "0rphan1" }, "/base/acme": { reachable: [] } }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+
+  assert.equal(command.preview.refused, true);
+  assert.match(command.preview.reason, /detached HEAD/);
+  assert.match(command.preview.reason, /never destroy/);
+  assert.ok(command.preview.nextActions.some((action) => action === "git -C /wt/acme switch -c <branch-name>"));
+  assert.equal(command.preview.approvalDigest, null);
+  assertNothingHappened(fixture);
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("a detached HEAD whose reachability cannot be determined refuses, and an unresolvable sha does too", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+
+  // An adapter that breaks its never-throws contract, and a HEAD with no resolvable sha. Both are
+  // "could not find out", and both must take the refusing branch rather than the warning one.
+  const base = scriptedGit(acmeFixture({ "/wt/acme": { branch: null, sha: "0rphan1" } }));
+  const throwing = {
+    ...base.git,
+    async isCommitReachable() {
+      throw new WorkflowError("PROCESS", "spawn git EAGAIN", { exitCode: 12 });
+    },
+  };
+  const thrown = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: throwing, present: ["/wt/acme"] }));
+  assert.equal(thrown.preview.refused, true);
+  assert.match(thrown.preview.reason, /detached HEAD/);
+
+  const noSha = scriptedGit(acmeFixture({ "/wt/acme": { branch: null, sha: "" } }));
+  const unresolvable = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: noSha.git, present: ["/wt/acme"] }));
+  assert.equal(unresolvable.preview.refused, true);
+  assert.match(unresolvable.preview.reason, /unresolvable commit/);
+  assert.deepEqual(
+    noSha.calls.filter((call) => call.method === "isCommitReachable"),
+    [],
+    "there is no sha to ask about",
+  );
+});
+
+test("reachability lost between preview and execute refuses at the recompute, and removes nothing", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const run = await acmeRun(store);
+  const fixture = scriptedGit(acmeFixture({
+    "/wt/acme": { branch: null, sha: "aaaa111" },
+    "/base/acme": { reachable: ["aaaa111"], unmerged: {} },
+  }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+  assert.equal(command.preview.refused, false);
+  assert.equal(command.preview.repositories[0].headReachable, true);
+  const digest = command.preview.approvalDigest;
+
+  // The operator deletes the branch that was containing it -- the commit is now referenced by
+  // nothing but this worktree's own HEAD.
+  fixture.script["/base/acme"] = { ...fixture.script["/base/acme"], reachable: [] };
+
+  // This is what actually protects, and it is the recompute rather than the digest comparison:
+  // execute rebuilds the whole preview first, so a world that became irrecoverable is refused
+  // before the approved digest is even looked at. `headReachable` is also bound into the digest so
+  // the approval record names the fact that was checked, but the refusal below is the guard.
+  await assert.rejects(
+    () => command.execute({ approvalDigest: digest }),
+    (error) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.category, "PREFLIGHT");
+      assert.equal(error.exitCode, ARCHIVE_EXIT_CODES.refused);
+      assert.match(error.message, /detached HEAD/);
+      return true;
+    },
+  );
+  assert.deepEqual(fixture.removals(), []);
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("a worktree on a branch is not asked about reachability at all", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+  const fixture = scriptedGit(acmeFixture());
 
   const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
 
   assert.equal(command.preview.refused, false);
-  assert.equal(command.preview.repositories[0].branch, null);
-  assert.ok(command.preview.losses.some((loss) => loss.kind === "detached-head"));
-  assert.deepEqual(
-    fixture.calls.filter((call) => call.method === "countCommitsNotIn"),
-    [],
-    "there is no branch to measure against",
-  );
+  assert.equal(command.preview.repositories[0].headReachable, null, "the branch ref IS the answer");
+  assert.deepEqual(fixture.calls.filter((call) => call.method === "isCommitReachable"), []);
+});
+
+test("real git: an interrupted rebase leaves a clean, detached, unreachable worktree — and archive refuses it", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const { basePath, worktreePath } = await realRun(t);
+
+  // The measured path from "clean archive" to "destroyed commit", built with real git:
+  // dev advances, then an interactive rebase stops at a `break` after re-applying one commit.
+  await realFs.writeFile(join(basePath, "base.txt"), "base advances\n");
+  await gitExec(basePath, ["add", "base.txt"]);
+  await gitExec(basePath, ["commit", "-m", "base advance"]);
+  await realFs.writeFile(join(worktreePath, "second.txt"), "w2\n");
+  await gitExec(worktreePath, ["add", "second.txt"]);
+  await gitExec(worktreePath, ["commit", "-m", "w2"]);
+  await execFileAsync("git", ["rebase", "-i", "dev"], {
+    cwd: worktreePath,
+    env: { ...process.env, GIT_SEQUENCE_EDITOR: 'sed -i "2i break"' },
+  });
+
+  // Everything the OLD gates looked at says "archivable".
+  const status = await gitExec(worktreePath, ["status", "--porcelain"]);
+  assert.equal(status.stdout, "", "the tree really is clean");
+  const branch = await gitExec(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  assert.equal(branch.stdout.trim(), "HEAD", "and really is detached");
+  const detachedSha = (await gitExec(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
+  const containing = await gitExec(basePath, ["for-each-ref", "--count=1", "--contains", detachedSha]);
+  assert.equal(containing.stdout.trim(), "", "and its commit really is referenced by no ref");
+
+  const created = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-1",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+    tabId: "w2M:t1",
+  });
+  const run = await advanceTo(store, created.id, RUN_STATES.COMPLETED);
+
+  const command = await archiveCommand({ runId: run.id }, {
+    store,
+    loadRegistry: archiveLoadRegistry({ acme: { label: "Acme", repository: "monorepo", path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+    herdr: scriptedHerdr().herdr,
+    inspectProcess: OWNER_GONE,
+  });
+
+  assert.equal(command.preview.refused, true, "this is the case that would have destroyed a commit");
+  // The rebase is caught first, which is the more actionable fact and the right remedy.
+  assert.match(command.preview.reason, /middle of a rebase/);
+  assert.ok(command.preview.nextActions.some((action) => /git -C .* rebase --abort/.test(action)));
+  assert.equal(command.preview.approvalDigest, null);
+
+  // Nothing removed, and the commit is still there.
+  await realFs.access(worktreePath);
+  assert.equal((await gitExec(worktreePath, ["cat-file", "-t", detachedSha])).stdout.trim(), "commit");
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("real git: a detached HEAD with no unfinished operation and no containing ref still refuses", async (t) => {
+  const store = await newStore(t);
+  const { basePath, worktreePath } = await realRun(t);
+
+  // The same danger without the rebase: an operator detached and committed. No `rebase-merge`, a
+  // clean tree -- only reachability can tell this apart from a harmless detached checkout.
+  await gitExec(worktreePath, ["checkout", "--detach"]);
+  await realFs.writeFile(join(worktreePath, "orphan.txt"), "only copy\n");
+  await gitExec(worktreePath, ["add", "orphan.txt"]);
+  await gitExec(worktreePath, ["commit", "-m", "orphaned work"]);
+  const orphan = (await gitExec(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
+
+  const created = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-1",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const run = await advanceTo(store, created.id, RUN_STATES.COMPLETED);
+  const deps = {
+    store,
+    loadRegistry: archiveLoadRegistry({ acme: { label: "Acme", repository: "monorepo", path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+    herdr: scriptedHerdr().herdr,
+    inspectProcess: OWNER_GONE,
+  };
+
+  const refused = await archiveCommand({ runId: run.id }, deps);
+  assert.equal(refused.preview.refused, true);
+  assert.match(refused.preview.reason, /detached HEAD/);
+  assert.match(refused.preview.reason, new RegExp(orphan));
+  await realFs.access(join(worktreePath, "orphan.txt"));
+
+  // Give those commits a ref -- the remedy the refusal names -- and the same run archives.
+  await gitExec(worktreePath, ["branch", "rescued", orphan]);
+  const allowed = await archiveCommand({ runId: run.id }, deps);
+  assert.equal(allowed.preview.refused, false, "a ref now contains it, so nothing would be destroyed");
+  assert.equal(allowed.preview.repositories[0].headReachable, true);
+  assert.ok(allowed.preview.losses.some((loss) => loss.kind === "detached-head"));
+
+  const report = await allowed.execute({ approvalDigest: allowed.preview.approvalDigest });
+  assert.equal(report.status, "archived");
+  assert.equal((await gitExec(basePath, ["rev-parse", "rescued"])).stdout.trim(), orphan, "the rescued commit survives");
 });
 
 // --- the base-checkout mapping ----------------------------------------------
@@ -841,6 +1135,31 @@ test("the five no-path repository entry shapes each refuse", async (t) => {
   }
 });
 
+test("a null entry beside a valid one refuses, rather than being silently skipped", async (t) => {
+  // The sixth shape, beyond the five above: `list()` filters null/undefined out of an array, so a
+  // `repositories: [valid, null]` record used to archive the valid one and never mention its
+  // malformed sibling -- the one entry shape that did NOT fail closed.
+  for (const malformed of [null, undefined]) {
+    const store = withAppendSpy(await newStore(t));
+    const created = await store.create({
+      projectAlias: "acme",
+      primaryTicket: "A-1",
+      repositories: [{ id: "primary", path: "/wt/acme", branch: "feature/recorded" }, malformed],
+      tabId: "w2M:t1",
+    });
+    const run = await advanceTo(store, created.id, RUN_STATES.COMPLETED);
+    const fixture = scriptedGit(acmeFixture());
+
+    const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+
+    assert.equal(command.preview.refused, true, `a ${String(malformed)} entry must refuse`);
+    assert.match(command.preview.reason, /no worktree path recorded/i);
+    assert.match(command.preview.reason, /at index 1/, "the refusal must say WHICH entry");
+    assertNothingHappened(fixture);
+    assert.deepEqual(store.appendEventCalls, []);
+  }
+});
+
 test("a relative worktree path refuses rather than resolving against the control plane's own directory", async (t) => {
   const store = await newStore(t);
   const run = await acmeRun(store, { path: ".worktrees/acme" });
@@ -898,6 +1217,12 @@ test("the digest changes when any material field moves", async (t) => {
     "the base branch": { project: { acme: { label: "Acme", repository: "monorepo", path: "/base/acme", base_branch: "main" } } },
     "the base checkout path": { project: { acme: { label: "Acme", repository: "monorepo", path: "/base/other", base_branch: "dev" } } },
     "the worktree's presence": { script: acmeFixture({ "/wt/acme": { missing: true } }), present: [] },
+    // Detaching a worktree onto a still-contained commit moves `branch`, `headSha` and
+    // `headReachable` together. Named for exactly that -- the three co-vary and no non-refused
+    // preview can move `headReachable` on its own; see the honesty test below.
+    "going from a branch to a contained detached HEAD": {
+      script: acmeFixture({ "/wt/acme": { branch: null, sha: "aaaa111" }, "/base/acme": { reachable: ["aaaa111"], unmerged: {} } }),
+    },
   };
   for (const [label, options] of Object.entries(variations)) {
     assert.notEqual(await digestFor(options), baseline, `${label} must change the digest`);
@@ -920,18 +1245,117 @@ test("the digest changes when any material field moves", async (t) => {
   assert.notEqual(await digestFor({ runId: failed.id }), baseline, "the run state must change the digest");
 });
 
-test("a display cap never leaks into the digest", async (t) => {
+test("the refusal caps what it names, says how much it is not naming, and caps nextActions with it", async (t) => {
+  const store = await newStore(t);
+  const repositories = Array.from({ length: 8 }, (_, i) => ({ id: `r${i}`, path: `/wt/r${i}`, branch: "feature/recorded" }));
+  const created = await store.create({ projectAlias: "sharyco", primaryTicket: "S-1", repositories, tabId: "w2M:t1" });
+  const run = await advanceTo(store, created.id, RUN_STATES.COMPLETED);
+
+  const script = {};
+  for (let i = 0; i < 8; i += 1) {
+    // 12 untracked paths each: over ARCHIVE_DISPLAY_LIMITS.reasonPaths, in 8 repositories, which is
+    // over ARCHIVE_DISPLAY_LIMITS.reasonRepositories. Both caps are exercised at once.
+    script[`/wt/r${i}`] = { branch: "feature/actual", sha: `sha${i}`, untrackedPaths: Array.from({ length: 12 }, (_, j) => `build/artifact-${j}.log`) };
+    script[`/base/r${i}`] = {};
+  }
+  const fixture = scriptedGit(script);
+  const project = {
+    sharyco: {
+      label: "Sharyco", repository: "group", path: "/base/meta",
+      repositories: Object.fromEntries(repositories.map((entry) => [entry.id, { path: `/base/${entry.id}`, base_branch: "dev" }])),
+    },
+  };
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, {
+    git: fixture.git,
+    project,
+    present: repositories.map((entry) => entry.path),
+  }));
+
+  assert.equal(command.preview.refused, true);
+  const { reasonPaths, reasonRepositories } = ARCHIVE_DISPLAY_LIMITS;
+
+  // Exactly `reasonRepositories` worktrees named, and the rest counted rather than dropped.
+  const namedWorktrees = [...command.preview.reason.matchAll(/\/wt\/r\d/g)].map((match) => match[0]);
+  assert.equal(new Set(namedWorktrees).size, reasonRepositories, `expected ${reasonRepositories} worktrees named`);
+  assert.match(command.preview.reason, new RegExp(`\\(\\+${8 - reasonRepositories} more repositories\\)`));
+
+  // Exactly `reasonPaths` paths per named worktree, and the remainder counted.
+  assert.match(command.preview.reason, new RegExp(`\\(\\+${12 - reasonPaths} more\\)`));
+  const namedPaths = [...command.preview.reason.matchAll(/build\/artifact-\d+\.log/g)];
+  assert.equal(namedPaths.length, reasonPaths * reasonRepositories);
+
+  // The regression this test exists for: nextActions used to grow with the FULL list while the
+  // reason stayed capped, so eight dirty repositories produced a bounded sentence beside an
+  // unbounded array. Both are now capped by the same slice.
+  const actionWorktrees = new Set([...command.preview.nextActions.join("\n").matchAll(/\/wt\/r\d/g)].map((match) => match[0]));
+  assert.equal(actionWorktrees.size, reasonRepositories, `nextActions must be capped too: ${JSON.stringify(command.preview.nextActions)}`);
+  assert.deepEqual(new Set(namedWorktrees), actionWorktrees, "the reason and the actions must name the SAME repositories");
+});
+
+// This test exists to keep an honest boundary honest, rather than to protect a behaviour. Fix
+// round 1 added `headReachable` to the digest; a mutation check then showed that REMOVING it again
+// fails no test. That is not a missing test — it is a true fact about the field, and the reason is
+// asserted here so a later reader does not "restore coverage" for a property that does not exist.
+test("headReachable cannot vary independently of branch and headSha, so the digest is not what guards it", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+
+  async function previewWith(script) {
+    const fixture = scriptedGit(script);
+    const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+    return command.preview;
+  }
+
+  // The only two values a NON-refused preview can carry, and the fact that ties them to `branch`.
+  const onBranch = await previewWith(acmeFixture());
+  const detachedReachable = await previewWith(acmeFixture({
+    "/wt/acme": { branch: null, sha: "aaaa111" },
+    "/base/acme": { reachable: ["aaaa111"], unmerged: {} },
+  }));
+
+  assert.equal(onBranch.repositories[0].headReachable, null);
+  assert.equal(detachedReachable.repositories[0].headReachable, true);
+
+  // `headReachable` is a FUNCTION of `branch`: null exactly when a branch is checked out, non-null
+  // exactly when one is not. So it cannot move without `branch` moving, and there is no pair of
+  // archivable worlds differing only in it. (Deliberately not asserting headSha differs too -- it
+  // need not, and the fixtures above share one; claiming otherwise would be the same
+  // assert-more-than-you-test defect this round exists to remove.)
+  assert.equal(onBranch.repositories[0].branch !== null, onBranch.repositories[0].headReachable === null);
+  assert.equal(detachedReachable.repositories[0].branch === null, detachedReachable.repositories[0].headReachable !== null);
+  assert.notEqual(onBranch.repositories[0].branch, detachedReachable.repositories[0].branch);
+  assert.notEqual(onBranch.approvalDigest, detachedReachable.approvalDigest);
+
+  const refusedUnreachable = await previewWith(acmeFixture({
+    "/wt/acme": { branch: null, sha: "0rphan1" },
+    "/base/acme": { reachable: [], unmerged: {} },
+  }));
+  assert.equal(refusedUnreachable.refused, true, "the third value refuses; it is never a digested world");
+  assert.equal(refusedUnreachable.approvalDigest, null);
+});
+
+test("no display cap can reach the digest, because a capped field never appears beside one", async (t) => {
   const store = await newStore(t);
   const run = await acmeRun(store);
   const fixture = scriptedGit(acmeFixture());
   const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
 
-  // The digest is over resolved facts, and the public projection is what is capped: the two must
-  // be produced from the same records, so no printed truncation can ever silently change what an
-  // operator approved. Proven by re-deriving the digest through a second, independent preview.
-  const second = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: scriptedGit(acmeFixture()).git, present: ["/wt/acme"] }));
-  assert.equal(second.preview.approvalDigest, command.preview.approvalDigest);
-  assert.ok(Array.isArray(command.preview.repositories[0].dirtyPaths));
+  // The two caps that ship are both inside a REFUSAL's reason text, and a refusal carries
+  // `approvalDigest: null` -- so there is no path on which a truncated value is bound. This asserts
+  // the structural property that makes that true, rather than asserting a cap that cannot fire:
+  // a repository that would have anything to truncate refuses instead of being projected.
+  assert.equal(command.preview.refused, false);
+  assert.equal(command.preview.repositories[0].dirty, false);
+  assert.equal(command.preview.repositories[0].dirtyCount, 0);
+  assert.equal(Object.hasOwn(command.preview.repositories[0], "dirtyPaths"), false, "an unreachable field must not be shipped");
+  assert.equal(Object.hasOwn(command.preview.repositories[0], "dirtyPathsTruncated"), false);
+  assert.deepEqual(Object.keys(ARCHIVE_DISPLAY_LIMITS).sort(), ["reasonPaths", "reasonRepositories"]);
+
+  const dirty = scriptedGit(acmeFixture({ "/wt/acme": { untrackedPaths: ["a", "b"] } }));
+  const refused = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: dirty.git, present: ["/wt/acme"] }));
+  assert.equal(refused.preview.approvalDigest, null, "the only shape with truncatable text has nothing to approve");
+  assert.deepEqual(refused.preview.repositories, []);
 });
 
 test("a stale digest is refused and names the fresh one, and nothing is removed", async (t) => {
@@ -1010,6 +1434,10 @@ test("a failure partway is reported as partial, with what was removed and what w
   const run = await groupRun(store);
   const fixture = scriptedGit(groupFixture({
     "/wt/panel": { removeFails: "fatal: '/wt/panel' is not a working tree", removeReason: "not-a-worktree" },
+    // Both repositories hold unmerged work, so the report has a loss for one that WAS removed and
+    // one that was not -- the distinction this test pins.
+    "/base/backend": { unmerged: { "dev..feature/actual": 2 } },
+    "/base/panel": { unmerged: { "dev..feature/actual": 4 } },
   }));
 
   const command = await archiveCommand({ runId: run.id }, archiveDeps(store, {
@@ -1025,6 +1453,13 @@ test("a failure partway is reported as partial, with what was removed and what w
   assert.deepEqual(report.kept.map((entry) => entry.worktreePath), ["/wt/panel"]);
   assert.equal(report.kept[0].reason, "not-a-worktree");
   assert.match(report.kept[0].detail, /is not a working tree/);
+  // A loss belonging to a worktree that is STILL ON DISK must not be reported as having happened.
+  const panelLoss = report.losses.find((loss) => loss.worktreePath === "/wt/panel");
+  const backendLoss = report.losses.find((loss) => loss.worktreePath === "/wt/backend");
+  assert.equal(panelLoss.removed, false);
+  assert.match(panelLoss.detail, /NOT removed and is still on disk/);
+  assert.equal(backendLoss.removed, true);
+  assert.doesNotMatch(backendLoss.detail, /still on disk/);
   // A partial archive must NOT mark the record archived: residue is still on disk, and the board
   // hiding the run would hide the residue with it.
   assert.equal((await store.read(run.id)).archivedAt, undefined);

@@ -230,6 +230,29 @@ async function readMergeState({ runner, fs, cwd }) {
   return OBJECT_ID.test(trimLine(String(contents).split("\n")[0] ?? "")) ? true : null;
 }
 
+// The unfinished operations git can leave a worktree sitting inside, in the order git's own
+// `wt_status_get_state` resolves them, each with the remedy that actually applies to it.
+//
+// Item 2.4 recorded "MERGE_HEAD only" as a deferred gap. It stopped being deferrable when it turned
+// out to be half of a path from "clean archive" to "destroyed commit": measured on this machine,
+// git 2.43, an interrupted `git rebase -i` leaves `rebase-merge/` present, MERGE_HEAD ABSENT, HEAD
+// DETACHED and the tree CLEAN -- so a MERGE_HEAD-only probe and a dirty check both see nothing
+// while the worktree holds rebased commits no ref references.
+//
+// The probe is EXISTENCE, deliberately weaker than readMergeState's content parsing: a marker whose
+// bytes are unreadable still means an operation is in progress, and every caller of this fails
+// closed. `rebase-apply/applying` is git's own discriminator between `git am` and a rebase using the
+// apply backend; the remedies differ, so the two are not collapsed.
+const PENDING_OPERATIONS = Object.freeze([
+  { entry: "rebase-merge", operation: "rebase", remedy: "git rebase --abort" },
+  { entry: "rebase-apply/applying", operation: "am", remedy: "git am --abort" },
+  { entry: "rebase-apply", operation: "rebase", remedy: "git rebase --abort" },
+  { entry: "MERGE_HEAD", operation: "merge", remedy: "git merge --abort" },
+  { entry: "CHERRY_PICK_HEAD", operation: "cherry-pick", remedy: "git cherry-pick --abort" },
+  { entry: "REVERT_HEAD", operation: "revert", remedy: "git revert --abort" },
+  { entry: "BISECT_LOG", operation: "bisect", remedy: "git bisect reset" },
+]);
+
 // `git log -1 --format=%cI` emits a strict ISO-8601 committer date. Validated rather than trusted
 // for the same reason OBJECT_ID is: a value that is not a timestamp is not an answer, and the one
 // caller compares it against verification evidence to decide whether that evidence is stale.
@@ -615,6 +638,83 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
           error: message,
         };
       }
+    },
+
+    // Does any ref in this repository contain `sha`? The question behind the design's unconditional
+    // acceptance criterion, "archiving a run never destroys a commit".
+    //
+    // A worktree on a BRANCH needs no such check -- the branch ref is the answer. A worktree on a
+    // DETACHED HEAD has exactly two things referencing its commits, its own HEAD and its own
+    // per-worktree reflog, and `git worktree remove` deletes both. If some ref also contains the
+    // commit, nothing is lost; if none does, removing the worktree makes it unreachable from that
+    // moment and any later `git gc`/`git worktree prune` collects it.
+    //
+    // Measured on git 2.43, run in the BASE checkout (linked worktrees share its ref store):
+    //   for-each-ref --count=1 --contains <commit on a branch>   exit 0, "<sha> commit\trefs/heads/feat"
+    //   for-each-ref --count=1 --contains <orphaned commit>      exit 0, EMPTY  <- the real answer
+    //   for-each-ref --count=1 --contains 000…000                exit 129, "error: no such commit"
+    //   for-each-ref --count=1 --contains --format=%00           exit 129 (git consumes the flag as
+    //                                                            the VALUE, so it cannot inject one)
+    //
+    // Returns `true` ONLY on positive proof of reachability. Every other outcome -- a nonzero exit,
+    // a spawn failure, an unusable sha, a runner that answers nothing -- is `false`, because the
+    // caller's response to `false` is to refuse. "I could not tell" and "nothing references it" are
+    // the same action here, and the safe one. It does not consult the reflog, so a commit reachable
+    // only from there also reads as unreachable: fail-closed in the direction that refuses.
+    async isCommitReachable({ cwd, sha, timeoutMs } = {}) {
+      // Stricter than isUsableRev on purpose: this is always a resolved HEAD sha from resolveHead,
+      // never a user-supplied name, so anything that is not an object id is a caller bug and must
+      // not be turned into a question git might answer affirmatively about something else.
+      if (typeof sha !== "string" || !OBJECT_ID.test(sha)) return false;
+
+      try {
+        const result = await runner.run("git", ["for-each-ref", "--count=1", "--contains", sha], { cwd, timeoutMs, allowFailure: true });
+        if (!result || result.code !== 0) return false;
+        return trimText(result.stdout).length > 0;
+      } catch {
+        return false;
+      }
+    },
+
+    // Is this worktree sitting inside an unfinished git operation of ANY kind? A superset of
+    // checkoutState's `merging`, which probes MERGE_HEAD alone and therefore cannot see a rebase, a
+    // cherry-pick, a revert, an `am` or a bisect -- see PENDING_OPERATIONS for the measurement that
+    // made this necessary rather than merely tidier.
+    //
+    // Three outcomes, never a tri-state boolean: `{status:"none"}` (proven idle),
+    // `{status:"in-progress", operation, path, remedy}`, and `{status:"unknown", reason}`. Callers
+    // must treat `unknown` exactly like `in-progress`; separating them exists so the operator is
+    // told which it was, not so one can be waved through.
+    //
+    // The admin directory comes from git rather than being assembled here: a linked worktree's
+    // `.git` is a FILE, and its per-worktree state lives under `.git/worktrees/<name>/`, which is
+    // exactly what `rev-parse --absolute-git-dir` returns from inside it (measured).
+    async pendingOperation({ cwd, timeoutMs } = {}) {
+      let gitDir;
+      try {
+        const result = await runner.run("git", ["rev-parse", "--absolute-git-dir"], { cwd, timeoutMs, allowFailure: true });
+        if (!result || result.code !== 0) return { status: "unknown", reason: `the git admin directory could not be resolved${result?.stderr ? `: ${trimText(result.stderr)}` : ""}` };
+        gitDir = trimLine(result.stdout);
+      } catch (error) {
+        return { status: "unknown", reason: reasonFrom(error) };
+      }
+      if (!gitDir) return { status: "unknown", reason: "git reported no admin directory" };
+
+      for (const { entry, operation, remedy } of PENDING_OPERATIONS) {
+        const path = resolve(gitDir, entry);
+        try {
+          await fs.stat(path);
+          return { status: "in-progress", operation, path, remedy };
+        } catch (error) {
+          // ENOENT/ENOTDIR is the ONLY answer that proves this marker is absent. Anything else --
+          // EACCES on the admin directory of a wedged run, most plausibly -- is unknown, and
+          // unknown must never read as "no operation in progress".
+          if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") {
+            return { status: "unknown", reason: `${entry} could not be checked: ${reasonFrom(error)}` };
+          }
+        }
+      }
+      return { status: "none" };
     },
 
     // How many commits are on `branch` that `base` does not have -- what archiving this run would

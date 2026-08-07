@@ -2585,11 +2585,15 @@ const ARCHIVE_REMOVE_TIMEOUT_MS = 5 * 60 * 1000;
 // size discipline in the formatter's tests must measure the caps that actually ship rather than
 // numbers copied out of this file, or raising one here silently changes the shipped payload while
 // every test keeps passing.
-const ARCHIVE_DIRTY_DISPLAY_LIMIT = 10;
+// There is deliberately no dirty-PATH-array cap here, because there is no dirty path array to cap:
+// a repository with `dirty: true` always refuses (irrecoverableRefusal), and a refusal carries
+// `repositories: []`. An earlier round shipped a `dirtyPaths` field and an
+// ARCHIVE_DIRTY_DISPLAY_LIMIT that were unreachable on every path, plus a test that claimed to
+// exercise them and did not. The caps that actually ship are these two, both inside the refusal
+// reason, and both are asserted against ARCHIVE_DISPLAY_LIMITS by test rather than against literals.
 const ARCHIVE_REASON_PATH_LIMIT = 5;
 const ARCHIVE_REASON_REPOSITORY_LIMIT = 5;
 export const ARCHIVE_DISPLAY_LIMITS = Object.freeze({
-  dirtyPaths: ARCHIVE_DIRTY_DISPLAY_LIMIT,
   reasonPaths: ARCHIVE_REASON_PATH_LIMIT,
   reasonRepositories: ARCHIVE_REASON_REPOSITORY_LIMIT,
 });
@@ -2643,9 +2647,13 @@ function archiveRefusal(runId, run, reason, diagnostics = [], evidence = {}) {
   };
 }
 
+// `isCommitReachable` and `pendingOperation` are as required as the rest: each closes half of a
+// measured path from "clean archive" to "destroyed commit" (see inspectRepositoryForArchive). An
+// adapter missing either cannot answer the questions this command must answer before removing
+// anything, so it is a preflight refusal rather than a silently skipped check.
 function archiveGitAdapter(deps) {
   const git = deps.git;
-  for (const method of ["checkoutState", "resolveHead", "countCommitsNotIn", "removeWorktree"]) {
+  for (const method of ["checkoutState", "resolveHead", "pendingOperation", "isCommitReachable", "countCommitsNotIn", "removeWorktree"]) {
     if (typeof git?.[method] !== "function") {
       archiveError("PREFLIGHT", `workflow archive requires a git adapter with ${method}()`, ARCHIVE_EXIT_CODES.refused);
     }
@@ -2718,19 +2726,34 @@ function lockRefusal(runId, run, lock) {
 // answer is the proof, and no answer is not proof of absence. The one shape that needs no answer at
 // all is a run that never recorded a pane (real run 273432a7, `failed`, died before agent
 // creation) -- there is no agent to prove gone, so Herdr is never even asked.
+// EVERY pane the run has ever named, not just the correlated one. `correlationPaneId` answers "which
+// pane is authoritative", which is the right question for a report and the wrong one for a
+// destructive gate: it is `transportIdentity.paneId ?? run.paneId`, so whenever a transport pane
+// exists the top-level pane is never asked about at all. A resumed run whose ORIGINAL pane somehow
+// still hosts a live agent would have been archived without anyone looking. The index is already
+// built, so asking about both costs nothing.
+function archiveAgentPaneIds(run) {
+  return [...new Set([run?.transportIdentity?.paneId, run?.paneId].filter((pane) => typeof pane === "string" && pane))];
+}
+
 async function inspectArchiveAgent(run, herdr) {
-  const pane = correlationPaneId(run);
-  if (!pane) return { agent: { paneId: null, resolved: false, reason: "the run records no pane id, so it has no agent to resolve" } };
+  const panes = archiveAgentPaneIds(run);
+  // The reported pane stays the correlated one, so this field keeps meaning the same thing it means
+  // everywhere else in the control plane.
+  const primary = correlationPaneId(run);
+  if (panes.length === 0) return { agent: { paneId: null, resolved: false, reason: "the run records no pane id, so it has no agent to resolve" } };
 
   const { agentsByPane, herdrAvailable } = await agentsByPaneFromHerdr(herdr);
   if (!herdrAvailable) {
-    return { error: `Herdr could not be asked whether pane ${pane} still has a live agent; refusing rather than archiving a run that may still be being worked on.` };
+    return { error: `Herdr could not be asked whether ${panes.map((pane) => `pane ${pane}`).join(" or ")} still has a live agent; refusing rather than archiving a run that may still be being worked on.` };
   }
-  const agent = agentsByPane.get(pane);
-  if (agent) {
-    return { error: `Run's agent is still live in Herdr on pane ${pane} (agent_status: ${agentStatus(agent) ?? "not reported"}); refusing to archive a run someone is still working on.` };
+  for (const pane of panes) {
+    const agent = agentsByPane.get(pane);
+    if (agent) {
+      return { error: `Run's agent is still live in Herdr on pane ${pane} (agent_status: ${agentStatus(agent) ?? "not reported"}); refusing to archive a run someone is still working on.` };
+    }
   }
-  return { agent: { paneId: pane, resolved: false, reason: `Herdr reports no agent on pane ${pane}` } };
+  return { agent: { paneId: primary, checkedPaneIds: panes, resolved: false, reason: `Herdr reports no agent on ${panes.map((pane) => `pane ${pane}`).join(" or ")}` } };
 }
 
 // --- the losses --------------------------------------------------------------
@@ -2818,10 +2841,12 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
   if (!presence.present) {
     // The most archivable case, and the one whose loss cannot be measured: there is no checkout to
     // read a branch or a HEAD out of, so the unmerged count is `null` (unknown) rather than 0.
+    // `headReachable: null` means "not asked", which is what it must be when there is no HEAD.
     return {
       record: {
         repositoryId, worktreePath, recordedBranch, present: false,
-        branch: null, headSha: null, dirty: false, dirtyPaths: [], trackedPaths: [], untrackedPaths: [],
+        branch: null, headSha: null, headReachable: null,
+        dirty: false, dirtyPaths: [], trackedPaths: [], untrackedPaths: [],
         basePath, baseBranch, unmergedCommits: null,
         unmergedReason: `the worktree directory at ${worktreePath} no longer exists, so its branch cannot be read`,
       },
@@ -2840,16 +2865,25 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
   }
 
   // Checked BEFORE `dirty`, and independently of it, for the reason git.js's checkoutState records:
-  // a worktree sitting inside a stopped merge holds resolution work that deleting the directory
-  // destroys, and naming only the uncommitted paths points at `git add`/`git stash`, which is the
-  // wrong move. `merging` is tri-state and only an explicit `false` may pass -- `null` means the
-  // MERGE_HEAD probe could not be answered, and an unknown merge state fails closed like every
-  // other unknown here.
-  if (state.merging === true) {
-    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is in the middle of a merge (MERGE_HEAD is present); finish it or run \`git -C ${worktreePath} merge --abort\` before archiving.`, actions: [`git -C ${worktreePath} status`] };
+  // a worktree stopped inside an unfinished operation holds resolution work that deleting the
+  // directory destroys, and naming only the uncommitted paths points at `git add`/`git stash`,
+  // which is the wrong move.
+  //
+  // `pendingOperation` rather than `checkoutState`'s `merging`, and that is the fix for half of a
+  // measured commit-destroying path: `merging` comes from a MERGE_HEAD-only probe, so an
+  // interrupted `git rebase` -- which leaves `rebase-merge/` and no MERGE_HEAD -- reported
+  // `merging: false` and sailed straight through this gate. Measured on this machine, git 2.43: an
+  // interrupted `rebase -i` stops with a CLEAN tree on a DETACHED HEAD, so neither this gate nor
+  // the dirty one below saw it. `merging` is left untouched for `mergeCommand`, whose question
+  // really is only about merges.
+  const pending = await git.pendingOperation({ cwd: worktreePath, timeoutMs });
+  if (pending.status === "in-progress") {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is in the middle of a ${pending.operation}; finish it or run \`git -C ${worktreePath} ${pending.remedy.replace(/^git /, "")}\` before archiving.`, actions: [`git -C ${worktreePath} status`, `git -C ${worktreePath} ${pending.remedy.replace(/^git /, "")}`] };
   }
-  if (state.merging !== false) {
-    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be checked for an in-progress merge (MERGE_HEAD is unreadable); an unknown merge state is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
+  if (pending.status !== "none") {
+    // Callers must treat `unknown` exactly like `in-progress`; the two are separated so the
+    // operator is told which it was, never so one can be waved through.
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be checked for an unfinished git operation (${pending.reason ?? "reason unknown"}); an unknown operation state is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
   }
   if (state.dirty !== true && state.dirty !== false) {
     // Item 0.14's direction: an unreadable status is never clean. `!== true && !== false` rather
@@ -2866,6 +2900,7 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
     record: {
       repositoryId, worktreePath, recordedBranch, present: true,
       branch, headSha,
+      headReachable: await headReachabilityFor({ git, basePath, branch, headSha, timeoutMs }),
       dirty: state.dirty === true,
       dirtyPaths: dirtyPaths.all,
       trackedPaths: dirtyPaths.tracked,
@@ -2875,6 +2910,28 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
       ...(unmerged.reason ? { unmergedReason: unmerged.reason } : {}),
     },
   };
+}
+
+// The other half of the measured commit-destroying path, and the direct implementation of the
+// design's unconditional acceptance criterion "archiving a run never destroys a commit".
+//
+//   on a branch  -> `null`, "not asked". The branch ref IS the reference that survives removal, so
+//                   there is nothing to prove and nothing to spend a subprocess on.
+//   detached     -> asked. `git worktree remove` deletes the worktree's HEAD and its per-worktree
+//                   reflog, which on a detached HEAD are the only two things referencing its
+//                   commits. `true` (some ref contains it) is a warning; `false` is a refusal.
+//
+// `false` is also what an unresolvable HEAD sha and a missing/failing adapter produce, because the
+// caller's response to `false` is to refuse: "no ref references this" and "I could not find out"
+// are the same action, and it is the safe one.
+async function headReachabilityFor({ git, basePath, branch, headSha, timeoutMs }) {
+  if (branch) return null;
+  if (!headSha) return false;
+  try {
+    return await git.isCommitReachable({ cwd: basePath, sha: headSha, timeoutMs }) === true;
+  } catch {
+    return false;
+  }
 }
 
 // How much work archiving this repository would leave behind on a branch nobody is looking at any
@@ -2959,45 +3016,78 @@ function archiveLosses(records) {
   return losses;
 }
 
-// The whole run refuses, not just the dirty repository: a group project is archived whole or not at
-// all, because a half-archived group leaves residue that is harder to reason about than the
-// original. This is enforced HERE, in the preview, before the first removal -- a mid-loop discovery
-// leaves a partial archive that re-running cannot fix.
-function dirtyRefusal(runId, run, records, evidence) {
+// Everything that exists only inside a worktree, collected across ALL repositories and refused
+// once. Two classes, and the run refuses for either:
+//
+//   DIRTY            -- uncommitted and untracked work has no other copy.
+//   UNREACHABLE HEAD -- a detached HEAD whose commits no ref contains; removing the worktree
+//                       deletes the only two things referencing them.
+//
+// The whole run refuses, not just the offending repository: a group project is archived whole or
+// not at all, because a half-archived group leaves residue harder to reason about than the
+// original. Enforced HERE, in the preview, before the first removal -- a mid-loop discovery leaves
+// a partial archive that re-running cannot fix.
+//
+// Both classes are reported together, and both list every affected repository (capped for
+// printing), because an operator shown only the first of three problems fixes one and comes
+// straight back. That is mergeCommand's own conflict-list lesson.
+function describeDirtyRecord(record) {
+  const parts = [];
+  if (record.trackedPaths.length > 0) {
+    parts.push(`${record.trackedPaths.length} uncommitted change(s): ${joinPaths(record.trackedPaths, ARCHIVE_REASON_PATH_LIMIT)}`);
+  }
+  if (record.untrackedPaths.length > 0) {
+    parts.push(`${record.untrackedPaths.length} untracked file(s): ${joinPaths(record.untrackedPaths, ARCHIVE_REASON_PATH_LIMIT)}`);
+  }
+  // `dirty: true` with nothing enumerable -- a status entry with no path, an adapter that reports
+  // the flag without the list. Still a refusal (the flag is the fail-closed signal), but it must
+  // not render as "<path> has ", which reads like a truncation bug rather than a reason.
+  if (parts.length === 0) parts.push("changes git reported but did not enumerate");
+  return `${record.worktreePath} has ${parts.join(" and ")}`;
+}
+
+// One capped clause per class: the same ARCHIVE_REASON_REPOSITORY_LIMIT bounds the list and the
+// `(+N more)` suffix says how much is not being named. `reason` and `nextActions` are capped by the
+// SAME slice (see irrecoverableRefusal) -- an earlier round capped only the reason, so eight dirty
+// repositories produced a bounded sentence beside a nextActions array that grew without limit.
+function describeClause(records, describe, noun) {
+  const shown = records.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT);
+  const rest = records.length - shown.length;
+  const suffix = rest > 0 ? ` (+${rest} more ${noun})` : "";
+  return `${shown.map(describe).join("; ")}${suffix}`;
+}
+
+function irrecoverableRefusal(runId, run, records, evidence) {
   const dirty = records.filter((record) => record.dirty);
-  if (dirty.length === 0) return null;
+  const unreachable = records.filter((record) => record.headReachable === false);
+  if (dirty.length === 0 && unreachable.length === 0) return null;
 
-  const shown = dirty.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT);
-  const rest = dirty.length - shown.length;
-  const described = shown.map((record) => {
-    const parts = [];
-    if (record.trackedPaths.length > 0) {
-      parts.push(`${record.trackedPaths.length} uncommitted change(s): ${joinPaths(record.trackedPaths, ARCHIVE_REASON_PATH_LIMIT)}`);
-    }
-    if (record.untrackedPaths.length > 0) {
-      parts.push(`${record.untrackedPaths.length} untracked file(s): ${joinPaths(record.untrackedPaths, ARCHIVE_REASON_PATH_LIMIT)}`);
-    }
-    // `dirty: true` with nothing enumerable -- a status entry with no path, an adapter that
-    // reports the flag without the list. Still a refusal (the flag is the fail-closed signal), but
-    // it must not render as "<path> has ", which reads like a truncation bug rather than a reason.
-    if (parts.length === 0) parts.push("changes git reported but did not enumerate");
-    return `${record.worktreePath} has ${parts.join(" and ")}`;
-  });
+  const clauses = [];
+  if (dirty.length > 0) {
+    clauses.push(`${describeClause(dirty, describeDirtyRecord, "repositories")}. Uncommitted and untracked work exists nowhere else, so this refuses for the whole run and never forces.`);
+  }
+  if (unreachable.length > 0) {
+    clauses.push(`${describeClause(
+      unreachable,
+      (record) => `${record.worktreePath} is on a detached HEAD at ${record.headSha ?? "an unresolvable commit"} that no ref contains`,
+      "repositories",
+    )}. Removing the worktree would delete the only references to those commits, and archiving a run must never destroy one.`);
+  }
 
-  const actions = dirty.flatMap((record) => [
-    `git -C ${record.worktreePath} status`,
-    // Only ever `-n` (dry run). This command refuses to destroy untracked work; it must not hand
-    // an operator a one-liner that destroys it either.
-    ...(record.untrackedPaths.length > 0 && record.trackedPaths.length === 0 ? [`git -C ${record.worktreePath} clean -nd`] : []),
-  ]);
+  // Capped by the SAME slice the reason uses, so the two cannot diverge in length.
+  const actions = [
+    ...dirty.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT).flatMap((record) => [
+      `git -C ${record.worktreePath} status`,
+      // Only ever `-n` (dry run). This command refuses to destroy untracked work; it must not hand
+      // an operator a one-liner that destroys it either.
+      ...(record.untrackedPaths.length > 0 && record.trackedPaths.length === 0 ? [`git -C ${record.worktreePath} clean -nd`] : []),
+    ]),
+    // The remedy for an unreachable detached HEAD is to give those commits a ref, which is exactly
+    // what makes them survive the removal this command is being asked to perform.
+    ...unreachable.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT).map((record) => `git -C ${record.worktreePath} switch -c <branch-name>`),
+  ];
 
-  return archiveRefusal(
-    runId,
-    run,
-    `Run ${runId} cannot be archived: ${described.join("; ")}${rest > 0 ? ` (+${rest} more repositor${rest === 1 ? "y" : "ies"})` : ""}. Uncommitted and untracked work exists nowhere else, so this refuses for the whole run and never forces.`,
-    [...new Set(actions)],
-    evidence,
-  );
+  return archiveRefusal(runId, run, `Run ${runId} cannot be archived: ${clauses.join(" ")}`, [...new Set(actions)], evidence);
 }
 
 // The digest binds run state, tab id, and per repository the worktree path, the branch and HEAD it
@@ -3022,6 +3112,18 @@ function archiveDigestPayload({ runId, run, records }) {
       present: record.present,
       branch: record.branch,
       headSha: record.headSha,
+      // Bound so the approval record names the fact that was checked. Stated honestly, because a
+      // digest field that cannot independently change the hash is decoration and this one nearly
+      // is: on any NON-refused preview `headReachable` is `null` (on a branch, or absent) or `true`
+      // (detached and contained by some ref) -- `false` refuses -- and it cannot move between those
+      // two without `branch` and `headSha` moving with it. So it never varies independently, and
+      // dropping it from this payload fails no test.
+      //
+      // What actually protects against reachability being lost between preview and approval is
+      // executeArchive's RECOMPUTE: the whole preview is rebuilt before the digest is compared, so
+      // a world that became irrecoverable refuses outright rather than merely failing to match.
+      // See the "reachability lost between preview and execute" test, which is that guard's own.
+      headReachable: record.headReachable,
       dirty: record.dirty,
       dirtyCount: record.dirtyPaths.length,
       trackedCount: record.trackedPaths.length,
@@ -3033,8 +3135,12 @@ function archiveDigestPayload({ runId, run, records }) {
   };
 }
 
+// What is PRINTED. Nothing here is capped, because nothing here can be long: this projection only
+// ever runs on the non-refused branch, where every record is by construction clean (`dirty: true`
+// refuses) -- so the dirty counts below are always 0 and there is no path list to truncate. They
+// are kept rather than dropped because "checked, and found clean" is the evidence an operator is
+// approving, and because they mirror the digest's own fields exactly.
 function publicArchiveRepository(record) {
-  const dirtyPaths = record.dirtyPaths.slice(0, ARCHIVE_DIRTY_DISPLAY_LIMIT);
   return {
     repositoryId: record.repositoryId,
     worktreePath: record.worktreePath,
@@ -3045,12 +3151,13 @@ function publicArchiveRepository(record) {
     // branch at all also disagrees with the worktree, and that is worth naming rather than hiding.
     branchMismatch: record.recordedBranch !== record.branch,
     headSha: record.headSha,
+    // `null` = on a branch, so not asked; `true` = detached but some ref contains it. `false` never
+    // reaches here -- it refuses.
+    headReachable: record.headReachable,
     dirty: record.dirty,
-    dirtyPaths,
     dirtyCount: record.dirtyPaths.length,
     trackedCount: record.trackedPaths.length,
     untrackedCount: record.untrackedPaths.length,
-    dirtyPathsTruncated: dirtyPaths.length < record.dirtyPaths.length,
     basePath: record.basePath,
     baseBranch: record.baseBranch,
     unmergedCommits: record.unmergedCommits,
@@ -3078,7 +3185,12 @@ async function buildArchivePreview(runId, run, options, deps) {
   // about a dirty worktree still shows that the lock and the agent were checked and cleared.
   const evidence = { lock, agent };
 
-  const repositories = list(run.repositories);
+  // NOT `list()`, which filters out `null`/`undefined` entries. That is right for the read-only
+  // commands it was written for, and wrong here: `repositories: [valid, null]` would archive the
+  // valid one and never mention the malformed sibling -- a sixth entry shape silently passing where
+  // the five item 2.3's C1 finding enumerated all refuse. A malformed entry has to reach
+  // inspectRepositoryForArchive, where it refuses like the rest.
+  const repositories = Array.isArray(run.repositories) ? run.repositories : [];
   if (repositories.length === 0) {
     return { preview: archiveRefusal(runId, run, `Run ${runId} has no repositories[] recorded; there is nothing to archive.`, [reconcileCommandFor(runId)], evidence), records: [] };
   }
@@ -3101,8 +3213,8 @@ async function buildArchivePreview(runId, run, options, deps) {
     records.push(outcome.record);
   }
 
-  const dirty = dirtyRefusal(runId, run, records, evidence);
-  if (dirty) return { preview: dirty, records: [] };
+  const irrecoverable = irrecoverableRefusal(runId, run, records, evidence);
+  if (irrecoverable) return { preview: irrecoverable, records: [] };
 
   const preview = {
     command: "archive",
@@ -3234,6 +3346,21 @@ async function closeArchiveTab(herdr, tabId) {
   return { tabId, closed: false, alreadyGone: reason === "not-found", reason };
 }
 
+// The preview's losses describe a world in which every worktree WAS removed. On a `partial` or
+// `failed` report that world did not happen, and telling an operator "nothing will point at this
+// work any more" about a worktree still sitting on disk is exactly the kind of dishonesty the rest
+// of this command's partial-completion handling is careful to avoid. Keyed on `worktreePath`, which
+// is guaranteed present and unique, rather than on `repositoryId`, which may be null on more than
+// one entry.
+function archiveReportLosses(losses, removed) {
+  const removedPaths = new Set(removed.map((entry) => entry.worktreePath));
+  return losses.map((loss) => (
+    removedPaths.has(loss.worktreePath)
+      ? { ...loss, removed: true }
+      : { ...loss, removed: false, detail: `${loss.detail} — but this worktree was NOT removed and is still on disk at ${loss.worktreePath}, so nothing has been lost yet.` }
+  ));
+}
+
 // What the run's own event log keeps once the worktree is gone -- the design's "the run's evidence
 // outlives its worktree", made concrete. After the removal this is the only surviving record of
 // which branch each worktree was on, at which commit, and how much of it was never merged.
@@ -3324,7 +3451,7 @@ async function executeArchive(options, deps, supplied) {
     removed,
     kept,
     tab,
-    losses: fresh.preview.losses,
+    losses: archiveReportLosses(fresh.preview.losses, removed),
     exitCode,
     ...(recordError ? { recordError } : {}),
     ...(evidenceError ? { evidenceError } : {}),

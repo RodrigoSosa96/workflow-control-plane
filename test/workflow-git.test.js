@@ -1541,3 +1541,184 @@ test("removeWorktree against real git is not fooled by a directory named like gi
   assert.equal(result.reason, "not-a-worktree", "real git, real spoofing path name, right verdict");
   assert.equal(existsSync(spoofPath), true);
 });
+
+// --- isCommitReachable and pendingOperation (item 2.5, fix round 1) ----------
+//
+// Both exist because of a single measured path from "clean archive" to "destroyed commit": an
+// interrupted rebase leaves a worktree on a DETACHED HEAD, with a CLEAN tree, holding commits that
+// no ref references -- and MERGE_HEAD is absent, so `checkoutState`'s `merging` reports `false` and
+// sees nothing. Removing that worktree deletes the only two things referencing those commits (its
+// HEAD and its per-worktree reflog).
+
+test("isCommitReachable proves reachability, and answers false for anything it cannot prove", async () => {
+  const calls = [];
+  const runner = {
+    async run(command, args, options) {
+      calls.push({ command, args, options });
+      return { code: 0, stdout: "6633671de08cf4144080932a6503dba33512d13a commit\trefs/heads/feat\n", stderr: "" };
+    },
+  };
+  const git = createGitAdapter({ runner });
+
+  assert.equal(await git.isCommitReachable({ cwd: "/base", sha: "a".repeat(40), timeoutMs: 5 }), true);
+  assert.deepEqual(calls[0].args, ["for-each-ref", "--count=1", "--contains", "a".repeat(40)]);
+  assert.equal(calls[0].options.allowFailure, true);
+  assert.equal(calls[0].options.timeoutMs, 5);
+
+  // Empty output is git's own answer for "no ref contains this commit" -- exit 0, measured.
+  const empty = createGitAdapter({ runner: { async run() { return { code: 0, stdout: "\n", stderr: "" }; } } });
+  assert.equal(await empty.isCommitReachable({ cwd: "/base", sha: "a".repeat(40) }), false);
+});
+
+test("isCommitReachable fails closed: unknown is never reported as reachable", async () => {
+  const cases = [
+    ["nonzero exit", { async run() { return { code: 129, stdout: "", stderr: "error: no such commit" }; } }],
+    ["a throwing runner", { async run() { throw new Error("spawn git ENOENT"); } }],
+    ["a runner that resolves undefined", { async run() { return undefined; } }],
+    ["a runner that resolves a non-object", { async run() { return "nope"; } }],
+    ["a runner that answers no stdout", { async run() { return { code: 0 }; } }],
+  ];
+  for (const [label, runner] of cases) {
+    assert.equal(await createGitAdapter({ runner }).isCommitReachable({ cwd: "/base", sha: "a".repeat(40) }), false, label);
+  }
+  // And with no arguments at all, like every other primitive on this irreversible path.
+  assert.equal(await createGitAdapter({ runner: {} }).isCommitReachable(), false);
+});
+
+test("isCommitReachable refuses a sha it cannot vouch for, before anything spawns", async () => {
+  let spawned = 0;
+  const git = createGitAdapter({ runner: { async run() { spawned += 1; return { code: 0, stdout: "x\n" }; } } });
+
+  // Not an object id, option-shaped, empty, absent, or not a string: none of these may spawn, and
+  // none may answer `true`. Measured: `for-each-ref --contains --format=%00` makes git consume the
+  // flag as the VALUE (exit 129), so this is defence in depth rather than the only guard -- but a
+  // caller must never learn "reachable" from a question that was never asked.
+  for (const sha of ["--format=%00", "-x", "", null, undefined, 42, {}, [], "HEAD", "not-a-sha"]) {
+    assert.equal(await git.isCommitReachable({ cwd: "/base", sha }), false, JSON.stringify(sha));
+  }
+  assert.equal(spawned, 0, "an unusable sha must be refused before anything spawns");
+});
+
+test("isCommitReachable against real git: a branch commit is reachable and an orphaned one is not", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  const worktreePath = join(root, "wt");
+  await gitExec(repoPath, ["worktree", "add", "-b", "feat", worktreePath, "main"]);
+  await writeFile(join(worktreePath, "a.txt"), "one\n");
+  await gitExec(worktreePath, ["add", "a.txt"]);
+  await gitExec(worktreePath, ["commit", "-m", "on the branch"]);
+  const onBranch = (await gitExec(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
+
+  await gitExec(worktreePath, ["checkout", "--detach"]);
+  await writeFile(join(worktreePath, "a.txt"), "two\n");
+  await gitExec(worktreePath, ["commit", "-am", "orphaned"]);
+  const orphan = (await gitExec(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
+
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  assert.equal(await git.isCommitReachable({ cwd: repoPath, sha: onBranch }), true);
+  assert.equal(await git.isCommitReachable({ cwd: repoPath, sha: orphan }), false, "no ref contains it");
+  // A commit that does not exist at all exits 129, which must read as unreachable, never reachable.
+  assert.equal(await git.isCommitReachable({ cwd: repoPath, sha: "0".repeat(40) }), false);
+});
+
+test("pendingOperation names each unfinished operation, and proves the absence of one", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  assert.deepEqual(await git.pendingOperation({ cwd: repoPath }), { status: "none" });
+
+  // A real interrupted rebase, in a real linked worktree. This is the measured case: MERGE_HEAD is
+  // absent, so the MERGE_HEAD-only probe reports "not merging" while a rebase is plainly running.
+  const worktreePath = join(root, "wt");
+  await gitExec(repoPath, ["worktree", "add", "-b", "feat", worktreePath, "main"]);
+  await writeFile(join(repoPath, "base.txt"), "base\n");
+  await gitExec(repoPath, ["add", "base.txt"]);
+  await gitExec(repoPath, ["commit", "-m", "base advances"]);
+  await writeFile(join(worktreePath, "a.txt"), "w1\n");
+  await gitExec(worktreePath, ["add", "a.txt"]);
+  await gitExec(worktreePath, ["commit", "-m", "w1"]);
+  await writeFile(join(worktreePath, "b.txt"), "w2\n");
+  await gitExec(worktreePath, ["add", "b.txt"]);
+  await gitExec(worktreePath, ["commit", "-m", "w2"]);
+  await execFileAsync("git", ["rebase", "-i", "main"], {
+    cwd: worktreePath,
+    env: { ...process.env, GIT_SEQUENCE_EDITOR: 'sed -i "2i break"' },
+  });
+
+  const pending = await git.pendingOperation({ cwd: worktreePath });
+  assert.equal(pending.status, "in-progress");
+  assert.equal(pending.operation, "rebase");
+  assert.match(pending.remedy, /git rebase --abort/);
+  assert.match(pending.path, /rebase-merge$/);
+
+  // The gap this closes, stated as an assertion rather than as a comment: the MERGE_HEAD probe
+  // `checkoutState` uses sees nothing here, and the tree is clean.
+  const state = await git.checkoutState({ cwd: worktreePath });
+  assert.equal(state.merging, false, "MERGE_HEAD really is absent during a rebase");
+  assert.equal(state.dirty, false, "and this rebase stopped with a clean tree");
+  assert.equal(state.branch, null, "on a detached HEAD");
+});
+
+test("pendingOperation distinguishes the other in-progress operations git leaves behind", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const gitDir = (await gitExec(repoPath, ["rev-parse", "--absolute-git-dir"])).stdout.trim();
+
+  // Each of these is the marker git itself writes; the probe is existence, which is deliberately
+  // WEAKER than parsing contents -- a marker whose bytes are unreadable still means an operation is
+  // in progress, and this gate must fail closed.
+  const expected = [
+    ["MERGE_HEAD", "merge", /git merge --abort/],
+    ["CHERRY_PICK_HEAD", "cherry-pick", /git cherry-pick --abort/],
+    ["REVERT_HEAD", "revert", /git revert --abort/],
+    ["BISECT_LOG", "bisect", /git bisect reset/],
+  ];
+  for (const [marker, operation, remedy] of expected) {
+    await writeFile(join(gitDir, marker), "");
+    const pending = await git.pendingOperation({ cwd: repoPath });
+    assert.equal(pending.status, "in-progress", marker);
+    assert.equal(pending.operation, operation, marker);
+    assert.match(pending.remedy, remedy, marker);
+    await rm(join(gitDir, marker));
+  }
+
+  // `rebase-apply` without `applying` is a rebase; with it, it is `git am`. That is the same
+  // discriminator git's own status code uses, and the remedies differ.
+  await mkdir(join(gitDir, "rebase-apply"));
+  assert.equal((await git.pendingOperation({ cwd: repoPath })).operation, "rebase");
+  await writeFile(join(gitDir, "rebase-apply", "applying"), "");
+  const am = await git.pendingOperation({ cwd: repoPath });
+  assert.equal(am.operation, "am");
+  assert.match(am.remedy, /git am --abort/);
+  await rm(join(gitDir, "rebase-apply"), { recursive: true });
+  assert.deepEqual(await git.pendingOperation({ cwd: repoPath }), { status: "none" });
+});
+
+test("pendingOperation reports unknown rather than none when it cannot tell, and never throws", async () => {
+  const unknowns = [
+    ["a git dir that cannot be resolved", { async run() { return { code: 128, stdout: "", stderr: "not a git repository" }; } }],
+    ["a runner that throws", { async run() { throw new Error("spawn git ENOENT"); } }],
+    ["a runner that resolves undefined", { async run() { return undefined; } }],
+    ["an empty git dir answer", { async run() { return { code: 0, stdout: "\n" }; } }],
+  ];
+  for (const [label, runner] of unknowns) {
+    const result = await createGitAdapter({ runner }).pendingOperation({ cwd: "/x" });
+    assert.equal(result.status, "unknown", label);
+    assert.equal(typeof result.reason, "string", label);
+  }
+
+  // A stat that fails for a reason other than absence is also unknown -- an EACCES on the admin
+  // directory must never read as "no operation in progress".
+  const runner = { async run() { return { code: 0, stdout: "/git/dir\n" }; } };
+  const fs = {
+    async stat() {
+      const error = new Error("EACCES: permission denied");
+      error.code = "EACCES";
+      throw error;
+    },
+  };
+  const denied = await createGitAdapter({ runner, fs }).pendingOperation({ cwd: "/x" });
+  assert.equal(denied.status, "unknown");
+  assert.match(denied.reason, /EACCES/);
+
+  assert.equal((await createGitAdapter({ runner: {} }).pendingOperation()).status, "unknown");
+});
