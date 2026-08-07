@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -1016,4 +1017,360 @@ test("a corrupt MERGE_HEAD reports an unknown merge state rather than 'not mergi
 
   await writeFile(join(repoPath, ".git", "MERGE_HEAD"), `${await gitExec(repoPath, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim())}\n`);
   assert.equal((await git.checkoutState({ cwd: repoPath })).merging, true);
+});
+
+// --- 2.5: removing a worktree without ever forcing -------------------------------------------
+//
+// Every stderr fixture below is git 2.43's real output, measured on this machine, not invented.
+// The quoted path varies, so only the stable clause is asserted on.
+const WORKTREE_DIRTY_STDERR = (path) =>
+  `fatal: '${path}' contains modified or untracked files, use --force to delete it\n`;
+const WORKTREE_MISSING_STDERR = (path) => `fatal: '${path}' is not a working tree\n`;
+
+test("removeWorktree removes a clean worktree and reports the argv that actually ran", async () => {
+  const fixture = fixtureRunner({
+    "git worktree remove /repo/.worktrees/task": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({
+    cwd: "/repo/main",
+    path: "/repo/.worktrees/task",
+    timeoutMs: 60000,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "");
+  assert.equal(result.reason, undefined, "a success carries no reason");
+  assert.deepEqual(result.argv, ["git", "worktree", "remove", "/repo/.worktrees/task"]);
+  assert.deepEqual(result.argv, [fixture.calls[0].command, ...fixture.calls[0].args],
+    "the reported argv must be the argv that ran, not a second literal that can drift from it");
+  assert.equal(fixture.calls[0].options.cwd, "/repo/main");
+  assert.equal(fixture.calls[0].options.timeoutMs, 60000);
+  assert.equal(fixture.calls[0].options.allowFailure, true);
+});
+
+test("removeWorktree classifies git's modified-or-untracked refusal as dirty", async () => {
+  const path = "/repo/.worktrees/task";
+  const fixture = fixtureRunner({
+    [`git worktree remove ${path}`]: async () => ({
+      code: 128,
+      stdout: "",
+      stderr: WORKTREE_DIRTY_STDERR(path),
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 128);
+  assert.equal(result.reason, "dirty", "this is the refusal the whole command exists to respect");
+  assert.match(result.stderr, /contains modified or untracked files/);
+  assert.ok(!result.argv.includes("--force"));
+});
+
+test("removeWorktree does not read `dirty` off the exit code, which 'not a working tree' shares", async () => {
+  const path = "/repo/.worktrees/never-was";
+  const fixture = fixtureRunner({
+    [`git worktree remove ${path}`]: async () => ({
+      code: 128,
+      stdout: "",
+      stderr: WORKTREE_MISSING_STDERR(path),
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 128, "the same 128 the dirty refusal uses");
+  assert.equal(result.reason, "not-a-worktree", "which is why the code alone cannot classify it");
+});
+
+test("removeWorktree reports a worktree whose directory already vanished as removed", async () => {
+  // Measured: git deregisters it and exits 0. This is exactly the residue archive exists to reclaim,
+  // so it must not read as an error.
+  const fixture = fixtureRunner({
+    "git worktree remove /repo/.worktrees/gone": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path: "/repo/.worktrees/gone" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, undefined);
+});
+
+test("removeWorktree reports an unrecognized failure without claiming to know it is dirty", async () => {
+  const fixture = fixtureRunner({
+    "git worktree remove /repo/.worktrees/task": async () => ({
+      code: 1,
+      stdout: "",
+      stderr: "fatal: could not lock config file\n",
+    }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path: "/repo/.worktrees/task" });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.equal(result.reason, "failed", "unknown fails closed to a generic refusal, never to dirty and never to ok");
+});
+
+test("removeWorktree reports a spawn failure or timeout as ok: false rather than throwing", async () => {
+  const fixture = fixtureRunner({
+    "git worktree remove /repo/.worktrees/task": async () => {
+      throw new WorkflowError("PROCESS", "git timed out after 100ms", {
+        exitCode: 12,
+        details: { reason: "timeout", stdout: "", stderr: "" },
+      });
+    },
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path: "/repo/.worktrees/task", timeoutMs: 100 });
+
+  assert.equal(result.ok, false);
+  assert.notEqual(result.code, 0, "a removal that could not run must never look like one that succeeded");
+  assert.equal(result.reason, "failed");
+  assert.match(result.error, /timed out/);
+  assert.deepEqual(result.argv, ["git", "worktree", "remove", "/repo/.worktrees/task"]);
+});
+
+// The constraint with no exception. `--force` must be unreachable by construction, including via
+// the one input a caller controls: the path itself.
+test("--force appears in no argv removeWorktree can produce, for any path", async () => {
+  const paths = [
+    "/repo/.worktrees/task",
+    "/repo/.worktrees/--force",
+    "/repo/.worktrees/name with spaces",
+    "--force",
+    "-f",
+    "",
+    null,
+    undefined,
+    42,
+  ];
+
+  for (const path of paths) {
+    const fixture = fixtureRunner({
+      [`git worktree remove ${path}`]: async () => ({ code: 0, stdout: "", stderr: "" }),
+    });
+    const git = createGitAdapter({ runner: fixture.runner });
+    const result = await git.removeWorktree({ cwd: "/repo/main", path });
+
+    assert.ok(!result.argv.includes("--force"), `argv leaked --force for path ${JSON.stringify(path)}`);
+    assert.ok(!result.argv.includes("-f"), `argv leaked -f for path ${JSON.stringify(path)}`);
+    for (const call of fixture.calls) {
+      assert.ok(!call.args.includes("--force"), `ran --force for path ${JSON.stringify(path)}`);
+      assert.ok(!call.args.includes("-f"), `ran -f for path ${JSON.stringify(path)}`);
+    }
+  }
+});
+
+test("removeWorktree refuses a path git would parse as an option, before anything spawns", async () => {
+  for (const path of ["--force", "-f", "--", "", null, undefined, 42]) {
+    const fixture = fixtureRunner({});
+    const git = createGitAdapter({ runner: fixture.runner });
+
+    const result = await git.removeWorktree({ cwd: "/repo/main", path });
+
+    assert.equal(result.ok, false, `accepted ${JSON.stringify(path)} as a worktree path`);
+    assert.equal(result.reason, "unsafe-path");
+    assert.deepEqual(fixture.calls, [], "nothing may spawn for a path git would read as a flag");
+  }
+});
+
+test("removeWorktree accepts an ordinary relative path and a path that merely contains a dash", async () => {
+  const fixture = fixtureRunner({
+    "git worktree remove .worktrees/my-task": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const result = await git.removeWorktree({ cwd: "/repo/main", path: ".worktrees/my-task" });
+
+  assert.equal(result.ok, true, "the guard is about a LEADING dash, not about dashes");
+});
+
+test("countCommitsNotIn counts what the base branch does not have", async () => {
+  const fixture = fixtureRunner({
+    "git rev-list --count main..feature/task": async () => ({ code: 0, stdout: "7\n", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  const count = await git.countCommitsNotIn({
+    cwd: "/repo/main",
+    base: "main",
+    branch: "feature/task",
+    timeoutMs: 30000,
+  });
+
+  assert.equal(count, 7);
+  assert.equal(fixture.calls[0].options.cwd, "/repo/main");
+  assert.equal(fixture.calls[0].options.timeoutMs, 30000);
+  assert.equal(fixture.calls[0].options.allowFailure, true);
+});
+
+test("countCommitsNotIn reports a fully merged branch as 0", async () => {
+  const fixture = fixtureRunner({
+    "git rev-list --count main..feature/task": async () => ({ code: 0, stdout: "0\n", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  assert.equal(await git.countCommitsNotIn({ cwd: "/repo/main", base: "main", branch: "feature/task" }), 0);
+});
+
+// The load-bearing distinction: 0 means "fully merged, nothing to warn about". A repository that
+// could not be read must never render as that.
+test("countCommitsNotIn answers null, never 0, when the count cannot be determined", async () => {
+  const unreadable = [
+    { code: 128, stdout: "", stderr: "fatal: bad revision 'main..feature/task'\n" },
+    { code: 1, stdout: "", stderr: "" },
+    { code: 0, stdout: "", stderr: "" },
+    { code: 0, stdout: "\n", stderr: "" },
+    { code: 0, stdout: "not a number\n", stderr: "" },
+    { code: 0, stdout: "-3\n", stderr: "" },
+    { code: 0, stdout: "3.5\n", stderr: "" },
+    { code: 0, stdout: "12 34\n", stderr: "" },
+    { code: 0, stdout: `${"9".repeat(30)}\n`, stderr: "" },
+  ];
+
+  for (const outcome of unreadable) {
+    const fixture = fixtureRunner({
+      "git rev-list --count main..feature/task": async () => outcome,
+    });
+    const git = createGitAdapter({ runner: fixture.runner });
+    const count = await git.countCommitsNotIn({ cwd: "/repo/main", base: "main", branch: "feature/task" });
+
+    assert.equal(count, null, `expected null for ${JSON.stringify(outcome)}`);
+    assert.notEqual(count, 0, "0 would claim the branch is fully merged");
+  }
+});
+
+test("countCommitsNotIn answers null instead of throwing when rev-list cannot be spawned", async () => {
+  const fixture = fixtureRunner({
+    "git rev-list --count main..feature/task": async () => {
+      throw new WorkflowError("PROCESS", "Failed to start git: working directory does not exist: /gone", { exitCode: 12 });
+    },
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  assert.equal(await git.countCommitsNotIn({ cwd: "/gone", base: "main", branch: "feature/task" }), null);
+});
+
+// --- 2.5, step 4: against real git, because what git leaves behind is the whole question --------
+//
+// Three linked worktrees in one repository: one clean, one with ONLY untracked files, one whose
+// directory has been deleted. The untracked-only case is the one that matters -- it is the shape a
+// worker leaves behind (node_modules, .env.local, logs) and the one an implementer is most likely
+// to assume is safe to remove.
+test("removeWorktree against real git: clean removes, untracked-only refuses, vanished deregisters", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  const cleanPath = join(root, "wt-clean");
+  const untrackedPath = join(root, "wt-untracked");
+  const vanishedPath = join(root, "wt-vanished");
+
+  await gitExec(repoPath, ["worktree", "add", "-b", "feature/clean", cleanPath, "main"]);
+  await gitExec(repoPath, ["worktree", "add", "-b", "feature/untracked", untrackedPath, "main"]);
+  await gitExec(repoPath, ["worktree", "add", "-b", "feature/vanished", vanishedPath, "main"]);
+
+  // Real committed work on the branch whose worktree is about to be removed, so "the branch and its
+  // commits survive" has something to actually prove.
+  await writeFile(join(cleanPath, "work.txt"), "committed work\n");
+  await gitExec(cleanPath, ["add", "work.txt"]);
+  await gitExec(cleanPath, ["commit", "-m", "work that must outlive its worktree"]);
+  const workSha = (await gitExec(cleanPath, ["rev-parse", "HEAD"])).stdout.trim();
+
+  // Untracked ONLY: not one tracked file differs.
+  await mkdir(join(untrackedPath, "node_modules"));
+  await writeFile(join(untrackedPath, "node_modules", "index.js"), "module.exports = {};\n");
+  await writeFile(join(untrackedPath, ".env.local"), "TOKEN=secret\n");
+  assert.equal(
+    (await gitExec(untrackedPath, ["status", "--porcelain", "--untracked-files=no"])).stdout,
+    "",
+    "this fixture must be untracked-only; a modified tracked file would be testing a different case",
+  );
+
+  await rm(vanishedPath, { recursive: true, force: true });
+
+  const clean = await git.removeWorktree({ cwd: repoPath, path: cleanPath, timeoutMs: 60000 });
+  assert.equal(clean.ok, true, clean.stderr);
+  assert.equal(clean.code, 0);
+  assert.equal(clean.reason, undefined);
+  assert.deepEqual(clean.argv, ["git", "worktree", "remove", cleanPath]);
+  assert.equal(existsSync(cleanPath), false, "the directory is what archiving reclaims");
+
+  // Archiving a run must never destroy a commit.
+  assert.equal((await gitExec(repoPath, ["rev-parse", "feature/clean"])).stdout.trim(), workSha,
+    "git worktree remove deletes no ref");
+  assert.equal((await gitExec(repoPath, ["cat-file", "-t", workSha])).stdout.trim(), "commit");
+  assert.match((await gitExec(repoPath, ["log", "-1", "--format=%s", "feature/clean"])).stdout,
+    /work that must outlive its worktree/);
+  assert.equal((await gitExec(repoPath, ["show", `${workSha}:work.txt`])).stdout, "committed work\n",
+    "the content survives too, not just the ref");
+
+  const untracked = await git.removeWorktree({ cwd: repoPath, path: untrackedPath, timeoutMs: 60000 });
+  assert.equal(untracked.ok, false, "untracked files are still work with no other copy; git refuses and so must this");
+  assert.equal(untracked.code, 128);
+  assert.equal(untracked.reason, "dirty");
+  assert.match(untracked.stderr, /contains modified or untracked files/);
+  assert.ok(!untracked.argv.includes("--force"), "the refusal is the point; an implementation that forces fails here");
+  assert.equal(existsSync(join(untrackedPath, ".env.local")), true, "a refusal destroys nothing");
+  assert.equal(existsSync(join(untrackedPath, "node_modules", "index.js")), true);
+
+  const vanished = await git.removeWorktree({ cwd: repoPath, path: vanishedPath, timeoutMs: 60000 });
+  assert.equal(vanished.ok, true, vanished.stderr);
+  assert.equal(vanished.code, 0);
+  assert.equal(vanished.reason, undefined, "a directory that is already gone is residue to reclaim, not an error");
+
+  const registered = (await gitExec(repoPath, ["worktree", "list", "--porcelain"])).stdout;
+  assert.ok(!registered.includes(cleanPath), "the removed worktree is deregistered");
+  assert.ok(!registered.includes(vanishedPath), "and so is the vanished one");
+  assert.ok(registered.includes(untrackedPath), "the refused one stays registered, exactly as it was");
+});
+
+test("removeWorktree against real git: a path that was never a worktree is not a dirty one", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const plainPath = join(root, "never-a-worktree");
+  await mkdir(plainPath);
+
+  const result = await git.removeWorktree({ cwd: repoPath, path: plainPath, timeoutMs: 60000 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 128);
+  assert.equal(result.reason, "not-a-worktree");
+  assert.match(result.stderr, /is not a working tree/);
+  assert.equal(existsSync(plainPath), true, "a path git does not own is not deleted by a failed removal");
+});
+
+test("countCommitsNotIn against real git counts, reaches 0 on a merge, and answers null for a ref that is gone", async (t) => {
+  const { repoPath } = await createDisposableRepo(t);
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  await gitExec(repoPath, ["checkout", "-b", "feature/task"]);
+  for (const name of ["one", "two", "three"]) {
+    await writeFile(join(repoPath, `${name}.txt`), `${name}\n`);
+    await gitExec(repoPath, ["add", `${name}.txt`]);
+    await gitExec(repoPath, ["commit", "-m", name]);
+  }
+  await gitExec(repoPath, ["checkout", "main"]);
+
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "main", branch: "feature/task", timeoutMs: 30000 }), 3);
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "feature/task", branch: "main" }), 0,
+    "the base has nothing the branch lacks");
+
+  await gitExec(repoPath, ["merge", "--no-ff", "--no-edit", "feature/task"]);
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "main", branch: "feature/task" }), 0,
+    "0 is the answer that means fully merged");
+
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "main", branch: "feature/does-not-exist" }), null,
+    "an unreadable range is unknown, and unknown is not 0");
+  assert.equal(await git.countCommitsNotIn({ cwd: repoPath, base: "no-such-base", branch: "main" }), null);
 });

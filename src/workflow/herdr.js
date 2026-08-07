@@ -592,6 +592,35 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
       return await invoke("agent", "focus", [target]);
     },
 
+    // Best-effort, idempotent tab closure. `herdr tab close <tab_id>` takes the id as a
+    // POSITIONAL, like `tab rename` and `tab focus`, not as an option.
+    //
+    // This one reports instead of throwing, and that is deliberate rather than a style choice: its
+    // caller runs it AFTER worktree removals that cannot be undone by re-running, so a throw here
+    // would discard the report of removals that really happened. Every branch therefore returns a
+    // result -- including the caller bug of asking to close a tab that was never recorded.
+    //
+    // `tab_not_found` is the COMMON case, not an edge one: measured on this machine, every recorded
+    // tabId is already stale because the Herdr server has been restarted since those runs launched.
+    // It means *already archived*, so it is reported as `not-found` and must never be confused with
+    // a real failure -- an unreachable server, or a tab id we never even sent, is not proof that a
+    // tab is gone.
+    async closeTab({ tabId } = {}) {
+      if (typeof tabId !== "string" || !tabId) {
+        return { closed: false, reason: "closeTab requires a tab id" };
+      }
+
+      try {
+        await invoke("tab", "close", [tabId]);
+        return { closed: true };
+      } catch (error) {
+        if (error?.details?.code === "tab_not_found") {
+          return { closed: false, reason: "not-found" };
+        }
+        return { closed: false, reason: String(error?.message ?? error).slice(0, 256) };
+      }
+    },
+
     // Kept as a fallback for callers that only hold a tab id; prefer focusAgent, which focuses
     // the agent's pane rather than just raising the tab.
     async focusTab({ tabId } = {}) {

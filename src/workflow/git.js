@@ -92,6 +92,32 @@ function mergeArgvFor(source) {
   return ["git", "merge", "--no-ff", "--no-edit", source];
 }
 
+// The one worktree-removal argv, written once, for the same reason mergeArgvFor exists: the
+// reported argv and the argv that runs are the same expression, so they cannot drift. There is
+// deliberately no flag here and no parameter that could add one -- see removeWorktree.
+function removeWorktreeArgvFor(path) {
+  return ["git", "worktree", "remove", path];
+}
+
+// Everything before the path, for the one case where there is no usable path to run with. Reported
+// rather than a runnable argv, because nothing ran.
+function removeWorktreeArgvPrefix() {
+  return removeWorktreeArgvFor(null).slice(0, -1);
+}
+
+// git 2.43's own refusals, measured on this machine. Only the stable clause is matched: the
+// sentence quotes the path, which varies. Matching the clause rather than the exit code is
+// required, because 128 also covers "is not a working tree" -- a completely different situation
+// with a completely different remedy. A message this does NOT recognize (a future rewording, a
+// localized git) degrades to the generic `failed`, which still refuses; it can never degrade to
+// `ok`, and it can never make this pass a flag.
+const WORKTREE_DIRTY = /contains modified or untracked files/;
+const WORKTREE_NOT_A_WORKTREE = /is not a working tree/;
+
+// `git rev-list --count` prints a bare count and nothing else. Anything that is not a run of
+// digits is not an answer -- same rule as OBJECT_ID and ISO_TIMESTAMP.
+const COUNT = /^\d+$/;
+
 // `git merge-tree --write-tree --name-only -z <base> <source>` (measured on git 2.43) writes
 // the merged tree OID first, then one field per conflicted path, then an EMPTY field, then
 // git's informational records. Only the OID and the paths are contractual enough to depend on;
@@ -552,6 +578,94 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
           stdout: typeof details.stdout === "string" ? details.stdout : "",
           stderr: stderr || message,
           argv,
+          error: message,
+        };
+      }
+    },
+
+    // How many commits are on `branch` that `base` does not have -- what archiving this run would
+    // quietly leave behind on a branch nobody is looking at any more. Read-only and never throws.
+    //
+    // `null` is "could not be determined", and keeping it distinct from `0` is the whole point:
+    // `0` means "fully merged, nothing to warn about", so an unreadable repository, a ref that no
+    // longer exists, or a spawn that failed must never render as that. The output is validated
+    // rather than trusted for the same reason -- a value that is not a count is not an answer.
+    async countCommitsNotIn({ cwd, base, branch, timeoutMs }) {
+      let result;
+      try {
+        result = await runner.run("git", ["rev-list", "--count", `${base}..${branch}`], { cwd, timeoutMs, allowFailure: true });
+      } catch {
+        return null;
+      }
+      if (result.code !== 0) return null;
+
+      const value = trimText(result.stdout);
+      if (!COUNT.test(value)) return null;
+
+      const count = Number.parseInt(value, 10);
+      return Number.isSafeInteger(count) ? count : null;
+    },
+
+    // The one destructive operation in the archive path, and it NEVER forces.
+    //
+    // There is no `force` parameter -- not one defaulted to false, absent -- because an
+    // unused-but-present option is exactly how the constraint erodes. Uncommitted and untracked
+    // work in a worktree is the one thing in this system that exists nowhere else, and git's
+    // refusal to delete it is a feature this adapter forwards rather than overrides. A dirty
+    // worktree is a refusal the caller reports, never a `--force` away.
+    //
+    // Never throws: a group run archives several worktrees, and the removals already performed
+    // still have to be reported. `reason` is absent on success and is one of `dirty`,
+    // `not-a-worktree`, `unsafe-path` or `failed` otherwise -- `failed` being the fail-closed
+    // landing spot for anything unrecognized. `argv` comes from the same expression that runs.
+    async removeWorktree({ cwd, path, timeoutMs }) {
+      // git parses a leading `-` as an option, so a path shaped like one is the single input
+      // through which `--force` could reach this argv at all. Refused before anything spawns:
+      // that is what makes the flag unreachable by construction rather than by convention. An
+      // absent or non-string path lands here too -- the caller has no worktree to name.
+      if (typeof path !== "string" || !path || path.startsWith("-")) {
+        return {
+          ok: false,
+          code: 1,
+          stdout: "",
+          stderr: `Refusing to remove a worktree at an unsafe path: ${JSON.stringify(path)}`,
+          argv: removeWorktreeArgvPrefix(),
+          reason: "unsafe-path",
+        };
+      }
+
+      const argv = removeWorktreeArgvFor(path);
+      const [command, ...args] = argv;
+
+      try {
+        const result = await runner.run(command, args, { cwd, timeoutMs, allowFailure: true });
+        const stderr = typeof result.stderr === "string" ? result.stderr : "";
+
+        // Measured on git 2.43: a worktree whose directory has already been deleted exits 0 and is
+        // deregistered. That is residue this command exists to reclaim, not an error.
+        if (result.code === 0) {
+          return { ok: true, code: 0, stdout: result.stdout, stderr, argv };
+        }
+
+        let reason = "failed";
+        if (WORKTREE_DIRTY.test(stderr)) reason = "dirty";
+        else if (WORKTREE_NOT_A_WORKTREE.test(stderr)) reason = "not-a-worktree";
+
+        return { ok: false, code: result.code, stdout: result.stdout, stderr, argv, reason };
+      } catch (error) {
+        // A timeout, a signal, or a failed spawn. Nothing is known about whether the removal
+        // happened, so this is `failed` -- never `dirty`, and never `ok`.
+        const details = error?.details ?? {};
+        const message = reasonFrom(error);
+        const stderr = typeof details.stderr === "string" ? details.stderr : "";
+
+        return {
+          ok: false,
+          code: Number.isInteger(details.code) && details.code !== 0 ? details.code : 1,
+          stdout: typeof details.stdout === "string" ? details.stdout : "",
+          stderr: stderr || message,
+          argv,
+          reason: "failed",
           error: message,
         };
       }

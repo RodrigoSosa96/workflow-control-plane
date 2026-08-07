@@ -1442,3 +1442,89 @@ test("startAgent requires paneId and kind", async () => {
   );
   assert.deepEqual(calls, []);
 });
+
+// --- 2.5: best-effort, idempotent tab closure --------------------------------------------------
+//
+// Measured against the real machine: every recorded tabId on it is already stale, because the Herdr
+// server has been restarted since those runs launched. `tab_not_found` is therefore the COMMON
+// case, and it means "already archived", never "failed".
+test("closeTab closes the recorded tab, passing the id as a positional", async () => {
+  const fixture = fixtureRunner([
+    {
+      assert: ({ args, options }) => {
+        assert.deepEqual(args, ["tab", "close", "w2M:t1"]);
+        assert.deepEqual(options, { allowFailure: true });
+      },
+      stdout: cliResult({ closed: true }, "cli:tab:close"),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(await herdr.closeTab({ tabId: "w2M:t1" }), { closed: true });
+});
+
+test("closeTab treats tab_not_found as already archived, not as a failure", async () => {
+  // Measured: `herdr tab close <missing-id>` writes its error envelope to stdout and exits 0.
+  const fixture = fixtureRunner([
+    {
+      code: 0,
+      stdout: JSON.stringify({
+        error: { code: "tab_not_found", message: "tab w2M:t1 not found" },
+        id: "cli:tab:close",
+      }),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  assert.deepEqual(await herdr.closeTab({ tabId: "w2M:t1" }), { closed: false, reason: "not-found" });
+});
+
+test("closeTab reports any other Herdr failure rather than throwing it", async () => {
+  const fixture = fixtureRunner([
+    {
+      code: 1,
+      stdout: "",
+      stderr: JSON.stringify({ error: { code: "server_unavailable", message: "herdr server is not running" } }),
+    },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.closeTab({ tabId: "w2M:t1" });
+
+  assert.equal(result.closed, false);
+  assert.notEqual(result.reason, "not-found", "an unreachable server must never read as already archived");
+  assert.match(result.reason, /not running/);
+});
+
+test("closeTab reports a spawn failure rather than throwing it", async () => {
+  const fixture = fixtureRunner([
+    { error: new WorkflowError("PROCESS", "Failed to start herdr: spawn herdr ENOENT", { exitCode: 12 }) },
+  ]);
+  const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+  const result = await herdr.closeTab({ tabId: "w2M:t1" });
+
+  assert.equal(result.closed, false);
+  assert.notEqual(result.reason, "not-found");
+  assert.match(result.reason, /ENOENT/);
+});
+
+// A worktree removal cannot be undone by re-running, so nothing in the tab step may throw past a
+// completed removal -- including the caller bug of asking to close a tab that was never recorded.
+test("closeTab never throws, even for a missing or malformed tab id", async () => {
+  for (const tabId of ["", null, undefined, 42, {}]) {
+    const fixture = fixtureRunner([]);
+    const herdr = createHerdrAdapter({ runner: fixture.runner });
+
+    const result = await herdr.closeTab({ tabId });
+
+    assert.equal(result.closed, false, `accepted ${JSON.stringify(tabId)} as a tab id`);
+    assert.notEqual(result.reason, "not-found", "never asking is not the same as being told it is gone");
+    assert.ok(typeof result.reason === "string" && result.reason.length > 0);
+    assert.deepEqual(fixture.calls, [], "nothing may spawn without a tab id");
+  }
+
+  const bare = createHerdrAdapter({ runner: fixtureRunner([]).runner });
+  assert.deepEqual(await bare.closeTab(), { closed: false, reason: "closeTab requires a tab id" });
+  assert.deepEqual(await bare.closeTab({}), { closed: false, reason: "closeTab requires a tab id" });
+});
