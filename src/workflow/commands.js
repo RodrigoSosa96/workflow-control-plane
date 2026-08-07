@@ -786,10 +786,36 @@ function sortRunsForBoard(runs) {
 // a state-machine fact. `state` is the most specific ask and wins outright over `all`; with
 // neither, the live set is the default so a run that fell out of it (completed/failed/interrupted)
 // does not linger on the board an operator has stopped watching.
+//
+// Roadmap item 2.5's board change: an ARCHIVED run is excluded from both the default view and
+// `--all`, and an explicit `--state` still shows it. That asymmetry is the point -- `--all` means
+// "every state", not "every record ever created", and the whole reason `workflow archive` marks the
+// record instead of deleting the run directory is so the board can stop showing residue an operator
+// has already dealt with (the relief item 2.1 explicitly named when it measured the 12-14 run JSON
+// ceiling with no cleanup available). An explicit `--state completed` is an explicit ask for that
+// state's records, archived or not, and narrowing it would leave an operator with no way to see an
+// archived run from this command at all.
+//
+// The predicate is `typeof run.archivedAt === "string"`, deliberately not truthiness and
+// deliberately not a boolean field: the record has to answer *when*, and only a full archive stamps
+// it (a partial one leaves it unset on purpose, so the board can never hide a run that still has
+// worktrees on disk).
+//
+// What is hidden is COUNTED and returned, never merely dropped -- item 2.1's own rule for skipped
+// crash residue, applied to the residue this command chooses not to show.
+function isArchivedRun(run) {
+  return typeof run?.archivedAt === "string";
+}
+
 function selectRunsForBoard(runs, { state, all }) {
-  if (state !== undefined) return runs.filter((run) => run.state === state);
-  if (all) return runs;
-  return runs.filter((run) => LIVE_RUN_STATES.has(run.state));
+  if (state !== undefined) return { runs: runs.filter((run) => run.state === state), archivedHidden: 0 };
+  const inScope = all ? runs : runs.filter((run) => LIVE_RUN_STATES.has(run.state));
+  const visible = inScope.filter((run) => !isArchivedRun(run));
+  // Counted against what this view would otherwise have shown, not against the whole store: the
+  // default (live) view can hardly ever contain an archived run -- archiving a live run is refused
+  // -- and reporting "12 archived hidden" under a board that was never going to show them would be
+  // a true number answering a question nobody asked.
+  return { runs: visible, archivedHidden: inScope.length - visible.length };
 }
 
 // The board underneath `workflow runs` (roadmap item 2.1): answers "what is running right now"
@@ -802,11 +828,13 @@ export async function runsCommand(options = {}, deps = {}) {
   const { store, skipped } = await runsStoreForCommand(options, deps);
   const filters = options.projectAlias !== undefined ? { projectAlias: options.projectAlias } : {};
   const runs = await store.list(filters);
+  const selected = selectRunsForBoard(runs, { state: options.state, all: Boolean(options.all) });
 
   return {
     command: "runs",
-    runs: sortRunsForBoard(selectRunsForBoard(runs, { state: options.state, all: Boolean(options.all) })),
+    runs: sortRunsForBoard(selected.runs),
     skipped,
+    archivedHidden: selected.archivedHidden,
     exitCode: 0,
   };
 }
@@ -2741,7 +2769,12 @@ async function inspectArchiveAgent(run, herdr) {
   // The reported pane stays the correlated one, so this field keeps meaning the same thing it means
   // everywhere else in the control plane.
   const primary = correlationPaneId(run);
-  if (panes.length === 0) return { agent: { paneId: null, resolved: false, reason: "the run records no pane id, so it has no agent to resolve" } };
+  // `checkedPaneIds: []` rather than an absent key, found reading real `--format json` output in
+  // task 3's step 5: this branch was the one place the agent object's key set differed from the
+  // other, against this command's own stated rule that a renderer must never have to test for a
+  // field's presence to know which shape it is holding. Empty IS the honest answer here -- nothing
+  // was asked, because there was nothing to ask about.
+  if (panes.length === 0) return { agent: { paneId: null, checkedPaneIds: [], resolved: false, reason: "the run records no pane id, so it has no agent to resolve" } };
 
   const { agentsByPane, herdrAvailable } = await agentsByPaneFromHerdr(herdr);
   if (!herdrAvailable) {
@@ -2876,14 +2909,36 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
   // interrupted `rebase -i` stops with a CLEAN tree on a DETACHED HEAD, so neither this gate nor
   // the dirty one below saw it. `merging` is left untouched for `mergeCommand`, whose question
   // really is only about merges.
-  const pending = await git.pendingOperation({ cwd: worktreePath, timeoutMs });
-  if (pending.status === "in-progress") {
-    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is in the middle of a ${pending.operation}; finish it or run \`git -C ${worktreePath} ${pending.remedy.replace(/^git /, "")}\` before archiving.`, actions: [`git -C ${worktreePath} status`, `git -C ${worktreePath} ${pending.remedy.replace(/^git /, "")}`] };
+  // Guarded for the same reason unmergedCommitsFor guards countCommitsNotIn: git.js documents this
+  // as never throwing and it does not, but a read that turns a read-only `--dry-run` into a stack
+  // trace instead of a preview is a contract this file must not depend on another module keeping.
+  // A probe that could not be run is `unknown`, which refuses -- the same answer as a probe that
+  // ran and could not tell.
+  let pending;
+  try {
+    pending = await git.pendingOperation({ cwd: worktreePath, timeoutMs });
+  } catch (error) {
+    pending = { status: "unknown", reason: `the unfinished-operation probe itself failed: ${archiveErrorText(error)}` };
   }
-  if (pending.status !== "none") {
+  if (pending?.status === "in-progress") {
+    // `operation` and `remedy` are read defensively for the same reason: an `in-progress` result
+    // missing `remedy` used to be a TypeError off `.replace`, i.e. a crash on the one branch whose
+    // whole job is refusing safely. An unnamed remedy is reported as unnamed and NEVER replaced by
+    // a guessed one -- the point of carrying the operation's own remedy is that `git merge --abort`
+    // is the wrong move for a rebase, and inventing a default would reintroduce exactly that bug.
+    const operation = typeof pending.operation === "string" && pending.operation ? pending.operation : "unfinished git operation";
+    const remedy = typeof pending.remedy === "string" && pending.remedy
+      ? `git -C ${worktreePath} ${pending.remedy.replace(/^git /, "")}`
+      : null;
+    return {
+      refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is in the middle of a ${operation}; ${remedy ? `finish it or run \`${remedy}\`` : "finish or abort it (git reported no remedy for this operation)"} before archiving.`,
+      actions: [`git -C ${worktreePath} status`, ...(remedy ? [remedy] : [])],
+    };
+  }
+  if (pending?.status !== "none") {
     // Callers must treat `unknown` exactly like `in-progress`; the two are separated so the
     // operator is told which it was, never so one can be waved through.
-    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be checked for an unfinished git operation (${pending.reason ?? "reason unknown"}); an unknown operation state is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be checked for an unfinished git operation (${pending?.reason ?? "reason unknown"}); an unknown operation state is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
   }
   if (state.dirty !== true && state.dirty !== false) {
     // Item 0.14's direction: an unreadable status is never clean. `!== true && !== false` rather
@@ -2974,11 +3029,18 @@ function archiveLosses(records) {
   const losses = [];
   for (const record of records) {
     if (record.present && !record.branch) {
-      // Nothing but this worktree's own HEAD references those commits. `git worktree remove` never
-      // deletes a ref -- but there is no ref here to keep, so removing the directory is the point
-      // at which they become unreachable. Named, digested through `branch: null`, never refused:
-      // the design's own line is that this command surfaces losses and gates only on
-      // irrecoverability.
+      // **Corrected after the reachability split.** This branch used to say "nothing but this
+      // worktree's own HEAD references those commits", and that is now the opposite of what the
+      // command proved: a detached HEAD that NO ref contains is refused outright by
+      // irrecoverableRefusal (headReachable === false), so every record that reaches this line has
+      // `headReachable === true` -- some ref does contain the commit, and that ref is what keeps it
+      // alive after `git worktree remove` deletes the worktree's HEAD and per-worktree reflog.
+      //
+      // So this is a loss of FINDABILITY, not of commits: nothing is destroyed, but the run's work
+      // is on no branch of its own, and after the removal there is no name pointing at it that
+      // belongs to this run. That is worth naming -- it is the same "removed, and therefore
+      // forgotten" concern the unmerged-commits loss exists for -- and it is why this warns rather
+      // than refusing.
       losses.push({
         repositoryId: record.repositoryId,
         kind: "detached-head",
@@ -2986,7 +3048,7 @@ function archiveLosses(records) {
         branch: null,
         baseBranch: record.baseBranch,
         count: null,
-        detail: `the worktree at ${record.worktreePath} is on a detached HEAD at ${record.headSha ?? "an unknown commit"}; no branch references its commits`,
+        detail: `the worktree at ${record.worktreePath} is on a detached HEAD at ${record.headSha ?? "an unknown commit"}; another ref still contains that commit, so removing the worktree destroys nothing — but this run's work is on no branch of its own, so afterwards there is no name of this run's left pointing at it`,
       });
     }
     if (record.unmergedCommits === null) {

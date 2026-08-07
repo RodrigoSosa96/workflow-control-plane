@@ -11,6 +11,7 @@ import { createHerdrAdapter } from "../src/workflow/herdr.js";
 import { ASSIGNMENT_LIMITS } from "../src/workflow/assignment.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import {
+  archiveCommand as defaultArchiveCommand,
   closeCommand as defaultCloseCommand,
   delegationGateClearCommand as defaultDelegationGateClearCommand,
   delegationHandoffCommand as defaultDelegationHandoffCommand,
@@ -60,6 +61,8 @@ Commands:
   workflow verify <run-id> [--format compact|json]
   workflow merge <run-id> --dry-run [--format compact|json]
   workflow merge <run-id> --yes --approval-digest <digest> [--format compact|json]
+  workflow archive <run-id> --dry-run [--format compact|json]
+  workflow archive <run-id> --yes --approval-digest <digest> [--format compact|json]
   workflow reconcile [project] --run <run-id> [--format compact|json]
   workflow runs [project] [--state <state>] [--all] [--format compact|json]
   workflow inbox [project] [--format compact|json]
@@ -346,6 +349,24 @@ export function parseArgs(argv) {
   if (command === "merge") {
     validateShape("merge", positionals, options, { min: 1, max: 1, allowedOptions: ["dry-run", "approval-digest", "yes"] });
     assertPathSafeUuidSyntax(positionals[0], "merge run ID");
+    return {
+      command,
+      runId: positionals[0],
+      ...(options["dry-run"] ? { dryRun: true } : {}),
+      ...(options["approval-digest"] ? { approvalDigest: options["approval-digest"] } : {}),
+      ...(options.yes ? { yes: true } : {}),
+      format,
+    };
+  }
+
+  // The same three options `merge` takes, for the same three reasons, and nothing else -- `--repos`
+  // in particular, because an archive covers exactly the repositories the run recorded and
+  // narrowing that by argument would half-archive a group project, leaving residue harder to reason
+  // about than the original (commands.js refuses the whole run rather than part of it for the same
+  // reason).
+  if (command === "archive") {
+    validateShape("archive", positionals, options, { min: 1, max: 1, allowedOptions: ["dry-run", "approval-digest", "yes"] });
+    assertPathSafeUuidSyntax(positionals[0], "archive run ID");
     return {
       command,
       runId: positionals[0],
@@ -767,6 +788,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const resultCommand = dependencies.resultCommand ?? defaultResultCommand;
   const verifyCommand = dependencies.verifyCommand ?? defaultVerifyCommand;
   const mergeCommand = dependencies.mergeCommand ?? defaultMergeCommand;
+  const archiveCommand = dependencies.archiveCommand ?? defaultArchiveCommand;
   const reconcileCommand = dependencies.reconcileCommand ?? defaultReconcileCommand;
   const runsCommand = dependencies.runsCommand ?? defaultRunsCommand;
   const inboxCommand = dependencies.inboxCommand ?? defaultInboxCommand;
@@ -935,6 +957,52 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       // a partially merged group project is not a success.
       const report = await command.execute({ approvalDigest: args.approvalDigest });
       emit(out, formatWorkflowResult("merge", report, args.format));
+      return Number.isInteger(report.exitCode) ? report.exitCode : 0;
+    }
+
+    // The other end of the arc `merge` opens, and gated identically (see merge's own comment
+    // above): `--yes` without `--approval-digest` is a usage error, and "neither --dry-run nor
+    // --yes" is one too -- there is no interactive-confirmation path, because a y/N prompt approves
+    // a rendering while the digest approves the exact worktree paths, HEADs, dirty status and
+    // unmerged-commit counts that were measured.
+    //
+    // This one REMOVES directories. `merge` advances a branch, which git can revert; `git worktree
+    // remove` cannot be undone by re-running anything, which is why the preview it gates is written
+    // around what would be LOST rather than around what would be removed.
+    if (args.command === "archive") {
+      if (args.yes && !args.approvalDigest) {
+        emit(err, "USAGE: archive --yes requires --approval-digest from the current dry-run preview.");
+        return 64;
+      }
+      if (!args.dryRun && !args.yes) {
+        emit(err, "USAGE: archive requires --dry-run to preview, or --yes with --approval-digest to execute.");
+        return 64;
+      }
+
+      // archiveCommand's lock gate runs item 1.1's classifyMarkerOwnership, which expects
+      // deps.inspectProcess by that literal name -- the same aliasing unlock, reconcile and
+      // gate-clear do below, and for the same reason (see the naming note where inspectProcessByPid
+      // is constructed). Without it, every held lock would classify as unprovable and every run
+      // with one would refuse.
+      const command = await archiveCommand(
+        options,
+        { ...liveDependencies, inspectProcess: liveDependencies.inspectProcessByPid },
+      );
+
+      if (args.dryRun) {
+        // `preview.exitCode` verbatim: 0 archivable, 10 refused. A refused dry-run must not exit 0
+        // -- a script gating on this command's exit code is exactly why the preview evaluates all
+        // three gates and every repository before anything can run.
+        emit(out, formatWorkflowResult("archive", command.preview, args.format));
+        return Number.isInteger(command.preview.exitCode) ? command.preview.exitCode : 0;
+      }
+
+      // execute() throws for a refusal and for a missing/invalid/stale digest (PREFLIGHT -> 10);
+      // categorizeError already maps that. It returns a report only when removals actually ran, and
+      // that report's own exitCode distinguishes archived (0) from partial (13) from failed (1) --
+      // never collapsed, because a partially archived run still has residue on disk.
+      const report = await command.execute({ approvalDigest: args.approvalDigest });
+      emit(out, formatWorkflowResult("archive", report, args.format));
       return Number.isInteger(report.exitCode) ? report.exitCode : 0;
     }
 

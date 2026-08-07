@@ -1430,6 +1430,56 @@ test("runsCommand --state completed returns exactly the completed runs, bypassin
   assert.deepEqual(result.runs.map((run) => run.id), [completedRun.id]);
 });
 
+// Roadmap item 2.5's board change. `archivedAt` is a top-level ISO string set only by a FULLY
+// successful `workflow archive` (a partial one deliberately leaves it unset, so the board cannot
+// hide a run that still has residue on disk). It is driven here through the real store's own
+// update(), never written as raw run.json, exactly like every other runsCommand test above.
+test("runsCommand --all hides archived runs and reports how many it hid", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const archived = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
+  await store.update(archived.id, () => ({ archivedAt: "2026-08-07T12:00:00.000Z" }));
+  const stillCompleted = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-2" });
+  const running = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-3" });
+
+  const all = await runsCommand({ all: true }, { stateRoot });
+  assert.deepEqual(all.runs.map((run) => run.id).sort(), [stillCompleted.id, running.id].sort());
+  assert.equal(all.archivedHidden, 1, "a run the board chose not to show is named as a count, never dropped in silence");
+
+  // The default (live-set) view never showed a completed run anyway, so nothing is hidden there --
+  // the count has to be honest about that rather than reporting every archived run in the store.
+  const live = await runsCommand({}, { stateRoot });
+  assert.deepEqual(live.runs.map((run) => run.id), [running.id]);
+  assert.equal(live.archivedHidden, 0);
+});
+
+test("runsCommand --state still shows archived runs, because an explicit state is an explicit ask", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const archived = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
+  await store.update(archived.id, () => ({ archivedAt: "2026-08-07T12:00:00.000Z" }));
+
+  const result = await runsCommand({ state: RUN_STATES.COMPLETED }, { stateRoot });
+
+  assert.deepEqual(result.runs.map((run) => run.id), [archived.id]);
+  assert.equal(result.archivedHidden, 0, "nothing was hidden, so nothing is claimed to have been");
+  assert.equal(result.runs[0].archivedAt, "2026-08-07T12:00:00.000Z");
+});
+
+test("only a real archivedAt string hides a run; a truthy non-string never does", async (t) => {
+  const stateRoot = await tempStateRoot(t);
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const bogus = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
+  await store.update(bogus.id, () => ({ archivedAt: true }));
+
+  const all = await runsCommand({ all: true }, { stateRoot });
+
+  // The predicate is `typeof run.archivedAt === "string"` on purpose: the field also has to answer
+  // *when*, and a record carrying something else has not been archived by this control plane.
+  assert.deepEqual(all.runs.map((run) => run.id), [bogus.id]);
+  assert.equal(all.archivedHidden, 0);
+});
+
 test("runsCommand refuses an unknown --state", async (t) => {
   const stateRoot = await tempStateRoot(t);
 

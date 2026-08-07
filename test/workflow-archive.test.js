@@ -614,7 +614,12 @@ test("a lock whose owner is proven gone does not block the archive, and a SUCCES
   assert.equal(report.status, "archived");
   assert.deepEqual(fixture.removals().map((call) => call.path), ["/wt/acme"]);
   assert.deepEqual(store.removeLockCalls, [], "a successful archive must still leave the lock alone");
-  assert.notEqual(await store.inspectLock(run.id), null, "the lock is still there for `workflow unlock`");
+  // There used to be an `assert.notEqual(await store.inspectLock(run.id), null)` here. It passed
+  // unconditionally: `withLockHeld` overrides `inspectLock` to return a fabricated lock on every
+  // call, so it asserted a property of the test double rather than of archive. The real property --
+  // "archive never removes the lock" -- is the removeLockCalls assertion above, which IS
+  // mutation-checked (M1). Removed rather than reworded, because there is no non-vacuous version:
+  // the lock in this fixture only ever existed inside the double.
 });
 
 test("a store that cannot answer whether a lock is held refuses rather than assuming none", async (t) => {

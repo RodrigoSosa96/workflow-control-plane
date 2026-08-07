@@ -457,6 +457,21 @@ function appendSkippedLine(lines, skipped) {
   lines.push(`Skipped: ${skipped.length} (${ids})`);
 }
 
+// Roadmap item 2.5's board change, reported exactly the way appendSkippedLine reports crash
+// residue: a run this board chose not to show is NAMED as a count underneath it, never silently
+// dropped. Archived runs are excluded from the default view and from `--all` (that exclusion is the
+// relief item 2.1 named when it measured the 12-14 run JSON ceiling), and an operator must be able
+// to tell "there is nothing else" from "there are four you are not being shown".
+//
+// Only ever rendered when something was actually hidden: an unconditional `Archived: 0` would be
+// noise on every board this repo has printed to date, and `runsCommand` reports 0 for the common
+// case (the default live view can hardly ever contain an archived run, since a live run refuses to
+// archive at all).
+function appendArchivedLine(lines, archivedHidden) {
+  if (!Number.isFinite(archivedHidden) || archivedHidden <= 0) return;
+  lines.push(`Archived: ${archivedHidden} hidden (--state <state> still shows them)`);
+}
+
 export function formatRuns(value = {}, deps = {}) {
   const nowMs = typeof deps.now === "function" ? deps.now() : Date.now();
   const runs = list(value.runs);
@@ -469,6 +484,7 @@ export function formatRuns(value = {}, deps = {}) {
     : renderTable(RUNS_COLUMNS, runs.map((run) => runRow(run, nowMs)));
 
   appendSkippedLine(lines, skipped);
+  appendArchivedLine(lines, value.archivedHidden);
 
   return bound(lines.join("\n"));
 }
@@ -859,9 +875,12 @@ function mergeVerificationLine(verification) {
 // report about a merge that failed, which is precisely backwards. Continuation lines are indented
 // so every line of a reason is visibly part of one entry, and git's text is preserved verbatim
 // rather than collapsed onto one line, which would mangle output an operator has to act on.
-function reasonBlock(label, reason) {
+// `separator` exists for formatArchive's refusal line, which follows formatMerge's own
+// `Merge: refused — <reason>` shape rather than a `label: value` one. Defaulted, so every existing
+// caller is unchanged.
+function reasonBlock(label, reason, separator = ": ") {
   const [first, ...rest] = String(reason).replace(/\r\n?/g, "\n").split("\n");
-  return [`${label}: ${first}`, ...rest.map((line) => `    ${line}`)];
+  return [`${label}${separator}${first}`, ...rest.map((line) => `    ${line}`)];
 }
 
 function appendMergeNextActions(lines, nextActions) {
@@ -1006,6 +1025,335 @@ export function formatMerge(value = {}) {
   return formatMergePreview(value);
 }
 
+// --- formatArchive (roadmap item 2.5's `workflow archive`) -------------------------------------
+//
+// Three shapes reach this renderer, and the discriminator is structural rather than an import from
+// commands.js -- this file is deliberately dependency-free, so nothing here reads
+// ARCHIVE_EXIT_CODES or any other command constant. A refusal is recognized by `refused` (the same
+// way formatMerge recognizes one), an execution report by its `removed`/`kept` lists, and anything
+// else is a preview.
+//
+// What this view exists to make impossible to miss, and the five ways it could quietly lie:
+//   1. **`losses[]` leads `repositories[]`.** The design's centre of gravity is "what would be
+//      LOST", not "what would be removed": `repositories[]` is an inventory of paths, `losses[]` is
+//      the list of work that stops being findable. The headline states the total before any of it.
+//   2. **`count: null` is UNKNOWN and must never render as `0`.** `0` means "measured, and fully
+//      merged -- nothing to warn about"; `null` means nobody could tell. They are opposite facts,
+//      and collapsing them is the exact false green the adapter layer had to have removed from it
+//      (git.js's countCommitsNotIn). One `?? 0` here would put it straight back.
+//   3. **A partial report mixes losses that HAPPENED with losses that did not** (`removed:
+//      true|false`), and telling an operator "nothing will point at this work any more" about a
+//      worktree still sitting on disk is a lie about a world that did not occur.
+//   4. **`argv` is on `removed[]` only.** A `kept[]` entry -- an `unsafe-path`, a spawn that failed
+//      -- has no argv precisely because nothing ran; rendering one would be an audit trail of a
+//      command that never executed.
+//   5. **`tab` has four distinguishable outcomes and `alreadyGone` is the COMMON one** (every
+//      recorded tab id on the machine this was built against is stale). Printing "not closed" for
+//      all of them would make the normal case look broken.
+
+// `null` is UNKNOWN, and it is spelled out rather than blanked, so a table cell can never be read
+// as a measured zero. Point 2 above, in one function -- every count in this renderer goes through
+// it.
+function archiveCount(count) {
+  return Number.isFinite(count) ? String(count) : "UNKNOWN";
+}
+
+// Reads the run's state and lock/agent evidence the same way formatReconcile renders its own lock
+// line: the verdict is what decides whether `workflow unlock` even applies. `held: true` with a
+// removable verdict is archivable AND will fail persistence (archive does not remove the lock, but
+// store.update/appendEvent both take it), which is why this line says so rather than only noting
+// that a lock exists.
+function archiveLockLine(lock) {
+  if (!lock || typeof lock !== "object") return "Lock: not reported";
+  if (lock.held !== true) return "Lock: not held";
+  const verdict = text(lock.ownership?.verdict);
+  const reason = lock.ownership?.reason ? ` — ${lock.ownership.reason}` : "";
+  return `Lock: HELD (${verdict}${reason}); archive never removes it, but marking the run archived needs it`;
+}
+
+// `checkedPaneIds` is the honest evidence: the correlated pane is what `agent.paneId` means
+// everywhere else in the control plane, but the gate asks about EVERY pane the run has named, which
+// may be two (a resumed run's original pane can still host a live agent). Naming both is what makes
+// "no live agent" a checkable claim rather than an assurance.
+// **Corrected against real CLI output (step 5).** This used to render
+// `Agent: no live agent (panes checked: none recorded)` for a run that never named a pane -- a
+// claim of having checked, immediately contradicted by the parenthetical saying there was nothing
+// to check. The two cases are genuinely different evidence and now say so: Herdr was asked about
+// specific panes and answered, or Herdr was never asked because the run has no agent to resolve.
+function archiveAgentLine(agent) {
+  if (!agent || typeof agent !== "object") return "Agent: not reported";
+  const checked = list(agent.checkedPaneIds).map((pane) => String(pane));
+  if (checked.length === 0) {
+    return "Agent: none to resolve (the run never recorded a pane id, so Herdr was not asked)";
+  }
+  return `Agent: no live agent (Herdr asked about ${checked.join(", ")})`;
+}
+
+const ARCHIVE_COLUMNS = [
+  { key: "repo", label: "REPO" },
+  { key: "worktree", label: "WORKTREE" },
+  { key: "branch", label: "BRANCH" },
+  { key: "head", label: "HEAD" },
+  { key: "base", label: "BASE" },
+  { key: "unmerged", label: "UNMERGED" },
+];
+
+// Three states this cell must keep apart, and `text()`'s "unknown" fallback would flatten two of
+// them into the third: an absent worktree has no branch to read (`-`), a present one on no branch
+// is DETACHED (a known fact, not an unknown), and everything else is a branch name.
+function archiveBranchCell(record) {
+  if (record.present === false) return "-";
+  if (record.branch) return String(record.branch);
+  return "DETACHED";
+}
+
+function archiveRow(record = {}) {
+  return {
+    repo: text(record.repositoryId),
+    // The residue this command exists to reclaim: git deregisters a vanished worktree cleanly, so
+    // this is an archivable state rather than an error, and it must be visible as such.
+    worktree: `${text(record.worktreePath)}${record.present === false ? " (ALREADY GONE)" : ""}`,
+    branch: archiveBranchCell(record),
+    head: record.headSha ? String(record.headSha).slice(0, 12) : "-",
+    base: text(record.baseBranch, "NONE"),
+    unmerged: archiveCount(record.unmergedCommits),
+  };
+}
+
+// One line per loss, keyed off `kind` -- a closed vocabulary of three -- with the count rendered
+// through archiveCount so an unmeasurable loss never borrows a measured one's shape. `detail` goes
+// through reasonBlock because it can carry git's own text.
+// **Corrected against real CLI output (step 5).** This label used to spell out
+// `<count> commit(s) on <branch> not in <baseBranch>`, which is very nearly the opening clause of
+// the `detail` printed immediately after it -- so every unmerged loss rendered as
+// `backend | 1 commit(s) on feature/x not in dev: 1 commit(s) on feature/x are not in dev; ...`.
+// The label's job is to be the SCANNABLE classifier beside a sentence, not a paraphrase of it: the
+// count is the number an operator is scanning for, and `UNKNOWN` in the same slot is the fact that
+// must never be mistaken for a zero.
+function archiveLossLabel(loss = {}) {
+  if (loss.kind === "unmerged-commits" || loss.kind === "unmerged-commits-unknown") {
+    return `UNMERGED (${archiveCount(loss.count)})`;
+  }
+  if (loss.kind === "detached-head") return "DETACHED HEAD";
+  return text(loss.kind).toUpperCase();
+}
+
+// `removed` only exists on an execution report's losses, and there it is the difference between a
+// loss that happened and one that did not. On a preview it is absent, and no suffix is added --
+// nothing has happened yet, and the whole document is written in the conditional.
+function archiveLossOutcome(loss = {}) {
+  if (loss.removed === true) return " | LOST";
+  if (loss.removed === false) return " | NOT LOST (the worktree is still on disk)";
+  return "";
+}
+
+function appendArchiveLosses(lines, losses) {
+  if (losses.length === 0) {
+    lines.push("Losses: none");
+    return;
+  }
+  lines.push("Losses:");
+  for (const loss of losses) {
+    lines.push(...reasonBlock(
+      `${text(loss.repositoryId)} | ${archiveLossLabel(loss)}${archiveLossOutcome(loss)}`,
+      text(loss.detail, "no detail recorded"),
+    ));
+  }
+}
+
+// The one line an operator must not be able to skip, and the reason it sits above every path-heavy
+// section: `bound()` truncates the TAIL, so a wide group project loses the sections below it before
+// it loses this. Unknown-size losses are counted as their own quantity rather than summed as zero
+// -- point 2 above, at the level of the total rather than the cell.
+function archiveLossHeadline(losses) {
+  if (losses.length === 0) {
+    return "Would be lost: nothing — every worktree is on a branch, and every branch is fully merged into its base";
+  }
+  const commits = losses.reduce((sum, loss) => (Number.isFinite(loss.count) ? sum + loss.count : sum), 0);
+  const unknown = losses.filter((loss) => !Number.isFinite(loss.count)).length;
+  const parts = [];
+  if (commits > 0) parts.push(`${commits} unmerged commit(s)`);
+  if (unknown > 0) parts.push(`${unknown} loss(es) of UNKNOWN size`);
+  const worktrees = new Set(losses.map((loss) => String(loss.worktreePath))).size;
+  return `Would be lost: ${losses.length} loss(es) across ${worktrees} worktree(s) — ${parts.join(", ") || "size not reported"}`;
+}
+
+// `branchMismatch` is literally `recordedBranch !== branch` (commands.js), so a run that recorded no
+// branch at all lands here too -- the same call formatMerge makes, and worth naming for the same
+// reason: on the machine this was built against, two of eight real runs record a branch that no
+// longer exists. Rendered only for a preview; the execute report has already acted on it.
+// **Corrected against real CLI output (step 5).** An ALREADY GONE worktree has `branch: null`, so
+// `branchMismatch` (literally `recordedBranch !== branch`) is true for every one of them -- and the
+// line rendered as "the worktree <path> is on -", which is not a mismatch, it is a missing
+// worktree. A vanished directory is reported as vanished; only a worktree that is really there can
+// disagree with the record about its branch.
+function appendArchiveBranchMismatch(lines, repositories) {
+  const mismatched = repositories.filter((record) => record.branchMismatch);
+  if (mismatched.length === 0) {
+    lines.push("Branch mismatch: none");
+    return;
+  }
+  lines.push("Branch mismatch:");
+  for (const record of mismatched) {
+    lines.push(record.present === false
+      ? `${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; that worktree is already gone, so no branch could be read from it`
+      : `${text(record.repositoryId)}: the run recorded ${text(record.recordedBranch, "no branch")}; the worktree ${text(record.worktreePath)} is on ${archiveBranchCell(record)} — the worktree's own state is what was measured`);
+  }
+}
+
+function appendArchiveNextActions(lines, nextActions) {
+  const actions = list(nextActions).map((action) => String(action));
+  if (actions.length === 0) return;
+  lines.push("Next:");
+  for (const action of actions) lines.push(`- ${action}`);
+}
+
+// **Corrected against real CLI output (step 5).** This used to read
+// `Archive: 2 worktree(s) would be removed` for a run whose two worktrees were both ALREADY GONE --
+// re-previewing an already-archived run, which is a shape this command produces routinely (it is
+// how an operator finishes a partial archive, and re-running after a complete one is the obvious
+// thing to try). Nothing would be removed from disk there; git only reclaims the registration. The
+// two counts are separated so the headline can never promise a removal that is not going to happen.
+function archiveHeadline(repositories) {
+  const gone = repositories.filter((record) => record.present === false).length;
+  const present = repositories.length - gone;
+  if (gone === 0) return `Archive: ${present} worktree(s) would be removed`;
+  if (present === 0) return `Archive: nothing left on disk — all ${gone} recorded worktree(s) are already gone; only their git registrations would be reclaimed`;
+  return `Archive: ${present} worktree(s) would be removed, and ${gone} already gone (only their git registrations would be reclaimed)`;
+}
+
+function formatArchivePreview(value) {
+  const repositories = list(value.repositories);
+  const losses = list(value.losses);
+  const lines = [
+    `Run: ${text(value.runId)}`,
+    `Project: ${text(value.projectAlias)} (run state: ${text(value.runState)})`,
+    archiveHeadline(repositories),
+    archiveLossHeadline(losses),
+  ];
+  // Above everything that scales with repository count, for exactly the reason formatMergePreview
+  // puts its own digest there: this is the one string the operator has to copy, and losing it to
+  // truncation is a bad way to be safe.
+  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
+
+  appendArchiveLosses(lines, losses);
+
+  if (repositories.length === 0) lines.push("Repositories: none");
+  else lines.push(...renderTable(ARCHIVE_COLUMNS, repositories.map(archiveRow)));
+
+  appendArchiveBranchMismatch(lines, repositories);
+  lines.push(archiveLockLine(value.lock));
+  lines.push(archiveAgentLine(value.agent));
+  lines.push(value.tabId
+    ? `Tab: ${value.tabId} (closed after the removals, best-effort; a tab that is already gone is not a failure)`
+    : "Tab: none recorded");
+  appendArchiveNextActions(lines, value.nextActions);
+  return bound(lines.join("\n"));
+}
+
+const ARCHIVE_REPORT_COLUMNS = [
+  { key: "repo", label: "REPO" },
+  { key: "status", label: "STATUS" },
+  { key: "worktree", label: "WORKTREE" },
+  { key: "branch", label: "BRANCH" },
+];
+
+function archiveReportRow(entry = {}, status) {
+  return {
+    repo: text(entry.repositoryId),
+    status,
+    worktree: text(entry.worktreePath),
+    branch: text(entry.branch, "no branch"),
+  };
+}
+
+// Point 5 above. Four outcomes, four lines, and the middle two are the ones that must not read as
+// failures: nothing was ever asked, and already-gone (which means already archived).
+function archiveTabLine(tab) {
+  if (!tab || typeof tab !== "object") return "Tab: not reported";
+  if (tab.reason === "no-tab-recorded") return "Tab: none recorded (the run never had one to close)";
+  const tabId = text(tab.tabId);
+  if (tab.closed === true) return `Tab: ${tabId} closed`;
+  if (tab.alreadyGone === true) return `Tab: ${tabId} already gone (nothing left to close — this is the normal case, not a failure)`;
+  return `Tab: ${tabId} NOT CLOSED — ${text(tab.reason, "no reason recorded")}`;
+}
+
+function formatArchiveReport(value) {
+  const removed = list(value.removed);
+  const kept = list(value.kept);
+  const status = value.status === "archived" ? "archived" : text(value.status).toUpperCase();
+
+  const lines = [
+    `Run: ${text(value.runId)}`,
+    `Archive: ${status}`,
+  ];
+  if (value.archivedAt) lines.push(`Archived at: ${value.archivedAt}`);
+  if (value.approvalDigest) lines.push(`Approval digest: ${value.approvalDigest}`);
+
+  const rows = [
+    ...removed.map((entry) => archiveReportRow(entry, "removed")),
+    ...kept.map((entry) => archiveReportRow(entry, `KEPT (${text(entry.reason, "unknown")})`)),
+  ];
+  if (rows.length === 0) lines.push("Repositories: none");
+  else lines.push(...renderTable(ARCHIVE_REPORT_COLUMNS, rows));
+
+  // The two explicit empty lines, for the same reason formatMergeReport prints its own: an operator
+  // scanning a report has to be able to read "nothing was left behind" off the page rather than
+  // infer it from an absence.
+  if (removed.length === 0) lines.push("Removed: none");
+  if (kept.length === 0) lines.push("Kept: none");
+
+  // Point 4: the EXECUTED argv, and only for removals that actually succeeded. A kept entry carries
+  // none by construction (commands.js attaches it on the success side only), and this renderer
+  // keys off which list an entry is in rather than off whether an argv happens to be present.
+  if (removed.length > 0) {
+    lines.push("Removed (executed argv):");
+    for (const entry of removed) {
+      lines.push(`${text(entry.repositoryId)}: ${Array.isArray(entry.argv) ? JSON.stringify(entry.argv) : "unavailable"}`);
+    }
+  }
+  if (kept.length > 0) {
+    lines.push("Kept, with git's own reason:");
+    for (const entry of kept) {
+      lines.push(...reasonBlock(`${text(entry.repositoryId)} (${text(entry.reason, "unknown")})`, text(entry.detail, "no detail recorded")));
+    }
+  }
+
+  appendArchiveLosses(lines, list(value.losses));
+  lines.push(archiveTabLine(value.tab));
+
+  // Item 2.3's I4 finding, and it matters more here than anywhere it has mattered before: by the
+  // time these render, real directories are gone from a real filesystem and rerunning cannot undo
+  // it. Named last, as "and one more thing", never folded into the verdict above.
+  if (value.recordError) lines.push(`Record: ${value.recordError}`);
+  if (value.evidenceError) lines.push(`Evidence: ${value.evidenceError}`);
+  appendArchiveNextActions(lines, value.nextActions);
+  return bound(lines.join("\n"));
+}
+
+export function formatArchive(value = {}) {
+  if (value.refused) {
+    // A refusal carries `repositories: []` and `losses: []` BY DESIGN, so neither section renders
+    // here: "Losses: none" over a refusal would read as "checked, and nothing would be lost", which
+    // is the opposite of what happened, and an empty table would read as a completed archive of
+    // nothing. `reason` is already capped by commands.js (reasonRepositories x reasonPaths) and is
+    // rendered verbatim rather than re-parsed back into a table.
+    const lines = [
+      `Run: ${text(value.runId)}`,
+      ...reasonBlock("Archive: refused", text(value.reason, "no reason recorded"), " — "),
+    ];
+    // The ownership verdict is what decides whether `workflow unlock` is even applicable, so it is
+    // carried onto the refusal that names it -- the same thing formatReconcile does with its own.
+    if (value.lock?.held === true) lines.push(archiveLockLine(value.lock));
+    appendArchiveNextActions(lines, value.nextActions);
+    return bound(lines.join("\n"));
+  }
+  if (Array.isArray(value.removed) || Array.isArray(value.kept)) {
+    return formatArchiveReport(value);
+  }
+  return formatArchivePreview(value);
+}
+
 // The projection roadmap item 2.1's design spec promised ("machines get complete records") was
 // wrong at board scale, and the wrongness is measured, not theoretical: against the 8 real runs
 // on the machine that first ran this command, whole records serialize to 53,791 characters for
@@ -1037,6 +1385,12 @@ export function formatMerge(value = {}) {
 //     the field a tool consuming the board actually wants.
 // Everything else stays out on purpose. An operator or script that needs the rest already has the
 // tool sized for exactly that: `workflow result <run-id>` returns one run's full record.
+//   - archivedAt: item 2.5's own field, and the reason it belongs on a BOARD projection rather than
+//     only in `workflow result`: this board now hides archived runs from its default view and from
+//     `--all`, so a JSON consumer looking at a `--state completed` listing has to be able to tell
+//     which of those rows are archived residue from which are still waiting to be dealt with. It is
+//     `undefined` on every run that has never been archived, so it costs nothing on the common
+//     board (JSON.stringify omits undefined keys entirely) and appears only where it is true.
 function runProjection(run) {
   if (!run || typeof run !== "object") return run;
   return {
@@ -1048,6 +1402,7 @@ function runProjection(run) {
     harness: run.harness,
     updatedAt: run.updatedAt,
     repositories: run.repositories,
+    archivedAt: run.archivedAt,
   };
 }
 
@@ -1144,6 +1499,10 @@ function runsOverflowFallback(command, source, limit) {
     runCount: droppedRuns.length,
     runIds,
     skippedCount: list(source.skipped).length,
+    // Carried for the same reason `skippedCount` is: a collapse must not read as "and nothing was
+    // hidden either". Item 2.5's archived count is residue this board deliberately did not show,
+    // and a degraded response is exactly where an operator is least able to go and check.
+    archivedHidden: Number.isFinite(source.archivedHidden) ? source.archivedHidden : 0,
     truncated: true,
     truncationMarker: `JSON output truncated at ${limit} characters; ${droppedRuns.length} runs did not fit and were dropped from this response (their ids are in runIds). There is no --limit flag for this command; --state <state> narrows further if more than one live state is present, and \`workflow result <run-id>\` inspects one run at a time.`,
   };
@@ -1423,6 +1782,124 @@ function mergeOverflowFallback(command, source, limit, tier) {
   return degraded;
 }
 
+// `archive` needs its own fallback for the same reason `verify` and `merge` did, and the failure
+// mode is the one this command can least afford: the general fallback below keeps only
+// `{command, runId, status?, truncated, truncationMarker}`, so one repository past the budget turns
+// a preview into a response with **no worktree paths and no loss counts in it at all** -- the two
+// things the digest is over, and the two things an operator is being asked to approve. A `runs`
+// board that collapses is annoying; an archive preview that collapses is an approval request with
+// the subject removed.
+//
+// What scales here is per-path TEXT, and specifically the sentences: every `losses[].detail`
+// restates its own worktree path, branch and base branch in prose, `unmergedReason` restates why a
+// count is unknown, a `kept[]` entry carries git's own stderr (capped at 2,000 characters by
+// commands.js), and a refusal's `reason` restates up to reasonRepositories x reasonPaths paths.
+// Everything else -- ids, paths, branches, shas, booleans, counts, and the executed argv -- is
+// fixed-size per repository. So this degrades exactly the prose and keeps every field a decision
+// rests on.
+//
+// Two tiers, tried in order, and every boundary below is MEASURED against the fixture in
+// test/workflow-format.test.js rather than reasoned about. n = repositories, each with a full loss
+// entry at realistic sharyco-shaped path lengths (~80-character worktree paths):
+//
+//   n = 1..10   no fallback needed          (n=1: 1,865 · n=10: 11,009)
+//   n = 11      tier 1                      (11,443)
+//   n = 12..16  tier 2                      (n=12: 9,022 · n=16: 11,421)
+//   n >= 17     the general fallback below  (202 characters, no paths, no counts)
+//
+// The tiers ARE fixture-relative -- shorter worktree paths push every boundary out -- which is why
+// the tests pin which tier engages rather than the byte counts. Tier 1 covering exactly one width
+// is not an oversight: the two tiers exist so the shape degrades gradually instead of falling off a
+// cliff one repository past a measured number, and the gradual step happens to be narrow at these
+// path lengths. The compact view stays under budget considerably longer (measured: it first
+// truncates at n=21), which is the opposite of `merge`, where compact was the first to go.
+//
+// A first attempt at this shipped ONE tier that bounded each `detail` to 120 characters. Measuring
+// it is what caught the defect: the real detail sentence is 119 characters, so `bound()` returned
+// it unchanged, the degraded response was byte-for-byte the size of the original, and the command
+// fell straight through to the general fallback at every size -- a fallback that existed, was
+// wired in, and did nothing. That is exactly the class of collapse items 2.1, 2.3 and 2.4 each
+// shipped once, and it was invisible from a green suite because the assertion it would have broken
+// is the one measurement added.
+//
+// Tier 1 drops the prose and keeps every structured field. Tier 2 additionally reduces each record
+// to the fields a decision actually rests on. What NEITHER tier ever drops, at any width: every
+// `worktreePath` (what would be removed), every `unmergedCommits` and every loss `count` (what
+// would be lost -- with `null` still meaning UNKNOWN, never 0), `branch`/`headSha` (what the digest
+// binds), the approval digest itself, and every executed `argv` on a report's `removed[]`, which is
+// the audit trail of directories that cannot be un-removed.
+const ARCHIVE_OVERFLOW_TIERS = [
+  { minimal: false, reasonLimit: 600, detailLimit: 240 },
+  { minimal: true, reasonLimit: 240, detailLimit: 100 },
+];
+
+function strippedArchiveRepository(record, tier) {
+  if (!record || typeof record !== "object") return record;
+  if (tier.minimal) {
+    return {
+      repositoryId: record.repositoryId,
+      worktreePath: record.worktreePath,
+      present: record.present,
+      branch: record.branch,
+      headSha: record.headSha,
+      basePath: record.basePath,
+      baseBranch: record.baseBranch,
+      // Copied verbatim, never defaulted: `null` here is UNKNOWN and a `?? 0` would turn it into
+      // "fully merged, nothing to warn about" -- the opposite fact, and the one false green this
+      // whole item exists to remove.
+      unmergedCommits: record.unmergedCommits,
+    };
+  }
+  // `unmergedReason` is the per-repository field whose size scales with path text. Dropping it
+  // loses WHY a count is unknown; `unmergedCommits: null` still says THAT it is, and the marker
+  // names the drop rather than letting it happen quietly.
+  const { unmergedReason, ...rest } = record;
+  return rest;
+}
+
+function strippedArchiveLoss(loss, tier) {
+  if (!loss || typeof loss !== "object") return loss;
+  if (tier.minimal) {
+    return {
+      repositoryId: loss.repositoryId,
+      kind: loss.kind,
+      // The join key back to `repositories[]`, and unique where `repositoryId` may be null on more
+      // than one entry -- the same reason archiveReportLosses keys on it in commands.js.
+      worktreePath: loss.worktreePath,
+      count: loss.count,
+      // Only ever present on an execution report, where it is the difference between a loss that
+      // happened and one that did not. Preserved exactly, including `false`.
+      ...(Object.hasOwn(loss, "removed") ? { removed: loss.removed } : {}),
+    };
+  }
+  const { detail, ...rest } = loss;
+  return rest;
+}
+
+function boundedArchiveDetail(entry, tier) {
+  if (!entry || typeof entry !== "object" || typeof entry.detail !== "string") return entry;
+  return { ...entry, detail: bound(entry.detail, tier.detailLimit, "detail") };
+}
+
+function archiveOverflowFallback(command, source, limit, tier) {
+  const degraded = {
+    ...source,
+    ...(typeof source.reason === "string" ? { reason: bound(source.reason, tier.reasonLimit, "reason") } : {}),
+    ...(Object.hasOwn(source, "repositories") ? { repositories: list(source.repositories).map((record) => strippedArchiveRepository(record, tier)) } : {}),
+    ...(Object.hasOwn(source, "losses") ? { losses: list(source.losses).map((loss) => strippedArchiveLoss(loss, tier)) } : {}),
+    // `removed[]` carries no `detail` at all and its `argv` is never touched -- it is the record of
+    // what actually ran against a filesystem that re-running cannot restore. `kept[]` carries git's
+    // own stderr, which is the one entry-level string whose size scales.
+    ...(Object.hasOwn(source, "kept") ? { kept: list(source.kept).map((entry) => boundedArchiveDetail(entry, tier)) } : {}),
+    truncated: true,
+  };
+  const dropped = tier.minimal
+    ? "every loss's `detail` sentence was dropped, and each repository was reduced to `repositoryId`/`worktreePath`/`present`/`branch`/`headSha`/`basePath`/`baseBranch`/`unmergedCommits` -- `recordedBranch`, `branchMismatch`, `headReachable`, `unmergedReason` and the dirty counts were dropped with it, as were each loss's `branch`/`baseBranch`/`detail`"
+    : "every loss's `detail` sentence was dropped and each repository's `unmergedReason` was dropped, so a count that is `null` still says it is UNKNOWN but no longer says why";
+  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, any \`kept\` entry's git output was bounded to ${tier.detailLimit} characters, and a refusal's \`reason\` was bounded to ${tier.reasonLimit}. Every repository's \`worktreePath\` and \`unmergedCommits\`, every loss's \`kind\` and \`count\` (\`null\` means UNKNOWN, never 0), every removal's executed \`argv\`, and the approval digest all survive at every tier: the worktree path is what would be removed, the count is what would be lost, and the digest is what binds them. The compact view (--format compact, the default) is bounded to ${OUTPUT_LIMIT} characters too and truncates its TAIL -- it keeps the run header, the "Would be lost" headline and the approval digest, which are printed above every path-heavy section for exactly this reason.`;
+  return degraded;
+}
+
 function boundedJson(command, value) {
   const text = JSON.stringify(normalizeJson(valueForJson(command, value)), null, 2);
   const limit = command === "launch" ? ASSIGNMENT_OUTPUT_LIMIT + OUTPUT_LIMIT : OUTPUT_LIMIT;
@@ -1445,6 +1922,16 @@ function boundedJson(command, value) {
     // answer rather than a response that claims to be complete.
     for (const tier of MERGE_OVERFLOW_TIERS) {
       const degraded = JSON.stringify(normalizeJson(mergeOverflowFallback(command, source, limit, tier)), null, 2);
+      if (degraded.length <= limit) return degraded;
+    }
+  }
+  if (command === "archive") {
+    // Same escalate-then-admit shape `merge` uses above: degrade the text that scales, keep the
+    // paths and the counts. If even the minimal tier does not fit, something other than per-record
+    // text is the cause and the general shape below is the honest answer rather than a response
+    // that claims to be complete.
+    for (const tier of ARCHIVE_OVERFLOW_TIERS) {
+      const degraded = JSON.stringify(normalizeJson(archiveOverflowFallback(command, source, limit, tier)), null, 2);
       if (degraded.length <= limit) return degraded;
     }
   }
@@ -1487,6 +1974,8 @@ export function formatWorkflowResult(command, value, format = "compact") {
       return formatVerify(value);
     case "merge":
       return formatMerge(value);
+    case "archive":
+      return formatArchive(value);
     case "reconcile":
       return formatReconcile(value);
     case "resume":

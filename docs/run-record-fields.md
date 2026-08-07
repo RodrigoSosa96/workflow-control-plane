@@ -145,6 +145,22 @@ One harness's pair of marker fields appears per run, named after `run.harness` (
 | `resultFingerprints` | Per-repository git fingerprint digests recorded with the result. | After a structured handoff is submitted | Yes |
 | `resultStaleAt` | Timestamp the result was marked stale, written by the unexported `markResultStale()`, reached through `readCurrentResult()` when the current result no longer matches what's registered (metadata drift or a worktree fingerprint mismatch). | When a read detects the registered result is stale | Yes |
 
+## `commands.js` — `archiveCommand`'s execution (`workflow archive <run-id> --yes`)
+
+| Field | Meaning | When it appears | Verified by the check |
+| --- | --- | --- | --- |
+| `archivedAt` | ISO-8601 timestamp of the archive that removed this run's worktrees. Written **only** when every recorded worktree was successfully removed (`status: "archived"`); a `partial` archive deliberately leaves it unset, because `workflow runs` hides archived runs and hiding one with worktrees still on disk would hide the residue with it. Never set by any other command, and never cleared — re-running `workflow archive` after a complete archive re-previews the (now absent) worktrees and stamps a fresh timestamp. | After a fully successful `workflow archive <run-id> --yes --approval-digest <digest>` | No — not exercised (the check builds its record through launch/lifecycle/handoff/resume, none of which archive) |
+
+`workflow runs` treats `typeof run.archivedAt === "string"` as "archived" — deliberately a
+timestamp rather than a boolean, so the board can also answer *when*. That predicate lives in
+`selectRunsForBoard` (`src/workflow/commands.js`); an archived run is excluded from the default view
+and from `--all`, counted in `archivedHidden`, and still listed by an explicit `--state`.
+
+**This row is not enforced by `test/workflow-run-record-inventory.test.js`.** That check builds its
+record through real launch/lifecycle/handoff/telemetry/delegation/resume operations, and none of
+them archive, so a missing row here would not have turned it red. It is written deliberately, and
+the same caveat applies to any future field written only by `archiveCommand`.
+
 ## `telemetry-store.js` — `record()`
 
 | Field | Meaning | When it appears | Verified by the check |

@@ -5,7 +5,7 @@ import { formatInbox, formatRuns, formatVerify, formatWorkflowResult } from "../
 // worst-case fixture below is built FROM them, so raising one there makes the size assertions
 // in this file measure the payload that would really be emitted -- which is the whole point of
 // the worst-case test, and was not true when the counts were hardcoded.
-import { MERGE_DISPLAY_LIMITS } from "../src/workflow/commands.js";
+import { ARCHIVE_DISPLAY_LIMITS, MERGE_DISPLAY_LIMITS } from "../src/workflow/commands.js";
 
 const RUN_ID = "55555555-5555-4555-8555-555555555555";
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -404,6 +404,28 @@ test("skipped records are named under the table with a count and their ids, neve
   assert.match(populatedBoard, /Skipped: 2 \(99999999-9999-4999-8999-999999999999, 88888888-8888-4888-8888-888888888888\)$/);
   // The skip footer follows the table directly; it never removes the readable run above it.
   assert.match(populatedBoard, /^11111111\s+\|\s+running/m);
+});
+
+// Roadmap item 2.5's board change, and the same discipline the skip footer above established:
+// residue this board chose not to show is NAMED underneath it, never silently dropped. Archived
+// runs are excluded from `--all` (that is the relief item 2.1 named when it measured the 12-14 run
+// JSON ceiling), and an operator has to be able to tell "there are no other runs" from "there are
+// four you are not being shown".
+test("archived runs hidden from the board are counted under the table, never silently dropped", () => {
+  const withHidden = formatRuns({ command: "runs", runs: [runRecord()], skipped: [], archivedHidden: 4 }, { now: fixedNow });
+  assert.match(withHidden, /^Archived: 4 hidden \(--state <state> still shows them\)$/m);
+  assert.match(withHidden, /^11111111\s+\|\s+running/m, "the visible runs are untouched by the footer");
+
+  // Nothing hidden means no footer at all: an unconditional "Archived: 0" would be noise on every
+  // board this repo has ever printed.
+  const nothingHidden = formatRuns({ command: "runs", runs: [runRecord()], skipped: [], archivedHidden: 0 }, { now: fixedNow });
+  assert.doesNotMatch(nothingHidden, /Archived:/);
+  assert.doesNotMatch(formatRuns({ command: "runs", runs: [runRecord()], skipped: [] }, { now: fixedNow }), /Archived:/);
+
+  // An empty board whose emptiness is entirely archived runs must say so, or it reads as "you have
+  // nothing", which is the opposite of the truth.
+  const allHidden = formatRuns({ command: "runs", runs: [], skipped: [], archivedHidden: 3 }, { now: fixedNow });
+  assert.equal(allHidden, ["Runs: none", "Archived: 3 hidden (--state <state> still shows them)"].join("\n"));
 });
 
 test("column alignment survives a long project alias and a long ticket without breaking other columns or truncating either", () => {
@@ -2119,4 +2141,595 @@ test("each JSON fallback tier's marker describes the compact view accurately for
   assert.doesNotMatch(compactAtTierTwo, /^Next:$/m);
   assert.match(compactAtTierTwo, /^Conflicts:$/m, "the header survives; it is the tail of the list that is cut");
   assert.ok(compactAtTierTwo.split("\n").some((line) => line.startsWith("- ")), "and so do the first entries");
+});
+
+// --- formatArchive (roadmap item 2.5's `workflow archive`) -------------------------------------
+//
+// Three shapes reach this renderer, and the discriminator is structural rather than a constant
+// imported from commands.js (format.js is deliberately dependency-free): a refusal carries
+// `refused: true`, an execution report carries `removed`/`kept`, and everything else is a preview.
+//
+// What this view must never lose, from Task 2's own concerns:
+//   1. `losses[]` leads. The design's whole point is "what would be LOST", not "what would be
+//      removed" -- `repositories[]` is a list of paths, `losses[]` is the list of work that stops
+//      being findable.
+//   2. `count: null` is UNKNOWN and must never render as `0`. `0` means "fully merged, nothing to
+//      warn about"; they are opposite facts.
+//   3. A partial report mixes losses that happened with losses that did not (`removed: true|false`)
+//      and must render the difference.
+//   4. `argv` is on `removed[]` only -- a `kept[]` entry's argv never ran, which is why it is not
+//      carried at all.
+//   5. `tab` has three distinguishable outcomes and `alreadyGone` is the COMMON one.
+
+const ARCHIVE_RUN_ID = "7c3f1a2b-5d4e-4f60-9a8b-2c1d0e9f8a7b";
+const ARCHIVE_DIGEST = `sha256:${"c7e1".repeat(16)}`;
+const ARCHIVE_WORKTREE = (repositoryId) => `/home/op/projects/work/sharyco/worktrees/1216110941098331-registro-impl/${repositoryId}`;
+const ARCHIVE_BASE = (repositoryId) => `/home/op/projects/work/sharyco/${repositoryId}`;
+
+function archiveRepository(overrides = {}) {
+  const repositoryId = overrides.repositoryId ?? "backend";
+  return {
+    repositoryId,
+    worktreePath: ARCHIVE_WORKTREE(repositoryId),
+    recordedBranch: "feature/1216110941098331/registro-impl",
+    present: true,
+    branch: "feature/registro-impl",
+    branchMismatch: true,
+    headSha: "3445371ae5e6c9d8b7a6f5e4d3c2b1a09876543f",
+    headReachable: null,
+    dirty: false,
+    dirtyCount: 0,
+    trackedCount: 0,
+    untrackedCount: 0,
+    basePath: ARCHIVE_BASE(repositoryId),
+    baseBranch: "dev",
+    unmergedCommits: 3,
+    ...overrides,
+  };
+}
+
+function unmergedLoss(repositoryId, count) {
+  return {
+    repositoryId,
+    kind: "unmerged-commits",
+    worktreePath: ARCHIVE_WORKTREE(repositoryId),
+    branch: "feature/registro-impl",
+    baseBranch: "dev",
+    count,
+    detail: `${count} commit(s) on feature/registro-impl are not in dev; the branch survives, but nothing will point at this work any more`,
+  };
+}
+
+function unknownLoss(repositoryId, why) {
+  return {
+    repositoryId,
+    kind: "unmerged-commits-unknown",
+    worktreePath: ARCHIVE_WORKTREE(repositoryId),
+    branch: "feature/registro-impl",
+    baseBranch: "dev",
+    count: null,
+    detail: `how much of this work is unmerged could not be determined: ${why}`,
+  };
+}
+
+function archivePreview(overrides = {}) {
+  const repositories = overrides.repositories ?? [archiveRepository()];
+  const losses = overrides.losses ?? [unmergedLoss("backend", 3)];
+  return {
+    command: "archive",
+    runId: ARCHIVE_RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: false,
+    reason: null,
+    tabId: "w2M:t1",
+    agent: {
+      paneId: "w2W:p3",
+      checkedPaneIds: ["w2W:p3", "w1V:p2"],
+      resolved: false,
+      reason: "Herdr reports no agent on pane w2W:p3 or pane w1V:p2",
+    },
+    lock: { held: false, ageMs: null, stale: null, ownership: null },
+    removable: true,
+    approvalDigest: ARCHIVE_DIGEST,
+    exitCode: 0,
+    nextActions: [`workflow archive ${ARCHIVE_RUN_ID} --yes --approval-digest ${ARCHIVE_DIGEST}`],
+    ...overrides,
+    repositories,
+    losses,
+  };
+}
+
+function threeRepositoryArchivePreview(perRepository = () => ({})) {
+  const repositories = ["backend", "panel", "webapp"].map((repositoryId, index) => archiveRepository({
+    repositoryId,
+    ...perRepository(repositoryId, index),
+  }));
+  return archivePreview({
+    repositories,
+    losses: repositories.flatMap((record) => (
+      record.unmergedCommits === null
+        ? [unknownLoss(record.repositoryId, "the project has no base_branch configured, so the unmerged count cannot be measured")]
+        : record.unmergedCommits > 0 ? [unmergedLoss(record.repositoryId, record.unmergedCommits)] : []
+    )),
+  });
+}
+
+test("the compact archive preview leads with what would be lost, names every loss, and prints the digest above the path-heavy sections", () => {
+  const preview = threeRepositoryArchivePreview((repositoryId, index) => ({ unmergedCommits: index + 1 }));
+
+  const compact = formatWorkflowResult("archive", preview, "compact");
+  const lines = compact.split("\n");
+
+  // The headline: the total is impossible to miss even if everything below it were cut.
+  assert.match(compact, /^Would be lost: /m);
+  assert.match(compact, /6 unmerged commit\(s\)/, "1 + 2 + 3 commits across the three repositories");
+
+  // `losses[]` leads `repositories[]`: the section naming what is lost comes before the table of
+  // paths, so the first thing an operator reads is the consequence, not the inventory.
+  const lossesIndex = lines.findIndex((line) => line === "Losses:");
+  const tableIndex = lines.findIndex((line) => /^REPO\s+\|/.test(line));
+  assert.ok(lossesIndex > 0, `the preview must have a Losses section:\n${compact}`);
+  assert.ok(tableIndex > lossesIndex, `the losses must come before the repository table:\n${compact}`);
+
+  // The digest is above both, because bound() truncates the TAIL and the digest is the one string
+  // an operator has to copy (formatMergePreview's own measured lesson).
+  const digestIndex = lines.findIndex((line) => line === `Approval digest: ${ARCHIVE_DIGEST}`);
+  assert.ok(digestIndex >= 0 && digestIndex < lossesIndex, `the digest must precede the losses:\n${compact}`);
+
+  for (const record of preview.repositories) {
+    assert.ok(compact.includes(record.worktreePath), `the worktree path for ${record.repositoryId} must be named`);
+  }
+  assert.match(compact, new RegExp(`^- workflow archive ${ARCHIVE_RUN_ID} --yes --approval-digest ${ARCHIVE_DIGEST}$`, "m"));
+});
+
+test("an unmerged count that could not be measured renders as UNKNOWN, never as 0, and never like a fully merged repository", () => {
+  const preview = threeRepositoryArchivePreview((repositoryId, index) => ({
+    unmergedCommits: index === 0 ? 0 : index === 1 ? null : 4,
+    ...(index === 1 ? { unmergedReason: "the project has no base_branch configured, so the unmerged count cannot be measured" } : {}),
+  }));
+
+  const compact = formatWorkflowResult("archive", preview, "compact");
+  // Read the row out of the TABLE, not out of the losses section above it -- both start with the
+  // repository id, and the UNMERGED cell is the table's.
+  const lines = compact.split("\n");
+  const tableIndex = lines.findIndex((line) => /^REPO\s+\|/.test(line));
+  const rowFor = (repositoryId) => lines.slice(tableIndex).find((line) => line.startsWith(repositoryId));
+
+  // The false green this whole item exists to remove: `null` is "nobody could tell", `0` is
+  // "checked, and nothing is unmerged". They must not produce the same cell.
+  assert.match(rowFor("backend"), /\|\s+0\s*$/, "a measured 0 renders as 0");
+  assert.match(rowFor("panel"), /\|\s+UNKNOWN\s*$/, "an unmeasurable count must never render as 0");
+  assert.match(rowFor("webapp"), /\|\s+4\s*$/);
+
+  // And in the loss list, and in the headline total.
+  assert.match(compact, /UNKNOWN/);
+  assert.doesNotMatch(compact, /panel \| 0 commit/);
+  assert.match(compact, /^Would be lost: .*4 unmerged commit\(s\)/m, "the unknown loss must not be summed as 0 alongside the measured ones");
+  assert.match(compact, /^Would be lost: .*UNKNOWN/m);
+});
+
+test("a fully merged, fully branched run says so explicitly rather than printing an empty losses section", () => {
+  const preview = archivePreview({
+    repositories: [archiveRepository({ unmergedCommits: 0 })],
+    losses: [],
+  });
+
+  const compact = formatWorkflowResult("archive", preview, "compact");
+  assert.match(compact, /^Would be lost: nothing/m);
+  assert.match(compact, /^Losses: none$/m);
+});
+
+test("a refused archive preview renders as a refusal, never as an empty success, and keeps the -n in the remedy it was given", () => {
+  const dirtyPath = ARCHIVE_WORKTREE("panel");
+  const value = {
+    command: "archive",
+    runId: ARCHIVE_RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: true,
+    reason: `Run ${ARCHIVE_RUN_ID} cannot be archived: ${dirtyPath} has 2 untracked file(s): .env.local, tmp/scratch.txt. Uncommitted and untracked work exists nowhere else, so this refuses for the whole run and never forces.`,
+    tabId: "w2M:t1",
+    agent: null,
+    lock: null,
+    repositories: [],
+    losses: [],
+    removable: false,
+    approvalDigest: null,
+    exitCode: 10,
+    nextActions: [`git -C ${dirtyPath} status`, `git -C ${dirtyPath} clean -nd`, `workflow archive ${ARCHIVE_RUN_ID} --dry-run`],
+  };
+
+  const compact = formatWorkflowResult("archive", value, "compact");
+
+  assert.match(compact, /^Archive: refused — Run .* cannot be archived: /m);
+  assert.match(compact, /\.env\.local/);
+  // A refusal carries `repositories: []` and `losses: []`; rendering either as an empty section
+  // would read as "checked, and nothing would be lost" -- the opposite of what happened.
+  assert.doesNotMatch(compact, /^Losses: none$/m);
+  assert.doesNotMatch(compact, /^Would be lost: nothing/m);
+  assert.doesNotMatch(compact, /^REPO\s+\|/m);
+  assert.doesNotMatch(compact, /Approval digest/);
+  // `-n` is a dry run; a command that refuses to destroy untracked work must not hand the operator
+  // a one-liner that destroys it.
+  assert.match(compact, new RegExp(`^- git -C ${dirtyPath.replace(/\//g, "\\/")} clean -nd$`, "m"));
+  assert.match(compact, new RegExp(`^- workflow archive ${ARCHIVE_RUN_ID} --dry-run$`, "m"));
+});
+
+test("an in-progress-operation refusal prints the remedy it was handed, not a hardcoded merge one", () => {
+  const worktree = ARCHIVE_WORKTREE("backend");
+  const compact = formatWorkflowResult("archive", {
+    command: "archive",
+    runId: ARCHIVE_RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: true,
+    reason: `Run ${ARCHIVE_RUN_ID} repository backend worktree at ${worktree} is in the middle of a rebase; finish it or run \`git -C ${worktree} rebase --abort\` before archiving.`,
+    tabId: null,
+    agent: null,
+    lock: null,
+    repositories: [],
+    losses: [],
+    removable: false,
+    approvalDigest: null,
+    exitCode: 10,
+    nextActions: [`git -C ${worktree} status`, `git -C ${worktree} rebase --abort`, `workflow archive ${ARCHIVE_RUN_ID} --dry-run`],
+  }, "compact");
+
+  assert.match(compact, /rebase --abort/);
+  assert.doesNotMatch(compact, /merge --abort/, "the remedy for a rebase is not the merge one");
+});
+
+test("a held lock is named on an archivable preview, together with the command that clears it", () => {
+  const compact = formatWorkflowResult("archive", archivePreview({
+    lock: {
+      held: true,
+      ageMs: 21_600_000,
+      stale: true,
+      ownership: { verdict: "owner-gone", removable: true, reason: "pid 4242 no longer exists" },
+    },
+    nextActions: [
+      `workflow archive ${ARCHIVE_RUN_ID} --yes --approval-digest ${ARCHIVE_DIGEST}`,
+      `workflow unlock ${ARCHIVE_RUN_ID} --yes`,
+    ],
+  }), "compact");
+
+  // Archive does not remove the lock, but store.update/appendEvent both take it -- so an operator
+  // who does not see this archives successfully and then gets a recordError with no explanation.
+  assert.match(compact, /^Lock: HELD/m);
+  assert.match(compact, /owner-gone/);
+  assert.match(compact, new RegExp(`^- workflow unlock ${ARCHIVE_RUN_ID} --yes$`, "m"));
+});
+
+test("an already-vanished worktree and a detached HEAD are each named in the table rather than rendered as unknowns", () => {
+  const compact = formatWorkflowResult("archive", archivePreview({
+    repositories: [
+      archiveRepository({ repositoryId: "backend", present: false, branch: null, headSha: null, unmergedCommits: null }),
+      archiveRepository({ repositoryId: "panel", branch: null, headReachable: true, unmergedCommits: null }),
+    ],
+    losses: [
+      unknownLoss("backend", `the worktree directory at ${ARCHIVE_WORKTREE("backend")} no longer exists, so its branch cannot be read`),
+      {
+        repositoryId: "panel",
+        kind: "detached-head",
+        worktreePath: ARCHIVE_WORKTREE("panel"),
+        branch: null,
+        baseBranch: "dev",
+        count: null,
+        detail: `the worktree at ${ARCHIVE_WORKTREE("panel")} is on a detached HEAD at 3445371ae5e6`,
+      },
+    ],
+  }), "compact");
+
+  assert.match(compact, /ALREADY GONE/, "a worktree the directory of which has vanished is the residue this command exists for");
+  assert.match(compact, /DETACHED/);
+  assert.doesNotMatch(compact, /\|\s+0\s*$/m, "no count here was measured, so none may render as 0");
+});
+
+function archiveReport(overrides = {}) {
+  return {
+    command: "archive",
+    runId: ARCHIVE_RUN_ID,
+    projectAlias: "sharyco",
+    approvalDigest: ARCHIVE_DIGEST,
+    status: "archived",
+    archivedAt: "2026-08-07T12:00:00.000Z",
+    removed: [{
+      repositoryId: "backend",
+      worktreePath: ARCHIVE_WORKTREE("backend"),
+      branch: "feature/registro-impl",
+      code: 0,
+      argv: ["git", "worktree", "remove", ARCHIVE_WORKTREE("backend")],
+    }],
+    kept: [],
+    tab: { tabId: "w2M:t1", closed: false, alreadyGone: true, reason: "not-found" },
+    losses: [{ ...unmergedLoss("backend", 3), removed: true }],
+    exitCode: 0,
+    nextActions: [],
+    ...overrides,
+  };
+}
+
+test("the archive report separates what was removed from what was kept, and a partial never reads as archived", () => {
+  const report = archiveReport({
+    status: "partial",
+    archivedAt: null,
+    kept: [{
+      repositoryId: "panel",
+      worktreePath: ARCHIVE_WORKTREE("panel"),
+      branch: "feature/registro-impl",
+      code: 128,
+      reason: "dirty",
+      detail: `fatal: '${ARCHIVE_WORKTREE("panel")}' contains modified or untracked files, use --force to delete it`,
+    }],
+    losses: [
+      { ...unmergedLoss("backend", 3), removed: true },
+      { ...unmergedLoss("panel", 5), removed: false, detail: `5 commit(s) on feature/registro-impl are not in dev — but this worktree was NOT removed and is still on disk at ${ARCHIVE_WORKTREE("panel")}, so nothing has been lost yet.` },
+    ],
+    exitCode: 13,
+    nextActions: [`workflow archive ${ARCHIVE_RUN_ID} --dry-run`],
+  });
+
+  const compact = formatWorkflowResult("archive", report, "compact");
+
+  assert.match(compact, /^Archive: PARTIAL$/m);
+  assert.doesNotMatch(compact, /^Archive: archived$/m);
+  assert.match(compact, /backend\s+\|\s+removed/);
+  assert.match(compact, /panel\s+\|\s+KEPT/);
+  assert.match(compact, /contains modified or untracked files/);
+
+  // The losses on a partial report describe two DIFFERENT worlds and must not render identically:
+  // backend's happened, panel's did not.
+  const backendLoss = compact.split("\n").find((line) => line.includes("backend") && line.includes("commit(s)"));
+  const panelLoss = compact.split("\n").find((line) => line.includes("panel") && line.includes("commit(s)"));
+  assert.ok(backendLoss && panelLoss, `both losses must be rendered:\n${compact}`);
+  assert.notEqual(backendLoss.replace("backend", "X"), panelLoss.replace("panel", "X"), "a loss that happened must not render like one that did not");
+  assert.match(panelLoss, /NOT LOST/);
+});
+
+test("the executed argv is rendered only for removals that actually succeeded", () => {
+  const report = archiveReport({
+    status: "partial",
+    archivedAt: null,
+    kept: [{
+      repositoryId: "panel",
+      worktreePath: ARCHIVE_WORKTREE("panel"),
+      branch: "feature/registro-impl",
+      code: null,
+      reason: "unsafe-path",
+      // Task 1's concern: this entry deliberately carries NO argv, because nothing ran.
+      detail: "the worktree path is not absolute; refusing to spawn",
+    }],
+    exitCode: 13,
+  });
+
+  const compact = formatWorkflowResult("archive", report, "compact");
+
+  assert.match(compact, /^Removed \(executed argv\):$/m);
+  assert.match(compact, new RegExp(`^backend: \\["git","worktree","remove","${ARCHIVE_WORKTREE("backend").replace(/\//g, "\\/")}"\\]$`, "m"));
+  assert.doesNotMatch(compact, /panel: \["git"/, "a kept repository never ran a command; printing one would be an audit trail of something that did not happen");
+  assert.match(compact, /unsafe-path/);
+});
+
+test("the archive report's three tab outcomes never collapse into one", () => {
+  const outcomes = [
+    [{ tabId: null, closed: false, alreadyGone: false, reason: "no-tab-recorded" }, /^Tab: none recorded/m],
+    // The COMMON case on a real machine: every recorded tab id is stale, so this is what an
+    // operator sees almost every time. It must not read as a failure.
+    [{ tabId: "w2M:t1", closed: false, alreadyGone: true, reason: "not-found" }, /^Tab: w2M:t1 already gone/m],
+    [{ tabId: "w2M:t1", closed: true, alreadyGone: false, reason: null }, /^Tab: w2M:t1 closed$/m],
+    [{ tabId: "w2M:t1", closed: false, alreadyGone: false, reason: "herdr exited with code 1" }, /^Tab: w2M:t1 NOT CLOSED — herdr exited with code 1$/m],
+  ];
+
+  const rendered = outcomes.map(([tab, expected]) => {
+    const compact = formatWorkflowResult("archive", archiveReport({ tab }), "compact");
+    const line = compact.split("\n").find((entry) => entry.startsWith("Tab: "));
+    assert.match(compact, expected, `tab outcome ${JSON.stringify(tab)} rendered as:\n${line}`);
+    return line;
+  });
+  assert.equal(new Set(rendered).size, outcomes.length, "four distinguishable outcomes must produce four distinguishable lines");
+  assert.doesNotMatch(rendered[1], /NOT CLOSED|failed/i, "already gone is already archived, not a failure");
+});
+
+test("a persistence failure after real removals is named last, never folded into the verdict", () => {
+  const compact = formatWorkflowResult("archive", archiveReport({
+    recordError: "the run could not be marked archived: run lock is held",
+    evidenceError: "evidence could not be persisted: run lock is held",
+    nextActions: [`workflow unlock ${ARCHIVE_RUN_ID} --yes`],
+  }), "compact");
+
+  assert.match(compact, /^Archive: archived$/m, "the removals really happened; the verdict is about them");
+  assert.match(compact, /^Record: the run could not be marked archived: run lock is held$/m);
+  assert.match(compact, /^Evidence: evidence could not be persisted: run lock is held$/m);
+  assert.match(compact, new RegExp(`^- workflow unlock ${ARCHIVE_RUN_ID} --yes$`, "m"));
+});
+
+// --- archive JSON, measured against the shared 12,000-character budget -------------------------
+//
+// Items 2.1, 2.3 and 2.4 each shipped a JSON collapse that only measurement caught, so this is
+// measured against a fixture built FROM the caps that actually ship (ARCHIVE_DISPLAY_LIMITS),
+// never against numbers copied out of commands.js.
+
+function worstCaseArchivePreview(repositoryIds) {
+  const repositories = repositoryIds.map((repositoryId) => archiveRepository({
+    repositoryId,
+    unmergedCommits: 900,
+    unmergedReason: undefined,
+  }));
+  return archivePreview({
+    repositories,
+    losses: repositories.map((record) => unmergedLoss(record.repositoryId, 900)),
+  });
+}
+
+function worstCaseArchiveRefusal(repositoryIds) {
+  // A refusal's only long field is `reason`, already capped at reasonRepositories x reasonPaths by
+  // commands.js. `nextActions` is capped by the SAME slice.
+  const shown = repositoryIds.slice(0, ARCHIVE_DISPLAY_LIMITS.reasonRepositories);
+  const clause = shown.map((repositoryId) => {
+    const paths = Array.from({ length: ARCHIVE_DISPLAY_LIMITS.reasonPaths }, (_, index) => `packages/${repositoryId}/src/features/registro/hooks/use-registro-${String(index).padStart(4, "0")}.ts`);
+    return `${ARCHIVE_WORKTREE(repositoryId)} has 12 untracked file(s): ${paths.join(", ")} (+7 more)`;
+  }).join("; ");
+  return {
+    command: "archive",
+    runId: ARCHIVE_RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: true,
+    reason: `Run ${ARCHIVE_RUN_ID} cannot be archived: ${clause}${repositoryIds.length > shown.length ? ` (+${repositoryIds.length - shown.length} more repositories)` : ""}. Uncommitted and untracked work exists nowhere else, so this refuses for the whole run and never forces.`,
+    tabId: "w2M:t1",
+    agent: { paneId: "w2W:p3", checkedPaneIds: ["w2W:p3"], resolved: false, reason: "Herdr reports no agent on pane w2W:p3" },
+    lock: { held: false, ageMs: null, stale: null, ownership: null },
+    repositories: [],
+    losses: [],
+    removable: false,
+    approvalDigest: null,
+    exitCode: 10,
+    nextActions: [...shown.flatMap((repositoryId) => [`git -C ${ARCHIVE_WORKTREE(repositoryId)} status`, `git -C ${ARCHIVE_WORKTREE(repositoryId)} clean -nd`]), `workflow archive ${ARCHIVE_RUN_ID} --dry-run`],
+  };
+}
+
+test("--format json for a realistic three-repository archive fits the shared 12,000-character limit, preview, refusal and report alike", () => {
+  for (const [label, value] of [
+    ["preview", threeRepositoryArchivePreview((repositoryId, index) => ({ unmergedCommits: index === 1 ? null : 900 }))],
+    ["refusal", worstCaseArchiveRefusal(["backend", "panel", "webapp"])],
+    ["report", archiveReport({
+      removed: ["backend", "panel", "webapp"].map((repositoryId) => ({
+        repositoryId,
+        worktreePath: ARCHIVE_WORKTREE(repositoryId),
+        branch: "feature/registro-impl",
+        code: 0,
+        argv: ["git", "worktree", "remove", ARCHIVE_WORKTREE(repositoryId)],
+      })),
+      losses: ["backend", "panel", "webapp"].map((repositoryId) => ({ ...unmergedLoss(repositoryId, 900), removed: true })),
+    })],
+  ]) {
+    const json = formatWorkflowResult("archive", value, "json");
+    assert.ok(json.length < 12000 * 0.9, `the ${label} was ${json.length} characters, expected comfortably under 90% of OUTPUT_LIMIT`);
+    const parsed = JSON.parse(json);
+    assert.equal(parsed.truncated, undefined, `the ${label} must not have fallen through to an overflow fallback`);
+  }
+});
+
+test("--format json for an archive preview too wide to fit keeps every worktree path and every loss count rather than collapsing the envelope", () => {
+  const repositoryIds = ["backend", "panel", "webapp", "admin", "mobile", "docs", "infra", "edge", "cms", "gateway", "billing", "search"];
+  const overflowing = worstCaseArchivePreview(repositoryIds);
+  assert.ok(
+    JSON.stringify(overflowing, null, 2).length > 12000,
+    "the fixture is too small to prove anything: it must actually exceed OUTPUT_LIMIT",
+  );
+
+  const json = formatWorkflowResult("archive", overflowing, "json");
+  assert.ok(json.length <= 12000, `the degraded response was ${json.length} characters`);
+  const parsed = JSON.parse(json);
+
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.repositories.length, repositoryIds.length, "the general fallback would have dropped every one of them");
+  for (const [index, record] of parsed.repositories.entries()) {
+    assert.equal(record.worktreePath, overflowing.repositories[index].worktreePath, "the path is what would be removed; it must survive");
+    assert.equal(record.unmergedCommits, 900, "the loss count is what an operator is approving");
+  }
+  assert.equal(parsed.losses.length, repositoryIds.length);
+  for (const loss of parsed.losses) {
+    assert.equal(loss.count, 900);
+    assert.equal(typeof loss.kind, "string");
+  }
+  assert.equal(parsed.approvalDigest, ARCHIVE_DIGEST, "without the digest nothing can be approved at all");
+  assert.match(parsed.truncationMarker, /worktree path|path/i);
+});
+
+test("an unknown loss count survives the JSON overflow fallback as null, never as 0", () => {
+  const repositoryIds = ["backend", "panel", "webapp", "admin", "mobile", "docs", "infra", "edge", "cms", "gateway", "billing", "search"];
+  const overflowing = worstCaseArchivePreview(repositoryIds);
+  overflowing.repositories[0].unmergedCommits = null;
+  overflowing.losses[0] = unknownLoss(repositoryIds[0], "the project has no base_branch configured, so the unmerged count cannot be measured");
+
+  const parsed = JSON.parse(formatWorkflowResult("archive", overflowing, "json"));
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.repositories[0].unmergedCommits, null);
+  assert.equal(parsed.losses[0].count, null);
+});
+
+// The boundaries the ARCHIVE_OVERFLOW_TIERS comment documents, pinned as tiers rather than as byte
+// counts (they are fixture-relative: shorter worktree paths push each one out). Mirrors the merge
+// tier test, and exists for the same reason: the first version of this fallback bounded each
+// `detail` to 120 characters when the real sentence is 119, so it degraded nothing, fired never,
+// and left every wide archive collapsing to the general fallback's 202 characters. Only measuring
+// caught that.
+test("the archive JSON fallback tiers engage where they are documented to, and every tier keeps the paths and the counts", () => {
+  const tierOf = (n) => {
+    const parsed = JSON.parse(formatWorkflowResult("archive", worstCaseArchivePreview(
+      Array.from({ length: n }, (_, index) => `repo-${String(index).padStart(2, "0")}`),
+    ), "json"));
+    if (!parsed.truncated) return "none";
+    if (parsed.repositories === undefined) return "general";
+    return Object.hasOwn(parsed.repositories[0], "recordedBranch") ? "tier1" : "tier2";
+  };
+
+  assert.equal(tierOf(10), "none");
+  assert.equal(tierOf(11), "tier1");
+  assert.equal(tierOf(12), "tier2");
+  assert.equal(tierOf(16), "tier2");
+  assert.equal(tierOf(17), "general");
+
+  // And at every tier that is not the general one, the two things this fallback exists to protect
+  // survive: the path that would be removed, and the count that would be lost.
+  for (const n of [11, 12, 16]) {
+    const preview = worstCaseArchivePreview(Array.from({ length: n }, (_, index) => `repo-${String(index).padStart(2, "0")}`));
+    const parsed = JSON.parse(formatWorkflowResult("archive", preview, "json"));
+    assert.equal(parsed.repositories.length, n);
+    assert.deepEqual(parsed.repositories.map((record) => record.worktreePath), preview.repositories.map((record) => record.worktreePath));
+    assert.deepEqual(parsed.losses.map((loss) => loss.count), preview.losses.map((loss) => loss.count));
+    assert.equal(parsed.approvalDigest, ARCHIVE_DIGEST);
+  }
+});
+
+// Three defects this renderer shipped and only the real CLI (task 3, step 5) exposed, all three in
+// the same output: re-previewing an already-archived run. Each was a true-looking sentence that was
+// false about the world it was describing.
+test("a preview of a run whose worktrees are already gone never promises removals, mismatches, or checks that did not happen", () => {
+  const preview = archivePreview({
+    repositories: ["backend", "panel"].map((repositoryId) => archiveRepository({
+      repositoryId,
+      present: false,
+      branch: null,
+      headSha: null,
+      unmergedCommits: null,
+    })),
+    losses: ["backend", "panel"].map((repositoryId) => unknownLoss(repositoryId, `the worktree directory at ${ARCHIVE_WORKTREE(repositoryId)} no longer exists, so its branch cannot be read`)),
+    agent: { paneId: null, checkedPaneIds: [], resolved: false, reason: "the run records no pane id, so it has no agent to resolve" },
+  });
+
+  const compact = formatWorkflowResult("archive", preview, "compact");
+
+  // 1. `2 worktree(s) would be removed` was false: both directories are already gone, so nothing is
+  //    removed from disk and only the git registration is reclaimed.
+  assert.doesNotMatch(compact, /^Archive: 2 worktree\(s\) would be removed$/m);
+  assert.match(compact, /^Archive: nothing left on disk — all 2 recorded worktree\(s\) are already gone/m);
+
+  // 2. `the worktree <path> is on -` was not a branch mismatch; it was a missing worktree.
+  assert.doesNotMatch(compact, /is on - —/);
+  assert.match(compact, /^backend: the run recorded feature\/1216110941098331\/registro-impl; that worktree is already gone/m);
+
+  // 3. `no live agent (panes checked: none recorded)` claimed a check and denied it in the same
+  //    breath. A run with no pane has no agent to resolve and Herdr is never asked.
+  assert.doesNotMatch(compact, /panes checked: none recorded/);
+  assert.match(compact, /^Agent: none to resolve \(the run never recorded a pane id, so Herdr was not asked\)$/m);
+
+  // And a run that DID record panes still reports which ones were asked about -- `checkedPaneIds`
+  // may name two, and that is the evidence behind "no live agent".
+  const withPanes = formatWorkflowResult("archive", archivePreview(), "compact");
+  assert.match(withPanes, /^Agent: no live agent \(Herdr asked about w2W:p3, w1V:p2\)$/m);
+});
+
+// A fourth defect from the same real run: the loss label restated the detail it sat in front of, so
+// every unmerged loss printed its own opening clause twice.
+test("a loss label is a scannable classifier, not a paraphrase of the sentence beside it", () => {
+  const compact = formatWorkflowResult("archive", archivePreview(), "compact");
+  const line = compact.split("\n").find((entry) => entry.startsWith("backend | "));
+
+  assert.match(line, /^backend \| UNMERGED \(3\): 3 commit\(s\) on feature\/registro-impl are not in dev/);
+  // The count and the branch appear once each in the label's slot; the sentence is not restated.
+  assert.equal(line.match(/not in dev/g).length, 1);
+  assert.equal(line.match(/feature\/registro-impl/g).length, 1);
 });

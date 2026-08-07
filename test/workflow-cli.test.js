@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import * as realFs from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -2901,4 +2902,279 @@ test("workflow merge end-to-end against a real conflicting pair: the dry-run pre
   assert.match(executed.stderr[0], /^CONFLICT: /);
   assert.equal(gitRun(basePath, ["rev-parse", "dev"]), beforeBaseSha, "a blocked merge must move nothing");
   assert.deepEqual(worktreeFingerprint(worktreePath), beforeWorktree);
+});
+
+// --- `workflow archive` (roadmap item 2.5) ----------------------------------------------------
+//
+// The CLI gate mirrors `merge`'s, for the same reason: the digest binds what would be removed AND
+// what would be lost (each worktree's dirty status, its HEAD, its unmerged-commit count), so a
+// `--yes` on its own would be approving a preview nobody read. There is no interactive y/N
+// fallback here either -- a prompt approves a rendering, a digest approves the exact state.
+
+const ARCHIVE_APPROVAL_DIGEST = `sha256:${"c".repeat(64)}`;
+
+function archivePreviewFixture(overrides = {}) {
+  return {
+    command: "archive",
+    runId: RUN_ID,
+    projectAlias: "sharyco",
+    runState: "completed",
+    refused: false,
+    reason: null,
+    tabId: "w2M:t1",
+    agent: { paneId: null, checkedPaneIds: [], resolved: false, reason: "the run records no pane id, so it has no agent to resolve" },
+    lock: { held: false, ageMs: null, stale: null, ownership: null },
+    repositories: [],
+    losses: [],
+    removable: true,
+    approvalDigest: ARCHIVE_APPROVAL_DIGEST,
+    exitCode: 0,
+    nextActions: [`workflow archive ${RUN_ID} --yes --approval-digest ${ARCHIVE_APPROVAL_DIGEST}`],
+    ...overrides,
+  };
+}
+
+test("archive parses its dry-run and approval shapes, and rejects everything else", () => {
+  assert.deepEqual(parseArgs(["archive", RUN_ID, "--dry-run"]), {
+    command: "archive",
+    runId: RUN_ID,
+    dryRun: true,
+    format: "compact",
+  });
+
+  assert.deepEqual(parseArgs(["archive", RUN_ID, "--yes", "--approval-digest", ARCHIVE_APPROVAL_DIGEST, "--format", "json"]), {
+    command: "archive",
+    runId: RUN_ID,
+    approvalDigest: ARCHIVE_APPROVAL_DIGEST,
+    yes: true,
+    format: "json",
+  });
+
+  assert.throws(() => parseArgs(["archive"]), /archive requires an argument/i);
+  assert.throws(() => parseArgs(["archive", "not-a-uuid", "--dry-run"]), /path-safe|UUID/i);
+  assert.throws(() => parseArgs(["archive", RUN_ID, "extra", "--dry-run"]), /unexpected argument/i);
+  // Archiving covers exactly the repositories the run recorded; narrowing that by argument would
+  // half-archive a group project and leave residue harder to reason about than the original.
+  assert.throws(() => parseArgs(["archive", RUN_ID, "--repos", "backend"]), /archive does not accept --repos/i);
+});
+
+test("archive --dry-run previews without executing and returns the preview's own exit code", async () => {
+  for (const [preview, expectedCode] of [
+    [archivePreviewFixture(), 0],
+    [archivePreviewFixture({ refused: true, reason: "Run is in running, which is still live", removable: false, approvalDigest: null, exitCode: 10 }), 10],
+  ]) {
+    const output = io();
+    const code = await main(["archive", RUN_ID, "--dry-run"], {
+      ...output,
+      archiveCommand: async (options) => {
+        assert.equal(options.runId, RUN_ID);
+        return {
+          preview,
+          execute: async () => {
+            throw new Error("a dry-run must never remove a worktree");
+          },
+        };
+      },
+      formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.exitCode}`,
+    });
+    assert.equal(code, expectedCode);
+    assert.deepEqual(output.stdout, [`archive:compact:${expectedCode}`]);
+    assert.deepEqual(output.stderr, []);
+  }
+});
+
+test("archive --yes without --approval-digest is a usage error, and never even builds the command", async () => {
+  const output = io();
+  const code = await main(["archive", RUN_ID, "--yes"], {
+    ...output,
+    archiveCommand: async () => {
+      throw new Error("archive --yes without a digest must not reach archiveCommand");
+    },
+  });
+  assert.equal(code, 64);
+  assert.match(output.stderr[0], /USAGE/);
+  assert.match(output.stderr[0], /--approval-digest/);
+  assert.deepEqual(output.stdout, []);
+});
+
+test("archive with neither --dry-run nor --yes is a usage error", async () => {
+  const output = io();
+  const code = await main(["archive", RUN_ID], {
+    ...output,
+    archiveCommand: async () => {
+      throw new Error("archive with no mode must not reach archiveCommand");
+    },
+  });
+  assert.equal(code, 64);
+  assert.match(output.stderr[0], /USAGE/);
+  assert.match(output.stderr[0], /--dry-run/);
+  assert.deepEqual(output.stdout, []);
+});
+
+test("archive --yes --approval-digest passes the digest through and exits the report's own code", async () => {
+  const calls = [];
+  const output = io();
+  const code = await main(["archive", RUN_ID, "--yes", "--approval-digest", ARCHIVE_APPROVAL_DIGEST], {
+    ...output,
+    archiveCommand: async () => ({
+      preview: archivePreviewFixture(),
+      execute: async (executeOptions) => {
+        calls.push(executeOptions);
+        return {
+          command: "archive",
+          runId: RUN_ID,
+          status: "partial",
+          archivedAt: null,
+          removed: [{ repositoryId: "backend" }],
+          kept: [{ repositoryId: "panel", reason: "dirty" }],
+          tab: { tabId: "w2M:t1", closed: false, alreadyGone: true, reason: "not-found" },
+          losses: [],
+          exitCode: 13,
+        };
+      },
+    }),
+    formatWorkflowResult: (command, value, format) => `${command}:${format}:${value.status}`,
+  });
+  assert.equal(code, 13);
+  assert.deepEqual(calls, [{ approvalDigest: ARCHIVE_APPROVAL_DIGEST }]);
+  assert.deepEqual(output.stdout, ["archive:compact:partial"]);
+});
+
+test("archive surfaces a thrown refusal as PREFLIGHT/10", async () => {
+  const output = io();
+  const code = await main(["archive", RUN_ID, "--yes", "--approval-digest", ARCHIVE_APPROVAL_DIGEST], {
+    ...output,
+    archiveCommand: async () => ({
+      preview: archivePreviewFixture(),
+      execute: async () => {
+        throw new WorkflowError("PREFLIGHT", "Stale approval digest; rerun workflow archive <id> --dry-run before executing.", { exitCode: 10 });
+      },
+    }),
+  });
+  assert.equal(code, 10);
+  assert.match(output.stderr[0], /^PREFLIGHT: Stale approval digest/);
+  assert.deepEqual(output.stdout, []);
+});
+
+// --- `workflow archive` end to end against real git --------------------------------------------
+//
+// The whole point of item 2.5 is removing real directories, so the acceptance criteria are checked
+// with real `git worktree` against real repositories, driven through the real `main` --
+// parseArgs -> archiveCommand -> git.js -> formatArchive -- with only the registry injected.
+
+async function realArchiveFixture(t, { dirty = false } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "workflow-archive-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const basePath = join(root, "base");
+  await mkdir(basePath, { recursive: true });
+  gitRun(root, ["init", "--initial-branch=dev", basePath]);
+  gitRun(basePath, ["config", "user.name", "Workflow Tests"]);
+  gitRun(basePath, ["config", "user.email", "workflow@example.test"]);
+  await writeFile(join(basePath, "README.md"), "base\n");
+  gitRun(basePath, ["add", "README.md"]);
+  gitRun(basePath, ["commit", "-m", "initial"]);
+
+  const worktreePath = join(root, "work");
+  gitRun(basePath, ["worktree", "add", "-b", "feature/actual", worktreePath, "dev"]);
+  await writeFile(join(worktreePath, "feature.txt"), "feature side\n");
+  gitRun(worktreePath, ["add", "."]);
+  gitRun(worktreePath, ["commit", "-m", "feature work"]);
+  if (dirty) await writeFile(join(worktreePath, ".env.local"), "SECRET=1\n");
+
+  return { root, basePath, worktreePath };
+}
+
+test("workflow archive end-to-end against real git: the dry-run's digest removes the worktree, and the branch, its commits and the run directory all survive", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "workflow-archive-cli-state-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const stateRoot = join(stateDir, "state");
+  const store = createRunStore({ stateRoot });
+  const { basePath, worktreePath } = await realArchiveFixture(t);
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  await store.update(run.id, () => ({ state: RUN_STATES.LAUNCHING }));
+  await store.update(run.id, () => ({ state: RUN_STATES.RUNNING }));
+  await store.update(run.id, () => ({ state: RUN_STATES.COMPLETED }));
+  const loadRegistry = async () => ({ projects: { ocr: { path: basePath, base_branch: "dev" } } });
+  const herdr = { listAgents: async () => [] };
+
+  const branchSha = gitRun(basePath, ["rev-parse", "feature/actual"]);
+
+  const preview = io();
+  assert.equal(await main(["archive", run.id, "--dry-run"], { ...preview, stateRoot, loadRegistry, herdr }), 0);
+  assert.match(preview.stdout[0], /^Would be lost: .*1 unmerged commit\(s\)/m);
+  assert.match(preview.stdout[0], /^Losses:$/m);
+  const digest = preview.stdout[0].match(/^Approval digest: (sha256:[0-9a-f]{64})$/m)?.[1];
+  assert.ok(digest, `the preview must print a digest:\n${preview.stdout[0]}`);
+
+  // A dry-run mutated nothing an operator can observe.
+  assert.equal(existsSync(worktreePath), true, "a --dry-run must not remove anything");
+  assert.equal(gitRun(basePath, ["rev-parse", "feature/actual"]), branchSha);
+
+  const executed = io();
+  assert.equal(await main(["archive", run.id, "--yes", "--approval-digest", digest], { ...executed, stateRoot, loadRegistry, herdr }), 0);
+  assert.match(executed.stdout[0], /^Archive: archived$/m);
+
+  // The three acceptance criteria, checked against real git rather than against the report.
+  assert.equal(existsSync(worktreePath), false, "the worktree directory must be gone");
+  assert.doesNotMatch(gitRun(basePath, ["worktree", "list", "--porcelain"]), new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "git must no longer list it");
+  assert.equal(gitRun(basePath, ["rev-parse", "feature/actual"]), branchSha, "archiving a run never destroys a commit: the branch still points at it");
+  assert.equal(gitRun(basePath, ["cat-file", "-t", branchSha]), "commit");
+  assert.equal(gitRun(basePath, ["show", `${branchSha}:feature.txt`]), "feature side");
+
+  // The run's evidence outlives its worktree.
+  const archivedRun = await store.read(run.id);
+  assert.equal(typeof archivedRun.archivedAt, "string", "a fully successful archive stamps the record");
+  assert.equal(existsSync(join(stateRoot, run.id, "events.jsonl")), true);
+
+  // And the board now forgets it while still saying how many it forgot.
+  const board = io();
+  assert.equal(await main(["runs", "--all"], { ...board, stateRoot, loadRegistry }), 0);
+  assert.match(board.stdout[0], /^Runs: none$/m);
+  assert.match(board.stdout[0], /^Archived: 1 hidden/m);
+  const explicit = io();
+  assert.equal(await main(["runs", "--state", "completed"], { ...explicit, stateRoot, loadRegistry }), 0);
+  assert.match(explicit.stdout[0], new RegExp(`^${run.id.slice(0, 8)}\\s+\\|`, "m"), "an explicit --state still shows it");
+
+  // Replaying the same digest is refused: the worktree is gone, so the preview it approved is gone.
+  const replay = io();
+  assert.equal(await main(["archive", run.id, "--yes", "--approval-digest", digest], { ...replay, stateRoot, loadRegistry, herdr }), 10);
+  assert.match(replay.stderr[0], /^PREFLIGHT: /);
+});
+
+test("workflow archive end-to-end against a real dirty worktree: it refuses, removes nothing, and every file is still there", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "workflow-archive-cli-dirty-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const stateRoot = join(stateDir, "state");
+  const store = createRunStore({ stateRoot });
+  const { basePath, worktreePath } = await realArchiveFixture(t, { dirty: true });
+  const run = await store.create({
+    projectAlias: "ocr",
+    primaryTicket: "A-2",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  await store.update(run.id, () => ({ state: RUN_STATES.LAUNCHING }));
+  await store.update(run.id, () => ({ state: RUN_STATES.RUNNING }));
+  await store.update(run.id, () => ({ state: RUN_STATES.COMPLETED }));
+  const loadRegistry = async () => ({ projects: { ocr: { path: basePath, base_branch: "dev" } } });
+  const herdr = { listAgents: async () => [] };
+
+  // The fixture really is untracked-only, so the remedy this refusal names is the cleaning one.
+  assert.equal(gitRun(worktreePath, ["status", "--porcelain", "--untracked-files=no"]), "");
+
+  const preview = io();
+  assert.equal(await main(["archive", run.id, "--dry-run"], { ...preview, stateRoot, loadRegistry, herdr }), 10, "a refused dry-run must not exit 0");
+  assert.match(preview.stdout[0], /^Archive: refused — /m);
+  assert.match(preview.stdout[0], /\.env\.local/);
+  assert.doesNotMatch(preview.stdout[0], /Approval digest/, "a refusal carries no digest to approve");
+  assert.match(preview.stdout[0], /clean -nd/, "the offered clean is always a dry run");
+
+  assert.equal(existsSync(worktreePath), true);
+  assert.equal(existsSync(join(worktreePath, ".env.local")), true, "untracked files are work with no other copy");
+  assert.equal(existsSync(join(worktreePath, "feature.txt")), true);
+  assert.match(gitRun(basePath, ["worktree", "list", "--porcelain"]), new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the worktree is still registered");
+  assert.equal((await store.read(run.id)).archivedAt, undefined, "a refusal never marks the record");
 });
