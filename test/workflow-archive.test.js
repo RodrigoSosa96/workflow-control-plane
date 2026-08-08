@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import { archiveCommand, ARCHIVE_DISPLAY_LIMITS, ARCHIVE_EXIT_CODES } from "../src/workflow/commands.js";
 import { WorkflowError } from "../src/workflow/errors.js";
+import { formatWorkflowResult } from "../src/workflow/format.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
@@ -2053,4 +2054,97 @@ test("a store that cannot list other runs refuses rather than assuming this run 
     assert.match(command.preview.reason, /another run|other runs/i);
     assertNothingHappened(fixture);
   }
+});
+
+// The re-review's blocker, and it reproduced C1's own failure mode inside C1's fix: the
+// ignored-content block first shipped BELOW the `unmergedCommits === null` branch, which ended in a
+// `continue`. So on any repository whose unmerged count could not be measured, the `.env` was
+// dropped from `losses[]` -- present in the digest and in `--format json`, absent from the compact
+// preview, which is the default approval surface. Both paths below reach it WITHOUT refusing.
+test("ignored content is named even when the unmerged count is UNKNOWN, on every path that reaches it", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+  const ignored = { ignoredFiles: [".env"], ignoredDirectories: ["node_modules/"] };
+
+  // Path 1: an unmeasurable count -- no `base_branch`, or a git failure. `countCommitsNotIn`
+  // answering `null` is the case commit f061430 deliberately widened. The range is asked in the
+  // BASE checkout, so that is where the fixture has to withhold the answer.
+  const unmeasurable = scriptedGit(acmeFixture({
+    "/wt/acme": { ...ignored },
+    "/base/acme": { unmerged: {} },
+  }));
+  // Path 2: a detached HEAD some ref contains, which this command documents as a warning rather
+  // than a refusal -- so `branch` is null, and the unmerged count is null with it.
+  // Reachability is also asked in the BASE checkout (linked worktrees share its ref store).
+  const detached = scriptedGit(acmeFixture({
+    "/wt/acme": { ...ignored, branch: null, sha: "aaaa111" },
+    "/base/acme": { reachable: ["aaaa111"] },
+  }));
+
+  for (const [label, fixture] of [["unmeasurable base_branch", unmeasurable], ["reachable detached HEAD", detached]]) {
+    const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+    const preview = command.preview;
+
+    assert.equal(preview.refused, false, `${label}: this path must not refuse, or it proves nothing`);
+    const kinds = preview.losses.map((loss) => loss.kind);
+    assert.ok(kinds.includes("unmerged-commits-unknown"), `${label}: fixture premise -- the count really is unknown (${kinds})`);
+    assert.ok(
+      kinds.includes("ignored-content"),
+      `${label}: the ignored content must be named even though the unmerged count is unknown; got ${JSON.stringify(kinds)}`,
+    );
+
+    const loss = preview.losses.find((entry) => entry.kind === "ignored-content");
+    assert.deepEqual(loss.files, [".env"]);
+    assert.equal(loss.fileCount, 1);
+    assert.equal(loss.directoryCount, 1);
+
+    // And it reaches the DEFAULT surface an operator approves from, not just --format json.
+    const compact = formatWorkflowResult("archive", preview, "compact");
+    assert.match(compact, /\.env/, `${label}: the compact preview is the approval surface; the file has to appear there`);
+    assert.match(compact, /IGNORED, DELETED \(1 file\(s\), 1 dir\(s\)\)/, `${label}: ${compact}`);
+
+    // The execution report carries it too, tagged with whether it actually happened.
+    const report = await command.execute({ approvalDigest: preview.approvalDigest });
+    const reported = report.losses.find((entry) => entry.kind === "ignored-content");
+    assert.ok(reported, `${label}: the report must carry the loss it realised`);
+    assert.equal(reported.removed, true);
+  }
+});
+
+test("a sharer whose state cannot be classified is treated as LIVE, because unknown is never proof of finished", async (t) => {
+  const store = await newStore(t);
+  const target = await runSharing(store, "/wt/acme", { ticket: "A-1", state: RUN_STATES.FAILED });
+  const fixture = scriptedGit(acmeFixture());
+
+  // A record whose `state` is absent, or a string outside run-state.js's vocabulary. Neither is
+  // evidence that the run finished; both used to fall through `LIVE_RUN_STATES.has(state)` as
+  // "not live" and downgrade the refusal to a warning.
+  for (const state of [undefined, null, "", "wedged", "RUNNING"]) {
+    const sharer = await store.create({
+      projectAlias: "acme",
+      primaryTicket: "A-2",
+      repositories: [{ id: "acme", path: "/wt/acme", branch: "feature/x" }],
+    });
+    const listing = [...await store.list()].map((entry) => (
+      entry.id === sharer.id ? { ...entry, state } : entry
+    ));
+    const patched = { ...store, async list() { return listing; } };
+
+    const command = await archiveCommand({ runId: target.id }, archiveDeps(patched, { git: fixture.git, present: ["/wt/acme"] }));
+    assert.equal(command.preview.refused, true, `state ${JSON.stringify(state)} is not proof of a finished run`);
+    assert.match(command.preview.reason, /still live/);
+    assertNothingHappened(fixture);
+
+    await store.update(sharer.id, () => ({ archivedAt: "2026-08-08T00:00:00.000Z" }));
+  }
+
+  // The control: a state that IS recognized and IS terminal downgrades to a warning, so the
+  // assertion above is about classification failing closed and not about refusing everything.
+  const finished = await runSharing(store, "/wt/acme", { ticket: "A-3", state: RUN_STATES.COMPLETED });
+  const allowed = await archiveCommand({ runId: target.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+  assert.equal(allowed.preview.refused, false);
+  assert.deepEqual(
+    allowed.preview.losses.find((loss) => loss.kind === "shared-worktree").sharedWith.map((s) => s.runId),
+    [finished.id],
+  );
 });

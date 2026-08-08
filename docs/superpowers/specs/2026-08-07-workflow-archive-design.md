@@ -285,9 +285,14 @@ workflow archive <run-id> --yes --approval-digest <digest>
   out. Gating on it is impractical — every `--amend`, rebase and reset would trip it — so it is
   documented rather than refused. What *is* guaranteed: an unreachable detached HEAD refuses
   outright, so no commit anything still names is destroyed.
-- **Archiving never deletes content it did not name.** Uncommitted and untracked work refuses;
-  gitignored content is deleted, and the preview names every entry and binds the list into the
-  digest. See correction C1 above for why that asymmetry is the right one.
+- **Archiving never deletes content it did not name**, and "name" is meant at two different
+  granularities on purpose. Uncommitted and untracked work refuses. Gitignored content is deleted:
+  the preview names it as its own loss class with the **full counts** of files and directories and a
+  path list **capped at 10 per kind** (marked truncated when it cuts), while the approval digest
+  binds the **complete, uncapped list of entry names** — so nothing is ever deleted that the
+  approval did not cover, even when the printed list did not have room to show it. That split is the
+  same one the dirty-path fields use: cap what is printed, never what is digested. See correction
+  C1 above for why deletion-with-naming is the right asymmetry here rather than a refusal.
 - A run still being worked on cannot be archived by any combination of flags — including when the
   live run is **not the run being archived**. The whole-branch review (I1) measured this: the
   worktree path template derives from project + ticket + slug, so a relaunch reuses the directory,

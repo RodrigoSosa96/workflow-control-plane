@@ -3131,23 +3131,25 @@ function archiveLosses(records) {
         detail: `${record.sharedWith.map((sharer) => `run ${sharer.runId} (${sharer.state})`).join(", ")} also record${record.sharedWith.length === 1 ? "s" : ""} this worktree; none of them is live, so removing it is safe — but it reclaims their directory too, and they will preview as already gone afterwards`,
       });
     }
-    if (record.unmergedCommits === null) {
-      losses.push({
-        repositoryId: record.repositoryId,
-        kind: "unmerged-commits-unknown",
-        worktreePath: record.worktreePath,
-        branch: record.branch,
-        baseBranch: record.baseBranch,
-        count: null,
-        detail: `how much of this work is unmerged could not be determined: ${record.unmergedReason ?? "reason unknown"}`,
-      });
-      continue;
-    }
-    // C1. The most literal loss of the three kinds above it: unmerged commits survive on a branch
-    // and a detached HEAD's commits survive on some other ref, but these files are DELETED off the
-    // disk by `git worktree remove` and exist nowhere else. Files and directories are split because
-    // they mean opposite things to an operator -- `node_modules/` is regenerable noise, a `.env` is
-    // an only copy -- and a warning that cannot tell them apart is a warning nobody reads.
+    // C1. The most literal loss of any kind here: unmerged commits survive on a branch and a
+    // detached HEAD's commits survive on some other ref, but these files are DELETED off the disk by
+    // `git worktree remove` and exist nowhere else. Files and directories are split because they
+    // mean opposite things to an operator -- `node_modules/` is regenerable noise, a `.env` is an
+    // only copy -- and a warning that cannot tell them apart is a warning nobody reads.
+    //
+    // **Hoisted above the unmerged branches, and the ordering is load-bearing rather than
+    // cosmetic.** This block first shipped BELOW them, and the `unmergedCommits === null` branch
+    // ended in a `continue` -- so on any repository whose unmerged count could not be measured, the
+    // ignored content was silently dropped from `losses[]`. Two reachable, non-refusing paths hit
+    // it: a detached HEAD some ref contains (documented as a warning), and an unmeasurable
+    // `countCommitsNotIn` (no `base_branch`, or a git failure -- the same `null` that f061430
+    // deliberately widened). The digest still bound the names and `--format json` still carried
+    // them, but the compact preview -- the default approval surface -- never mentioned the file,
+    // which is the same failure mode C1 exists to close, reproduced inside C1's own fix.
+    //
+    // Every class below is now independent and unconditional: no branch here may end in `continue`,
+    // because "this repository's unmerged count is unknown" says nothing whatever about whether it
+    // also holds a `.env`.
     if (record.ignoredFiles.length > 0 || record.ignoredDirectories.length > 0) {
       losses.push({
         repositoryId: record.repositoryId,
@@ -3169,6 +3171,20 @@ function archiveLosses(records) {
         detail: describeIgnoredContent(record),
       });
     }
+    if (record.unmergedCommits === null) {
+      losses.push({
+        repositoryId: record.repositoryId,
+        kind: "unmerged-commits-unknown",
+        worktreePath: record.worktreePath,
+        branch: record.branch,
+        baseBranch: record.baseBranch,
+        count: null,
+        detail: `how much of this work is unmerged could not be determined: ${record.unmergedReason ?? "reason unknown"}`,
+      });
+    }
+    // `null > 0` is already false, so this needs no `else` -- and deliberately does not have one:
+    // the previous shape used `continue` to express the same exclusivity and took an unrelated loss
+    // class down with it.
     if (record.unmergedCommits > 0) {
       losses.push({
         repositoryId: record.repositoryId,
@@ -3184,21 +3200,6 @@ function archiveLosses(records) {
   return losses;
 }
 
-// Everything that exists only inside a worktree, collected across ALL repositories and refused
-// once. Two classes, and the run refuses for either:
-//
-//   DIRTY            -- uncommitted and untracked work has no other copy.
-//   UNREACHABLE HEAD -- a detached HEAD whose commits no ref contains; removing the worktree
-//                       deletes the only two things referencing them.
-//
-// The whole run refuses, not just the offending repository: a group project is archived whole or
-// not at all, because a half-archived group leaves residue harder to reason about than the
-// original. Enforced HERE, in the preview, before the first removal -- a mid-loop discovery leaves
-// a partial archive that re-running cannot fix.
-//
-// Both classes are reported together, and both list every affected repository (capped for
-// printing), because an operator shown only the first of three problems fixes one and comes
-// straight back. That is mergeCommand's own conflict-list lesson.
 // The sentence an operator reads before approving the deletion of files that exist nowhere else.
 // Files lead, because they are the ones with no other copy; directories follow, framed as what they
 // usually are so the common `node_modules/` case does not train anyone to skim past this line.
@@ -3239,6 +3240,28 @@ function describeClause(records, describe, noun) {
   return `${shown.map(describe).join("; ")}${suffix}`;
 }
 
+// Every condition that makes this run un-archivable, collected across ALL repositories and refused
+// once. THREE classes now, and the run refuses for any of them:
+//
+//   LIVE SHARED WORKTREE -- another run that is still live records this same directory (I1).
+//   DIRTY                -- uncommitted and untracked work has no other copy.
+//   UNREACHABLE HEAD     -- a detached HEAD whose commits no ref contains; removing the worktree
+//                           deletes the only two things referencing them.
+//
+// (The comment that used to sit here listed only the last two, and had drifted onto the wrong
+// function entirely when `describeIgnoredContent` was added above it. Both fixed.)
+//
+// Ignored content is deliberately NOT a class here: it is deleted, named and digested rather than
+// refused -- see ignoredContentFor for why refusing on it would make the command useless.
+//
+// The whole run refuses, not just the offending repository: a group project is archived whole or
+// not at all, because a half-archived group leaves residue harder to reason about than the
+// original. Enforced HERE, in the preview, before the first removal -- a mid-loop discovery leaves
+// a partial archive that re-running cannot fix.
+//
+// All classes are reported together, and each lists every affected repository (capped for
+// printing), because an operator shown only the first of three problems fixes one and comes
+// straight back. That is mergeCommand's own conflict-list lesson.
 function irrecoverableRefusal(runId, run, records, evidence) {
   const dirty = records.filter((record) => record.dirty);
   const unreachable = records.filter((record) => record.headReachable === false);
@@ -3309,6 +3332,18 @@ function irrecoverableRefusal(runId, run, records, evidence) {
 // marked archived after every one of its worktrees was really removed, so it is no longer a claim
 // on the directory. A PARTIAL archive leaves `archivedAt` unset precisely so its remaining residue
 // still counts here.
+// UNKNOWN MEANS LIVE, which is the opposite of what `LIVE_RUN_STATES.has(state)` answers on its own.
+// A sharer whose `state` is absent, malformed, or outside `run-state.js`'s vocabulary is not proof
+// of a finished run -- it is a record this control plane cannot classify, and the consequence of
+// guessing wrong is deleting the working directory of a run somebody is using. So a sharer is
+// treated as not-live only when its state is a RECOGNIZED state that is also not in
+// LIVE_RUN_STATES; everything else refuses. This is item 0.14's rule, and it is the one place the
+// shared-worktree gate did not follow it when it first shipped.
+function sharerIsLive(state) {
+  if (!isRunState(state)) return true;
+  return LIVE_RUN_STATES.has(state);
+}
+
 async function inspectSharedWorktrees(store, runId, records) {
   if (typeof store?.list !== "function") {
     return { error: "this run store cannot list other runs, so it cannot say whether another run is using these worktrees; refusing rather than removing a directory something else may be working in." };
@@ -3328,7 +3363,7 @@ async function inspectSharedWorktrees(store, runId, records) {
       const path = recordedRepositoryPath(entry);
       if (!path) continue;
       if (!byPath.has(path)) byPath.set(path, []);
-      byPath.get(path).push({ runId: other.id, state: other.state ?? null, live: LIVE_RUN_STATES.has(other.state) });
+      byPath.get(path).push({ runId: other.id, state: other.state ?? null, live: sharerIsLive(other.state) });
     }
   }
 
