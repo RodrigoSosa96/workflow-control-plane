@@ -1135,6 +1135,17 @@ function archiveLossLabel(loss = {}) {
     return `UNMERGED (${archiveCount(loss.count)})`;
   }
   if (loss.kind === "detached-head") return "DETACHED HEAD";
+  // C1 (whole-branch review). The only loss kind whose content is genuinely DELETED rather than left
+  // referenced somewhere else, so it is the one label that says so in the classifier slot rather
+  // than leaving it to the sentence. Files and directories are counted apart because they mean
+  // opposite things: `node_modules/` is regenerable, a `.env` is an only copy, and a single number
+  // covering both would let the second hide behind the first.
+  if (loss.kind === "ignored-content") {
+    return `IGNORED, DELETED (${archiveCount(loss.fileCount)} file(s), ${archiveCount(loss.directoryCount)} dir(s))`;
+  }
+  // I1. Only non-live sharers reach a rendered preview -- a live one refuses -- so this is
+  // information, not a warning about danger.
+  if (loss.kind === "shared-worktree") return `ALSO RECORDED BY ${archiveCount(loss.count)} OTHER RUN(S)`;
   return text(loss.kind).toUpperCase();
 }
 
@@ -1165,15 +1176,37 @@ function appendArchiveLosses(lines, losses) {
 // section: `bound()` truncates the TAIL, so a wide group project loses the sections below it before
 // it loses this. Unknown-size losses are counted as their own quantity rather than summed as zero
 // -- point 2 above, at the level of the total rather than the cell.
+//
+// **Kind-aware since C1**, and it has to be: this used to sum `count` across every loss and label
+// the total "unmerged commit(s)". An `ignored-content` loss carries a count too, so the moment that
+// kind existed the headline would have reported deleted files as unmerged commits -- a true number
+// under a false noun, which is worse than no number. Deleted files lead, because they are the only
+// thing here that stops existing.
 function archiveLossHeadline(losses) {
   if (losses.length === 0) {
-    return "Would be lost: nothing — every worktree is on a branch, and every branch is fully merged into its base";
+    return "Would be lost: nothing — every worktree is on a branch, every branch is fully merged into its base, and no ignored content would be deleted";
   }
-  const commits = losses.reduce((sum, loss) => (Number.isFinite(loss.count) ? sum + loss.count : sum), 0);
-  const unknown = losses.filter((loss) => !Number.isFinite(loss.count)).length;
+  const sumOf = (kind, field) => losses
+    .filter((loss) => loss.kind === kind)
+    .reduce((sum, loss) => (Number.isFinite(loss[field]) ? sum + loss[field] : sum), 0);
+
+  const ignoredFiles = sumOf("ignored-content", "fileCount");
+  const ignoredDirectories = sumOf("ignored-content", "directoryCount");
+  const commits = sumOf("unmerged-commits", "count");
+  // Only the two kinds that genuinely cannot be measured; `ignored-content` and `shared-worktree`
+  // always carry a real count, so neither can drift into this bucket.
+  const unknown = losses.filter((loss) => (
+    (loss.kind === "unmerged-commits-unknown" || loss.kind === "detached-head") && !Number.isFinite(loss.count)
+  )).length;
+  const shared = losses.filter((loss) => loss.kind === "shared-worktree").length;
+
   const parts = [];
+  if (ignoredFiles > 0 || ignoredDirectories > 0) {
+    parts.push(`${ignoredFiles} ignored file(s) and ${ignoredDirectories} ignored director(y/ies) DELETED`);
+  }
   if (commits > 0) parts.push(`${commits} unmerged commit(s)`);
   if (unknown > 0) parts.push(`${unknown} loss(es) of UNKNOWN size`);
+  if (shared > 0) parts.push(`${shared} worktree(s) another run also records`);
   const worktrees = new Set(losses.map((loss) => String(loss.worktreePath))).size;
   return `Would be lost: ${losses.length} loss(es) across ${worktrees} worktree(s) — ${parts.join(", ") || "size not reported"}`;
 }

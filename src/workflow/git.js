@@ -510,6 +510,60 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
       }
     },
 
+    // The content `git status --porcelain=v1` does not know exists, and `git worktree remove`
+    // deletes without saying a word.
+    //
+    // Measured, git 2.43, and this is the whole reason this method exists: `git worktree remove`
+    // WITHOUT `--force` refuses a worktree holding modified or untracked files -- and silently
+    // deletes ignored ones, exit 0, no output. `--porcelain=v1` excludes ignored entries by
+    // definition, so every probe built on it reports such a worktree as clean. On the machine this
+    // was written against, a real run's worktree held a 615-byte `.env` that existed in no ref, no
+    // other checkout and no backup, while the base checkout's `.env` was a different 1,853-byte
+    // file. Archiving would have destroyed it and reported success.
+    //
+    // `--ignored=matching` rather than the default `traditional`, and the difference is load-bearing
+    // for output size: `matching` reports entries that match an ignore PATTERN, so `node_modules/`
+    // collapses to one directory entry instead of enumerating tens of thousands of files, while a
+    // `*.log` pattern still lists each file it matches. Measured on a fixture with
+    // `build`/`*.log`/`.env`/`coverage/` ignored:
+    //
+    //   !! .env                  <- file
+    //   !! a.log                 <- file
+    //   !! build/                <- directory (trailing slash, even though .gitignore said `build`)
+    //   !! deep/nested/c.log     <- file, nested
+    //
+    // The trailing slash is git's own file/directory discriminator and is what lets a caller tell
+    // regenerable noise (`node_modules/`, `dist/`) from an only-copy secret (`.env`). A path that is
+    // a file can never end in `/`, so it is a total discrimination, not a heuristic.
+    //
+    // Never throws. `status: "unknown"` is the fail-closed answer, and a caller must treat it as
+    // "there may be ignored content I cannot name" -- never as "there is none", which is the exact
+    // false green this method was added to remove.
+    async ignoredEntries({ cwd, timeoutMs }) {
+      let result;
+      try {
+        result = await runner.run("git", ["status", "--porcelain=v1", "--ignored=matching", "-z"], { cwd, timeoutMs, allowFailure: true });
+      } catch (error) {
+        return { status: "unknown", files: [], directories: [], reason: reasonFrom(error) };
+      }
+      if (!result || result.code !== 0) {
+        return { status: "unknown", files: [], directories: [], reason: `git status --ignored exited with code ${result?.code ?? "unknown"}${result?.stderr ? `: ${trimText(result.stderr)}` : ""}` };
+      }
+
+      const files = [];
+      const directories = [];
+      // Reusing parseStatus rather than re-splitting: `!!` entries share the porcelain-v1 record
+      // shape, so rename/copy's two-value encoding is handled the same way here as anywhere else.
+      for (const entry of parseStatus(result.stdout ?? "")) {
+        if (entry.x !== "!" || entry.y !== "!") continue;
+        const path = typeof entry.path === "string" ? entry.path : "";
+        if (!path) continue;
+        if (path.endsWith("/")) directories.push(path);
+        else files.push(path);
+      }
+      return { status: "read", files, directories };
+    },
+
     // What a ref name resolves to IN THIS CHECKOUT's own ref namespace. `refExists` answers only
     // whether an OBJECT is present, which is a different question: `git merge <branch>` resolves
     // the NAME here, so a caller that previewed a sha has to prove the name it is about to hand

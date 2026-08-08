@@ -2807,3 +2807,64 @@ test("an archive report degrades through the same tiers, and every executed argv
     assert.deepEqual(parsed.losses.map((loss) => loss.removed), report.losses.map((loss) => loss.removed), "a loss that happened must stay distinguishable from one that did not");
   }
 });
+
+// C1 and I1 (whole-branch review): two new loss kinds, and the headline that has to keep them apart.
+test("deleted ignored content leads the loss headline and is never counted as unmerged commits", () => {
+  const ignoredLoss = {
+    repositoryId: "backend",
+    kind: "ignored-content",
+    worktreePath: ARCHIVE_WORKTREE("backend"),
+    branch: "feature/registro-impl",
+    baseBranch: "dev",
+    count: 3,
+    fileCount: 2,
+    directoryCount: 1,
+    files: [".env", "deploy.secret"],
+    directories: ["node_modules/"],
+    filesTruncated: false,
+    directoriesTruncated: false,
+    detail: "2 ignored file(s) — .env, deploy.secret — which git tracks nowhere, so removing the worktree DELETES them and no branch, commit or backup holds a copy; 1 ignored director(y/ies) — node_modules/ — deleted with it, usually regenerable build output but not checked",
+  };
+  const compact = formatWorkflowResult("archive", archivePreview({
+    losses: [ignoredLoss, unmergedLoss("backend", 4)],
+  }), "compact");
+
+  // The headline used to sum every `count` under the noun "unmerged commit(s)". An ignored loss
+  // carries a count too, so that would have reported 3 deleted files as 3 unmerged commits.
+  assert.match(compact, /^Would be lost: .*2 ignored file\(s\) and 1 ignored director\(y\/ies\) DELETED/m);
+  assert.match(compact, /^Would be lost: .*4 unmerged commit\(s\)/m);
+  assert.doesNotMatch(compact, /7 unmerged commit\(s\)/, "the two totals must never be added together");
+
+  // Deleted content leads the list of quantities, because it is the only one that stops existing.
+  const headline = compact.split("\n").find((line) => line.startsWith("Would be lost:"));
+  assert.ok(headline.indexOf("DELETED") < headline.indexOf("unmerged commit"), headline);
+
+  // And the label says DELETED in the scannable slot, with files and directories counted apart.
+  assert.match(compact, /^backend \| IGNORED, DELETED \(2 file\(s\), 1 dir\(s\)\): /m);
+  assert.match(compact, /\.env/);
+  assert.match(compact, /node_modules\//);
+});
+
+test("a worktree another finished run also records is named, and a run with nothing to lose says so about ignored content too", () => {
+  const shared = formatWorkflowResult("archive", archivePreview({
+    losses: [{
+      repositoryId: "backend",
+      kind: "shared-worktree",
+      worktreePath: ARCHIVE_WORKTREE("backend"),
+      branch: "feature/registro-impl",
+      baseBranch: "dev",
+      count: 1,
+      sharedWith: [{ runId: "0b2612a8-6f2c-4a1e-8b7d-3f9c2a1d5e40", state: "completed", live: false }],
+      detail: "run 0b2612a8-6f2c-4a1e-8b7d-3f9c2a1d5e40 (completed) also records this worktree; none of them is live, so removing it is safe — but it reclaims their directory too, and they will preview as already gone afterwards",
+    }],
+  }), "compact");
+  assert.match(shared, /^backend \| ALSO RECORDED BY 1 OTHER RUN\(S\): run 0b2612a8/m);
+  assert.match(shared, /^Would be lost: .*1 worktree\(s\) another run also records/m);
+
+  // The all-clear line has to cover ignored content too, or it promises more than it checked.
+  const clean = formatWorkflowResult("archive", archivePreview({
+    repositories: [archiveRepository({ unmergedCommits: 0 })],
+    losses: [],
+  }), "compact");
+  assert.match(clean, /^Would be lost: nothing — .*no ignored content would be deleted$/m);
+});

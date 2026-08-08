@@ -2621,9 +2621,17 @@ const ARCHIVE_REMOVE_TIMEOUT_MS = 5 * 60 * 1000;
 // reason, and both are asserted against ARCHIVE_DISPLAY_LIMITS by test rather than against literals.
 const ARCHIVE_REASON_PATH_LIMIT = 5;
 const ARCHIVE_REASON_REPOSITORY_LIMIT = 5;
+// The ignored-content cap, added by the whole-branch review's C1. Unlike the `dirtyPaths` cap an
+// earlier round deleted, this one is REACHABLE on every non-refused preview: ignored entries do not
+// refuse (see ignoredContentFor), so they are printed on exactly the path that goes on to remove
+// them. 10 rather than 5 because this list is the only warning an operator gets before a file that
+// exists nowhere else is deleted, and `--ignored=matching` already collapses `node_modules/` to a
+// single entry, so 10 covers a realistic project's whole ignore surface.
+const ARCHIVE_IGNORED_PATH_LIMIT = 10;
 export const ARCHIVE_DISPLAY_LIMITS = Object.freeze({
   reasonPaths: ARCHIVE_REASON_PATH_LIMIT,
   reasonRepositories: ARCHIVE_REASON_REPOSITORY_LIMIT,
+  ignoredPaths: ARCHIVE_IGNORED_PATH_LIMIT,
 });
 const ARCHIVE_FAILURE_TEXT_LIMIT = 2000;
 const ARCHIVE_DIGEST_VERSION = 1;
@@ -2681,7 +2689,7 @@ function archiveRefusal(runId, run, reason, diagnostics = [], evidence = {}) {
 // anything, so it is a preflight refusal rather than a silently skipped check.
 function archiveGitAdapter(deps) {
   const git = deps.git;
-  for (const method of ["checkoutState", "resolveHead", "pendingOperation", "isCommitReachable", "countCommitsNotIn", "removeWorktree"]) {
+  for (const method of ["checkoutState", "resolveHead", "pendingOperation", "isCommitReachable", "ignoredEntries", "countCommitsNotIn", "removeWorktree"]) {
     if (typeof git?.[method] !== "function") {
       archiveError("PREFLIGHT", `workflow archive requires a git adapter with ${method}()`, ARCHIVE_EXIT_CODES.refused);
     }
@@ -2880,6 +2888,9 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
         repositoryId, worktreePath, recordedBranch, present: false,
         branch: null, headSha: null, headReachable: null,
         dirty: false, dirtyPaths: [], trackedPaths: [], untrackedPaths: [],
+        // Empty rather than absent, so every record carries the same key set: there is no directory
+        // left to hold ignored content, so "none" here is a fact rather than a gap.
+        ignoredFiles: [], ignoredDirectories: [],
         basePath, baseBranch, unmergedCommits: null,
         unmergedReason: `the worktree directory at ${worktreePath} no longer exists, so its branch cannot be read`,
       },
@@ -2946,6 +2957,24 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
     return { refusal: `Run ${runId} repository ${label} worktree status at ${worktreePath} could not be read (${state.statusError ?? "reason unknown"}); an unreadable status is a refusal, never a clean one.`, actions: [`git -C ${worktreePath} status`] };
   }
 
+  // The whole-branch review's C1, and the one probe whose absence let this command destroy a file
+  // that existed nowhere else while reporting the worktree clean. `git status --porcelain=v1`
+  // excludes ignored entries BY DEFINITION, and `git worktree remove` without `--force` deletes
+  // them without a word (measured, git 2.43) -- so every gate above this line can pass over a
+  // worktree holding the only copy of a `.env`.
+  //
+  // Unknown REFUSES, unlike the ignored content itself. The two are different questions: "there is
+  // ignored content" is surfaced and digested so the operator can approve it knowingly (see
+  // ignoredContentFor's own comment for why refusing on it would make the command useless), whereas
+  // "I could not find out whether there is any" cannot be approved at all -- the design's promise is
+  // an approval that NAMED what would be destroyed, and an unreadable probe has nothing to name. It
+  // is the same fail-closed direction as the unreadable-status and unknown-operation refusals above,
+  // for a strictly more destructive fact.
+  const ignored = await ignoredContentFor({ git, worktreePath, timeoutMs });
+  if (ignored.error) {
+    return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be checked for ignored files (${ignored.error}); ignored content is deleted by \`git worktree remove\` without warning, so an unreadable answer is a refusal, never an empty one.`, actions: [`git -C ${worktreePath} status --ignored=matching`] };
+  }
+
   const dirtyPaths = splitDirtyPaths(state.entries);
   const branch = state.branch ?? null;
   const headSha = typeof head?.sha === "string" && head.sha ? head.sha : null;
@@ -2960,11 +2989,47 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
       dirtyPaths: dirtyPaths.all,
       trackedPaths: dirtyPaths.tracked,
       untrackedPaths: dirtyPaths.untracked,
+      ignoredFiles: ignored.files,
+      ignoredDirectories: ignored.directories,
       basePath, baseBranch,
       unmergedCommits: unmerged.count,
       ...(unmerged.reason ? { unmergedReason: unmerged.reason } : {}),
     },
   };
+}
+
+// Ignored content is SURFACED AND DIGESTED, never refused, and that is a deliberate decision with a
+// measured basis rather than a softening.
+//
+// Refusing on it was considered and rejected: 5 of the 8 real worktrees on the machine this was
+// built against carry ignored content, and every Node project has `node_modules/`, so refusing
+// would block essentially every real archive and leave the command useless -- which is worse than
+// the status quo for a tool whose entire job is reclaiming worktrees. Refusing only on ignored
+// FILES (as opposed to directories) is an arbitrary heuristic that would still fire on `.env` for
+// every project, i.e. still useless, with a rule nobody could state.
+//
+// The design's actual promise is not "nothing is ever destroyed"; it is "nothing that exists only
+// inside a worktree is ever destroyed without an explicit, digest-bound approval that named it".
+// Naming the entries, splitting files from directories, and binding the full list into the digest
+// honours that promise exactly -- the same treatment unmerged commits already get, for the same
+// reason: the operator decides, having been told.
+//
+// A vanished worktree is not asked (there is nothing to read), which is why this is only called on
+// the present branch.
+async function ignoredContentFor({ git, worktreePath, timeoutMs }) {
+  let result;
+  try {
+    result = await git.ignoredEntries({ cwd: worktreePath, timeoutMs });
+  } catch (error) {
+    // git.js documents this as never throwing, and it does not. Guarded for the same reason every
+    // other adapter read in this function is: a contract this file must not depend on another
+    // module keeping.
+    return { error: `the ignored-content probe itself failed: ${archiveErrorText(error)}` };
+  }
+  if (result?.status !== "read") {
+    return { error: result?.reason ?? "reason unknown" };
+  }
+  return { files: list(result.files).map(String), directories: list(result.directories).map(String) };
 }
 
 // The other half of the measured commit-destroying path, and the direct implementation of the
@@ -3051,6 +3116,21 @@ function archiveLosses(records) {
         detail: `the worktree at ${record.worktreePath} is on a detached HEAD at ${record.headSha ?? "an unknown commit"}; another ref still contains that commit, so removing the worktree destroys nothing — but this run's work is on no branch of its own, so afterwards there is no name of this run's left pointing at it`,
       });
     }
+    // I1's non-refusing half. A live sharer refuses (irrecoverableRefusal), so anything reaching
+    // here is a finished run that also recorded this directory -- removing it settles two records at
+    // once, which is fine but is not something an operator should discover afterwards.
+    if (record.sharedWith.length > 0) {
+      losses.push({
+        repositoryId: record.repositoryId,
+        kind: "shared-worktree",
+        worktreePath: record.worktreePath,
+        branch: record.branch,
+        baseBranch: record.baseBranch,
+        count: record.sharedWith.length,
+        sharedWith: record.sharedWith,
+        detail: `${record.sharedWith.map((sharer) => `run ${sharer.runId} (${sharer.state})`).join(", ")} also record${record.sharedWith.length === 1 ? "s" : ""} this worktree; none of them is live, so removing it is safe — but it reclaims their directory too, and they will preview as already gone afterwards`,
+      });
+    }
     if (record.unmergedCommits === null) {
       losses.push({
         repositoryId: record.repositoryId,
@@ -3062,6 +3142,32 @@ function archiveLosses(records) {
         detail: `how much of this work is unmerged could not be determined: ${record.unmergedReason ?? "reason unknown"}`,
       });
       continue;
+    }
+    // C1. The most literal loss of the three kinds above it: unmerged commits survive on a branch
+    // and a detached HEAD's commits survive on some other ref, but these files are DELETED off the
+    // disk by `git worktree remove` and exist nowhere else. Files and directories are split because
+    // they mean opposite things to an operator -- `node_modules/` is regenerable noise, a `.env` is
+    // an only copy -- and a warning that cannot tell them apart is a warning nobody reads.
+    if (record.ignoredFiles.length > 0 || record.ignoredDirectories.length > 0) {
+      losses.push({
+        repositoryId: record.repositoryId,
+        kind: "ignored-content",
+        worktreePath: record.worktreePath,
+        branch: record.branch,
+        baseBranch: record.baseBranch,
+        // Every entry, so `count: null` keeps meaning UNKNOWN everywhere in this array -- an
+        // unreadable ignored probe refuses rather than arriving here as a null.
+        count: record.ignoredFiles.length + record.ignoredDirectories.length,
+        fileCount: record.ignoredFiles.length,
+        directoryCount: record.ignoredDirectories.length,
+        // Files first, and files capped separately from directories, so a project with a hundred
+        // ignored directories can never push the one `.env` off the end of the printed list.
+        files: record.ignoredFiles.slice(0, ARCHIVE_IGNORED_PATH_LIMIT),
+        directories: record.ignoredDirectories.slice(0, ARCHIVE_IGNORED_PATH_LIMIT),
+        filesTruncated: record.ignoredFiles.length > ARCHIVE_IGNORED_PATH_LIMIT,
+        directoriesTruncated: record.ignoredDirectories.length > ARCHIVE_IGNORED_PATH_LIMIT,
+        detail: describeIgnoredContent(record),
+      });
     }
     if (record.unmergedCommits > 0) {
       losses.push({
@@ -3093,6 +3199,20 @@ function archiveLosses(records) {
 // Both classes are reported together, and both list every affected repository (capped for
 // printing), because an operator shown only the first of three problems fixes one and comes
 // straight back. That is mergeCommand's own conflict-list lesson.
+// The sentence an operator reads before approving the deletion of files that exist nowhere else.
+// Files lead, because they are the ones with no other copy; directories follow, framed as what they
+// usually are so the common `node_modules/` case does not train anyone to skim past this line.
+function describeIgnoredContent(record) {
+  const parts = [];
+  if (record.ignoredFiles.length > 0) {
+    parts.push(`${record.ignoredFiles.length} ignored file(s) — ${joinPaths(record.ignoredFiles, ARCHIVE_IGNORED_PATH_LIMIT)} — which git tracks nowhere, so removing the worktree DELETES them and no branch, commit or backup holds a copy`);
+  }
+  if (record.ignoredDirectories.length > 0) {
+    parts.push(`${record.ignoredDirectories.length} ignored director(y/ies) — ${joinPaths(record.ignoredDirectories, ARCHIVE_IGNORED_PATH_LIMIT)} — deleted with it, usually regenerable build output but not checked`);
+  }
+  return parts.join("; ");
+}
+
 function describeDirtyRecord(record) {
   const parts = [];
   if (record.trackedPaths.length > 0) {
@@ -3122,9 +3242,29 @@ function describeClause(records, describe, noun) {
 function irrecoverableRefusal(runId, run, records, evidence) {
   const dirty = records.filter((record) => record.dirty);
   const unreachable = records.filter((record) => record.headReachable === false);
-  if (dirty.length === 0 && unreachable.length === 0) return null;
+  // I1 (whole-branch review). A worktree path this run records that ANOTHER, still-live run also
+  // records. Measured on the machine this was built against: two pairs of the eight real runs record
+  // byte-identical worktree path sets, because the path template derives from project + ticket +
+  // slug, so relaunching a failed run reuses the directory -- the old run goes `failed` (archivable)
+  // and the new one is `running`. Archiving the old one deleted the live one's worktree, reported
+  // `archived`, exited 0, and left the live run's state untouched at `running`.
+  //
+  // This is the design's acceptance criterion "a run still being worked on cannot be archived by any
+  // combination of flags" -- and it was reachable through a run that is not the one being archived,
+  // which is why none of the three per-run gates saw it.
+  const liveShared = records.filter((record) => record.sharedWith.some((sharer) => sharer.live));
+  if (dirty.length === 0 && unreachable.length === 0 && liveShared.length === 0) return null;
 
   const clauses = [];
+  // Named FIRST when present: it is the only class here whose remedy is not something the operator
+  // can do to this run at all -- they have to wait for, or close, a different run.
+  if (liveShared.length > 0) {
+    clauses.push(`${describeClause(
+      liveShared,
+      (record) => `${record.worktreePath} is also recorded by ${record.sharedWith.filter((sharer) => sharer.live).map((sharer) => `run ${sharer.runId} (${sharer.state})`).join(" and ")}`,
+      "repositories",
+    )}. That run is still live, and removing this worktree would destroy the work it is doing right now.`);
+  }
   if (dirty.length > 0) {
     clauses.push(`${describeClause(dirty, describeDirtyRecord, "repositories")}. Uncommitted and untracked work exists nowhere else, so this refuses for the whole run and never forces.`);
   }
@@ -3138,6 +3278,11 @@ function irrecoverableRefusal(runId, run, records, evidence) {
 
   // Capped by the SAME slice the reason uses, so the two cannot diverge in length.
   const actions = [
+    // Points at the LIVE run, not at this one: inspecting the run being archived tells the operator
+    // nothing about the run that is actually using the directory.
+    ...liveShared.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT).flatMap((record) => (
+      record.sharedWith.filter((sharer) => sharer.live).map((sharer) => resultCommandFor(sharer.runId))
+    )),
     ...dirty.slice(0, ARCHIVE_REASON_REPOSITORY_LIMIT).flatMap((record) => [
       `git -C ${record.worktreePath} status`,
       // Only ever `-n` (dry run). This command refuses to destroy untracked work; it must not hand
@@ -3150,6 +3295,47 @@ function irrecoverableRefusal(runId, run, records, evidence) {
   ];
 
   return archiveRefusal(runId, run, `Run ${runId} cannot be archived: ${clauses.join(" ")}`, [...new Set(actions)], evidence);
+}
+
+// I1. Which OTHER runs record each of this run's worktree paths, read once from the store rather
+// than per repository. Everything this command knew before came from the single `run` object, so a
+// second run recording the same directory was structurally invisible.
+//
+// Fails CLOSED, the same direction as the lock gate and for a stronger reason: a store that cannot
+// list has not proven that nobody else is using these directories, and this command is about to
+// delete them. "Could not ask" is not "nobody else".
+//
+// Archived runs are skipped: their record of the path is stale by construction -- a run is only
+// marked archived after every one of its worktrees was really removed, so it is no longer a claim
+// on the directory. A PARTIAL archive leaves `archivedAt` unset precisely so its remaining residue
+// still counts here.
+async function inspectSharedWorktrees(store, runId, records) {
+  if (typeof store?.list !== "function") {
+    return { error: "this run store cannot list other runs, so it cannot say whether another run is using these worktrees; refusing rather than removing a directory something else may be working in." };
+  }
+  let runs;
+  try {
+    runs = await store.list();
+  } catch (error) {
+    return { error: `other runs could not be listed (${archiveErrorText(error)}); an unreadable run set is a refusal, never an empty one.` };
+  }
+
+  const byPath = new Map();
+  for (const other of list(runs)) {
+    if (!other || other.id === runId) continue;
+    if (typeof other.archivedAt === "string") continue;
+    for (const entry of (Array.isArray(other.repositories) ? other.repositories : [])) {
+      const path = recordedRepositoryPath(entry);
+      if (!path) continue;
+      if (!byPath.has(path)) byPath.set(path, []);
+      byPath.get(path).push({ runId: other.id, state: other.state ?? null, live: LIVE_RUN_STATES.has(other.state) });
+    }
+  }
+
+  return {
+    // Sorted by run id so the digest does not depend on directory-enumeration order.
+    sharers: records.map((record) => [...(byPath.get(record.worktreePath) ?? [])].sort((a, b) => String(a.runId).localeCompare(String(b.runId)))),
+  };
 }
 
 // The digest binds run state, tab id, and per repository the worktree path, the branch and HEAD it
@@ -3190,6 +3376,25 @@ function archiveDigestPayload({ runId, run, records }) {
       dirtyCount: record.dirtyPaths.length,
       trackedCount: record.trackedPaths.length,
       untrackedCount: record.untrackedPaths.length,
+      // C1, and the ONE place in this payload where the full path list is bound rather than just a
+      // count. Every other list here is digested as a length because its contents survive the
+      // removal in some other place -- a commit stays on a branch, a dirty file refuses outright.
+      // Ignored entries are DELETED, so the design's promise ("an approval that named it") is only
+      // kept if the names themselves are what the approval is over: with counts alone, a `.env`
+      // renamed to `.envx` between preview and execute would keep the digest valid and destroy a
+      // file the operator was never shown. Sorted so the hash does not depend on git's enumeration
+      // order, and uncapped on purpose -- this payload is hashed, never printed, so its size costs
+      // nothing an operator sees, and capping the DIGEST is exactly the "approving these 3 of 300"
+      // defect the printed projection's caps exist to avoid.
+      //
+      // `--ignored=matching` collapses `node_modules/` to one entry, so this stays small for the
+      // case that would otherwise dominate it, and it stays stable while npm rewrites the contents.
+      ignoredFileCount: record.ignoredFiles.length,
+      ignoredDirectoryCount: record.ignoredDirectories.length,
+      ignoredEntries: [...record.ignoredFiles, ...record.ignoredDirectories].sort(),
+      // I1. Binds WHICH other runs record this same worktree path, so an approval goes stale the
+      // moment a relaunch starts recording it -- the exact sequence that makes this dangerous.
+      sharedWith: record.sharedWith.map((sharer) => ({ runId: sharer.runId, state: sharer.state })),
       basePath: record.basePath,
       baseBranch: record.baseBranch,
       unmergedCommits: record.unmergedCommits,
@@ -3220,6 +3425,19 @@ function publicArchiveRepository(record) {
     dirtyCount: record.dirtyPaths.length,
     trackedCount: record.trackedPaths.length,
     untrackedCount: record.untrackedPaths.length,
+    // C1. Counts are the FULL counts (they mirror the digest); the path lists are the only capped
+    // fields on this projection, and they are capped separately per kind so a hundred ignored
+    // directories can never hide the one ignored file that matters.
+    ignoredFileCount: record.ignoredFiles.length,
+    ignoredDirectoryCount: record.ignoredDirectories.length,
+    ignoredFiles: record.ignoredFiles.slice(0, ARCHIVE_IGNORED_PATH_LIMIT),
+    ignoredDirectories: record.ignoredDirectories.slice(0, ARCHIVE_IGNORED_PATH_LIMIT),
+    ignoredFilesTruncated: record.ignoredFiles.length > ARCHIVE_IGNORED_PATH_LIMIT,
+    ignoredDirectoriesTruncated: record.ignoredDirectories.length > ARCHIVE_IGNORED_PATH_LIMIT,
+    // I1. Only ever non-live sharers reach a non-refused preview -- a live one refuses -- so this
+    // is the "another finished run also recorded this path" warning, carried so the operator can see
+    // that removing it settles two records at once.
+    sharedWith: record.sharedWith,
     basePath: record.basePath,
     baseBranch: record.baseBranch,
     unmergedCommits: record.unmergedCommits,
@@ -3274,6 +3492,15 @@ async function buildArchivePreview(runId, run, options, deps) {
     if (outcome.refusal) return { preview: archiveRefusal(runId, run, outcome.refusal, list(outcome.actions), evidence), records: [] };
     records.push(outcome.record);
   }
+
+  // I1. One store read for the whole run, after every worktree path is resolved and before anything
+  // can be removed. Annotated onto the records so the refusal, the digest and the printed projection
+  // all read the same answer rather than each deriving its own.
+  const shared = await inspectSharedWorktrees(store, runId, records);
+  if (shared.error) {
+    return { preview: archiveRefusal(runId, run, `Run ${runId} cannot be archived: ${shared.error}`, [reconcileCommandFor(runId)], evidence), records: [] };
+  }
+  for (const [index, record] of records.entries()) record.sharedWith = shared.sharers[index];
 
   const irrecoverable = irrecoverableRefusal(runId, run, records, evidence);
   if (irrecoverable) return { preview: irrecoverable, records: [] };

@@ -616,9 +616,16 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
     // tab is gone.
     // It is also the one method here that is BOUNDED by default. The rest of this adapter spawns
     // without a timeout, which is survivable for them; it is not survivable here, because a hung
-    // `herdr` CLI would hang the step that runs after worktree removals that cannot be undone --
-    // "always returns" is not a property a caller can have if the process can block forever. A
+    // `herdr` CLI would hang the step that runs after worktree removals that cannot be undone. A
     // timeout surfaces as an ordinary reported failure, never as `not-found`.
+    //
+    // **What that timeout does and does not guarantee**, corrected in review after this comment
+    // claimed an "always returns" property the layer underneath cannot provide: process.js's
+    // timeout sends `SIGTERM` to the DIRECT child only and settles the promise on the child's
+    // `close` event. A `herdr` that ignores SIGTERM, or a grandchild still holding the inherited
+    // stdio pipes open, can therefore delay `close` past the deadline -- so the bound is "signalled
+    // at the deadline", not "returned by the deadline". It removes the ordinary hang, not every
+    // possible one, and no caller should be written as though the stronger property held.
     async closeTab({ tabId, timeoutMs = TAB_CLOSE_TIMEOUT_MS } = {}) {
       if (typeof tabId !== "string" || !tabId) {
         return { closed: false, reason: "closeTab requires a tab id" };

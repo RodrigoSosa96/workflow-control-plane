@@ -1722,3 +1722,66 @@ test("pendingOperation reports unknown rather than none when it cannot tell, and
 
   assert.equal((await createGitAdapter({ runner: {} }).pendingOperation()).status, "unknown");
 });
+
+// The probe added for the whole-branch review's C1. `git status --porcelain=v1` excludes ignored
+// entries by definition and `git worktree remove` deletes them without `--force` and without a word,
+// so this is the only thing standing between an archive and a silently destroyed `.env`.
+test("ignoredEntries against real git: it sees what --porcelain cannot, and splits files from directories", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  await writeFile(join(repoPath, ".gitignore"), "build\n*.log\n.env\ncoverage/\n");
+  await gitExec(repoPath, ["add", ".gitignore"]);
+  await gitExec(repoPath, ["commit", "-m", "ignore rules"]);
+
+  const worktreePath = join(root, "wt");
+  await gitExec(repoPath, ["worktree", "add", "-b", "feat", worktreePath, "main"]);
+  await writeFile(join(worktreePath, ".env"), "SECRET=only-copy\n");
+  await writeFile(join(worktreePath, "a.log"), "log\n");
+  await mkdir(join(worktreePath, "build", "sub"), { recursive: true });
+  await writeFile(join(worktreePath, "build", "out.js"), "x\n");
+  await mkdir(join(worktreePath, "coverage"), { recursive: true });
+  await writeFile(join(worktreePath, "coverage", "index.html"), "<html>\n");
+  await mkdir(join(worktreePath, "deep", "nested"), { recursive: true });
+  await writeFile(join(worktreePath, "deep", "nested", "c.log"), "log\n");
+
+  const git = createGitAdapter({ runner: createProcessRunner() });
+
+  // The premise: every probe this command was built on reports this worktree as clean.
+  const state = await git.checkoutState({ cwd: worktreePath });
+  assert.equal(state.dirty, false, "--porcelain=v1 cannot see any of it, which is the whole defect");
+
+  const ignored = await git.ignoredEntries({ cwd: worktreePath });
+  assert.equal(ignored.status, "read");
+  // Files and directories split by git's own trailing slash -- `build` was written without one in
+  // .gitignore and still reports as `build/`, and nothing under an ignored directory is enumerated
+  // separately, which is what keeps `node_modules/` from producing tens of thousands of entries.
+  assert.deepEqual(ignored.files.sort(), [".env", "a.log", "deep/nested/c.log"]);
+  assert.deepEqual(ignored.directories.sort(), ["build/", "coverage/"]);
+
+  // Fail-closed: an unreadable answer is `unknown`, never an empty list, because the caller's whole
+  // job is refusing when it cannot name what would be deleted.
+  const outside = await git.ignoredEntries({ cwd: root });
+  assert.equal(outside.status, "unknown");
+  assert.deepEqual(outside.files, []);
+  assert.deepEqual(outside.directories, []);
+  assert.match(outside.reason, /not a git repository|exited with code/i);
+});
+
+test("ignoredEntries: git worktree remove really does delete ignored content without --force", async (t) => {
+  const { root, repoPath } = await createDisposableRepo(t);
+  await writeFile(join(repoPath, ".gitignore"), ".env\n");
+  await gitExec(repoPath, ["add", ".gitignore"]);
+  await gitExec(repoPath, ["commit", "-m", "ignore rules"]);
+  const worktreePath = join(root, "wt");
+  await gitExec(repoPath, ["worktree", "add", "-b", "feat", worktreePath, "main"]);
+  await writeFile(join(worktreePath, ".env"), "SECRET=only-copy\n");
+
+  const git = createGitAdapter({ runner: createProcessRunner() });
+  const ignored = await git.ignoredEntries({ cwd: worktreePath });
+  assert.deepEqual(ignored.files, [".env"]);
+
+  // The measurement this whole probe exists because of: exit 0, no complaint, file gone.
+  const result = await git.removeWorktree({ cwd: repoPath, path: worktreePath });
+  assert.equal(result.ok, true);
+  assert.equal(result.code, 0);
+  assert.equal(existsSync(join(worktreePath, ".env")), false, "git deletes ignored content silently, which is why the preview has to name it first");
+});

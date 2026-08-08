@@ -83,6 +83,26 @@ never a worktree exits 128.
 exists nowhere else, and an archive command that destroys it silently is worse than no archive
 command. A dirty worktree is a refusal naming the files.
 
+**Correction, from the whole-branch review (C1): "modified or untracked" is not the complete set of
+what lives only inside a worktree, and this section originally read as though it were.** Measured,
+git 2.43: `git worktree remove` without `--force` refuses modified and untracked files and **deletes
+ignored ones silently, exit 0, with no output**. `git status --porcelain=v1` — the probe every gate
+in this command was built on — excludes ignored entries *by definition*, so a worktree holding the
+only copy of a `.env` previewed as `dirty: false`, archived, and reported success. On this machine
+that is not hypothetical: 5 of the 8 real worktrees carry ignored content, and one holds a 615-byte
+`.env` that differs from its base checkout's 1,853-byte one and exists in no ref, no other checkout
+and no backup. It survives today only because an unrelated `package-lock.json` edit trips the dirty
+refusal — whose own remedy tells the operator to go clean that up.
+
+The fix surfaces and digests rather than refusing, deliberately: refusing on ignored content would
+block essentially every real archive (every Node project has `node_modules/`), which is worse than
+no archive command for a tool whose job is reclaiming worktrees. Refusing only on ignored *files*
+is an arbitrary heuristic that still fires on `.env` everywhere. The design's promise is not "nothing
+is destroyed" — it is an approval *that named it* — so the preview reads
+`git status --ignored=matching`, reports ignored files and directories as a distinct loss kind with
+counts and a capped path list, and binds the **full list of entry names** into the approval digest.
+An unreadable ignored probe refuses, because an approval cannot name what could not be read.
+
 ### Unmerged work is the real risk, and 7 of 8 real worktrees have it
 
 Measured against the real base checkouts: **seven of the eight worktrees hold commits not in their
@@ -120,7 +140,7 @@ any live state is refused, naming its state.
 This is what 2.5 depends on 1.1 for. Two independent liveness questions, both answered before
 anything is removed:
 
-- **The run lock.** If it is held, `classifyMarkerOwnership` (`commands.js:2793`) decides via
+- **The run lock.** If it is held, `classifyMarkerOwnership` (`commands.js`, near the mutex-recovery helpers at the end of the file — the line number this once cited drifted into the archive losses section) decides via
   `inspectExactProcessByPid`, which returns `null` *only* on positive proof of absence and throws
   on ambiguity. A lock whose owner is alive, or whose ownership is `unprovable`, refuses. Archive
   does **not** remove the lock — that stays `workflow unlock`'s job, and the refusal names it.
@@ -257,8 +277,24 @@ workflow archive <run-id> --yes --approval-digest <digest>
 - An operator can reclaim the 8 worktrees on this machine without `rm -rf`, and cannot do it to the
   3 that are dirty without first dealing with the changes.
 - The preview says what would be **lost**, not just what would be removed.
-- Archiving a run never destroys a commit.
-- A run still being worked on cannot be archived by any combination of flags.
+- Archiving a run never destroys a commit **that any ref points at**. Stated with that qualifier
+  after the whole-branch review measured the one case the unqualified version got wrong: a commit
+  made on a branch and then `git reset --hard HEAD~1`-ed away is referenced only by the
+  per-worktree reflog, which `git worktree remove` deletes. The worktree is clean, `for-each-ref
+  --contains` finds nothing, and the reachability probe never even asks because a branch is checked
+  out. Gating on it is impractical — every `--amend`, rebase and reset would trip it — so it is
+  documented rather than refused. What *is* guaranteed: an unreachable detached HEAD refuses
+  outright, so no commit anything still names is destroyed.
+- **Archiving never deletes content it did not name.** Uncommitted and untracked work refuses;
+  gitignored content is deleted, and the preview names every entry and binds the list into the
+  digest. See correction C1 above for why that asymmetry is the right one.
+- A run still being worked on cannot be archived by any combination of flags — including when the
+  live run is **not the run being archived**. The whole-branch review (I1) measured this: the
+  worktree path template derives from project + ticket + slug, so a relaunch reuses the directory,
+  and two pairs of this machine's eight runs record byte-identical worktree path sets. Every gate
+  read only the single `run` object, so a second run recording the same path was invisible and
+  archiving the old one deleted the live one's worktree. The preview now reads `store.list()`,
+  refuses on a live sharer, warns on a finished one, and binds the sharing runs into the digest.
 
 ## An honest note about what this does not reclaim
 

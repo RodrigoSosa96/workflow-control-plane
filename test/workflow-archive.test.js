@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import * as realFs from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -117,6 +118,17 @@ function scriptedGit(script = {}) {
         const entry = entryFor(cwd);
         if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
         return entry.pending ?? { status: "none" };
+      },
+      // C1 (whole-branch review). Defaults to "read, and nothing ignored" rather than to unknown,
+      // because unknown REFUSES and every pre-existing fixture in this file describes a worktree
+      // with no ignored content. A fixture opts in with `ignoredFiles`/`ignoredDirectories`, or
+      // opts into the unreadable case with `ignoredError`.
+      async ignoredEntries({ cwd, timeoutMs }) {
+        calls.push({ method: "ignoredEntries", cwd, timeoutMs });
+        const entry = entryFor(cwd);
+        if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
+        if (entry.ignoredError) return { status: "unknown", files: [], directories: [], reason: entry.ignoredError };
+        return { status: "read", files: entry.ignoredFiles ?? [], directories: entry.ignoredDirectories ?? [] };
       },
       async isCommitReachable({ cwd, sha, timeoutMs }) {
         calls.push({ method: "isCommitReachable", cwd, sha, timeoutMs });
@@ -1346,21 +1358,52 @@ test("no display cap can reach the digest, because a capped field never appears 
   const fixture = scriptedGit(acmeFixture());
   const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
 
-  // The two caps that ship are both inside a REFUSAL's reason text, and a refusal carries
-  // `approvalDigest: null` -- so there is no path on which a truncated value is bound. This asserts
-  // the structural property that makes that true, rather than asserting a cap that cannot fire:
-  // a repository that would have anything to truncate refuses instead of being projected.
+  // **Rewritten for C1.** This test used to assert that no capped field can ever sit beside a
+  // digest, on the grounds that the only two caps lived inside a refusal's reason and a refusal
+  // carries `approvalDigest: null`. C1 made that thesis obsolete rather than merely incomplete:
+  // `ignoredPaths` is a cap that ships on a NON-refused preview, printed on exactly the path that
+  // goes on to delete the files it names. The property worth pinning is the one that survives --
+  // **a cap bounds what is PRINTED and never what is DIGESTED** -- and unlike the old assertion it
+  // is no longer vacuous, because there is now a reachable cap to test it against.
   assert.equal(command.preview.refused, false);
   assert.equal(command.preview.repositories[0].dirty, false);
   assert.equal(command.preview.repositories[0].dirtyCount, 0);
   assert.equal(Object.hasOwn(command.preview.repositories[0], "dirtyPaths"), false, "an unreachable field must not be shipped");
-  assert.equal(Object.hasOwn(command.preview.repositories[0], "dirtyPathsTruncated"), false);
-  assert.deepEqual(Object.keys(ARCHIVE_DISPLAY_LIMITS).sort(), ["reasonPaths", "reasonRepositories"]);
+  assert.deepEqual(Object.keys(ARCHIVE_DISPLAY_LIMITS).sort(), ["ignoredPaths", "reasonPaths", "reasonRepositories"]);
 
   const dirty = scriptedGit(acmeFixture({ "/wt/acme": { untrackedPaths: ["a", "b"] } }));
   const refused = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: dirty.git, present: ["/wt/acme"] }));
-  assert.equal(refused.preview.approvalDigest, null, "the only shape with truncatable text has nothing to approve");
+  assert.equal(refused.preview.approvalDigest, null, "a refusal has nothing to approve");
   assert.deepEqual(refused.preview.repositories, []);
+});
+
+test("the ignored-path cap bounds what is printed and never what is digested", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+  const over = ARCHIVE_DISPLAY_LIMITS.ignoredPaths + 3;
+  const files = Array.from({ length: over }, (_, index) => `secrets/key-${String(index).padStart(3, "0")}.pem`);
+  const build = (ignoredFiles) => scriptedGit(acmeFixture({ "/wt/acme": { ignoredFiles } }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: build(files).git, present: ["/wt/acme"] }));
+  const record = command.preview.repositories[0];
+
+  // Printed: capped, and SAYING it is capped -- "these 10" must never read as the complete set.
+  assert.equal(record.ignoredFiles.length, ARCHIVE_DISPLAY_LIMITS.ignoredPaths);
+  assert.equal(record.ignoredFilesTruncated, true);
+  // Counted: the FULL count, mirroring the digest.
+  assert.equal(record.ignoredFileCount, over);
+
+  // Digested: the full LIST. Proven by changing an entry that the printed list never showed -- if
+  // the digest bound only the count, or only the capped slice, this would not move.
+  const beyondCap = [...files];
+  beyondCap[over - 1] = "secrets/renamed-past-the-cap.pem";
+  const renamed = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: build(beyondCap).git, present: ["/wt/acme"] }));
+  assert.equal(renamed.preview.repositories[0].ignoredFileCount, over, "the count is deliberately unchanged, so only the list can explain a different digest");
+  assert.notEqual(
+    renamed.preview.approvalDigest,
+    command.preview.approvalDigest,
+    "renaming an ignored file past the display cap must still invalidate the approval: the design's promise is an approval that NAMED what would be destroyed",
+  );
 });
 
 test("a stale digest is refused and names the fresh one, and nothing is removed", async (t) => {
@@ -1646,7 +1689,7 @@ test("a persistence failure degrades to an error field without discarding the re
 
 // --- real git ---------------------------------------------------------------
 
-async function realRun(t, { dirty = null, baseBranch = "dev", sourceBranch = "feature/actual" } = {}) {
+async function realRun(t, { dirty = null, ignored = null, baseBranch = "dev", sourceBranch = "feature/actual" } = {}) {
   const root = await mkdtemp(join(tmpdir(), "workflow-archive-git-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
 
@@ -1656,7 +1699,14 @@ async function realRun(t, { dirty = null, baseBranch = "dev", sourceBranch = "fe
   await gitExec(basePath, ["config", "user.name", "Workflow Tests"]);
   await gitExec(basePath, ["config", "user.email", "workflow@example.test"]);
   await realFs.writeFile(join(basePath, "README.md"), "base\n");
-  await gitExec(basePath, ["add", "README.md"]);
+  // Committed on the base branch so it is inherited by the worktree, which is what makes the
+  // ignored content below genuinely ignored rather than merely untracked.
+  // `*.secret` is here so a later test can create a NEW ignored file without having to change
+  // .gitignore -- which would not work anyway: .gitignore is committed on the base branch, so a
+  // pattern added there afterwards is not present in the worktree's own checkout and the new file
+  // would be untracked (and refuse) rather than ignored. Found writing that test the wrong way.
+  if (ignored) await realFs.writeFile(join(basePath, ".gitignore"), ".env\nnode_modules/\n*.secret\n");
+  await gitExec(basePath, ["add", "-A"]);
   await gitExec(basePath, ["commit", "-m", "initial"]);
 
   const worktreePath = join(root, "work");
@@ -1671,6 +1721,13 @@ async function realRun(t, { dirty = null, baseBranch = "dev", sourceBranch = "fe
   }
   if (dirty === "modified") {
     await realFs.writeFile(join(worktreePath, "feature.txt"), "edited, never committed\n");
+  }
+  if (ignored) {
+    // The measured C1 shape: content `git status --porcelain=v1` cannot see and
+    // `git worktree remove` deletes without a word.
+    await realFs.writeFile(join(worktreePath, ".env"), "SECRET=only-copy-of-this\n");
+    await realFs.mkdir(join(worktreePath, "node_modules", "pkg"), { recursive: true });
+    await realFs.writeFile(join(worktreePath, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
   }
 
   return { root, basePath, worktreePath, sha };
@@ -1763,4 +1820,237 @@ test("real git: an untracked-only worktree refuses, and every one of its files i
   const list = await gitExec(basePath, ["worktree", "list", "--porcelain"]);
   assert.match(list.stdout, new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.deepEqual(store.appendEventCalls, []);
+});
+
+// --- C1 (whole-branch review): ignored content ------------------------------
+//
+// `git worktree remove` without `--force` refuses modified and untracked files and DELETES ignored
+// ones, exit 0, no output — and `git status --porcelain=v1`, which every probe in this command was
+// built on, excludes ignored entries by definition. So a worktree holding the only copy of a `.env`
+// previewed as clean, archived, and reported success. These tests are the guard on the fix, and the
+// real-git one is the load-bearing half: it fails against an implementation that never asks.
+
+test("real git: a gitignored file is named in the preview, bound in the digest, and does not refuse", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const { basePath, worktreePath } = await realRun(t, { ignored: true });
+  const created = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-9",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const run = await advanceTo(store, created.id, RUN_STATES.COMPLETED);
+  const deps = {
+    store,
+    loadRegistry: archiveLoadRegistry({ acme: { label: "Acme", repository: "monorepo", path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+    herdr: scriptedHerdr({}),
+    inspectProcess: OWNER_GONE,
+  };
+
+  // The fixture's own premise: the dirty gate really does see a clean tree, so nothing but the
+  // ignored probe can be what surfaces this.
+  const status = await gitExec(worktreePath, ["status", "--porcelain"]);
+  assert.equal(status.stdout.trim(), "", "the fixture must be clean per --porcelain, or it proves nothing");
+
+  const command = await archiveCommand({ runId: run.id }, deps);
+  const preview = command.preview;
+
+  assert.equal(preview.refused, false, "ignored content is surfaced and digested, never refused: every Node project has node_modules/");
+  const record = preview.repositories[0];
+  assert.deepEqual(record.ignoredFiles, [".env"]);
+  assert.deepEqual(record.ignoredDirectories, ["node_modules/"], "--ignored=matching collapses the directory instead of listing every file under it");
+  assert.equal(record.ignoredFileCount, 1);
+  assert.equal(record.ignoredDirectoryCount, 1);
+
+  const loss = preview.losses.find((entry) => entry.kind === "ignored-content");
+  assert.ok(loss, `the preview must name the ignored content as a loss: ${JSON.stringify(preview.losses)}`);
+  assert.equal(loss.fileCount, 1);
+  assert.equal(loss.directoryCount, 1);
+  assert.match(loss.detail, /\.env/);
+  assert.match(loss.detail, /DELETES/, "the word an operator has to see before approving");
+  assert.match(loss.detail, /node_modules\//);
+
+  // Bound into the digest: adding another ignored file invalidates the approval.
+  const digestBefore = preview.approvalDigest;
+  await realFs.writeFile(join(worktreePath, ".env"), "SECRET=only-copy-of-this\n");
+  await realFs.mkdir(join(worktreePath, "node_modules", "other"), { recursive: true });
+  const unchanged = await archiveCommand({ runId: run.id }, deps);
+  assert.equal(unchanged.preview.approvalDigest, digestBefore, "content inside an already-named ignored directory does not move the digest");
+
+  // A NEW ignored file, matching a pattern the worktree's own committed .gitignore already carries.
+  await realFs.writeFile(join(worktreePath, "deploy.secret"), "another only copy\n");
+  const withMore = await archiveCommand({ runId: run.id }, deps);
+  assert.equal(withMore.preview.refused, false, "a second ignored file still does not refuse");
+  assert.notEqual(withMore.preview.approvalDigest, digestBefore, "a NEW ignored file must invalidate the approval");
+  assert.deepEqual(withMore.preview.repositories[0].ignoredFiles.sort(), [".env", "deploy.secret"]);
+});
+
+test("real git: the archive that was approved really does delete the ignored file, and the report says so", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const { basePath, worktreePath } = await realRun(t, { ignored: true });
+  const created = await store.create({
+    projectAlias: "acme",
+    primaryTicket: "A-10",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const run = await advanceTo(store, created.id, RUN_STATES.COMPLETED);
+  const command = await archiveCommand({ runId: run.id }, {
+    store,
+    loadRegistry: archiveLoadRegistry({ acme: { label: "Acme", repository: "monorepo", path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+    herdr: scriptedHerdr({}),
+    inspectProcess: OWNER_GONE,
+  });
+
+  assert.equal(existsSync(join(worktreePath, ".env")), true);
+  const report = await command.execute({ approvalDigest: command.preview.approvalDigest });
+
+  // This is the honest half of the fix: the file IS destroyed. What changed is that the operator
+  // was told, by name, before approving — which is the design's actual promise.
+  assert.equal(report.status, "archived");
+  assert.equal(existsSync(worktreePath), false);
+  const reported = report.losses.find((entry) => entry.kind === "ignored-content");
+  assert.ok(reported, "the report must carry the ignored-content loss it just realised");
+  assert.equal(reported.removed, true, "the worktree really was removed, so the loss really happened");
+
+  // And the run's own event log keeps the record after the directory is gone.
+  const event = store.appendEventCalls.at(-1).event;
+  assert.equal(event.type, "archive");
+});
+
+test("an unreadable ignored probe refuses, because an unnameable deletion cannot be approved", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+  const fixture = scriptedGit(acmeFixture({ "/wt/acme": { ignoredError: "fatal: unable to read index" } }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+
+  assert.equal(command.preview.refused, true);
+  assert.match(command.preview.reason, /ignored/i);
+  assert.match(command.preview.reason, /unable to read index/);
+  assert.equal(command.preview.approvalDigest, null);
+  assertNothingHappened(fixture);
+});
+
+test("ignored files and ignored directories are counted and reported apart, so node_modules cannot hide a .env", async (t) => {
+  const store = await newStore(t);
+  const run = await acmeRun(store);
+  const fixture = scriptedGit(acmeFixture({
+    "/wt/acme": { ignoredFiles: [".env"], ignoredDirectories: ["node_modules/", "dist/", "coverage/"] },
+  }));
+
+  const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+  const loss = command.preview.losses.find((entry) => entry.kind === "ignored-content");
+
+  assert.equal(loss.fileCount, 1);
+  assert.equal(loss.directoryCount, 3);
+  assert.deepEqual(loss.files, [".env"]);
+  assert.deepEqual(loss.directories, ["node_modules/", "dist/", "coverage/"]);
+  // The file clause comes first, because the file is the one with no other copy.
+  assert.ok(loss.detail.indexOf(".env") < loss.detail.indexOf("node_modules/"), `files must lead: ${loss.detail}`);
+  assert.match(loss.detail, /regenerable build output/, "directories are framed as what they usually are");
+});
+
+// --- I1 (whole-branch review): a worktree two runs record --------------------
+//
+// The path template derives from project + ticket + slug, so relaunching a failed run reuses the
+// directory: the old run goes `failed` (archivable) and the new one is `running`. Two pairs of the
+// eight real runs on the machine this was built against record byte-identical worktree path sets.
+// Everything this command knew came from the single `run` object, so the live run was invisible.
+
+async function runSharing(store, worktreePath, { ticket, state }) {
+  const created = await store.create({
+    projectAlias: "acme",
+    primaryTicket: ticket,
+    repositories: [{ id: "acme", path: worktreePath, branch: "feature/x" }],
+  });
+  return await advanceTo(store, created.id, state);
+}
+
+test("a worktree another LIVE run also records refuses, names that run, and removes nothing", async (t) => {
+  const store = await newStore(t);
+  const stale = await runSharing(store, "/wt/acme", { ticket: "A-1", state: RUN_STATES.FAILED });
+  const live = await runSharing(store, "/wt/acme", { ticket: "A-2", state: RUN_STATES.RUNNING });
+  const fixture = scriptedGit(acmeFixture());
+
+  const command = await archiveCommand({ runId: stale.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+
+  assert.equal(command.preview.refused, true, "a run still being worked on cannot be archived by any combination of flags");
+  assert.match(command.preview.reason, new RegExp(live.id));
+  assert.match(command.preview.reason, /still live/);
+  assert.equal(command.preview.approvalDigest, null);
+  // The remedy points at the LIVE run, not at the one being archived.
+  assert.ok(
+    command.preview.nextActions.some((action) => action === `workflow result ${live.id}`),
+    `the refusal must point at the live run: ${JSON.stringify(command.preview.nextActions)}`,
+  );
+  assertNothingHappened(fixture);
+});
+
+test("execute refuses too, so the gate cannot be walked past with a digest taken before the other run started", async (t) => {
+  const store = withAppendSpy(await newStore(t));
+  const stale = await runSharing(store, "/wt/acme", { ticket: "A-1", state: RUN_STATES.FAILED });
+  const fixture = scriptedGit(acmeFixture());
+  const deps = archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] });
+
+  // Approved while nothing else claimed the directory.
+  const command = await archiveCommand({ runId: stale.id }, deps);
+  assert.equal(command.preview.refused, false);
+  const digest = command.preview.approvalDigest;
+
+  // A relaunch starts, recording the same path, before the operator pastes the digest back.
+  const live = await runSharing(store, "/wt/acme", { ticket: "A-2", state: RUN_STATES.RUNNING });
+
+  await assert.rejects(
+    () => command.execute({ approvalDigest: digest }),
+    (error) => {
+      assert.equal(error.category, "PREFLIGHT");
+      assert.equal(error.exitCode, ARCHIVE_EXIT_CODES.refused);
+      assert.match(error.message, new RegExp(live.id));
+      return true;
+    },
+  );
+  assert.deepEqual(fixture.removals(), [], "the live run's worktree must still be there");
+  assert.deepEqual(store.appendEventCalls, []);
+});
+
+test("a non-live sharer warns and is digested rather than refusing, and an archived sharer is ignored entirely", async (t) => {
+  const store = await newStore(t);
+  const target = await runSharing(store, "/wt/acme", { ticket: "A-1", state: RUN_STATES.FAILED });
+  const sibling = await runSharing(store, "/wt/acme", { ticket: "A-2", state: RUN_STATES.COMPLETED });
+  const fixture = scriptedGit(acmeFixture());
+  const deps = archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] });
+
+  const command = await archiveCommand({ runId: target.id }, deps);
+  assert.equal(command.preview.refused, false, "a finished sharer is a warning, not a blocker");
+  const loss = command.preview.losses.find((entry) => entry.kind === "shared-worktree");
+  assert.ok(loss, `the preview must name the sharer: ${JSON.stringify(command.preview.losses)}`);
+  assert.deepEqual(loss.sharedWith.map((sharer) => sharer.runId), [sibling.id]);
+  assert.equal(loss.sharedWith[0].live, false);
+  const withSharer = command.preview.approvalDigest;
+
+  // Once that sibling is itself archived, its claim on the directory is stale by construction --
+  // a run is only marked archived after every one of its worktrees was really removed.
+  await store.update(sibling.id, () => ({ archivedAt: "2026-08-08T00:00:00.000Z" }));
+  const after = await archiveCommand({ runId: target.id }, deps);
+  assert.equal(after.preview.losses.some((entry) => entry.kind === "shared-worktree"), false);
+  assert.deepEqual(after.preview.repositories[0].sharedWith, []);
+  assert.notEqual(after.preview.approvalDigest, withSharer, "the sharer set is bound into the digest");
+});
+
+test("a store that cannot list other runs refuses rather than assuming this run is the only claim", async (t) => {
+  const base = await newStore(t);
+  const run = await acmeRun(base);
+  const fixture = scriptedGit(acmeFixture());
+
+  const withoutList = { ...base };
+  delete withoutList.list;
+  const throwing = { ...base, async list() { throw new Error("EACCES: permission denied"); } };
+
+  for (const store of [withoutList, throwing]) {
+    const command = await archiveCommand({ runId: run.id }, archiveDeps(store, { git: fixture.git, present: ["/wt/acme"] }));
+    assert.equal(command.preview.refused, true);
+    assert.match(command.preview.reason, /another run|other runs/i);
+    assertNothingHappened(fixture);
+  }
 });
