@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { WorkflowError } from "./errors.js";
+// Shared with verify-runner.js, the other runner in this directory that spawns `detached`. The
+// mechanism is common; the interrupt POLICY below deliberately is not -- see process-group.js.
+import { killChild, SIGNAL_EXIT_CODES } from "./process-group.js";
 
 // Exported so a parser of a captured stream can say that its input was cut off here, rather
 // than repeating the number and drifting from it.
@@ -18,11 +21,6 @@ const DEFAULT_KILL_GRACE_MS = 2000;
 // and it is deliberately short because the whole point is not to wait on a writer this process
 // cannot close.
 const SETTLE_DRAIN_MS = 100;
-
-// Exit code convention for a process that dies of a signal (128 + signal number) -- the same
-// number a shell reports for the same event, so a caller inspecting this process's own exit code
-// sees the familiar value rather than an arbitrary one. Matches verify-runner.js.
-const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
 
 function appendBounded(current, chunk) {
   if (current.length >= OUTPUT_LIMIT) return current;
@@ -56,39 +54,9 @@ function toProcessError(message, details) {
   });
 }
 
-// Sends a signal to the whole process group `child` leads, not just `child` itself. Same shape and
-// same reasoning as verify-runner.js's killChild, brought here because this is the runner every
-// git and Herdr call in the repo goes through: `run` below spawns with `detached: true`, which on
-// POSIX makes `child.pid` the leader of its own new process group, so `-child.pid` reaches every
-// descendant that has not further detached itself -- including a grandchild a command backgrounded
-// with `&`, which `child.kill()` alone never could. Measured before this fix: `sh -c 'sleep 30'`
-// with `timeoutMs: 500` settled at 30,205ms because `sh` forked `sleep` rather than exec'ing it,
-// so the SIGTERM reached only `sh` while `sleep` kept the inherited stdio pipes (and therefore
-// `close`) open for its full 30 seconds.
-//
-// Falls back to signaling `child` directly when there is no usable pid to form a group from (a real
-// spawn always provides one; a test double may not) -- same best-effort, never-throws posture as
-// every other kill site.
-function killChild(child, signal) {
-  if (typeof child.pid === "number" && Number.isInteger(child.pid)) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // No such process group (already gone) or group signaling unavailable -- fall through to a
-      // direct kill below rather than assuming the job is done.
-    }
-  }
-  try {
-    child.kill(signal);
-  } catch {
-    // Best-effort: if the process is already gone, the settle path below still runs.
-  }
-}
-
 // --- The interrupt trap -----------------------------------------------------------------------
 //
-// `detached: true` (see killChild above) is what lets a timeout reach a backgrounded grandchild's
+// `detached: true` (see killChild in process-group.js) is what lets a timeout reach a grandchild's
 // whole process group -- and the same detachment takes the child OUT of this CLI's own process
 // group, so a terminal's Ctrl-C, delivered to the whole *foreground group* and not to this process
 // by pid, no longer reaches it. That regression is not hypothetical: item 2.3 shipped exactly this
@@ -97,10 +65,41 @@ function killChild(child, signal) {
 // the SIGTERM -> grace -> SIGKILL escalation lives inside the process that just died.
 //
 // So: for exactly as long as at least one child is alive, an interrupt delivered to THIS process
-// (SIGINT from a terminal, SIGTERM from e.g. a process manager) kills every live child's group
-// first -- SIGKILL, not the timeout path's escalation, because this process is about to exit and
-// will not be alive to run that timer -- and then exits the way an uninterrupted SIGINT/SIGTERM
+// (SIGINT from a terminal, SIGTERM from e.g. a process manager) reaches every live child's group
+// before this process exits, and this process then exits the way an uninterrupted SIGINT/SIGTERM
 // would (128 + signal number).
+//
+// **What that interrupt sends is the third deliberate difference from verify-runner.js, and it is
+// the one a copy gets wrong.** That file SIGKILLs, which is right for a verification command --
+// nothing it runs cleans up after itself. This runner fronts repository MUTATIONS: `git merge
+// --no-ff` (git.js:665), `git worktree add` (:457, :466), `git worktree remove` (:845). SIGKILL
+// cannot be caught or handled, so a killed command never runs the cleanup it registered; git
+// installs exactly such a handler (`sigchain_push_common`, which removes its tempfiles and
+// lockfiles) and it only ever runs for a signal git is allowed to receive. Forwarding is therefore
+// strictly better than killing for anything that tidies up after itself, and this runner's callers
+// all do.
+//
+// The review that found this reported a measured case of an interrupted `git commit` leaving
+// `.git/index.lock` behind. That specific artifact did NOT reproduce here: probed against git 2.43,
+// no `*.lock` exists under `.git` during pre-commit, prepare-commit-msg, commit-msg, post-commit,
+// post-merge or post-checkout, nor while a blocking `GIT_EDITOR` is open. The lock window is
+// version- and command-dependent; the reason to forward is not, which is why it is stated above as
+// the property (an uncatchable signal runs no handler) rather than as a number this file cannot
+// stand behind. The tests assert the mechanism -- the child receives a catchable signal -- not a
+// lockfile this git never creates.
+//
+// So the trap FORWARDS the signal it received to each live group, and only then escalates: SIGKILL
+// plus `process.exit` from a short timer, which this process is alive to run precisely because it
+// owns the handler that is deferring its own exit. A second interrupt while that is pending skips
+// the wait -- an operator pressing Ctrl-C twice is asking for exactly that -- and the escalation is
+// a hard ceiling, so an ignored signal costs one grace window, never an unbounded hang.
+//
+// While that shutdown is draining, no run may hand control back to its caller. A child dying of the
+// forwarded SIGINT settles like any other signalled child, and an `allowFailure` caller would take
+// that as an ordinary nonzero result and march on to its NEXT step -- removing a worktree, say --
+// inside a process that is already exiting. `shuttingDown` below is what stops that: settles still
+// release their registry slot (so the escalation knows when everything is gone), but the promise is
+// left pending and the exit happens on the trap's own schedule.
 //
 // **This is where it differs from verify-runner.js, and the difference is the reason it is not a
 // copy-paste.** That file runs one child at a time, so its comment can say "at most one trap is
@@ -115,28 +114,63 @@ function killChild(child, signal) {
 //
 // Never registered while no child is alive, which matters for more than tidiness: a registered
 // SIGINT listener suppresses node's own default termination, so leaving one installed would change
-// how the CLI responds to Ctrl-C at every other moment of its life.
+// how the CLI responds to Ctrl-C at every other moment of its life. The one case where it stays
+// installed indefinitely is a child that really is still alive: an untimed run whose `close` never
+// arrives is never released, so its registry slot -- and the trap -- outlive every later command in
+// that process, and a SIGINT handler registered afterwards never runs because this one exits first.
+// That is the honest reading of "a child is alive", not a leak, and B2/B3/B4 giving those call
+// sites a `timeoutMs` is what removes the case rather than papering over it.
 const liveChildren = new Set();
 let installedTrap = null;
+// Set once an interrupt has been received and never cleared: this process is on its way out, and
+// the flag is what keeps a settle from handing control back to a caller in the interim.
+let shuttingDown = false;
+let interruptSignal = null;
 
-function fireInterruptTrap(signal) {
+// How long a forwarded interrupt has to work before SIGKILL. Same window as the timeout path's
+// escalation, because it answers the same question -- how long a signalled command gets to die on
+// its own -- and one number is easier to reason about than two.
+const INTERRUPT_ESCALATION_MS = DEFAULT_KILL_GRACE_MS;
+
+function exitFromInterrupt() {
   // A snapshot, because killing is best-effort and a child's own handlers may mutate the registry.
   for (const child of [...liveChildren]) {
     killChild(child, "SIGKILL");
   }
   liveChildren.clear();
-  process.exit(SIGNAL_EXIT_CODES[signal] ?? 1);
+  process.exit(SIGNAL_EXIT_CODES[interruptSignal] ?? 1);
+}
+
+function fireInterruptTrap(signal) {
+  if (shuttingDown) {
+    // Interrupted twice. The operator is not asking again, they are asking harder.
+    exitFromInterrupt();
+    return;
+  }
+  shuttingDown = true;
+  interruptSignal = signal;
+
+  // Forward what the terminal sent, not something stronger: this is the only signal a mutating
+  // command can act on to clean up after itself (see the measurement above).
+  for (const child of [...liveChildren]) {
+    killChild(child, signal);
+  }
+
+  if (liveChildren.size === 0) {
+    exitFromInterrupt();
+    return;
+  }
+
+  // A plain timer, not a wait on any stream or child event, so nothing a child does (or stops
+  // doing) can extend it: the exit happens on this schedule whether or not anything reports back.
+  // `unref` is deliberately NOT used -- this timer keeping the loop alive is the point.
+  setTimeout(exitFromInterrupt, INTERRUPT_ESCALATION_MS);
 }
 
 function trackChild(child) {
   liveChildren.add(child);
   if (!installedTrap) {
-    let firing = false;
-    installedTrap = (signal) => {
-      if (firing) return;
-      firing = true;
-      fireInterruptTrap(signal);
-    };
+    installedTrap = (signal) => fireInterruptTrap(signal);
     process.on("SIGINT", installedTrap);
     process.on("SIGTERM", installedTrap);
   }
@@ -146,6 +180,13 @@ function trackChild(child) {
     if (released) return;
     released = true;
     liveChildren.delete(child);
+    if (shuttingDown) {
+      // Every child has now answered the forwarded signal, so there is nothing left to wait for --
+      // exit now rather than sitting out the rest of the escalation window. The listeners stay
+      // registered on purpose: a second interrupt arriving in this instant must still be caught.
+      if (liveChildren.size === 0) exitFromInterrupt();
+      return;
+    }
     if (liveChildren.size === 0 && installedTrap) {
       process.removeListener("SIGINT", installedTrap);
       process.removeListener("SIGTERM", installedTrap);
@@ -220,6 +261,12 @@ export function createProcessRunner({ spawnImpl = spawn } = {}) {
           if (killTimer) clearTimeout(killTimer);
           if (drainTimer) clearTimeout(drainTimer);
           releaseChild();
+          // An interrupt is draining (see the trap above). `releaseChild` has already recorded that
+          // this child is done -- which is what lets the shutdown exit as soon as the last one
+          // answers -- but the promise is deliberately left pending: resolving or rejecting here
+          // would hand a caller mid-shutdown an ordinary-looking result (an `allowFailure` caller
+          // reads a signalled child as just another nonzero code) and let it start its next step
+          // inside a process that is already on its way out.
           callback();
         };
 

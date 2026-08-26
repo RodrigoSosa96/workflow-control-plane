@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createProcessRunner } from "../src/workflow/process.js";
@@ -363,12 +365,77 @@ test("the interrupt trap does not accumulate across sequential or concurrent spa
   }
 });
 
+// killChild's group branch. Every makeManualChild above leaves `pid` null, which is the direct-kill
+// fallback -- so without these two the group signal is only ever exercised through a real process,
+// and the fallback path is only ever exercised by accident. `process.kill` is swapped for the
+// duration rather than given a real pid: signalling `-1234` for real would hit whatever process
+// group happens to own that number on the machine running the suite. node:test runs the tests in
+// this file one at a time, so the swap is not visible to anything else.
+async function withStubbedProcessKill(stub, body) {
+  const original = process.kill;
+  const calls = [];
+  process.kill = (pid, signal) => {
+    calls.push({ pid, signal });
+    return stub(pid, signal);
+  };
+  try {
+    return await body(calls);
+  } finally {
+    process.kill = original;
+  }
+}
+
+test("a timeout signals the child's process group, not the child alone", { timeout: 10_000 }, async () => {
+  const child = makeManualChild({ pid: 4321 });
+  const runner = createProcessRunner({ spawnImpl: () => child });
+
+  await withStubbedProcessKill(() => true, async (kills) => {
+    const promise = runner.run("git", ["status"], { timeoutMs: 20, killGraceMs: 5000 });
+    setTimeout(() => child.emit("close", null, "SIGTERM"), 80);
+    await assert.rejects(promise, (error) => error.details.reason === "timeout");
+
+    assert.deepEqual(kills, [{ pid: -4321, signal: "SIGTERM" }], "the negated pid is the process group");
+    assert.deepEqual(child.killSignals, [], "the direct kill is a fallback, not the first choice");
+  });
+});
+
+test("a group signal that fails falls back to killing the child directly", { timeout: 10_000 }, async () => {
+  const child = makeManualChild({ pid: 4321 });
+  const runner = createProcessRunner({ spawnImpl: () => child });
+
+  await withStubbedProcessKill(
+    () => {
+      const error = new Error("ESRCH: no such process group");
+      error.code = "ESRCH";
+      throw error;
+    },
+    async (kills) => {
+      const promise = runner.run("git", ["status"], { timeoutMs: 20, killGraceMs: 5000 });
+      setTimeout(() => child.emit("close", null, "SIGTERM"), 80);
+      await assert.rejects(promise, (error) => error.details.reason === "timeout");
+
+      assert.deepEqual(kills, [{ pid: -4321, signal: "SIGTERM" }], "the group is tried first");
+      assert.deepEqual(child.killSignals, ["SIGTERM"], "and the child directly when that throws");
+    },
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Real processes. Everything above proves the wiring; these prove the property, with a real
 // process group, a real kernel, and `ps` as the witness that nothing survived.
 // ---------------------------------------------------------------------------
 
 const hasRealShell = existsSync("/bin/sh");
+
+// The interrupt tests below send a signal to a process GROUP (`process.kill(-pid, …)`), which is
+// POSIX-only -- the one thing in this file that cannot work on Windows at all, where its siblings
+// only need `/bin/sh`. CI is ubuntu, so this changes nothing today; it is here so the guard names
+// the real requirement instead of borrowing a neighbour's.
+const posixGroups = process.platform !== "win32";
+const skipWithoutGroups = posixGroups ? false : "process groups are POSIX-only";
+const skipWithoutShellAndGroups = hasRealShell
+  ? skipWithoutGroups
+  : "no /bin/sh on this host";
 
 function psSnapshot() {
   try {
@@ -378,12 +445,18 @@ function psSnapshot() {
   }
 }
 
-// Matches on `sleep <marker>` rather than the bare marker so the fixture subprocess that carries
-// the same number on its own command line is never mistaken for the child under test.
+// Excluding the fixture is load-bearing, not tidiness. The fixture takes the command to run as its
+// own argv, so `ps` shows `node process-signal-child.mjs <cwd> sh -c '… sleep <marker>'` alongside
+// the real child -- and a precondition that waits for the marker to APPEAR was satisfied by the
+// fixture itself, before it had spawned anything or installed the trap. The interrupt then landed
+// on a process with no trap, node's default SIGINT killed it outright, and the tests failed
+// claiming the child had been SIGKILLed. Caught by those failures, not by review.
+const FIXTURE_SCRIPT = "process-signal-child.mjs";
+
 function markerPids(marker) {
   return psSnapshot()
     .split("\n")
-    .filter((line) => line.includes(`sleep ${marker}`))
+    .filter((line) => line.includes(`sleep ${marker}`) && !line.includes(FIXTURE_SCRIPT))
     .map((line) => Number.parseInt(line.trim(), 10))
     .filter((pid) => Number.isInteger(pid) && pid > 0);
 }
@@ -494,23 +567,46 @@ test(
   },
 );
 
+// A real subprocess standing in for the CLI, spawned as the leader of its own process group so that
+// signalling `-child.pid` reproduces what a terminal does on Ctrl-C: it signals the whole foreground
+// group, never one pid.
+function spawnInterruptibleCli(cwd, command, ...args) {
+  const { env, commandArgs } = typeof cwd === "object" && cwd !== null
+    ? { env: cwd.env, commandArgs: [cwd.cwd, command, ...args] }
+    : { env: undefined, commandArgs: [cwd, command, ...args] };
+  const scriptPath = join(import.meta.dirname, "support", "process-signal-child.mjs");
+  const child = spawn(process.execPath, [scriptPath, ...commandArgs], {
+    detached: true,
+    stdio: "ignore",
+    env: env ? { ...process.env, ...env } : process.env,
+  });
+  const state = { exited: false, code: null, signal: null };
+  child.once("exit", (code, signal) => {
+    state.exited = true;
+    state.code = code;
+    state.signal = signal;
+  });
+  return { child, state };
+}
+
+function killCli(child, state) {
+  if (state.exited) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
+}
+
 test(
   "an interrupt (SIGINT) to the CLI's own process group kills the running child too, not just the CLI",
-  { timeout: 30_000 },
+  { skip: skipWithoutGroups, timeout: 30_000 },
   async () => {
-    // A real subprocess standing in for the CLI, spawned as the leader of its own process group so
-    // that signalling `-child.pid` reproduces what a terminal does on Ctrl-C: it signals the whole
-    // foreground group, never one pid. Without the trap, the detached `sleep` is reparented to init
-    // and outlives the interrupted CLI with no bound at all -- the timeout that would have killed
-    // it lives inside the process that just exited.
+    // Without the trap, the detached child is reparented to init and outlives the interrupted CLI
+    // with no bound at all -- the timeout that would have killed it lives inside the process that
+    // just exited.
     const marker = "194904";
-    const scriptPath = join(import.meta.dirname, "support", "process-signal-child.mjs");
-    const child = spawn(process.execPath, [scriptPath, marker], { detached: true, stdio: "ignore" });
-
-    let childExited = false;
-    child.once("exit", () => {
-      childExited = true;
-    });
+    const { child, state } = spawnInterruptibleCli(import.meta.dirname, "sleep", marker);
 
     try {
       assert.ok(
@@ -521,19 +617,229 @@ test(
       const start = Date.now();
       process.kill(-child.pid, "SIGINT");
 
-      const cliExited = await waitUntil(() => childExited, { timeoutMs: 5000 });
+      const cliExited = await waitUntil(() => state.exited, { timeoutMs: 5000 });
       assert.ok(cliExited, `expected the CLI subprocess to exit after SIGINT; still running after ${Date.now() - start}ms`);
 
       const orphanGone = await waitUntil(() => markerPids(marker).length === 0, { timeoutMs: 5000 });
       assert.ok(orphanGone, `expected the sleep to be gone once the CLI handled SIGINT; still present after ${Date.now() - start}ms`);
     } finally {
-      if (!childExited) {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          // Already gone.
-        }
-      }
+      killCli(child, state);
+      killMarker(marker);
+    }
+  },
+);
+
+// R2 (review): the trap used to send SIGKILL, which is uncatchable -- so an interrupted `git` never
+// ran its own cleanup and left `.git/index.lock` behind. These three cover the corrected policy:
+// forward what was received, escalate only if that is ignored, and let a second interrupt skip the
+// wait. The lockfile test further down is the property they exist for.
+test(
+  "an interrupt forwards the signal it received, so the command can still clean up after itself",
+  { skip: skipWithoutShellAndGroups, timeout: 30_000 },
+  async (t) => {
+    const marker = "194905";
+    const scratch = await mkdtemp(join(tmpdir(), "workflow-process-signal-"));
+    t.after(async () => {
+      await rm(scratch, { recursive: true, force: true });
+    });
+    const witness = join(scratch, "caught-int");
+
+    // A command that can only produce this file if it received a CATCHABLE signal. SIGKILL cannot
+    // be trapped, so an empty scratch directory at the end is exactly the old behaviour.
+    const { child, state } = spawnInterruptibleCli(
+      scratch,
+      "sh",
+      "-c",
+      `trap 'echo caught > ${witness}; exit 0' INT; sleep ${marker}`,
+    );
+
+    try {
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length > 0),
+        "precondition: the command must be running before the interrupt is sent",
+      );
+
+      process.kill(-child.pid, "SIGINT");
+
+      assert.ok(await waitUntil(() => state.exited, { timeoutMs: 8000 }), "expected the CLI subprocess to exit");
+      assert.ok(existsSync(witness), "expected the child to receive SIGINT itself, not an uncatchable SIGKILL");
+      assert.ok(await waitUntil(() => markerPids(marker).length === 0), "expected no orphan to survive the interrupt");
+    } finally {
+      killCli(child, state);
+      killMarker(marker);
+    }
+  },
+);
+
+test(
+  "a run interrupted mid-flight never hands control back to its caller",
+  { skip: skipWithoutShellAndGroups, timeout: 30_000 },
+  async (t) => {
+    // The child exits cleanly the instant it is interrupted, which is exactly the case that used to
+    // settle the promise: a caller would take that ordinary-looking result and start its NEXT step
+    // -- removing a worktree, say -- inside a process already on its way out. The fixture writes
+    // the witness file the moment its run settles, so an absent file is the assertion.
+    const marker = "194909";
+    const scratch = await mkdtemp(join(tmpdir(), "workflow-process-settle-"));
+    t.after(async () => {
+      await rm(scratch, { recursive: true, force: true });
+    });
+    const settleWitness = join(scratch, "settled");
+
+    const { child, state } = spawnInterruptibleCli(
+      { cwd: scratch, env: { WORKFLOW_TEST_SETTLE_WITNESS: settleWitness } },
+      "sh",
+      "-c",
+      `trap 'exit 0' INT; sleep ${marker}`,
+    );
+
+    try {
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length > 0),
+        "precondition: the command must be running before the interrupt is sent",
+      );
+
+      process.kill(-child.pid, "SIGINT");
+
+      assert.ok(await waitUntil(() => state.exited, { timeoutMs: 8000 }), "expected the CLI subprocess to exit");
+      assert.equal(state.code, 130, "the process must exit through the trap (128 + SIGINT), not through a settled run");
+      assert.equal(existsSync(settleWitness), false, "a run must not settle into its caller while a shutdown is draining");
+    } finally {
+      killCli(child, state);
+      killMarker(marker);
+    }
+  },
+);
+
+test(
+  "an interrupt still escalates to SIGKILL when the forwarded signal is ignored",
+  { skip: skipWithoutShellAndGroups, timeout: 30_000 },
+  async () => {
+    // `trap '' INT` is inherited across exec, so the `sleep` ignores SIGINT too: nothing in this
+    // group can be ended by the forwarded signal, and only the escalation can end the run.
+    const marker = "194906";
+    const { child, state } = spawnInterruptibleCli(import.meta.dirname, "sh", "-c", `trap '' INT; sleep ${marker}`);
+
+    try {
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length > 0),
+        "precondition: the command must be running before the interrupt is sent",
+      );
+
+      const start = Date.now();
+      process.kill(-child.pid, "SIGINT");
+
+      const cliExited = await waitUntil(() => state.exited, { timeoutMs: 10_000 });
+      const wall = Date.now() - start;
+      assert.ok(cliExited, `expected the escalation to end the CLI subprocess; still running after ${wall}ms`);
+      assert.ok(wall < 8000, `expected the escalation to bound the wall clock, took ${wall}ms`);
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length === 0),
+        "expected SIGKILL to reach the group that ignored the interrupt",
+      );
+    } finally {
+      killCli(child, state);
+      killMarker(marker);
+    }
+  },
+);
+
+test(
+  "a second interrupt does not wait out the escalation window",
+  { skip: skipWithoutShellAndGroups, timeout: 30_000 },
+  async () => {
+    const marker = "194908";
+    const { child, state } = spawnInterruptibleCli(import.meta.dirname, "sh", "-c", `trap '' INT; sleep ${marker}`);
+
+    try {
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length > 0),
+        "precondition: the command must be running before the interrupt is sent",
+      );
+
+      process.kill(-child.pid, "SIGINT");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const start = Date.now();
+      process.kill(-child.pid, "SIGINT");
+
+      const cliExited = await waitUntil(() => state.exited, { timeoutMs: 10_000 });
+      const wall = Date.now() - start;
+      assert.ok(cliExited, `expected the CLI subprocess to exit; still running after ${wall}ms`);
+      // The escalation window is 2s. A second interrupt must not sit through the rest of it.
+      assert.ok(wall < 1500, `expected the second interrupt to exit immediately, took ${wall}ms`);
+      assert.ok(await waitUntil(() => markerPids(marker).length === 0), "expected no orphan to survive");
+    } finally {
+      killCli(child, state);
+      killMarker(marker);
+    }
+  },
+);
+
+// The policy above exists because this runner fronts repository MUTATIONS (`git merge --no-ff`,
+// `git worktree add`, `git worktree remove`), where a command that cannot run its own cleanup leaves
+// state behind. This is that case with real git rather than a shell trap: an interrupted `git` must
+// be reached by the interrupt itself and must leave the repository in a state the next git command
+// accepts.
+//
+// It deliberately does NOT assert on `.git/index.lock`. The review that found this reported a
+// measured table where an interrupted `git commit` held `index.lock` across a slow `pre-commit`
+// hook; probed here against git 2.43, no `*.lock` exists anywhere under `.git` during pre-commit,
+// prepare-commit-msg, commit-msg, post-commit, post-merge or post-checkout, nor while a blocking
+// `GIT_EDITOR` is open -- this git releases the index lock before handing control to any of them.
+// Asserting a lock that this git never creates would be a test that passes for the wrong reason, so
+// what is asserted is the property that does hold everywhere: the signal reaches git, and the
+// repository is left usable.
+test(
+  "an interrupt during a real git command reaches git and leaves the repository usable",
+  { skip: skipWithoutShellAndGroups, timeout: 30_000 },
+  async (t) => {
+    const marker = "194907";
+    const root = await mkdtemp(join(tmpdir(), "workflow-process-git-"));
+    t.after(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+
+    const repoPath = join(root, "repo");
+    const git = (...args) => execFileSync("git", args, { cwd: repoPath, encoding: "utf8" });
+    execFileSync("git", ["init", "--initial-branch=main", repoPath], { encoding: "utf8" });
+    git("config", "user.name", "Workflow Tests");
+    git("config", "user.email", "workflow@example.test");
+    git("config", "commit.gpgsign", "false");
+    // Neutralises a global core.hooksPath, which would otherwise stop the hook below from running
+    // and turn this test's precondition into a confusing failure on a developer machine.
+    git("config", "core.hooksPath", join(repoPath, ".git", "hooks"));
+    await writeFile(join(repoPath, "README.md"), "hello\n");
+    git("add", "README.md");
+    git("commit", "-m", "initial");
+
+    // A hook slow enough to hold the commit open while the interrupt is delivered, so the signal
+    // lands on a git that is genuinely mid-operation rather than one that already finished.
+    await writeFile(join(repoPath, ".git", "hooks", "pre-commit"), `#!/bin/sh\nsleep ${marker}\n`, { mode: 0o755 });
+    await writeFile(join(repoPath, "README.md"), "changed\n");
+    git("add", "README.md");
+
+    const { child, state } = spawnInterruptibleCli(repoPath, "git", "commit", "-m", "held by the hook");
+
+    try {
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length > 0, { timeoutMs: 10_000 }),
+        "precondition: git must be mid-commit, held by its own hook, before the interrupt is sent",
+      );
+
+      process.kill(-child.pid, "SIGINT");
+
+      assert.ok(await waitUntil(() => state.exited, { timeoutMs: 10_000 }), "expected the CLI subprocess to exit");
+      assert.ok(
+        await waitUntil(() => markerPids(marker).length === 0),
+        "expected the interrupt to reach git's own hook child, not just the CLI",
+      );
+
+      // The repository still answers, and the interrupted commit did not land.
+      const log = git("log", "--format=%s");
+      assert.equal(log.trim(), "initial", "the interrupted commit must not have been created");
+      assert.equal(git("status", "--porcelain=v1").includes("README.md"), true, "the staged change must still be staged");
+    } finally {
+      killCli(child, state);
       killMarker(marker);
     }
   },

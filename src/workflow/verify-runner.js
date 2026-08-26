@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { killChild, SIGNAL_EXIT_CODES } from "./process-group.js";
 
 // The ONE place in this repo that runs a shell, and the reasoning is in the spec: these are the
 // operator's own strings from their own registry, they come from no worker, and they enter no
@@ -103,37 +104,13 @@ async function checkCwd(cwd) {
   return null;
 }
 
-// Sends a signal to the whole process group `child` leads, not just `child` itself. This is what
-// makes a timeout actually bound the wall clock (see the top-of-file discussion this function's
-// call site anchors to): `spawnAndCollect` below spawns with `detached: true`, which on POSIX
-// makes `child.pid` the leader of its own new process group, so `-child.pid` reaches every
-// descendant that hasn't further detached itself -- including a grandchild an operator's own
-// command backgrounded with `&`, which `child.kill()` alone never could (it only ever signals
-// the direct `/bin/sh` child, and a backgrounded grandchild is reparented away from it well
-// before any signal is sent). Falls back to signaling `child` directly when there is no usable
-// pid to form a group from (real spawn always provides one; a test double may not) -- same
-// best-effort, never-throws posture every other kill site in this file already has.
-function killChild(child, signal) {
-  if (typeof child.pid === "number" && Number.isInteger(child.pid)) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // No such process group (already gone) or group signaling unavailable -- fall through to a
-      // direct kill below rather than assuming the job is done.
-    }
-  }
-  try {
-    child.kill(signal);
-  } catch {
-    // Best-effort: if the process is already gone, the close handler still settles below.
-  }
-}
-
-// Exit code convention for a process that dies of a signal (128 + signal number) -- the same
-// number a shell reports for the same event, so a caller inspecting this process's own exit code
-// sees the familiar value rather than an arbitrary one.
-const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
+// `killChild` (signal the child's whole process group, not just the child) and SIGNAL_EXIT_CODES
+// are imported at the top of this file from process-group.js: `process.js` grew a byte-identical
+// copy of both when it adopted this file's `detached: true` shape, and a review pulled them out
+// rather than let a sixth duplicated block accumulate in this repo. What is shared is the
+// mechanism; what is deliberately NOT shared is the interrupt POLICY -- see installInterruptTrap
+// below, and process-group.js's own header for why this file's trap goes straight to SIGKILL while
+// the shared runner's forwards the received signal first.
 
 // R1 (branch re-review): `detached: true` above (see killChild's own comment) is what lets a
 // timeout reach a backgrounded grandchild's whole process group -- and that part of the fix
@@ -153,6 +130,15 @@ const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 };
 // immediate and unmissable one -- and then this process exits the same way an uninterrupted
 // SIGINT/SIGTERM would (128 + signal number, the shell's own convention), rather than continuing
 // to run as though nothing happened.
+//
+// **SIGKILL is right HERE and wrong in process.js, and the divergence is deliberate.** What this
+// file runs is a verification command -- a test suite, a typecheck -- which owns no lock and no
+// half-written repository, so no cleanup handler has anything to do and killing outright is the
+// strongest guarantee that nothing survives. `process.js` fronts repository MUTATIONS
+// (`git merge --no-ff`, `git worktree add`, `git worktree remove`), where an uncatchable SIGKILL
+// means git never runs the cleanup it registered for catchable signals; its trap therefore forwards
+// the received signal first and escalates only after a grace window. Neither policy belongs in the
+// shared process-group.js, which holds only what is true for both.
 //
 // Installed and torn down per spawned child (see the two call sites in spawnAndCollect below), and
 // never left registered once that child has settled: `runVerifyMatrix` in commands.js calls
