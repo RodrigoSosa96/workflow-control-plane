@@ -50,10 +50,15 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
     return new AsanaApiError(`Asana API ${response.status}: ${detail}${retry}`, { status: response.status, kind: "api" });
   }
 
-  async function request(path, query = {}) {
+  async function request(path, query = {}, { method = "GET", body } = {}) {
+    const options = { method, headers: { ...apiHeaders } };
+    if (body !== undefined) {
+      options.headers["content-type"] = "application/json";
+      options.body = JSON.stringify({ data: body });
+    }
     let response;
     try {
-      response = await fetchImpl(apiUrl(path, query), { headers: { ...apiHeaders } });
+      response = await fetchImpl(apiUrl(path, query), options);
     } catch (error) {
       if (error instanceof AsanaApiError) throw error;
       throw new AsanaApiError(`Asana API network failure: ${redact(error?.message || error).slice(0, 400)}`);
@@ -94,6 +99,12 @@ export function createAsanaClient({ token, fetchImpl = fetch, baseUrl = DEFAULT_
     dependents: (gid) => list(`tasks/${gid}/dependents`, { opt_fields: TASK_FIELDS }),
     attachments: (gid) => list(`tasks/${gid}/attachments`, { opt_fields: ATTACHMENT_FIELDS }),
     attachment: async (gid) => (await request(`attachments/${gid}`, { opt_fields: ATTACHMENT_FIELDS })).data,
+    createTask: async (fields) => (await request("tasks", { opt_fields: TASK_FIELDS }, { method: "POST", body: fields })).data,
+    updateTask: async (gid, fields) => (await request(`tasks/${gid}`, { opt_fields: TASK_FIELDS }, { method: "PUT", body: fields })).data,
+    addStory: async (gid, text) => (await request(`tasks/${gid}/stories`, { opt_fields: STORY_FIELDS }, { method: "POST", body: { text } })).data,
+    addTaskToSection: async (sectionGid, taskGid) => (await request(`sections/${sectionGid}/add_task`, {}, { method: "POST", body: { task: taskGid } })).data,
+    createProject: async (fields) => (await request("projects", { opt_fields: PROJECT_FIELDS }, { method: "POST", body: fields })).data,
+    createSection: async (projectGid, name) => (await request(`projects/${projectGid}/sections`, { opt_fields: SECTION_FIELDS }, { method: "POST", body: { name } })).data,
     async downloadAttachment(gid) {
       const attachment = await client.attachment(gid);
       const attachmentError = (message, status) => new AsanaApiError(message, { status, kind: "attachment" });

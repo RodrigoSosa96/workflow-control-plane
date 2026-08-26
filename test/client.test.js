@@ -161,3 +161,53 @@ test("rejects Asana attachments without HTTPS downloadable content", async () =>
   const client = createAsanaClient({ token: "x", fetchImpl: async () => jsonResponse({ data: { gid: "a1", host: "asana", download_url: "http://download.test/a1" } }) });
   await assert.rejects(client.downloadAttachment("a1"), /valid HTTPS download URL/);
 });
+
+test("creates and updates tasks with authenticated JSON requests", async () => {
+  const requests = [];
+  const client = createAsanaClient({ token: "secret", fetchImpl: async (url, options) => {
+    requests.push({ url: String(url), options });
+    return jsonResponse({ data: { gid: "t1", name: "Ticket" } });
+  } });
+
+  await client.createTask({ workspace: "w1", name: "Ticket" });
+  await client.updateTask("t1", { completed: true });
+
+  assert.equal(requests[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(requests[0].options.body), { data: { workspace: "w1", name: "Ticket" } });
+  assert.equal(requests[1].options.method, "PUT");
+  assert.deepEqual(JSON.parse(requests[1].options.body), { data: { completed: true } });
+  assert.equal(requests[0].options.headers["content-type"], "application/json");
+  assert.equal(requests[0].options.headers.authorization, "Bearer secret");
+});
+
+test("uses Asana write endpoints for comments, sections, and projects", async () => {
+  const requests = [];
+  const client = createAsanaClient({ token: "x", fetchImpl: async (url, options) => {
+    requests.push({ url: String(url), options });
+    return jsonResponse({ data: { gid: "created" } });
+  } });
+
+  await client.addStory("t1", "Status update");
+  await client.addTaskToSection("s1", "t1");
+  await client.createProject({ workspace: "w1", name: "Board", default_view: "board", public: true });
+  await client.createSection("p1", "Backlog");
+
+  assert.match(requests[0].url, /tasks\/t1\/stories/);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { data: { text: "Status update" } });
+  assert.match(requests[1].url, /sections\/s1\/add_task/);
+  assert.deepEqual(JSON.parse(requests[1].options.body), { data: { task: "t1" } });
+  assert.equal(new URL(requests[2].url).pathname, "/api/1.0/projects");
+  assert.match(requests[3].url, /projects\/p1\/sections/);
+  assert.ok(requests.every((request) => request.options.method === "POST"));
+});
+
+test("redacts tokens from failed write requests", async () => {
+  const client = createAsanaClient({ token: "write-secret", fetchImpl: async () =>
+    jsonResponse({ errors: [{ message: "write-secret cannot create task" }] }, 403) });
+  await assert.rejects(client.createTask({ name: "Ticket" }), (error) => {
+    assert.ok(error instanceof AsanaApiError);
+    assert.doesNotMatch(error.message, /write-secret/);
+    assert.match(error.message, /\[REDACTED\]/);
+    return true;
+  });
+});
