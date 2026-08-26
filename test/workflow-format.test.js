@@ -1537,7 +1537,8 @@ function mergeRepository(overrides = {}) {
     baseCheckedOutBranch: "dev",
     baseBranchCheckedOut: true,
     baseDirty: false,
-    baseMerging: false,
+    basePending: "none",
+    basePendingOperation: null,
     baseDirtyPaths: [],
     baseDirtyCount: 0,
     baseSha: "1f7d3c9b5a2e84670d1b6f3a9c5e2807b4d1a6f3",
@@ -1886,7 +1887,7 @@ test("the conflict column is named after the oracle that produced it, not after 
 
 test("a base checkout stuck mid-merge is named as such, not merely as dirty", () => {
   const preview = threeRepositoryPreview((repositoryId) => (repositoryId === "panel"
-    ? { baseDirty: true, baseMerging: true, baseDirtyPaths: ["two.txt"], baseDirtyCount: 1 }
+    ? { baseDirty: true, basePending: "in-progress", basePendingOperation: "merge", baseDirtyPaths: ["two.txt"], baseDirtyCount: 1 }
     : {}));
   preview.mergeable = false;
   preview.exitCode = 11;
@@ -1896,11 +1897,12 @@ test("a base checkout stuck mid-merge is named as such, not merely as dirty", ()
   assert.doesNotMatch(compact, /DIRTY \(1\)/, "the more specific state must win; it is the one that changes what to do");
 });
 
-test("a base checkout whose merge state could not be read never renders as clean", () => {
-  // The tri-state twin of `baseDirty`: a `null` merge state on an otherwise spotless checkout used
-  // to reach the "clean" branch, which is the false green commands.js now refuses to compute.
+test("a base checkout whose operation state could not be read never renders as clean", () => {
+  // The tri-state twin of `baseDirty`: an unknown operation state on an otherwise spotless
+  // checkout used to reach the "clean" branch, which is the false green commands.js now refuses
+  // to compute.
   const preview = threeRepositoryPreview((repositoryId) => (repositoryId === "webapp"
-    ? { baseMerging: null, baseDirty: false, baseDirtyPaths: [], baseDirtyCount: 0 }
+    ? { basePending: "unknown", baseDirty: false, baseDirtyPaths: [], baseDirtyCount: 0 }
     : {}));
   preview.mergeable = false;
   preview.exitCode = 11;
@@ -1908,8 +1910,8 @@ test("a base checkout whose merge state could not be read never renders as clean
   const compact = formatWorkflowResult("merge", preview, "compact");
   const webappRow = compact.split("\n").find((line) => line.startsWith("webapp "));
   assert.ok(webappRow, compact);
-  assert.match(webappRow, /MERGE STATE UNKNOWN/);
-  assert.doesNotMatch(webappRow, /clean\s*\|/, "an unreadable merge state must not render as a clean checkout");
+  assert.match(webappRow, /OPERATION STATE UNKNOWN/);
+  assert.doesNotMatch(webappRow, /clean\s*\|/, "an unreadable operation state must not render as a clean checkout");
 });
 
 test("formatWorkflowResult dispatches \"merge\" to the compact merge renderer rather than raw JSON", () => {

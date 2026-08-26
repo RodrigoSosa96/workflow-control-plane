@@ -1937,13 +1937,38 @@ function mergeRefusal(runId, run, reason, diagnostics = []) {
 
 // The two diagnostics a refusal can point at. `doctorCommandFor` takes the alias because a
 // registry problem is about the project, not about this run.
+// One probe, two commands: archive refuses a WORKTREE sitting inside an unfinished git operation
+// and merge refuses a BASE checkout in one, and both wrap the probe so a throwing adapter degrades
+// to "unknown" -- which refuses -- rather than to a stack trace off a read-only `--dry-run`.
+async function pendingOperationFor({ git, path, timeoutMs, errorText }) {
+  try {
+    return await git.pendingOperation({ cwd: path, timeoutMs });
+  } catch (error) {
+    return { status: "unknown", reason: `the unfinished-operation probe itself failed: ${errorText(error)}` };
+  }
+}
+
+// `operation` and `remedy` are read defensively for the same reason the probe is wrapped: an
+// `in-progress` result missing `remedy` used to be a TypeError off `.replace`, i.e. a crash on
+// the one branch whose whole job is refusing safely. An unnamed remedy is reported as unnamed and
+// NEVER replaced by a guessed one -- the point of carrying the operation's own remedy is that
+// `git merge --abort` is the wrong move for a rebase, and inventing a default would reintroduce
+// exactly that bug.
+function pendingOperationDetail(pending, path) {
+  const operation = typeof pending?.operation === "string" && pending.operation ? pending.operation : "unfinished git operation";
+  const remedy = typeof pending?.remedy === "string" && pending.remedy
+    ? `git -C ${path} ${pending.remedy.replace(/^git /, "")}`
+    : null;
+  return { operation, remedy };
+}
+
 function doctorCommandFor(projectAlias) {
   return projectAlias ? `workflow doctor ${projectAlias}` : "workflow doctor";
 }
 
 function mergeGitAdapter(deps) {
   const git = deps.git;
-  for (const method of ["resolveHead", "checkoutState", "resolveRef", "previewMerge", "mergeArgv", "mergeBranch"]) {
+  for (const method of ["resolveHead", "checkoutState", "resolveRef", "previewMerge", "pendingOperation", "mergeArgv", "mergeBranch"]) {
     if (typeof git?.[method] !== "function") {
       mergeError("PREFLIGHT", `workflow merge requires a git adapter with ${method}()`, 10);
     }
@@ -2125,38 +2150,42 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   }
   const sourceCommittedAt = await safeCommitTimestamp(git, worktreePath, head.sha, timeoutMs);
 
+  // B7: the in-progress gate is `pendingOperation`, the probe archive already used, not
+  // checkoutState's `merging` -- which reads MERGE_HEAD alone. An interrupted rebase, cherry-pick,
+  // revert or bisect leaves no MERGE_HEAD (an interrupted `rebase -i` leaves a CLEAN tree; measured
+  // in 2.5), so a MERGE_HEAD-only gate either missed the operation entirely or named `git merge
+  // --abort` as the remedy for a state that is not a merge. The probe is wrapped like archive's:
+  // a throwing adapter is "unknown", and unknown blocks.
+  const pending = await pendingOperationFor({ git, path: basePath, timeoutMs, errorText: mergeErrorText });
+  const pendingDetail = pending.status === "in-progress" ? pendingOperationDetail(pending, basePath) : null;
+
   const recordedBranch = recordedRepositoryBranch(entry);
   const dirtyPaths = list(baseState.entries).map((statusEntry) => statusEntry?.path).filter((path) => typeof path === "string");
   const conflictPaths = list(preview.conflicts).map(String);
   const conflicts = [];
 
-  // Checked BEFORE `dirty`, and independently of it, because "mid-merge" is the more specific and
-  // more actionable fact and it must block even in the exotic case where a stopped merge staged
-  // nothing. See git.js's checkoutState for where this came from: naming only the uncommitted
-  // paths points an operator at `git add`/`git stash`, which is the wrong move for a checkout that
-  // is actually sitting inside a failed merge.
+  // Checked BEFORE `dirty`, and independently of it, because an in-progress operation is the more
+  // specific and more actionable fact and it must block even in the exotic case where a stopped
+  // operation staged nothing. Naming only the uncommitted paths points an operator at
+  // `git add`/`git stash`, which is the wrong move for a checkout sitting inside a stopped merge,
+  // rebase or cherry-pick.
   const uncommitted = dirtyPaths.length > 0
     ? ` with ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`
     : "";
-  if (baseState.merging === true) {
+  if (pending.status === "in-progress") {
     conflicts.push(mergeConflict(
       repositoryId,
       `base:${basePath}`,
-      `Base checkout ${basePath} is in the middle of a merge (MERGE_HEAD is present)${uncommitted}; most likely a previous merge that failed at commit time. Resolve it with \`git -C ${basePath} merge --abort\` (or finish it by hand) — staging or stashing those paths is not the fix.`,
+      `Base checkout ${basePath} is in the middle of a ${pendingDetail.operation}${uncommitted}; most likely an interrupted one. ${pendingDetail.remedy ? `Resolve it with \`${pendingDetail.remedy}\` (or finish it by hand)` : "Finish or abort it (git reported no remedy for this operation)"} — staging or stashing those paths is not the fix.`,
     ));
-  } else if (baseState.merging !== false) {
-    // `merging` is tri-state and only an explicit `false` may pass. git.js's checkoutState
-    // documents an unanswerable MERGE_HEAD probe as "cannot say" rather than "not merging", and
-    // item 0.14's rule -- an unreadable state is a conflict, never clean -- is the same rule
-    // already applied to `dirty` immediately below. Treating `null` as `false` here made the code
-    // fail OPEN against its own doc comment: a checkout that might be sitting inside a stopped
-    // merge would have been merged into. The residual case is narrow (a `--no-commit` merge that
-    // staged nothing, plus a probe that failed while `git status` still worked) but the direction
-    // is the binding constraint, not the size of the window.
+  } else if (pending.status !== "none") {
+    // Only an explicit `none` may pass. An unanswerable probe is item 0.14's rule -- an unreadable
+    // state is a conflict, never clean -- applied to the operation gate: a checkout that MIGHT be
+    // sitting inside a stopped operation would otherwise be merged into.
     conflicts.push(mergeConflict(
       repositoryId,
       `base:${basePath}`,
-      `Base checkout ${basePath} could not be checked for an in-progress merge (MERGE_HEAD is unreadable)${uncommitted}; an unknown merge state is a conflict, never clean. Confirm with \`git -C ${basePath} status\` before approving anything.`,
+      `Base checkout ${basePath} could not be checked for an in-progress git operation (${pending.reason ?? "reason unknown"})${uncommitted}; an unknown operation state is a conflict, never clean. Confirm with \`git -C ${basePath} status\` before approving anything.`,
     ));
   } else if (baseState.dirty === true) {
     conflicts.push(mergeConflict(repositoryId, `base:${basePath}`, `Base checkout ${basePath} has ${dirtyPaths.length} uncommitted path(s): ${joinPaths(dirtyPaths, MERGE_REASON_PATH_LIMIT)}`));
@@ -2180,6 +2209,18 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
     conflicts.push(mergeConflict(repositoryId, `merge:${basePath}`, `Conflicts could not be predicted for ${head.branch} into ${baseBranch}: ${preview.reason ?? "git merge-tree gave no answer"}`));
   }
 
+  // B5: the last adapter call in this function to be wrapped. mergeArgv is synchronous and returns
+  // a literal from today's adapter, but that is the other module's contract to keep or break; a
+  // throwing adapter must become a refusal here, not a stack trace off a read-only `--dry-run`.
+  let argv;
+  try {
+    // From the adapter, never rebuilt here: the string an operator approves has to be the string
+    // that runs, and `mergeBranch` destructures its child-process argv from this same expression.
+    argv = git.mergeArgv({ source: head.branch });
+  } catch (error) {
+    return { refusal: `Run ${runId} repository ${label} merge argv could not be built: ${mergeErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
+  }
+
   return {
     record: {
       repositoryId,
@@ -2196,12 +2237,15 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
       baseCheckedOutBranch: baseState.branch ?? null,
       baseBranchCheckedOut: baseState.branch === baseBranch,
       baseDirty: baseState.dirty ?? null,
-      baseMerging: baseState.merging ?? null,
+      // The operation gate the preview actually ran (B7): "none" / "in-progress" / "unknown",
+      // with the operation's own name and remedy when in progress. checkoutState's `merging` is no
+      // longer read here -- it sees MERGE_HEAD alone, and a stopped rebase has none.
+      basePending: pending.status,
+      basePendingOperation: pendingDetail?.operation ?? null,
+      basePendingRemedy: pendingDetail?.remedy ?? null,
       dirtyPaths,
       baseSha: typeof baseHead?.sha === "string" ? baseHead.sha : null,
-      // From the adapter, never rebuilt here: the string an operator approves has to be the string
-      // that runs, and `mergeBranch` destructures its child-process argv from this same expression.
-      argv: git.mergeArgv({ source: head.branch }),
+      argv,
       conflictStatus: preview.status,
       conflictPaths,
       conflictsTruncated: Boolean(preview.truncated),
@@ -2275,10 +2319,11 @@ function mergeDigestPayload({ runId, run, records, verification }) {
       baseCheckedOutBranch: record.baseCheckedOutBranch,
       baseBranchCheckedOut: record.baseBranchCheckedOut,
       baseDirty: record.baseDirty,
-      // Bound because it now blocks execution on its own (see inspectRepositoryForMerge): a
-      // checkout that stops being mid-merge between preview and approval is a materially
-      // different world, and the digest has to notice.
-      baseMerging: record.baseMerging,
+      // Bound because it blocks execution on its own (see inspectRepositoryForMerge): a checkout
+      // that stops being mid-operation between preview and approval is a materially different
+      // world, and the digest has to notice.
+      basePending: record.basePending,
+      basePendingOperation: record.basePendingOperation,
       baseSha: record.baseSha,
       argv: record.argv,
       conflictStatus: record.conflictStatus,
@@ -2304,7 +2349,8 @@ function publicMergeRepository(record) {
     baseCheckedOutBranch: record.baseCheckedOutBranch,
     baseBranchCheckedOut: record.baseBranchCheckedOut,
     baseDirty: record.baseDirty,
-    baseMerging: record.baseMerging,
+    basePending: record.basePending,
+    basePendingOperation: record.basePendingOperation,
     baseDirtyPaths,
     baseDirtyCount: record.dirtyPaths.length,
     baseSha: record.baseSha,
@@ -2370,10 +2416,12 @@ async function buildMergePreview(runId, run, options, deps) {
     nextActions: [],
   };
   // A blocked preview whose only next action is the dry-run that just printed it is a loop with no
-  // exit, and that is exactly what a checkout stuck mid-merge used to get (task 3, step 5). The
-  // abort is named first, per repository actually in that state, so the loop has a way out.
+  // exit, and that is exactly what a checkout stuck mid-operation used to get (task 3, step 5). The
+  // operation's own remedy is named first, per repository actually in that state, so the loop has
+  // a way out -- and it is the operation's own, because `git merge --abort` is the wrong move for a
+  // rebase.
   const abortActions = [...new Set(
-    records.filter((record) => record.baseMerging === true).map((record) => `git -C ${record.basePath} merge --abort`),
+    records.filter((record) => record.basePending === "in-progress").map((record) => record.basePendingRemedy ?? `git -C ${record.basePath} status`),
   )];
   preview.nextActions = mergeable
     ? [`workflow merge ${runId} --yes --approval-digest ${preview.approvalDigest}`]
@@ -2519,9 +2567,15 @@ async function executeMerge(options, deps, supplied) {
   // merge commit. It is not a failure -- the desired state holds -- but calling it `merged` puts
   // an integration in the event log that did not happen, so it gets its own status. A MIX still
   // reports `merged`, and the per-repository `integrated` flag carries which was which.
-  const nothingIntegrated = merged.length > 0 && merged.every((entry) => entry.integrated === false);
+  //
+  // B6: `integrated` is TRI-state, so the top-level status is too. A read-back that failed (`null`)
+  // mixed with genuine no-ops is neither `merged` -- no integration was confirmed -- nor
+  // `already-up-to-date` -- a failed read is not a confirmed no-op. It is `unconfirmed`: the merges
+  // ran clean (passed is still true, exit still 0), but the audit record cannot say what they did.
+  const anyIntegrated = merged.some((entry) => entry.integrated === true);
+  const anyUnconfirmed = merged.some((entry) => entry.integrated === null);
   const status = passed
-    ? (nothingIntegrated ? "already-up-to-date" : "merged")
+    ? (anyIntegrated || merged.length === 0 ? "merged" : anyUnconfirmed ? "unconfirmed" : "already-up-to-date")
     : merged.length > 0 ? "partial" : "failed";
   const exitCode = passed
     ? MERGE_EXIT_CODES.merged
@@ -2921,29 +2975,12 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
   // interrupted `git rebase` -- which leaves `rebase-merge/` and no MERGE_HEAD -- reported
   // `merging: false` and sailed straight through this gate. Measured on this machine, git 2.43: an
   // interrupted `rebase -i` stops with a CLEAN tree on a DETACHED HEAD, so neither this gate nor
-  // the dirty one below saw it. `merging` is left untouched for `mergeCommand`, whose question
-  // really is only about merges.
-  // Guarded for the same reason unmergedCommitsFor guards countCommitsNotIn: git.js documents this
-  // as never throwing and it does not, but a read that turns a read-only `--dry-run` into a stack
-  // trace instead of a preview is a contract this file must not depend on another module keeping.
-  // A probe that could not be run is `unknown`, which refuses -- the same answer as a probe that
-  // ran and could not tell.
-  let pending;
-  try {
-    pending = await git.pendingOperation({ cwd: worktreePath, timeoutMs });
-  } catch (error) {
-    pending = { status: "unknown", reason: `the unfinished-operation probe itself failed: ${archiveErrorText(error)}` };
-  }
+  // the dirty one below saw it. As of B7, `mergeCommand` gates on the same probe through the
+  // shared `pendingOperationFor`/`pendingOperationDetail` -- `merging` is no longer read by either
+  // command, and stays on the adapter only because the adapter's own contract documents it.
+  const pending = await pendingOperationFor({ git, path: worktreePath, timeoutMs, errorText: archiveErrorText });
   if (pending?.status === "in-progress") {
-    // `operation` and `remedy` are read defensively for the same reason: an `in-progress` result
-    // missing `remedy` used to be a TypeError off `.replace`, i.e. a crash on the one branch whose
-    // whole job is refusing safely. An unnamed remedy is reported as unnamed and NEVER replaced by
-    // a guessed one -- the point of carrying the operation's own remedy is that `git merge --abort`
-    // is the wrong move for a rebase, and inventing a default would reintroduce exactly that bug.
-    const operation = typeof pending.operation === "string" && pending.operation ? pending.operation : "unfinished git operation";
-    const remedy = typeof pending.remedy === "string" && pending.remedy
-      ? `git -C ${worktreePath} ${pending.remedy.replace(/^git /, "")}`
-      : null;
+    const { operation, remedy } = pendingOperationDetail(pending, worktreePath);
     return {
       refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} is in the middle of a ${operation}; ${remedy ? `finish it or run \`${remedy}\`` : "finish or abort it (git reported no remedy for this operation)"} before archiving.`,
       actions: [`git -C ${worktreePath} status`, ...(remedy ? [remedy] : [])],

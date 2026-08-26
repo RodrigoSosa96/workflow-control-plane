@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import * as realFs from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -64,6 +65,10 @@ function expectedMergeArgv(source) {
 function scriptedGit(script = {}) {
   const calls = [];
   const entryFor = (cwd) => script[cwd] ?? {};
+  // Which base checkouts a merge has already run against, so `readBackError` can model a read
+  // that fails ONLY on the post-merge read-back -- the preview reads the same path earlier and
+  // must keep answering (B6's case is a read that fails after the merge, not one that never worked).
+  const mergedPaths = new Set();
 
   return {
     calls,
@@ -72,6 +77,7 @@ function scriptedGit(script = {}) {
         calls.push({ method: "resolveHead", cwd, timeoutMs });
         const entry = entryFor(cwd);
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
+        if (entry.readBackError && mergedPaths.has(cwd)) throw new WorkflowError("PROCESS", entry.readBackError, { exitCode: 12 });
         return { branch: entry.branch ?? null, sha: entry.sha ?? "0".repeat(40) };
       },
       async checkoutState({ cwd, timeoutMs }) {
@@ -105,6 +111,12 @@ function scriptedGit(script = {}) {
         calls.push({ method: "previewMerge", cwd, base, source, timeoutMs });
         return entryFor(cwd).preview ?? { status: "clean", tree: "t".repeat(40), conflicts: [] };
       },
+      // B7: merge's in-progress-operation probe -- the same contract archive's double already
+      // models. Defaults to "none" (a healthy checkout); a test scripts `pending` per path.
+      async pendingOperation({ cwd, timeoutMs }) {
+        calls.push({ method: "pendingOperation", cwd, timeoutMs });
+        return entryFor(cwd).pending ?? { status: "none" };
+      },
       mergeArgv({ source }) {
         return argvBuilder.mergeArgv({ source });
       },
@@ -133,6 +145,7 @@ function scriptedGit(script = {}) {
         if (script[cwd] && scripted.alreadyUpToDate !== true) {
           script[cwd] = { ...script[cwd], sha: scripted.resultSha ?? `${script[cwd].sha ?? "base"}-merged` };
         }
+        mergedPaths.add(cwd);
         return { ok: true, code: 0, stdout: scripted.stdout ?? "Merge made by the 'ort' strategy.\n", stderr: "", argv };
       },
       async commitTimestamp({ cwd }) {
@@ -410,6 +423,57 @@ test("every checkout read in the preview and the post-merge read-back is bounded
     assert.ok(reads.length >= 2, "expected at least the preview read and the post-merge read-back");
     assert.equal(reads.at(-1).timeoutMs, 222_222, "the post-merge read-back must run under the merge bound");
   }
+});
+
+// B6: `integrated` is tri-state per repository, so the top-level status must be too. A read-back
+// that failed (`null`) mixed with genuine no-ops used to report `merged` -- the row said
+// `merged (UNCONFIRMED)` while the verdict claimed an integration, the view/verdict disagreement
+// this roadmap keeps removing. It is not `already-up-to-date` either: nothing was confirmed.
+test("a failed read-back mixed with genuine no-ops reports unconfirmed, never merged", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const fixture = scriptedGit(groupFixture({
+    "/base/backend": { merge: { alreadyUpToDate: true } },
+    "/base/panel": { merge: { alreadyUpToDate: true } },
+    "/base/webapp": { readBackError: "git rev-parse exploded" },
+  }));
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: fixture.git },
+  );
+
+  const report = await command.execute({ approvalDigest: command.preview.approvalDigest });
+
+  assert.equal(report.passed, true);
+  assert.deepEqual(report.merged.map((entry) => entry.integrated), [false, false, null]);
+  assert.notEqual(report.status, "merged", "no integration was confirmed; the verdict must not claim one");
+  assert.notEqual(report.status, "already-up-to-date", "a failed read-back is not a confirmed no-op either");
+  assert.equal(report.status, "unconfirmed");
+  assert.equal(report.exitCode, MERGE_EXIT_CODES.merged, "nothing failed; the read-back is what could not be confirmed");
+});
+
+// B5: the last unwrapped adapter call in the preview. mergeArgv is synchronous and returns a
+// literal today, but the file's own rule is that a caller must not depend on another module
+// keeping that contract -- a throwing adapter becomes a refusal, not a stack trace.
+test("a throwing mergeArgv refuses the preview rather than crashing it", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const fixture = scriptedGit(groupFixture());
+  const git = {
+    ...fixture.git,
+    mergeArgv() {
+      throw new WorkflowError("PROCESS", "argv exploded", { exitCode: 12 });
+    },
+  };
+
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git },
+  );
+
+  assert.equal(command.preview.refused, true);
+  assert.match(command.preview.reason, /argv exploded/);
+  assert.deepEqual(fixture.calls.filter((call) => call.method === "mergeBranch"), [], "a refused preview must merge nothing");
 });
 
 test("a predicted conflict blocks execution and names the conflicted files", async (t) => {
@@ -1341,7 +1405,7 @@ test("a base checkout left mid-merge is named as mid-merge, and its next action 
 
   const clean = await mergeCommand({ runId: run.id }, deps);
   assert.equal(clean.preview.mergeable, true);
-  assert.equal(clean.preview.repositories[0].baseMerging, false);
+  assert.equal(clean.preview.repositories[0].basePending, "none");
 
   // A hook that rejects at commit time: merge-tree predicts clean, the real merge stops mid-way.
   await realFs.writeFile(join(basePath, ".git", "hooks", "pre-merge-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
@@ -1351,10 +1415,11 @@ test("a base checkout left mid-merge is named as mid-merge, and its next action 
 
   const blocked = (await mergeCommand({ runId: run.id }, deps)).preview;
   assert.equal(blocked.mergeable, false);
-  assert.equal(blocked.repositories[0].baseMerging, true, "MERGE_HEAD is present in the base checkout");
+  assert.equal(blocked.repositories[0].basePending, "in-progress", "MERGE_HEAD is present in the base checkout");
+  assert.equal(blocked.repositories[0].basePendingOperation, "merge");
 
   const reason = blocked.conflicts.map((conflict) => conflict.reason).join("\n");
-  assert.match(reason, /in the middle of a merge \(MERGE_HEAD is present\)/);
+  assert.match(reason, /in the middle of a merge/);
   assert.match(reason, /merge --abort/);
   assert.match(reason, /staging or stashing those paths is not the fix/);
 
@@ -1367,7 +1432,7 @@ test("a base checkout left mid-merge is named as mid-merge, and its next action 
   // And the abort really is what clears it.
   await gitExec(basePath, ["merge", "--abort"]);
   const recovered = (await mergeCommand({ runId: run.id }, deps)).preview;
-  assert.equal(recovered.repositories[0].baseMerging, false);
+  assert.equal(recovered.repositories[0].basePending, "none");
   assert.equal(recovered.mergeable, true);
 });
 
@@ -1389,21 +1454,111 @@ test("a mid-merge base checkout changes the approval digest, so an approval take
   await gitExec(basePath, ["merge", "--no-commit", "--no-ff", "feature/actual"]);
   const after = (await mergeCommand({ runId: run.id }, deps)).preview;
 
-  assert.equal(after.repositories[0].baseMerging, true);
-  assert.notEqual(after.approvalDigest, before, "baseMerging blocks execution, so the digest must bind it");
+  assert.equal(after.repositories[0].basePending, "in-progress");
+  assert.notEqual(after.approvalDigest, before, "an in-progress operation blocks execution, so the digest must bind it");
 });
 
-// Fix round 2. `merging` is tri-state and git.js's checkoutState documents an unanswerable
-// MERGE_HEAD probe as "cannot say" rather than "not merging" -- but commands.js was treating
-// `null` exactly like `false`, so it neither blocked nor appeared anywhere. That is item 0.14's
-// rule (an unreadable state is a conflict, never clean) applied to `dirty` right beside it and not
-// to this. The residual window is narrow -- a `--no-commit` merge that staged nothing, plus a probe
-// that failed while `git status` still worked -- but the direction is the binding constraint.
-test("a base checkout whose in-progress-merge state cannot be read is a conflict, never clean", async (t) => {
+// B7: until now merge's only in-progress probe was checkoutState's `merging`, which reads
+// MERGE_HEAD and nothing else -- a base checkout stopped inside a rebase, a cherry-pick, a revert
+// or a bisect got either the merge remedy (the wrong move) or no gate at all (an interrupted
+// `rebase -i` leaves a CLEAN tree and no MERGE_HEAD; measured in 2.5). These two build the real
+// states with real git and assert the remedy named is the operation's own.
+
+// A second branch whose edit conflicts with dev's, so that replaying either side onto the other
+// stops the operation mid-way. Returns the side commit's sha.
+async function conflictingSideCommit(basePath) {
+  await gitExec(basePath, ["checkout", "-b", "side"]);
+  await realFs.writeFile(join(basePath, "README.md"), "side\n");
+  await gitExec(basePath, ["commit", "-am", "side edit"]);
+  const sha = (await gitExec(basePath, ["rev-parse", "HEAD"])).stdout.trim();
+  await gitExec(basePath, ["checkout", "dev"]);
+  await realFs.writeFile(join(basePath, "README.md"), "dev edit\n");
+  await gitExec(basePath, ["commit", "-am", "dev edit"]);
+  return sha;
+}
+
+test("a base checkout stopped mid-rebase refuses with the rebase remedy, never the merge one", async (t) => {
+  const store = await newStore(t);
+  const { basePath, worktreePath } = await realRepositoryPair(t);
+  await conflictingSideCommit(basePath);
+  // Replaying dev's edit onto side conflicts and stops the rebase; git exits 1, which is the
+  // expected outcome, not a test failure.
+  await gitExec(basePath, ["rebase", "side"]).catch(() => {});
+  assert.ok(existsSync(join(basePath, ".git", "rebase-merge")), "precondition: git must really be mid-rebase");
+
+  const run = await store.create({
+    projectAlias: "solo",
+    primaryTicket: "A-r",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const deps = {
+    store,
+    loadRegistry: mergeLoadRegistry({ solo: { path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+  };
+
+  const preview = (await mergeCommand({ runId: run.id }, deps)).preview;
+  assert.equal(preview.mergeable, false);
+  assert.equal(preview.repositories[0].basePending, "in-progress");
+  assert.equal(preview.repositories[0].basePendingOperation, "rebase");
+
+  const conflict = preview.conflicts.find((entry) => /in the middle of/.test(entry.reason));
+  assert.ok(conflict, `a mid-rebase base must be named: ${JSON.stringify(preview.conflicts)}`);
+  assert.match(conflict.reason, /in the middle of a rebase/);
+  assert.match(conflict.reason, /rebase --abort/);
+  assert.doesNotMatch(conflict.reason, /merge --abort/, "the remedy must be the operation's own");
+  assert.equal(preview.nextActions[0], `git -C ${basePath} rebase --abort`);
+
+  // And the named remedy really is what clears it.
+  await gitExec(basePath, ["rebase", "--abort"]);
+  const recovered = (await mergeCommand({ runId: run.id }, deps)).preview;
+  assert.equal(recovered.repositories[0].basePending, "none");
+});
+
+test("a base checkout stopped mid-cherry-pick refuses with the cherry-pick remedy, never the merge one", async (t) => {
+  const store = await newStore(t);
+  const { basePath, worktreePath } = await realRepositoryPair(t);
+  const side = await conflictingSideCommit(basePath);
+  await gitExec(basePath, ["cherry-pick", side]).catch(() => {});
+  assert.ok(existsSync(join(basePath, ".git", "CHERRY_PICK_HEAD")), "precondition: git must really be mid-cherry-pick");
+
+  const run = await store.create({
+    projectAlias: "solo",
+    primaryTicket: "A-c",
+    repositories: [{ id: "primary", path: worktreePath, branch: "feature/actual" }],
+  });
+  const deps = {
+    store,
+    loadRegistry: mergeLoadRegistry({ solo: { path: basePath, base_branch: "dev" } }),
+    git: realGit(),
+  };
+
+  const preview = (await mergeCommand({ runId: run.id }, deps)).preview;
+  assert.equal(preview.mergeable, false);
+  assert.equal(preview.repositories[0].basePending, "in-progress");
+  assert.equal(preview.repositories[0].basePendingOperation, "cherry-pick");
+
+  const conflict = preview.conflicts.find((entry) => /in the middle of/.test(entry.reason));
+  assert.ok(conflict, `a mid-cherry-pick base must be named: ${JSON.stringify(preview.conflicts)}`);
+  assert.match(conflict.reason, /in the middle of a cherry-pick/);
+  assert.match(conflict.reason, /cherry-pick --abort/);
+  assert.doesNotMatch(conflict.reason, /merge --abort/, "the remedy must be the operation's own");
+  assert.equal(preview.nextActions[0], `git -C ${basePath} cherry-pick --abort`);
+
+  await gitExec(basePath, ["cherry-pick", "--abort"]);
+  const recovered = (await mergeCommand({ runId: run.id }, deps)).preview;
+  assert.equal(recovered.repositories[0].basePending, "none");
+});
+
+// Fix round 2, carried over B7. The probe is now `pendingOperation` (which sees a rebase, an am,
+// a cherry-pick, a revert and a bisect, not only MERGE_HEAD), and the rule is the one item 0.14
+// applied to `dirty`: an UNANSWERABLE probe is a conflict, never clean. `checkoutState`'s `merging`
+// tri-state stays on the adapter; merge no longer reads it.
+test("a base checkout whose in-progress-operation state cannot be read is a conflict, never clean", async (t) => {
   const store = await newStore(t);
   const script = groupFixture();
   // Clean in every other respect: on base_branch, no uncommitted paths, merge-tree says clean.
-  script["/base/panel"] = { ...script["/base/panel"], merging: null };
+  script["/base/panel"] = { ...script["/base/panel"], pending: { status: "unknown", reason: "the probe itself failed" } };
   const fixture = scriptedGit(script);
   const run = await groupRun(store);
 
@@ -1414,14 +1569,14 @@ test("a base checkout whose in-progress-merge state cannot be read is a conflict
   });
 
   assert.equal(preview.refused, false);
-  assert.equal(preview.mergeable, false, "an unknown merge state must block; it must never fall through as clean");
+  assert.equal(preview.mergeable, false, "an unknown operation state must block; it must never fall through as clean");
   assert.equal(preview.exitCode, MERGE_EXIT_CODES.conflicted);
-  assert.equal(preview.repositories[1].baseMerging, null);
+  assert.equal(preview.repositories[1].basePending, "unknown");
 
   const conflict = preview.conflicts.find((entry) => entry.repositoryId === "panel");
   assert.ok(conflict, `panel must contribute a conflict: ${JSON.stringify(preview.conflicts)}`);
-  assert.match(conflict.reason, /could not be checked for an in-progress merge \(MERGE_HEAD is unreadable\)/);
-  assert.match(conflict.reason, /an unknown merge state is a conflict, never clean/);
+  assert.match(conflict.reason, /could not be checked for an in-progress git operation/);
+  assert.match(conflict.reason, /an unknown operation state is a conflict, never clean/);
 
   // And it really blocks: execute refuses rather than merging into a checkout it could not read.
   const command = await mergeCommand({ runId: run.id }, {
@@ -1439,10 +1594,10 @@ test("a base checkout whose in-progress-merge state cannot be read is a conflict
   assert.equal(fixture.calls.filter((call) => call.method === "mergeBranch").length, 0, "nothing may merge");
 });
 
-test("an unknown in-progress-merge state still names the uncommitted paths it did manage to read", async (t) => {
+test("an unknown in-progress-operation state still names the uncommitted paths it did manage to read", async (t) => {
   const store = await newStore(t);
   const script = groupFixture();
-  script["/base/panel"] = { ...script["/base/panel"], merging: null, dirty: true, dirtyPaths: ["src/a.ts", "src/b.ts"] };
+  script["/base/panel"] = { ...script["/base/panel"], pending: { status: "unknown", reason: "the probe itself failed" }, dirty: true, dirtyPaths: ["src/a.ts", "src/b.ts"] };
   const fixture = scriptedGit(script);
   const run = await groupRun(store);
 
@@ -1453,7 +1608,7 @@ test("an unknown in-progress-merge state still names the uncommitted paths it di
   });
 
   const conflict = preview.conflicts.find((entry) => entry.repositoryId === "panel");
-  assert.match(conflict.reason, /MERGE_HEAD is unreadable/);
+  assert.match(conflict.reason, /could not be checked for an in-progress git operation/);
   assert.match(conflict.reason, /with 2 uncommitted path\(s\): src\/a\.ts, src\/b\.ts/);
 });
 

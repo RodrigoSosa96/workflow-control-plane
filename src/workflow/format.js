@@ -755,13 +755,14 @@ function mergeCheckoutLabel(record) {
   const branch = text(record.baseCheckedOutBranch, "DETACHED");
   const onBase = record.baseBranchCheckedOut === true ? branch : `${branch} (NOT ${text(record.baseBranch)})`;
   const dirtyCount = Number.isFinite(record.baseDirtyCount) ? record.baseDirtyCount : list(record.baseDirtyPaths).length;
-  const state = record.baseMerging === true
-    ? `MID-MERGE (${dirtyCount})`
-    : record.baseMerging !== false
-      // Tri-state, like `baseDirty`: only an explicit `false` may reach the "clean" branch below.
-      // A `null` merge state with a clean status would otherwise render as `clean` -- the false
-      // green commands.js now refuses to compute (see its `merging !== false` conflict).
-      ? "MERGE STATE UNKNOWN"
+  const state = record.basePending === "in-progress"
+    ? `MID-${(typeof record.basePendingOperation === "string" && record.basePendingOperation ? record.basePendingOperation : "operation").toUpperCase()} (${dirtyCount})`
+    : record.basePending !== "none"
+      // Tri-state, like `baseDirty`: only an explicit "none" may reach the "clean" branch below.
+      // An unknown operation state on a spotless checkout would otherwise render as `clean` -- the
+      // false green commands.js now refuses to compute (see its `pending.status !== "none"`
+      // conflict).
+      ? "OPERATION STATE UNKNOWN"
       : record.baseDirty === false
         ? "clean"
         : record.baseDirty === true
@@ -1737,7 +1738,7 @@ function resultOverflowFallback(command, source, limit) {
 //
 // Two tiers and no third, and the reason is not that a third is impossible -- tier 2 still carries
 // plenty a third could take (`basePath`, `sourceSha`, `sourceBranch`, `baseBranch`,
-// `baseBranchCheckedOut`, `baseDirty`/`baseMerging`/`baseDirtyCount`, `branchMismatch`, and the
+// `baseBranchCheckedOut`, `baseDirty`/`basePending`/`basePendingOperation`/`baseDirtyCount`, `branchMismatch`, and the
 // full aggregated conflicts list with 100-character reasons). It is that each additional tier is
 // another distinct response shape a consumer has to handle, bought against a case no data supports:
 // ten repositories is three times the largest group project on this machine, with every one of them
@@ -1770,8 +1771,9 @@ function strippedMergeRepository(record, tier) {
       baseBranchCheckedOut: record.baseBranchCheckedOut,
       baseDirty: record.baseDirty ?? null,
       // Kept even in the minimal tier: it blocks execution on its own and it is what tells an
-      // operator to reach for `git merge --abort` rather than for `git add`.
-      baseMerging: record.baseMerging ?? null,
+      // operator which operation's remedy to reach for rather than for `git add`.
+      basePending: record.basePending ?? null,
+      basePendingOperation: record.basePendingOperation ?? null,
       baseDirtyCount: record.baseDirtyCount ?? 0,
       sourceBranch: record.sourceBranch,
       sourceSha: record.sourceSha,
@@ -1824,7 +1826,7 @@ function mergeOverflowFallback(command, source, limit, tier) {
   const compactNote = tier.minimal
     ? `The compact view (--format compact, the default) is not a fuller answer at this size -- it is bounded to ${OUTPUT_LIMIT} characters too and truncates its TAIL, so at a response this wide it loses \`Next:\` and the tail of \`Conflicts:\` while keeping the run header, the approval digest, the table, \`Argv:\`, and the first conflict entries.`
     : `The compact view (--format compact, the default) is bounded to ${OUTPUT_LIMIT} characters too and truncates its TAIL; at the response sizes that reach this tier it has measured under that limit, but it is not an unbounded alternative.`;
-  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, its \`baseDirty\`/\`baseMerging\`/\`baseDirtyCount\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. ${compactNote}`;
+  degraded.truncationMarker = `JSON output truncated at ${limit} characters; ${dropped}, and every reason string was bounded to ${tier.reasonLimit} characters. Every repository's \`argv\`, its \`conflictStatus\`/\`conflictCount\`/\`conflictsTruncated\`, its \`baseDirty\`/\`basePending\`/\`basePendingOperation\`/\`baseDirtyCount\`, the aggregated \`conflicts\` list, and the approval digest survive: the argv is what the digest approves, so it is never dropped, and a shortened conflict list is always marked \`conflictsTruncated\` rather than presented as complete. ${compactNote}`;
   return degraded;
 }
 
