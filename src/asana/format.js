@@ -54,6 +54,39 @@ function formatTaskFull(context) {
   return lines.join("\n");
 }
 
+function mutationValue(input) {
+  if (input === null) return "none";
+  if (Array.isArray(input)) return input.join(", ");
+  if (typeof input === "object") return JSON.stringify(input);
+  return value(input);
+}
+
+function formatMutation(result) {
+  if (result.dryRun) {
+    const lines = [`DRY RUN: ${result.action}`];
+    for (const [key, item] of Object.entries(result.details ?? {})) lines.push(`  ${key}: ${mutationValue(item)}`);
+    lines.push("Re-run with --confirm to apply.");
+    return lines.join("\n");
+  }
+
+  const lines = [`Applied: ${result.action}`];
+  if (result.task) {
+    lines.push(`Task: ${value(result.task.name)} [${value(result.task.gid)}]`);
+    if (result.task.permalink_url) lines.push(result.task.permalink_url);
+  }
+  if (result.story) lines.push(`Comment [${value(result.story.gid)}] added to task [${value(result.taskGid)}]`);
+  if (result.action === "move task" && result.section) {
+    lines.push(`Task [${value(result.taskGid)}] moved to section ${value(result.section.name)} [${value(result.section.gid)}]`);
+  } else if (result.section) lines.push(`Section: ${value(result.section.name)} [${value(result.section.gid)}]`);
+  if (result.project) {
+    lines.push(`Project: ${value(result.project.name)} [${value(result.project.gid)}]`);
+    if (result.project.permalink_url) lines.push(result.project.permalink_url);
+  }
+  if (result.sections?.length) lines.push(`Sections: ${result.sections.map(identity).join(", ")}`);
+  if (result.alias) lines.push(`Registered alias: ${result.alias}`);
+  return lines.join("\n");
+}
+
 export function formatResult(command, result, format = "compact") {
   if (format === "json") return JSON.stringify(result, null, 2);
   switch (command) {
@@ -67,6 +100,7 @@ export function formatResult(command, result, format = "compact") {
     case "task": return formatTaskFull({ task: result, stories: [], subtasks: [], dependencies: [], dependents: [], attachments: [] });
     case "task-full": return formatTaskFull(result);
     case "attachment-download": return `Downloaded ${result.name} [${result.gid}] to ${result.path} (${result.bytes} bytes)`;
+    case "mutation": return formatMutation(result);
     default: return typeof result === "string" ? result : JSON.stringify(result, null, 2);
   }
 }

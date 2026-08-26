@@ -12,7 +12,7 @@ This repository is a **control plane**, not an application. It stores project me
 - Herdr workspace, tab, pane, and runtime process orchestration.
 - Structured worker handoffs and canonical results.
 - Two-lane operator model: external workers produce canonical results; internal Pi delegations produce advisory evidence.
-- Read-only Asana triage CLI with secure token handling.
+- Asana triage and confirm-gated write CLI with secure token handling.
 
 ## Install
 
@@ -397,7 +397,7 @@ Replace `<fixture-registry>` and `<run-id>` with the paths printed by the script
 
 ## Asana workflow CLI
 
-The repository includes a zero-dependency, read-only Asana CLI. It discovers workspaces, projects, current sections, assignees, and full ticket context without injecting MCP tool schemas into every model request.
+The repository includes a compact Asana CLI for discovery, full ticket triage, and confirm-gated writes without injecting MCP tool schemas into every model request. Read commands execute directly; write commands produce a dry-run unless explicitly confirmed.
 
 ### Install
 
@@ -494,6 +494,20 @@ asana-workflow attachment download <attachment-gid> --output /tmp/asana-attachme
 ```
 
 Use `--format json` when a script needs normalized structured output. Compact text is the default to reduce model context usage.
+
+### Write operations
+
+```bash
+asana-workflow task create --project <alias-or-gid> --name <text> [--notes <text> | --notes-file <path>] [--section <name>] [--assignee me|<gid>] [--due YYYY-MM-DD]
+asana-workflow task update <task-gid> [--name <text>] [--notes <text> | --notes-file <path>] [--assignee me|none|<gid>] [--due YYYY-MM-DD|none] [--completed true|false]
+asana-workflow task comment <task-gid> --text <text>
+asana-workflow task move <task-gid> --project <alias-or-gid> --section <name>
+asana-workflow project create --workspace <gid> --name <text> --sections "Backlog,Doing,Done" [--register-alias <alias>]
+```
+
+Every write command is a dry-run unless `--confirm` is supplied. Agent workflows must show the dry-run to Rodrigo and obtain explicit approval before rerunning the exact command with `--confirm`. If any target or field changes, run a new dry-run and request approval again.
+
+`--notes-file` is preferred for multi-line task descriptions. `--assignee none` unassigns a task, `--due none` clears its due date, and `--completed false` reopens it. `project create` uses Asana's board view, creates the supplied sections in order, and can optionally register the returned project GID in the alias config.
 
 ### Uninstall
 

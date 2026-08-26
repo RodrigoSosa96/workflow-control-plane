@@ -63,3 +63,38 @@ test("formats attachment metadata with host and links", () => {
 test("formats authentication status without credentials", () => {
   assert.equal(formatResult("auth-status", { configured: false, message: "not configured" }), "Asana auth: not configured");
 });
+
+test("formats mutation dry-runs with exact details and confirmation guidance", () => {
+  const result = { dryRun: true, action: "create project", details: { workspace: "w1", name: "Board", sections: ["Backlog", "Done"] } };
+  const output = formatResult("mutation", result);
+  assert.match(output, /^DRY RUN: create project/);
+  assert.match(output, /workspace: w1/);
+  assert.match(output, /sections: Backlog, Done/);
+  assert.match(output, /Re-run with --confirm to apply\.$/);
+  assert.equal(formatResult("mutation", result, "json"), JSON.stringify(result, null, 2));
+});
+
+test("formats applied task, comment, move, and project mutations", () => {
+  const task = formatResult("mutation", {
+    applied: true, action: "create task", task: { gid: "t1", name: "Ticket", permalink_url: "https://asana.test/t1" },
+    section: { gid: "s1", name: "Backlog" },
+  });
+  assert.match(task, /^Applied: create task/);
+  assert.match(task, /Task: Ticket \[t1\]/);
+  assert.match(task, /https:\/\/asana\.test\/t1/);
+  assert.match(task, /Section: Backlog \[s1\]/);
+
+  const comment = formatResult("mutation", { applied: true, action: "add comment", taskGid: "t1", story: { gid: "story1" } });
+  assert.match(comment, /Comment \[story1\] added to task \[t1\]/);
+
+  const move = formatResult("mutation", { applied: true, action: "move task", taskGid: "t1", section: { gid: "s2", name: "Done" } });
+  assert.match(move, /Task \[t1\] moved to section Done \[s2\]/);
+
+  const project = formatResult("mutation", {
+    applied: true, action: "create project", project: { gid: "p1", name: "Board", permalink_url: "https://asana.test/p1" },
+    sections: [{ gid: "s1", name: "Backlog" }, { gid: "s2", name: "Done" }], alias: "board",
+  });
+  assert.match(project, /Project: Board \[p1\]/);
+  assert.match(project, /Sections: Backlog \[s1\], Done \[s2\]/);
+  assert.match(project, /Registered alias: board/);
+});
