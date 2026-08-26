@@ -1,4 +1,4 @@
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export class CommandError extends Error {
@@ -67,6 +67,114 @@ export async function getFullTaskContext(client, gid) {
     client.dependents(gid), client.attachments(gid),
   ]);
   return { task, stories, subtasks, dependencies, dependents, attachments };
+}
+
+export async function resolveSectionByName(client, projectGid, name) {
+  const sections = await client.sections(projectGid);
+  const target = name.toLocaleLowerCase();
+  const matches = sections.filter((section) => section.name?.toLocaleLowerCase() === target);
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) throw new CommandError(`Asana section '${name}' was not found in project ${projectGid}.`);
+  throw new CommandError(`Asana section name '${name}' is ambiguous in project ${projectGid}: ${matches.map((section) => `${section.name} (${section.gid})`).join(", ")}`);
+}
+
+const dryRun = (action, details) => ({ dryRun: true, action, details });
+
+async function resolveAssignee(client, assignee) {
+  if (assignee !== "me") return assignee;
+  return (await client.me()).gid;
+}
+
+export async function createTaskCommand(client, input, { confirm = false } = {}) {
+  const section = input.section ? await resolveSectionByName(client, input.project.gid, input.section) : undefined;
+  const assignee = input.assignee === undefined ? undefined : await resolveAssignee(client, input.assignee);
+  const fields = {
+    projects: [input.project.gid],
+    name: input.name,
+    ...(input.notes !== undefined ? { notes: input.notes } : {}),
+    ...(assignee !== undefined ? { assignee } : {}),
+    ...(input.dueOn !== undefined ? { due_on: input.dueOn } : {}),
+  };
+  const details = {
+    project: input.project.gid,
+    name: input.name,
+    ...(input.notes !== undefined ? { notes: input.notes } : {}),
+    ...(section ? { section: `${section.name} [${section.gid}]` } : {}),
+    ...(assignee !== undefined ? { assignee } : {}),
+    ...(input.dueOn !== undefined ? { due_on: input.dueOn } : {}),
+  };
+  if (!confirm) return dryRun("create task", details);
+  const task = await client.createTask(fields);
+  if (section) await client.addTaskToSection(section.gid, task.gid);
+  return { applied: true, action: "create task", task, ...(section ? { section } : {}) };
+}
+
+export async function updateTaskCommand(client, gid, input, { confirm = false } = {}) {
+  const assignee = input.assignee === undefined ? undefined : await resolveAssignee(client, input.assignee);
+  const fields = {
+    ...(input.name !== undefined ? { name: input.name } : {}),
+    ...(input.notes !== undefined ? { notes: input.notes } : {}),
+    ...(assignee !== undefined ? { assignee: assignee === "none" ? null : assignee } : {}),
+    ...(input.dueOn !== undefined ? { due_on: input.dueOn === "none" ? null : input.dueOn } : {}),
+    ...(input.completed !== undefined ? { completed: input.completed } : {}),
+  };
+  if (!confirm) return dryRun("update task", { task: gid, ...fields });
+  const task = await client.updateTask(gid, fields);
+  return { applied: true, action: "update task", task };
+}
+
+export async function commentTaskCommand(client, gid, text, { confirm = false } = {}) {
+  if (!confirm) return dryRun("add comment", { task: gid, text });
+  const story = await client.addStory(gid, text);
+  return { applied: true, action: "add comment", taskGid: gid, story };
+}
+
+export async function moveTaskCommand(client, gid, input, { confirm = false } = {}) {
+  const section = await resolveSectionByName(client, input.project.gid, input.section);
+  const details = { task: gid, project: input.project.gid, section: `${section.name} [${section.gid}]` };
+  if (!confirm) return dryRun("move task", details);
+  await client.addTaskToSection(section.gid, gid);
+  return { applied: true, action: "move task", taskGid: gid, projectGid: input.project.gid, section };
+}
+
+export async function createProjectCommand(client, input, { confirm = false } = {}) {
+  const details = { workspace: input.workspaceGid, name: input.name, sections: input.sections };
+  if (!confirm) return dryRun("create project", details);
+  const project = await client.createProject({
+    workspace: input.workspaceGid,
+    name: input.name,
+    default_view: "board",
+    public: true,
+  });
+  const sections = [];
+  for (const name of input.sections) sections.push(await client.createSection(project.gid, name));
+  return { applied: true, action: "create project", project, sections };
+}
+
+export async function registerProjectAlias(
+  configPath,
+  alias,
+  projectGid,
+  { readFileImpl = readFile, writeFileImpl = writeFile } = {},
+) {
+  if (!/^[\p{L}\p{N}._-]+$/u.test(alias || "")) throw new CommandError("Alias must be a valid Asana project alias.");
+  let config;
+  try {
+    config = JSON.parse(await readFileImpl(configPath, "utf8"));
+  } catch (error) {
+    throw new CommandError(`Unable to load Asana project configuration at ${configPath}: ${error.message}`);
+  }
+  if (config?.version !== 1 || !config.projects || typeof config.projects !== "object" || Array.isArray(config.projects)) {
+    throw new CommandError("Asana project configuration must use version 1 and contain a projects object.");
+  }
+  if (Object.hasOwn(config.projects, alias)) throw new CommandError(`Asana project alias '${alias}' already exists.`);
+  config.projects[alias] = { projectGid };
+  try {
+    await writeFileImpl(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  } catch (error) {
+    throw new CommandError(`Unable to write Asana project configuration at ${configPath}: ${error.message}`);
+  }
+  return { alias, projectGid, configPath };
 }
 
 export async function downloadAttachmentFile(
