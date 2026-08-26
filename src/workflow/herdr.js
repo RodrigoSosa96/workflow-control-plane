@@ -363,7 +363,7 @@ const PANE_READY_POLL_MS = 250;
 
 // Closing a tab is a local, near-instant operation, so a bound this generous only ever fires on a
 // genuinely wedged CLI or server. See closeTab for why it is the one bounded call in this adapter.
-const TAB_CLOSE_TIMEOUT_MS = 10000;
+export const TAB_CLOSE_TIMEOUT_MS = 10000;
 
 function defaultSleep(ms) {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -619,20 +619,25 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
     // `herdr` CLI would hang the step that runs after worktree removals that cannot be undone. A
     // timeout surfaces as an ordinary reported failure, never as `not-found`.
     //
-    // **What that timeout does and does not guarantee**, corrected in review after this comment
-    // claimed an "always returns" property the layer underneath cannot provide: process.js's
-    // timeout sends `SIGTERM` to the DIRECT child only and settles the promise on the child's
-    // `close` event. A `herdr` that ignores SIGTERM, or a grandchild still holding the inherited
-    // stdio pipes open, can therefore delay `close` past the deadline -- so the bound is "signalled
-    // at the deadline", not "returned by the deadline". It removes the ordinary hang, not every
-    // possible one, and no caller should be written as though the stronger property held.
-    async closeTab({ tabId, timeoutMs = TAB_CLOSE_TIMEOUT_MS } = {}) {
+    // **The bound is a real wall clock.** An earlier version of this comment, corrected in review,
+    // described process.js's timeout as "signalled at the deadline, not returned by the deadline",
+    // because it reached only the direct child and settled on `close`. B1 ended that: the runner
+    // signals the child's whole process group and escalates to SIGKILL after a grace window, so a
+    // herdr that ignores SIGTERM -- or a grandchild holding the pipes -- is still bounded. What
+    // remains true: a timeout surfaces as an ordinary reported failure, never as `not-found`.
+    //
+    // An explicitly-passed but unusable `timeoutMs` (null, 0, NaN, negative, a string) used to
+    // survive the default parameter and then be dropped by the runner's own finite check -- the
+    // one call that must be bounded, disarmed by the caller's mistake. It now falls back to the
+    // default instead (B4).
+    async closeTab({ tabId, timeoutMs } = {}) {
       if (typeof tabId !== "string" || !tabId) {
         return { closed: false, reason: "closeTab requires a tab id" };
       }
 
+      const boundMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : TAB_CLOSE_TIMEOUT_MS;
       try {
-        await invoke("tab", "close", [tabId], { timeoutMs });
+        await invoke("tab", "close", [tabId], { timeoutMs: boundMs });
         return { closed: true };
       } catch (error) {
         if (error?.details?.code === "tab_not_found") {

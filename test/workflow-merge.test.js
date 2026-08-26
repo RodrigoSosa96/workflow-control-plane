@@ -68,14 +68,14 @@ function scriptedGit(script = {}) {
   return {
     calls,
     git: {
-      async resolveHead({ cwd }) {
-        calls.push({ method: "resolveHead", cwd });
+      async resolveHead({ cwd, timeoutMs }) {
+        calls.push({ method: "resolveHead", cwd, timeoutMs });
         const entry = entryFor(cwd);
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
         return { branch: entry.branch ?? null, sha: entry.sha ?? "0".repeat(40) };
       },
-      async checkoutState({ cwd }) {
-        calls.push({ method: "checkoutState", cwd });
+      async checkoutState({ cwd, timeoutMs }) {
+        calls.push({ method: "checkoutState", cwd, timeoutMs });
         const entry = entryFor(cwd);
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
         // `merging` is part of the adapter's contract (git.js's checkoutState), so the double
@@ -378,6 +378,38 @@ test("a three-repository run previews three exact argvs, in the order the run re
     assert.ok(call.timeoutMs > 0);
   }
   assert.deepEqual(fixture.calls.filter((call) => call.method === "mergeBranch"), [], "a preview must run no merge");
+});
+
+// B2/B3: every read this command makes is a spawn, and an unbounded one would hold a `--dry-run`
+// -- or worse, the report of merges that already happened -- open forever. The preview reads run
+// under the preview bound; the post-merge read-back runs under the execution bound.
+test("every checkout read in the preview and the post-merge read-back is bounded", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const fixture = scriptedGit(groupFixture());
+  const command = await mergeCommand(
+    { runId: run.id },
+    { store, loadRegistry: mergeLoadRegistry(GROUP_PROJECT), git: fixture.git, previewTimeoutMs: 111_111, mergeTimeoutMs: 222_222 },
+  );
+
+  const previewReads = fixture.calls.filter((call) => call.method === "resolveHead" || call.method === "checkoutState");
+  assert.ok(previewReads.length > 0, "the preview must read the checkouts it judges");
+  for (const call of previewReads) {
+    assert.equal(call.timeoutMs, 111_111, `${call.method} on ${call.cwd} must run under the preview bound`);
+  }
+
+  const report = await command.execute({ approvalDigest: command.preview.approvalDigest });
+  assert.equal(report.status, "merged");
+
+  // execute re-computes the preview (the preview bound again), then reads each base HEAD back
+  // after merging it -- the read-back is the LAST resolveHead on each base path, and it is the
+  // one the execution bound must cover: it runs after real merge commits exist, where a hang
+  // would leave the operator without the report of what happened.
+  for (const basePath of ["/base/backend", "/base/panel", "/base/webapp"]) {
+    const reads = fixture.calls.filter((call) => call.method === "resolveHead" && call.cwd === basePath);
+    assert.ok(reads.length >= 2, "expected at least the preview read and the post-merge read-back");
+    assert.equal(reads.at(-1).timeoutMs, 222_222, "the post-merge read-back must run under the merge bound");
+  }
 });
 
 test("a predicted conflict blocks execution and names the conflicted files", async (t) => {

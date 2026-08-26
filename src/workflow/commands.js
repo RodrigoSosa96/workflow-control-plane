@@ -2061,7 +2061,7 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   // wrapped here rather than allowed to surface as an uncaught WorkflowError.
   let head;
   try {
-    head = await git.resolveHead({ cwd: worktreePath });
+    head = await git.resolveHead({ cwd: worktreePath, timeoutMs });
   } catch (error) {
     return { refusal: `Run ${runId} repository ${label} worktree HEAD could not be resolved at ${worktreePath}: ${mergeErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
   }
@@ -2075,8 +2075,8 @@ async function inspectRepositoryForMerge({ runId, projectAlias, project, entry, 
   let baseState;
   let baseHead;
   try {
-    baseState = await git.checkoutState({ cwd: basePath });
-    baseHead = await git.resolveHead({ cwd: basePath });
+    baseState = await git.checkoutState({ cwd: basePath, timeoutMs });
+    baseHead = await git.resolveHead({ cwd: basePath, timeoutMs });
   } catch (error) {
     return { refusal: `Project ${projectAlias} base checkout for repository ${label} could not be read at ${basePath}: ${mergeErrorText(error)}`, actions: [doctorCommandFor(projectAlias)] };
   }
@@ -2469,7 +2469,10 @@ async function runMergeSequence(records, git, timeoutMs) {
     // as "unconfirmed" and never as either outcome.
     let baseShaAfter = null;
     try {
-      const head = await git.resolveHead({ cwd: record.basePath });
+      // B2: bounded like everything else in this sequence -- this read runs AFTER real merge
+      // commits already exist, the worst place to hang: the work is done and unrepeatable, and
+      // a hang here would leave the operator without the report of what happened.
+      const head = await git.resolveHead({ cwd: record.basePath, timeoutMs });
       baseShaAfter = typeof head?.sha === "string" && head.sha ? head.sha : null;
     } catch {
       baseShaAfter = null;
@@ -2902,8 +2905,8 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
   let state;
   let head;
   try {
-    state = await git.checkoutState({ cwd: worktreePath });
-    head = await git.resolveHead({ cwd: worktreePath });
+    state = await git.checkoutState({ cwd: worktreePath, timeoutMs });
+    head = await git.resolveHead({ cwd: worktreePath, timeoutMs });
   } catch (error) {
     return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be read: ${archiveErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
   }

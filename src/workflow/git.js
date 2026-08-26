@@ -210,10 +210,10 @@ function parseMergeTree(output) {
 // rather than being assembled here because a linked worktree's `.git` is a file, not a directory,
 // and its MERGE_HEAD lives under the worktree's own admin directory. One git call, same as the
 // probe it replaces.
-async function readMergeState({ runner, fs, cwd }) {
+async function readMergeState({ runner, fs, cwd, timeoutMs }) {
   let path;
   try {
-    const result = await runner.run("git", ["rev-parse", "--git-path", "MERGE_HEAD"], { cwd });
+    const result = await runner.run("git", ["rev-parse", "--git-path", "MERGE_HEAD"], { cwd, timeoutMs });
     path = trimLine(result.stdout);
   } catch {
     return null;
@@ -470,9 +470,9 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     // Where the work actually is. Read from the checkout, never derived from a run record: a
     // recorded branch is a launch-time intention and two of the eight real runs on this machine
     // name a ref that no longer exists.
-    async resolveHead({ cwd }) {
-      const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
-      const shaResult = await runner.run("git", ["rev-parse", "HEAD"], { cwd });
+    async resolveHead({ cwd, timeoutMs }) {
+      const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeoutMs });
+      const shaResult = await runner.run("git", ["rev-parse", "HEAD"], { cwd, timeoutMs });
 
       return {
         branch: normalizeHeadBranch(trimLine(branchResult.stdout)),
@@ -495,14 +495,14 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     // apart. `true`/`false`/`null` for unknown, never throwing: an unanswerable probe degrades
     // to "cannot say" rather than to "not merging" — see readMergeState for why that required
     // reading the file rather than asking `rev-parse`.
-    async checkoutState({ cwd }) {
-      const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+    async checkoutState({ cwd, timeoutMs }) {
+      const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeoutMs });
       const branch = normalizeHeadBranch(trimLine(branchResult.stdout));
 
-      const merging = await readMergeState({ runner, fs, cwd });
+      const merging = await readMergeState({ runner, fs, cwd, timeoutMs });
 
       try {
-        const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd });
+        const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd, timeoutMs });
         const entries = parseStatus(statusResult.stdout);
         return { branch, dirty: entries.length > 0, entries, merging };
       } catch (error) {

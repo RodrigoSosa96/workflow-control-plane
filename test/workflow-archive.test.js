@@ -92,15 +92,15 @@ function scriptedGit(script = {}) {
     script,
     removals: () => calls.filter((call) => call.method === "removeWorktree"),
     git: {
-      async resolveHead({ cwd }) {
-        calls.push({ method: "resolveHead", cwd });
+      async resolveHead({ cwd, timeoutMs }) {
+        calls.push({ method: "resolveHead", cwd, timeoutMs });
         const entry = entryFor(cwd);
         if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
         return { branch: entry.branch ?? null, sha: entry.sha ?? "0".repeat(40) };
       },
-      async checkoutState({ cwd }) {
-        calls.push({ method: "checkoutState", cwd });
+      async checkoutState({ cwd, timeoutMs }) {
+        calls.push({ method: "checkoutState", cwd, timeoutMs });
         const entry = entryFor(cwd);
         if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
@@ -371,6 +371,30 @@ test("a dirty worktree refuses the whole run and removes nothing, including from
   assertNothingHappened(fixture, herdr);
   assert.deepEqual(store.appendEventCalls, [], "a refusal appends nothing");
   assert.equal((await store.read(run.id)).archivedAt, undefined, "a refusal marks nothing");
+});
+
+// B3: the preview's checkout reads are spawns too, and before this they carried no bound at all
+// while pendingOperation's already did. Every read the preview makes runs under the same bound.
+test("every checkout read in the preview runs under the preview bound", async (t) => {
+  const store = await newStore(t);
+  const run = await groupRun(store);
+  const fixture = scriptedGit(groupFixture());
+
+  const command = await archiveCommand({ runId: run.id }, {
+    ...archiveDeps(store, {
+      git: fixture.git,
+      project: GROUP_PROJECT,
+      present: ["/wt/backend", "/wt/panel", "/wt/webapp"],
+    }),
+    previewTimeoutMs: 111_111,
+  });
+
+  assert.equal(command.preview.refused, false);
+  const reads = fixture.calls.filter((call) => call.method === "resolveHead" || call.method === "checkoutState");
+  assert.ok(reads.length > 0, "the preview must read the worktrees it judges");
+  for (const call of reads) {
+    assert.equal(call.timeoutMs, 111_111, `${call.method} on ${call.cwd} must run under the preview bound`);
+  }
 });
 
 test("removeWorktree is never handed a force option, on any path this command can take", async (t) => {

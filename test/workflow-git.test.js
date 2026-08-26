@@ -357,6 +357,37 @@ test("resolveHead reads the branch and sha the checkout is actually on", async (
   assert.deepEqual(fixture.calls[1].args, ["rev-parse", "HEAD"]);
 });
 
+// B3: these two adapters are the ones the merge and archive previews read a checkout through, and
+// they used to spawn with no bound at all -- a wedged git would have held a `--dry-run` open
+// forever. The timeoutMs they accept must reach every runner call they make, including
+// checkoutState's MERGE_HEAD probe.
+test("resolveHead passes its timeoutMs through to both reads", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "dev\n", stderr: "" }),
+    "git rev-parse HEAD": async () => ({ code: 0, stdout: "0123456789012345678901234567890123456789\n", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  await git.resolveHead({ cwd: "/repo", timeoutMs: 4321 });
+
+  assert.equal(fixture.calls.length, 2);
+  assert.deepEqual(fixture.calls.map((call) => call.options.timeoutMs), [4321, 4321]);
+});
+
+test("checkoutState passes its timeoutMs through to every read it spawns", async () => {
+  const fixture = fixtureRunner({
+    "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "dev\n", stderr: "" }),
+    "git rev-parse --git-path MERGE_HEAD": async () => ({ code: 0, stdout: ".git/MERGE_HEAD\n", stderr: "" }),
+    "git status --porcelain=v1 -z": async () => ({ code: 0, stdout: "", stderr: "" }),
+  });
+  const git = createGitAdapter({ runner: fixture.runner });
+
+  await git.checkoutState({ cwd: "/repo", timeoutMs: 4321 });
+
+  assert.equal(fixture.calls.length, 3);
+  assert.deepEqual(fixture.calls.map((call) => call.options.timeoutMs), [4321, 4321, 4321]);
+});
+
 test("resolveHead reports a detached HEAD as a null branch", async () => {
   const fixture = fixtureRunner({
     "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "HEAD\n", stderr: "" }),

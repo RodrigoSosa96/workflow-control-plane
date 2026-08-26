@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WorkflowError } from "../src/workflow/errors.js";
-import { createHerdrAdapter } from "../src/workflow/herdr.js";
+import { createHerdrAdapter, TAB_CLOSE_TIMEOUT_MS } from "../src/workflow/herdr.js";
 
 function cliResult(result, id = "cli:test") {
   return JSON.stringify({ id, result });
@@ -1550,17 +1550,26 @@ test("closeTab bounds the CLI call so a wedged herdr cannot hang the archive", a
   assert.deepEqual(await herdr.closeTab({ tabId: "w2M:t1" }), { closed: true });
 });
 
-test("closeTab lets the caller choose the bound, and drops an unusable one", async () => {
+// B4: an unusable timeoutMs used to pass through the default parameter and get dropped further
+// down, leaving the one call that must be bounded with NO bound. The contract is now: a usable
+// value is honoured, anything else falls back to TAB_CLOSE_TIMEOUT_MS.
+test("closeTab lets the caller choose the bound, and an unusable one falls back to the default", async () => {
+  const unusable = [0, Number.NaN, null, -5, "10000"];
   const fixture = fixtureRunner([
     { assert: ({ options }) => { assert.equal(options.timeoutMs, 250); }, stdout: cliResult({ closed: true }) },
-    { assert: ({ options }) => { assert.ok(!("timeoutMs" in options), "an unusable timeout must not become a timer"); }, stdout: cliResult({ closed: true }) },
-    { assert: ({ options }) => { assert.ok(!("timeoutMs" in options)); }, stdout: cliResult({ closed: true }) },
+    ...unusable.map(() => ({
+      assert: ({ options }) => {
+        assert.equal(options.timeoutMs, TAB_CLOSE_TIMEOUT_MS, "an unusable timeout must fall back to the default, not disable the bound");
+      },
+      stdout: cliResult({ closed: true }),
+    })),
   ]);
   const herdr = createHerdrAdapter({ runner: fixture.runner });
 
   await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: 250 });
-  await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: 0 });
-  await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: Number.NaN });
+  for (const value of unusable) {
+    await herdr.closeTab({ tabId: "w2M:t1", timeoutMs: value });
+  }
 });
 
 test("a closeTab timeout is a reported failure, never already-archived", async () => {
