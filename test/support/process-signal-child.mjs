@@ -31,6 +31,28 @@ const recordSettle = () => {
   if (settleWitness) writeFileSync(settleWitness, "settled\n");
 };
 
+// A second, CONCURRENT run, for the test that interrupts while two children are alive: the first
+// child answering the forwarded signal must not settle its promise just because the second is
+// still draining. Same contract, own witness. JSON because the value is an argv array.
+const alsoArgv = process.env.WORKFLOW_TEST_ALSO ? JSON.parse(process.env.WORKFLOW_TEST_ALSO) : null;
+const settleWitness2 = process.env.WORKFLOW_TEST_SETTLE_WITNESS_2;
+const recordSettle2 = () => {
+  if (settleWitness2) writeFileSync(settleWitness2, "settled\n");
+};
+
+if (alsoArgv) {
+  createProcessRunner()
+    .run(alsoArgv[0], alsoArgv.slice(1), { cwd, timeoutMs: 600_000, allowFailure: true })
+    .then(() => {
+      recordSettle2();
+      process.exit(0);
+    })
+    .catch(() => {
+      recordSettle2();
+      process.exit(1);
+    });
+}
+
 createProcessRunner()
   .run(command, args, { cwd, timeoutMs: 600_000, allowFailure: true })
   .then((result) => {

@@ -712,6 +712,67 @@ test(
 );
 
 test(
+  "an interrupt with two runs in flight hands control back to neither caller",
+  { skip: skipWithoutShellAndGroups, timeout: 30_000 },
+  async (t) => {
+    // The single-child case above is saved by `process.exit` preempting the settle from inside
+    // `releaseChild`. With TWO children alive that preemption does not fire for the first one to
+    // die -- the registry is not empty yet -- so without the `shuttingDown` guard in `settle` its
+    // promise resolves mid-shutdown and the fixture exits 0 from that `.then`, witness written.
+    // Here the first command exits on the forwarded SIGINT while the second ignores it: only the
+    // escalation (a full grace window later) can end the run, which is also what makes the timing
+    // assertion meaningful.
+    const markerA = "194910";
+    const markerB = "194911";
+    const scratch = await mkdtemp(join(tmpdir(), "workflow-process-settle2-"));
+    t.after(async () => {
+      await rm(scratch, { recursive: true, force: true });
+    });
+    const witnessA = join(scratch, "settled-a");
+    const witnessB = join(scratch, "settled-b");
+
+    const { child, state } = spawnInterruptibleCli(
+      {
+        cwd: scratch,
+        env: {
+          WORKFLOW_TEST_SETTLE_WITNESS: witnessA,
+          WORKFLOW_TEST_ALSO: JSON.stringify(["sh", "-c", `trap '' INT; sleep ${markerB}`]),
+          WORKFLOW_TEST_SETTLE_WITNESS_2: witnessB,
+        },
+      },
+      "sh",
+      "-c",
+      `trap 'exit 0' INT; sleep ${markerA}`,
+    );
+
+    try {
+      assert.ok(
+        await waitUntil(() => markerPids(markerA).length > 0 && markerPids(markerB).length > 0),
+        "precondition: both commands must be running before the interrupt is sent",
+      );
+
+      const start = Date.now();
+      process.kill(-child.pid, "SIGINT");
+
+      assert.ok(await waitUntil(() => state.exited, { timeoutMs: 10_000 }), "expected the CLI subprocess to exit");
+      const wall = Date.now() - start;
+      assert.equal(state.code, 130, "the process must exit through the trap (128 + SIGINT), never through a settled run");
+      assert.ok(
+        wall >= 1500,
+        `expected the run to sit out the escalation window (~2s) because one child ignored SIGINT; exited after ${wall}ms, which means something settled early`,
+      );
+      assert.equal(existsSync(witnessA), false, "the first run to die must not settle while the second is still draining");
+      assert.equal(existsSync(witnessB), false, "the interrupted run must not settle either");
+      assert.ok(await waitUntil(() => markerPids(markerA).length === 0 && markerPids(markerB).length === 0), "expected no orphan to survive");
+    } finally {
+      killCli(child, state);
+      killMarker(markerA);
+      killMarker(markerB);
+    }
+  },
+);
+
+test(
   "an interrupt still escalates to SIGKILL when the forwarded signal is ignored",
   { skip: skipWithoutShellAndGroups, timeout: 30_000 },
   async () => {

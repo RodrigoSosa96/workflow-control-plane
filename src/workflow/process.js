@@ -266,7 +266,11 @@ export function createProcessRunner({ spawnImpl = spawn } = {}) {
           // answers -- but the promise is deliberately left pending: resolving or rejecting here
           // would hand a caller mid-shutdown an ordinary-looking result (an `allowFailure` caller
           // reads a signalled child as just another nonzero code) and let it start its next step
-          // inside a process that is already on its way out.
+          // inside a process that is already on its way out. With ONE child `releaseChild` exits
+          // the process before this line is ever reached; the guard is what makes the same true
+          // with two or more, where the first child to answer the forwarded signal empties
+          // nothing.
+          if (shuttingDown) return;
           callback();
         };
 
