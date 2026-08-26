@@ -2552,15 +2552,43 @@ test("a persistence failure after real removals is named last, never folded into
 // measured against a fixture built FROM the caps that actually ship (ARCHIVE_DISPLAY_LIMITS),
 // never against numbers copied out of commands.js.
 
-function worstCaseArchivePreview(repositoryIds) {
+// C1/I1's contribution to the worst case: the fields those fixes added ARE the heavy ones (two
+// capped path lists, their counts and truncation flags, a sharer list, and a second loss per
+// repository with eleven keys). A fixture without them measures a renderer that no longer exists.
+function ignoredLoss(repositoryId) {
+  return {
+    repositoryId,
+    kind: "ignored-content",
+    worktreePath: ARCHIVE_WORKTREE(repositoryId),
+    branch: "feature/registro-impl",
+    baseBranch: "dev",
+    count: 3,
+    fileCount: 2,
+    directoryCount: 1,
+    files: [".env", "deploy.secret"],
+    directories: ["node_modules/"],
+    filesTruncated: false,
+    directoriesTruncated: false,
+    detail: "2 ignored file(s) — .env, deploy.secret — which git tracks nowhere, so removing the worktree DELETES them and no branch, commit or backup holds a copy; 1 ignored director(y/ies) — node_modules/ — deleted with it, usually regenerable build output but not checked",
+  };
+}
+
+export function worstCaseArchivePreview(repositoryIds) {
   const repositories = repositoryIds.map((repositoryId) => archiveRepository({
     repositoryId,
     unmergedCommits: 900,
     unmergedReason: undefined,
+    ignoredFileCount: 2,
+    ignoredDirectoryCount: 1,
+    ignoredFiles: [".env", "deploy.secret"],
+    ignoredDirectories: ["node_modules/"],
+    ignoredFilesTruncated: false,
+    ignoredDirectoriesTruncated: false,
+    sharedWith: [{ runId: "e5f6a7b8-1111-4e60-9a8b-2c1d0e9f8a7b", state: "completed", live: false }],
   }));
   return archivePreview({
     repositories,
-    losses: repositories.map((record) => unmergedLoss(record.repositoryId, 900)),
+    losses: repositories.flatMap((record) => [unmergedLoss(record.repositoryId, 900), ignoredLoss(record.repositoryId)]),
   });
 }
 
@@ -2631,11 +2659,12 @@ test("--format json for an archive preview too wide to fit keeps every worktree 
     assert.equal(record.worktreePath, overflowing.repositories[index].worktreePath, "the path is what would be removed; it must survive");
     assert.equal(record.unmergedCommits, 900, "the loss count is what an operator is approving");
   }
-  assert.equal(parsed.losses.length, repositoryIds.length);
-  for (const loss of parsed.losses) {
-    assert.equal(loss.count, 900);
-    assert.equal(typeof loss.kind, "string");
-  }
+  assert.equal(parsed.losses.length, repositoryIds.length * 2, "each repository contributes its unmerged loss and its ignored-content loss");
+  assert.deepEqual(
+    parsed.losses.map((loss) => loss.count),
+    overflowing.losses.map((loss) => loss.count),
+    "every count is what an operator is approving, in the same order",
+  );
   assert.equal(parsed.approvalDigest, ARCHIVE_DIGEST, "without the digest nothing can be approved at all");
   assert.match(parsed.truncationMarker, /worktree path|path/i);
 });
@@ -2668,24 +2697,24 @@ test("the archive JSON fallback tiers engage where they are documented to, and e
     return Object.hasOwn(parsed.repositories[0], "recordedBranch") ? "tier1" : "tier2";
   };
 
-  assert.equal(tierOf(10), "none");
-  assert.equal(tierOf(11), "tier1");
+  assert.equal(tierOf(4), "none");
+  assert.equal(tierOf(5), "tier1");
+  assert.equal(tierOf(6), "tier2");
   assert.equal(tierOf(12), "tier2");
-  assert.equal(tierOf(16), "tier2");
-  assert.equal(tierOf(17), "general");
+  assert.equal(tierOf(13), "general");
 
   // The compact claim in the same comment, pinned rather than asserted in prose: compact stays
-  // under budget far longer than JSON does, and the first width at which it truncates is n=22, not
-  // n=21. The earlier comment said 21 and was off by one -- a number nothing checked.
+  // under budget far longer than JSON does, and the first width at which it truncates is n=14, not
+  // n=13. (Re-measured in B8 after C1/I1's added fields: the boundary was 21/22 before them.)
   const compactAt = (n) => formatWorkflowResult("archive", worstCaseArchivePreview(
     Array.from({ length: n }, (_, index) => `repo-${String(index).padStart(2, "0")}`),
   ), "compact");
-  assert.doesNotMatch(compactAt(21), /\[output truncated at/, "n=21 must still fit");
-  assert.match(compactAt(22), /\[output truncated at 12000 characters\]$/);
+  assert.doesNotMatch(compactAt(13), /\[output truncated at/, "n=13 must still fit");
+  assert.match(compactAt(14), /\[output truncated at 12000 characters\]$/);
 
   // And at every tier that is not the general one, the two things this fallback exists to protect
   // survive: the path that would be removed, and the count that would be lost.
-  for (const n of [11, 12, 16]) {
+  for (const n of [5, 6, 12]) {
     const preview = worstCaseArchivePreview(Array.from({ length: n }, (_, index) => `repo-${String(index).padStart(2, "0")}`));
     const parsed = JSON.parse(formatWorkflowResult("archive", preview, "json"));
     assert.equal(parsed.repositories.length, n);
@@ -2770,7 +2799,7 @@ test("a loss label is a scannable classifier, not a paraphrase of the sentence b
 // gets further before degrading. The property that matters is the last assertion: the EXECUTED argv
 // -- the audit trail of directories that re-running cannot restore -- survives every tier that is
 // not the general fallback.
-function worstCaseArchiveReport(repositoryIds) {
+export function worstCaseArchiveReport(repositoryIds) {
   return archiveReport({
     removed: repositoryIds.map((repositoryId) => ({
       repositoryId,
@@ -2779,7 +2808,10 @@ function worstCaseArchiveReport(repositoryIds) {
       code: 0,
       argv: ["git", "worktree", "remove", ARCHIVE_WORKTREE(repositoryId)],
     })),
-    losses: repositoryIds.map((repositoryId) => ({ ...unmergedLoss(repositoryId, 900), removed: true })),
+    losses: repositoryIds.flatMap((repositoryId) => [
+      { ...unmergedLoss(repositoryId, 900), removed: true },
+      { ...ignoredLoss(repositoryId), removed: true },
+    ]),
   });
 }
 
@@ -2792,13 +2824,13 @@ test("an archive report degrades through the same tiers, and every executed argv
     return Object.hasOwn(parsed.losses[0], "branch") ? "tier1" : "tier2";
   };
 
-  assert.equal(tierOf(14), "none");
-  assert.equal(tierOf(15), "tier1");
-  assert.equal(tierOf(16), "tier2");
-  assert.equal(tierOf(17), "tier2");
-  assert.equal(tierOf(18), "general");
+  assert.equal(tierOf(7), "none");
+  assert.equal(tierOf(8), "tier1");
+  assert.equal(tierOf(9), "tier2");
+  assert.equal(tierOf(12), "tier2");
+  assert.equal(tierOf(13), "general");
 
-  for (const n of [14, 15, 16, 17]) {
+  for (const n of [7, 8, 9, 12]) {
     const report = worstCaseArchiveReport(idsFor(n));
     const parsed = JSON.parse(formatWorkflowResult("archive", report, "json"));
     assert.deepEqual(
