@@ -157,3 +157,110 @@ test("main sanitizes internal failures and returns nonzero", async () => {
   assert.deepEqual(output.stderr, ["INTERNAL: request failed with [REDACTED]"]);
   assert.doesNotMatch(output.stderr[0], /super-secret/);
 });
+
+test("parses task create, update, comment, and move commands", () => {
+  assert.deepEqual(parseArgs(["task", "create", "--project", "ocr", "--name", "Ticket", "--section", "Backlog", "--confirm"]), {
+    command: "task-create", project: "ocr", name: "Ticket", notes: undefined, notesFile: undefined,
+    section: "Backlog", assignee: undefined, dueOn: undefined, confirm: true, format: "compact",
+  });
+  assert.deepEqual(parseArgs(["task", "update", "101", "--assignee", "none", "--due", "none", "--completed", "false"]), {
+    command: "task-update", gid: "101", name: undefined, notes: undefined, notesFile: undefined,
+    assignee: "none", dueOn: "none", completed: false, confirm: false, format: "compact",
+  });
+  assert.deepEqual(parseArgs(["task", "comment", "101", "--text", "Ready"]), {
+    command: "task-comment", gid: "101", text: "Ready", confirm: false, format: "compact",
+  });
+  assert.deepEqual(parseArgs(["task", "move", "101", "--project", "ocr", "--section", "Done"]), {
+    command: "task-move", gid: "101", project: "ocr", section: "Done", confirm: false, format: "compact",
+  });
+});
+
+test("parses minimal project creation with ordered sections and optional alias", () => {
+  assert.deepEqual(parseArgs([
+    "project", "create", "--workspace", "123", "--name", "Board",
+    "--sections", "Backlog,Doing,Done", "--register-alias", "board",
+  ]), {
+    command: "project-create", workspace: "123", name: "Board",
+    sections: ["Backlog", "Doing", "Done"], registerAlias: "board",
+    confirm: false, format: "compact",
+  });
+});
+
+test("rejects invalid Asana write command shapes", () => {
+  assert.throws(() => parseArgs(["task", "create", "--name", "Ticket"]), /--project/);
+  assert.throws(() => parseArgs(["task", "create", "--project", "ocr"]), /--name/);
+  assert.throws(() => parseArgs(["task", "create", "--project", "ocr", "--name", "Ticket", "--notes", "x", "--notes-file", "/tmp/x"]), /mutually exclusive/);
+  assert.throws(() => parseArgs(["task", "create", "--project", "ocr", "--name", "Ticket", "--due", "tomorrow"]), /YYYY-MM-DD/);
+  assert.throws(() => parseArgs(["task", "create", "--project", "ocr", "--name", "Ticket", "--assignee", "none"]), /me or an Asana GID/);
+  assert.throws(() => parseArgs(["task", "update", "101"]), /at least one field/);
+  assert.throws(() => parseArgs(["task", "update", "101", "--completed", "yes"]), /true or false/);
+  assert.throws(() => parseArgs(["task", "comment", "101"]), /--text/);
+  assert.throws(() => parseArgs(["task", "move", "101", "--project", "ocr"]), /--section/);
+  assert.throws(() => parseArgs(["project", "create", "--workspace", "not-gid", "--name", "Board", "--sections", "One"]), /workspace.*GID/i);
+  assert.throws(() => parseArgs(["project", "create", "--workspace", "123", "--name", "Board", "--sections", ",,"]), /at least one section/);
+  assert.throws(() => parseArgs(["project", "create", "--workspace", "123", "--name", "Board", "--sections", "One", "--register-alias", "../bad"]), /valid alias/);
+});
+
+test("main keeps task creation dry-run and reads notes files through injection", async () => {
+  const output = io();
+  let writes = 0;
+  const client = {
+    sections: async () => [{ gid: "s1", name: "Backlog" }],
+    createTask: async () => { writes += 1; return { gid: "t1" }; },
+    addTaskToSection: async () => { writes += 1; },
+  };
+  const code = await main([
+    "task", "create", "--project", "123", "--name", "Ticket", "--notes-file", "/tmp/notes", "--section", "Backlog", "--format", "json",
+  ], {
+    ...output,
+    loadToken: async () => ({ token: "hidden" }), createClient: () => client,
+    loadConfig: async () => ({ version: 1, projects: {} }),
+    readFile: async (path) => { assert.equal(path, "/tmp/notes"); return "Multi-line\nnotes"; },
+  });
+  assert.equal(code, 0);
+  assert.equal(writes, 0);
+  const result = JSON.parse(output.stdout[0]);
+  assert.equal(result.dryRun, true);
+  assert.equal(result.action, "create task");
+  assert.equal(result.details.notes, "Multi-line\nnotes");
+});
+
+test("main confirms project creation and registers its alias only after creation", async () => {
+  const output = io();
+  const calls = [];
+  const client = {
+    createProject: async (fields) => { calls.push(["project", fields]); return { gid: "p1", name: fields.name }; },
+    createSection: async (gid, name) => { calls.push(["section", gid, name]); return { gid: `s-${name}`, name }; },
+  };
+  const code = await main([
+    "project", "create", "--workspace", "123", "--name", "Board", "--sections", "Backlog,Done",
+    "--register-alias", "board", "--confirm", "--format", "json",
+  ], {
+    ...output,
+    loadToken: async () => ({ token: "hidden" }), createClient: () => client,
+    loadConfig: async () => ({ version: 1, projects: {} }),
+    registerProjectAlias: async (path, alias, gid) => calls.push(["alias", path, alias, gid]),
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(calls.map((call) => call[0]), ["project", "section", "section", "alias"]);
+  const result = JSON.parse(output.stdout[0]);
+  assert.equal(result.applied, true);
+  assert.equal(result.alias, "board");
+});
+
+test("main rejects a duplicate alias before creating a project", async () => {
+  const output = io();
+  let writes = 0;
+  const code = await main([
+    "project", "create", "--workspace", "123", "--name", "Board", "--sections", "Backlog",
+    "--register-alias", "existing", "--confirm",
+  ], {
+    ...output,
+    loadToken: async () => ({ token: "hidden" }),
+    createClient: () => ({ createProject: async () => { writes += 1; } }),
+    loadConfig: async () => ({ version: 1, projects: { existing: { projectGid: "p0" } } }),
+  });
+  assert.equal(code, 8);
+  assert.equal(writes, 0);
+  assert.match(output.stderr[0], /already exists/);
+});
