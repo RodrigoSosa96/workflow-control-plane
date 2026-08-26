@@ -4,16 +4,26 @@ import { test } from "node:test";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
-test("Asana skill enforces complete read-only triage", async () => {
+test("Asana skill enforces complete triage and explicitly approved writes", async () => {
   const skill = await read(".agents/skills/asana-triage/SKILL.md");
-  assert.match(skill, /^---\nname: asana-triage\ndescription:/);
+  assert.match(skill, /^---\nname: asana-triage\ndescription: Use when/);
   assert.match(skill, /asana-workflow auth status/);
   assert.match(skill, /asana-workflow me/);
   assert.match(skill, /asana-workflow triage/);
   assert.match(skill, /asana-workflow task <gid> --full/);
   assert.match(skill, /every candidate/i);
   assert.match(skill, /Do not (modify|write)/i);
+  assert.match(skill, /explicit approval/i);
+  assert.match(skill, /without `--confirm`/);
+  assert.match(skill, /with `--confirm`/);
   assert.match(skill, /--assignee me\|any\|<gid>/);
+  assert.match(skill, /asana-workflow task create/);
+  assert.match(skill, /asana-workflow task update/);
+  assert.match(skill, /asana-workflow task comment/);
+  assert.match(skill, /asana-workflow task move/);
+  assert.match(skill, /asana-workflow project create/);
+  assert.match(skill, /--notes-file/);
+  assert.match(skill, /--register-alias/);
 });
 
 test("README documents local installation and secure token setup", async () => {
