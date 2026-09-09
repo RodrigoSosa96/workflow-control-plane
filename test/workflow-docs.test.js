@@ -146,3 +146,16 @@ test("workflow prompts require plan approval, manual confirmation, and status-ba
   assert.match(resumePrompt, /recovery/i);
   assert.doesNotMatch(resumePrompt, /workflow (start|runtime) .*--yes/i);
 });
+
+test("README and the code-reviewer role document the advisory post-verify critic contract", async () => {
+  const readme = await read("README.md");
+  assert.match(readme, /system-post-verify/);
+  assert.match(readme, /aside`\/`concern`\/`blocker|aside.*concern.*blocker/);
+  assert.match(readme, /never a gate|advisory/i);
+
+  const role = await read(".pi/agents/code-reviewer.md");
+  assert.match(role, /findings/);
+  assert.match(role, /aside/, "the closed severity vocabulary");
+  assert.match(role, /blocker.{0,80}advisory|advisory.{0,80}blocker/is, "a blocker gates nothing");
+  assert.match(role, /no code or file modifications/);
+});
