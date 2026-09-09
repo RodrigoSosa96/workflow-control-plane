@@ -14,7 +14,7 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
-import { fixedClock } from "./support/helpers.js";
+import { fixedClock, tempStateRoot } from "./support/helpers.js";
 
 // --- archiveCommand (roadmap item 2.5) ---------------------------------------
 //
@@ -33,18 +33,12 @@ async function gitExec(cwd, args) {
   return await execFileAsync("git", args, { cwd });
 }
 
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-archive-"));
-  t.after(() => realFs.rm(root, { recursive: true, force: true }));
-  return join(root, "state");
-}
-
 function archiveLoadRegistry(projects) {
   return async () => ({ projects });
 }
 
 async function newStore(t) {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-archive-");
   return createRunStore({ stateRoot, clock: fixedClock("2026-08-07T00:00:00.000Z") });
 }
 

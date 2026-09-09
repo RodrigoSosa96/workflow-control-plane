@@ -11,7 +11,7 @@ import { formatWorkflowResult } from "../src/workflow/format.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
 import { runVerifyCommand as realRunVerifyCommand } from "../src/workflow/verify-runner.js";
-import { fixedClock } from "./support/helpers.js";
+import { fixedClock, tempStateRoot } from "./support/helpers.js";
 
 const registry = {
   launcher: {
@@ -1322,12 +1322,6 @@ test("reconcile performs no mutation even when the lock is removable", async () 
 // (create -> update -> update) rather than written as raw run.json, so these tests exercise the
 // same legality run-state.js's ALLOWED map enforces in production.
 
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-runs-command-"));
-  t.after(() => realFs.rm(root, { recursive: true, force: true }));
-  return join(root, "state");
-}
-
 // One second per now() call, so ordering assertions get strictly increasing updatedAt values
 // without depending on wall-clock timing. Each state-machine hop (create, or one update) consumes
 // exactly one now() call.
@@ -1365,7 +1359,7 @@ async function createRunInState(store, targetState, overrides = {}) {
 }
 
 test("runsCommand lists runs across every project when none is given", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const ocrRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
   const acmeRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "acme", primaryTicket: "B-1" });
@@ -1379,7 +1373,7 @@ test("runsCommand lists runs across every project when none is given", async (t)
 });
 
 test("runsCommand narrows to --project", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const ocrRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "acme", primaryTicket: "B-1" });
@@ -1390,7 +1384,7 @@ test("runsCommand narrows to --project", async (t) => {
 });
 
 test("runsCommand defaults to the live set, excluding completed/failed/interrupted and including the rest", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   for (const state of Object.values(RUN_STATES)) {
     await createRunInState(store, state, { projectAlias: "ocr", primaryTicket: state });
@@ -1405,7 +1399,7 @@ test("runsCommand defaults to the live set, excluding completed/failed/interrupt
 });
 
 test("runsCommand --all includes every state, live or not", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   for (const state of Object.values(RUN_STATES)) {
     await createRunInState(store, state, { projectAlias: "ocr", primaryTicket: state });
@@ -1417,7 +1411,7 @@ test("runsCommand --all includes every state, live or not", async (t) => {
 });
 
 test("runsCommand --state completed returns exactly the completed runs, bypassing the live-set default", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const completedRun = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2" });
@@ -1432,7 +1426,7 @@ test("runsCommand --state completed returns exactly the completed runs, bypassin
 // hide a run that still has residue on disk). It is driven here through the real store's own
 // update(), never written as raw run.json, exactly like every other runsCommand test above.
 test("runsCommand --all hides archived runs and reports how many it hid", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const archived = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
   await store.update(archived.id, () => ({ archivedAt: "2026-08-07T12:00:00.000Z" }));
@@ -1451,7 +1445,7 @@ test("runsCommand --all hides archived runs and reports how many it hid", async 
 });
 
 test("runsCommand --state still shows archived runs, because an explicit state is an explicit ask", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const archived = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
   await store.update(archived.id, () => ({ archivedAt: "2026-08-07T12:00:00.000Z" }));
@@ -1464,7 +1458,7 @@ test("runsCommand --state still shows archived runs, because an explicit state i
 });
 
 test("only a real archivedAt string hides a run; a truthy non-string never does", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const bogus = await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1" });
   await store.update(bogus.id, () => ({ archivedAt: true }));
@@ -1478,7 +1472,7 @@ test("only a real archivedAt string hides a run; a truthy non-string never does"
 });
 
 test("runsCommand refuses an unknown --state", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
 
   await assert.rejects(
     () => runsCommand({ state: "bogus" }, { stateRoot }),
@@ -1499,7 +1493,7 @@ test("runsCommand refuses an unknown --state", async (t) => {
 });
 
 test("runsCommand orders by updatedAt descending with a deterministic id tiebreak", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: incrementingClock() });
   const older = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
   const newer = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2" });
@@ -1511,7 +1505,7 @@ test("runsCommand orders by updatedAt descending with a deterministic id tiebrea
 });
 
 test("runsCommand breaks an updatedAt tie deterministically by id", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const first = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
   const second = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2" });
@@ -1524,7 +1518,7 @@ test("runsCommand breaks an updatedAt tie deterministically by id", async (t) =>
 });
 
 test("runsCommand surfaces a skipped record as data while the readable runs still list", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const readable = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1" });
 
@@ -1551,7 +1545,7 @@ test("runsCommand surfaces a skipped record as data while the readable runs stil
 // call order, which the "called exactly once" test below depends on).
 
 test("inboxCommand correlates through transportIdentity.paneId, not the stale top-level paneId, for a resumed run (load-bearing case)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, {
     projectAlias: "ocr",
@@ -1580,7 +1574,7 @@ test("inboxCommand correlates through transportIdentity.paneId, not the stale to
 });
 
 test("inboxCommand reports a run whose live agent is blocked", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, {
     projectAlias: "ocr",
@@ -1605,7 +1599,7 @@ test("inboxCommand reports a run whose live agent is blocked", async (t) => {
 });
 
 test("inboxCommand omits runs whose live agent is working or idle", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2", paneId: "w1:p2" });
@@ -1623,7 +1617,7 @@ test("inboxCommand omits runs whose live agent is working or idle", async (t) =>
 });
 
 test("inboxCommand never reports a blocked agent that has no run behind it", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const herdr = createHerdr({
@@ -1642,7 +1636,7 @@ test("inboxCommand never reports a blocked agent that has no run behind it", asy
 });
 
 test("inboxCommand reports a non-terminal run with no pane id as unresolved, with a reason", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.PLANNED, { projectAlias: "ocr", primaryTicket: "A-1" });
   const herdr = createHerdr({ agents: [] });
@@ -1658,7 +1652,7 @@ test("inboxCommand reports a non-terminal run with no pane id as unresolved, wit
 });
 
 test("inboxCommand reports a run whose pane id matches no live Herdr agent as unresolved, with a reason", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:gone" });
   const herdr = createHerdr({ agents: [] });
@@ -1681,7 +1675,7 @@ test("inboxCommand reports a run whose pane id matches no live Herdr agent as un
 // paragraph.
 
 test("inboxCommand puts a manual-handoff-required run with no live agent in waiting, not unresolved, naming the state and workflow result", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.MANUAL_HANDOFF_REQUIRED, {
     projectAlias: "ocr",
@@ -1704,7 +1698,7 @@ test("inboxCommand puts a manual-handoff-required run with no live agent in wait
 });
 
 test("inboxCommand puts a needs-input run with no pane id recorded in waiting, not unresolved", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.NEEDS_INPUT, { projectAlias: "ocr", primaryTicket: "A-1" });
   const herdr = createHerdr({ agents: [] });
@@ -1720,7 +1714,7 @@ test("inboxCommand puts a needs-input run with no pane id recorded in waiting, n
 });
 
 test("inboxCommand keeps an active run (idle-awaiting-handoff) with no live agent in unresolved -- that one really is a diagnostic", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.IDLE_AWAITING_HANDOFF, {
     projectAlias: "ocr",
@@ -1748,7 +1742,7 @@ test("inboxCommand keeps an active run (idle-awaiting-handoff) with no live agen
 // entry in any list. This is the fresh, typical case, not a corner case.
 
 test("inboxCommand still reports a manual-handoff-required run as waiting when its agent resolves alive and idle (C1)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.MANUAL_HANDOFF_REQUIRED, {
     projectAlias: "ocr",
@@ -1768,7 +1762,7 @@ test("inboxCommand still reports a manual-handoff-required run as waiting when i
 });
 
 test("inboxCommand still reports a needs-input run as waiting when its agent resolves alive with status done (C1)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.NEEDS_INPUT, {
     projectAlias: "ocr",
@@ -1792,7 +1786,7 @@ test("inboxCommand still reports a needs-input run as waiting when its agent res
 // its pane being gone is the expected shape, not an infrastructure complaint.
 
 test("inboxCommand puts a self-reported blocked run with no live agent in waiting, not unresolved (I3)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.BLOCKED, {
     projectAlias: "ocr",
@@ -1815,7 +1809,7 @@ test("inboxCommand puts a self-reported blocked run with no live agent in waitin
 // cannot be confirmed, because unlike manual-handoff-required/needs-input/blocked it is not a
 // worker self-reporting "I need a human" -- see AWAITS_OPERATOR_STATES's comment in commands.js.
 test("inboxCommand keeps a result-stale run with no live agent in unresolved, not waiting (documented decision)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RESULT_STALE, {
     projectAlias: "ocr",
@@ -1842,7 +1836,7 @@ test("inboxCommand keeps a result-stale run with no live agent in unresolved, no
 // of "blocked") all silently dropped the run with no entry in any list.
 
 test("inboxCommand reports a running run as unresolved, not silently dropped, when its agent status is unknown (C2)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "unknown", cwd: "/wt" }] });
@@ -1857,7 +1851,7 @@ test("inboxCommand reports a running run as unresolved, not silently dropped, wh
 });
 
 test("inboxCommand reports a running run as unresolved, not silently dropped, when its agent has no agent_status field at all (C2)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", cwd: "/wt" }] });
@@ -1871,7 +1865,7 @@ test("inboxCommand reports a running run as unresolved, not silently dropped, wh
 });
 
 test("inboxCommand reports a running run as unresolved, not silently dropped, when its agent status is outside Herdr's documented vocabulary (C2)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "awaiting-permission", cwd: "/wt" }] });
@@ -1886,7 +1880,7 @@ test("inboxCommand reports a running run as unresolved, not silently dropped, wh
 });
 
 test("inboxCommand still reports a run whose agent status is done as neither blocked nor waiting nor unresolved", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const herdr = createHerdr({ agents: [{ agent: "pi", pane_id: "w1:p1", agent_status: "done", cwd: "/wt" }] });
@@ -1899,7 +1893,7 @@ test("inboxCommand still reports a run whose agent status is done as neither blo
 });
 
 test("inboxCommand classifies a manual-handoff-required run as waiting even when Herdr itself is unreachable", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const manual = await createRunInState(store, RUN_STATES.MANUAL_HANDOFF_REQUIRED, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const running = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-2", paneId: "w1:p2" });
@@ -1914,7 +1908,7 @@ test("inboxCommand classifies a manual-handoff-required run as waiting even when
 });
 
 test("inboxCommand puts every non-terminal run in unresolved with herdrAvailable false when Herdr is unreachable, and still exits 0", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const withPane = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   const withoutPane = await createRunInState(store, RUN_STATES.PLANNED, { projectAlias: "ocr", primaryTicket: "A-2" });
@@ -1932,7 +1926,7 @@ test("inboxCommand puts every non-terminal run in unresolved with herdrAvailable
 });
 
 test("inboxCommand treats a missing herdr adapter as unavailable rather than throwing", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
 
@@ -1944,7 +1938,7 @@ test("inboxCommand treats a missing herdr adapter as unavailable rather than thr
 });
 
 test("inboxCommand never reports a terminal run, blocked or not", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   await createRunInState(store, RUN_STATES.COMPLETED, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   await createRunInState(store, RUN_STATES.FAILED, { projectAlias: "ocr", primaryTicket: "A-2", paneId: "w1:p2" });
@@ -1965,7 +1959,7 @@ test("inboxCommand never reports a terminal run, blocked or not", async (t) => {
 });
 
 test("inboxCommand narrows to --project", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const ocrRun = await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "acme", primaryTicket: "B-1", paneId: "w1:p2" });
@@ -1982,7 +1976,7 @@ test("inboxCommand narrows to --project", async (t) => {
 });
 
 test("inboxCommand calls herdr.listAgents exactly once regardless of run count", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   for (let index = 0; index < 5; index += 1) {
     await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: `A-${index}`, paneId: `w1:p${index}` });
@@ -1995,7 +1989,7 @@ test("inboxCommand calls herdr.listAgents exactly once regardless of run count",
 });
 
 test("inboxCommand surfaces a skipped record as data the same way runsCommand does", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   await createRunInState(store, RUN_STATES.RUNNING, { projectAlias: "ocr", primaryTicket: "A-1", paneId: "w1:p1" });
 
@@ -2067,7 +2061,7 @@ function scriptedVerifyRunner(script = {}) {
 }
 
 test("verifyCommand runs every verify command once per repository, with that repository's path as cwd, and attributes a second-repository failure to it", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await store.create({
     projectAlias: "acme",
@@ -2114,7 +2108,7 @@ test("verifyCommand runs every verify command once per repository, with that rep
 });
 
 test("verifyCommand records a passed status for a clean command and a failed status with its exit code otherwise", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
 
   const cleanRun = await store.create({
@@ -2148,7 +2142,7 @@ test("verifyCommand records a passed status for a clean command and a failed sta
 });
 
 test("a missing repository path is recorded as an error for that repository, and the remaining repositories still run", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await store.create({
     projectAlias: "acme",
@@ -2176,7 +2170,7 @@ test("a missing repository path is recorded as an error for that repository, and
 });
 
 test("a timed-out command does not abort the remaining matrix", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await store.create({
     projectAlias: "acme",
@@ -2199,7 +2193,7 @@ test("a timed-out command does not abort the remaining matrix", async (t) => {
 });
 
 test("verifyCommand refuses a run with no repositories[] recorded, and appends nothing", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = withAppendSpy(createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") }));
   const run = await store.create({ projectAlias: "ocr", primaryTicket: "A-1" });
   const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
@@ -2218,7 +2212,7 @@ test("verifyCommand refuses a run with no repositories[] recorded, and appends n
 });
 
 test("verifyCommand refuses a run whose project is absent from the registry, and appends nothing", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = withAppendSpy(createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") }));
   const run = await store.create({
     projectAlias: "ghost",
@@ -2239,7 +2233,7 @@ test("verifyCommand refuses a run whose project is absent from the registry, and
 });
 
 test("verifyCommand refuses a project with no verify commands configured, and appends nothing", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = withAppendSpy(createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") }));
   const run = await store.create({
     projectAlias: "ocr",
@@ -2265,7 +2259,7 @@ test("verifyCommand refuses a project with no verify commands configured, and ap
 });
 
 test("the evidence lands in the run's event log, in a form workflow result can read back", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
   const run = await store.create({
     projectAlias: "ocr",
@@ -2297,7 +2291,7 @@ test("the evidence lands in the run's event log, in a form workflow result can r
 // directory created out-of-band (not a mocked store), with `retryNow`/`sleep` injected so the
 // bounded retry exhausts its budget in simulated time instead of real wall-clock seconds.
 test("a held run lock does not discard the matrix that already ran; the results come back with an evidenceError instead of being thrown away", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   let elapsedMs = 0;
   const store = createRunStore({
     stateRoot,
@@ -2347,7 +2341,7 @@ test("a held run lock does not discard the matrix that already ran; the results 
 // (`path: repository.path ?? null`) both round-trip a missing path through to a bare `null` on the
 // run record without complaint.
 test("a repository entry with no usable path is a recorded error, not a silent pass in the CLI's own cwd, across every shape a run record can carry", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
 
   const shapes = {
@@ -2397,7 +2391,7 @@ test("a repository entry with no usable path is a recorded error, not a silent p
 // this checkout and reporting `passed`) -- reproduced here through the real runner end to end, the
 // same way C1's own test above does for a missing path.
 test("a repository entry with a relative path is a recorded error, not a silent pass in the CLI's own cwd", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
   const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
 
   const dir = await mkdtemp(join(tmpdir(), "verify-r2-"));

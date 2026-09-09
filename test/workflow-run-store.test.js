@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { MUTEX_RETRY_BUDGET_MS } from "../src/workflow/bounded-retry.js";
 import { RUN_STATES, transitionRun } from "../src/workflow/run-state.js";
 import { createRunStore, SUPPORTED_RUN_VERSION } from "../src/workflow/run-store.js";
-import { clockSequence, uuidSequence } from "./support/helpers.js";
+import { clockSequence, tempStateRoot, uuidSequence } from "./support/helpers.js";
 
 const RUN_ID_1 = "11111111-1111-4111-8111-111111111111";
 const RUN_ID_2 = "22222222-2222-4222-8222-222222222222";
@@ -15,12 +15,6 @@ const RUN_ID_3 = "33333333-3333-4333-8333-333333333333";
 const EVENT_ID_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const EVENT_ID_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const LOCK_OWNER_TOKEN_RE = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
-
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-run-store-"));
-  t.after(() => realFs.rm(root, { recursive: true, force: true }));
-  return join(root, "state");
-}
 
 async function fileMode(path) {
   return (await stat(path)).mode & 0o777;
@@ -99,7 +93,7 @@ async function writeRawRun(stateRoot, runId, record) {
 }
 
 test("creates private run directories and files", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -115,7 +109,7 @@ test("creates private run directories and files", async (t) => {
 });
 
 test("tightens preexisting state and run directory modes", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const runDirectory = join(stateRoot, RUN_ID_1);
   await mkdir(runDirectory, { recursive: true, mode: 0o755 });
   await chmod(stateRoot, 0o755);
@@ -133,7 +127,7 @@ test("tightens preexisting state and run directory modes", async (t) => {
 });
 
 test("rejects invalid and path-traversing run IDs", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
 
   await assert.rejects(
@@ -147,7 +141,7 @@ test("rejects invalid and path-traversing run IDs", async (t) => {
 });
 
 test("rejects duplicate create without overwriting the original", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -164,7 +158,7 @@ test("rejects duplicate create without overwriting the original", async (t) => {
 });
 
 test("rejects malformed run JSON without leaking the raw payload", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
   const runDirectory = join(stateRoot, RUN_ID_1);
   await mkdir(runDirectory, { recursive: true, mode: 0o700 });
@@ -186,7 +180,7 @@ test("rejects malformed run JSON without leaking the raw payload", async (t) => 
 });
 
 test("read accepts a run record at the supported version", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
   await writeRawRun(stateRoot, RUN_ID_1, rawRunRecord());
 
@@ -196,7 +190,7 @@ test("read accepts a run record at the supported version", async (t) => {
 });
 
 test("read refuses a run record from a newer version, naming both the version found and the version supported", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
   await writeRawRun(stateRoot, RUN_ID_1, rawRunRecord({ version: 2 }));
 
@@ -212,7 +206,7 @@ test("read refuses a run record from a newer version, naming both the version fo
 });
 
 test("read refuses a run record with an absent, non-integer, or zero version", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
 
   const absent = rawRunRecord();
@@ -231,7 +225,7 @@ test("read refuses a run record with an absent, non-integer, or zero version", a
 });
 
 test("read refuses an outsized version without echoing it unbounded", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
   const secret = `SECRET-${"X".repeat(4000)}`;
   await writeRawRun(stateRoot, RUN_ID_1, rawRunRecord({ version: secret }));
@@ -248,7 +242,7 @@ test("read refuses an outsized version without echoing it unbounded", async (t) 
 });
 
 test("read reports a non-object run record as invalid, not as a version mismatch", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
 
   const cases = [
@@ -271,7 +265,7 @@ test("read reports a non-object run record as invalid, not as a version mismatch
 });
 
 test("update refuses a run record whose version this control plane does not support, same as read", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot });
 
   const absent = rawRunRecord();
@@ -295,7 +289,7 @@ test("update refuses a run record whose version this control plane does not supp
 });
 
 test("list skips a future-version run record, reports it through onListProblem, and returns the supported ones", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const problems = [];
   const store = createRunStore({
     stateRoot,
@@ -319,7 +313,7 @@ test("list skips a future-version run record, reports it through onListProblem, 
 });
 
 test("the run version cannot be forged: create() ignores a caller-supplied version, and update() cannot move it off 1", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -404,7 +398,7 @@ test("transitionRun permits needs-input and failed runs to become result-stale",
 });
 
 test("update preserves the original when the updater throws or requests an illegal transition", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -422,7 +416,7 @@ test("update preserves the original when the updater throws or requests an illeg
 });
 
 test("persists run updates through a sibling temp file that is fsynced before rename", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const operations = [];
   const store = createRunStore({
     stateRoot,
@@ -452,7 +446,7 @@ test("persists run updates through a sibling temp file that is fsynced before re
 });
 
 test("creates a permanent private lock container and scoped active owner marker", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -491,7 +485,7 @@ test("creates a permanent private lock container and scoped active owner marker"
 });
 
 test("acquired lock marker is version 2 and carries pid, startedAt, and runId at mode 0600", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -520,7 +514,7 @@ test("acquired lock marker is version 2 and carries pid, startedAt, and runId at
 });
 
 test("a readOwnOwnership that throws still permits acquisition and yields a marker without pid or startedAt", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -547,7 +541,7 @@ test("a readOwnOwnership that throws still permits acquisition and yields a mark
 });
 
 test("reports bounded active lock contention with injected clock without deleting it", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   // A stale lock (crash residue) must fail fast into `workflow unlock` recovery rather than
   // waiting out acquireLockWithRetry's bounded retry budget -- that discrimination lives in
   // shouldRetry: (error) => error?.details?.stale === false. Inject a fake wall clock (sleep
@@ -600,7 +594,7 @@ test("reports bounded active lock contention with injected clock without deletin
 });
 
 test("treats a legacy fixed-file lock as a manual-recovery conflict", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -630,7 +624,7 @@ test("treats a legacy fixed-file lock as a manual-recovery conflict", async (t) 
 });
 
 test("read and list tighten preexisting private modes without recreating runs", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -662,7 +656,7 @@ test("read and list tighten preexisting private modes without recreating runs", 
 });
 
 test("update tightens preexisting private modes and a reused temporary run file", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -685,7 +679,7 @@ test("update tightens preexisting private modes and a reused temporary run file"
 });
 
 test("appendEvent tightens a permissive preexisting events file", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: uuidSequence(RUN_ID_1, EVENT_ID_1),
@@ -702,7 +696,7 @@ test("appendEvent tightens a permissive preexisting events file", async (t) => {
 });
 
 test("writeAssignment tightens a preexisting assignment before a failed atomic overwrite", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -739,7 +733,7 @@ test("writeAssignment tightens a preexisting assignment before a failed atomic o
 });
 
 test("release does not unlink a replacement active directory with a different owner marker", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -776,7 +770,7 @@ test("release does not unlink a replacement active directory with a different ow
 });
 
 test("appendEvent appends private JSONL entries with store-assigned unique IDs", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: uuidSequence(RUN_ID_1, EVENT_ID_1, EVENT_ID_2),
@@ -806,7 +800,7 @@ test("appendEvent appends private JSONL entries with store-assigned unique IDs",
 });
 
 test("writes a nested private artifact and updates the run under one run lock", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -834,7 +828,7 @@ test("writes a nested private artifact and updates the run under one run lock", 
 });
 
 test("exclusive private artifact writes reject a duplicate worker launch record", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   const run = await store.create(plannedInput());
   const relativePath = `worker-launches/${RUN_ID_2}.json`;
@@ -866,7 +860,7 @@ test("exclusive private artifact writes reject a duplicate worker launch record"
 });
 
 test("update skips the write when the updater returns an empty patch (a no-op must not bump updatedAt)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   // Distinct create vs. later-write timestamps: any real write on the no-op path would move
   // updatedAt off the create timestamp, so a bumped updatedAt is exactly what this test catches.
   const store = createRunStore({
@@ -884,7 +878,7 @@ test("update skips the write when the updater returns an empty patch (a no-op mu
 });
 
 test("rejects unsafe private artifact paths without writing outside the run", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   const run = await store.create(plannedInput());
 
@@ -916,7 +910,7 @@ test("rejects unsafe private artifact paths without writing outside the run", as
 });
 
 test("lists runs with filters and writes private assignments", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: uuidSequence(RUN_ID_1, RUN_ID_2, RUN_ID_3),
@@ -943,7 +937,7 @@ test("lists runs with filters and writes private assignments", async (t) => {
 });
 
 test("list skips unreadable run directories and reports them instead of failing wholesale", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const problems = [];
   const store = createRunStore({
     stateRoot,
@@ -968,7 +962,7 @@ test("list skips unreadable run directories and reports them instead of failing 
 });
 
 test("update retries a fresh lock collision briefly and succeeds once it clears", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const sleeps = [];
   const store = createRunStore({
     stateRoot,
@@ -999,7 +993,7 @@ test("update stays fail-fast when the lock collision persists past the bounded r
   // jittered backoff, never waiting in real time) and asserts the budget-based property instead:
   // retries continue until MUTEX_RETRY_BUDGET_MS of simulated time has elapsed, then the
   // contention error still surfaces.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const sleeps = [];
   let elapsedMs = 0;
   const store = createRunStore({
@@ -1034,7 +1028,7 @@ test("update stays fail-fast when the lock collision persists past the bounded r
 });
 
 test("inspectLock returns null with no lock, and returns the marker with a stale flag without mutating anything", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -1083,7 +1077,7 @@ test("inspectLock returns null with no lock, and returns the marker with a stale
 });
 
 test("removeLock removes only when allow returns true, refuses without throwing when the marker changes first, and unblocks the run", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({
     stateRoot,
     randomUUID: () => RUN_ID_1,
@@ -1153,7 +1147,7 @@ test("removeLock removes only when allow returns true, refuses without throwing 
 });
 
 test("removeLock refuses without throwing when there is no active lock to remove", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   await store.create(plannedInput());
 
@@ -1168,7 +1162,7 @@ test("removeLock's refusal is the public {removed:false, reason} shape, not mute
   // `{removed: false, reason}` shape. mutex-removal.js's own tests only ever assert the internal
   // sentinel (that is its contract); nothing previously asserted that removeLock actually
   // performs the translation, so a caller that forgot it would go uncaught.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   await store.create(plannedInput());
 
@@ -1178,7 +1172,7 @@ test("removeLock's refusal is the public {removed:false, reason} shape, not mute
 });
 
 test("removeLock rejects a non-function allow before touching the filesystem", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   await store.create(plannedInput());
 
@@ -1191,7 +1185,7 @@ test("inspectLock reports stale: false for a freshly created lock", async (t) =>
   // so ageMs comes out small and deterministic without needing utimes(). This exists because
   // every other inspectLock test here pins a stale (5+ minute) lock, so a hardcoded `stale:
   // true` in the implementation would otherwise pass the whole suite undetected.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   const run = await store.create(plannedInput());
   const activePath = join(run.directory, "run.lock", "active");
@@ -1208,7 +1202,7 @@ test("inspectLock reports stale: false for a freshly created lock", async (t) =>
 });
 
 test("inspectLock ignores a stray non-owner file and still finds the real marker", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   const run = await store.create(plannedInput());
   const activePath = join(run.directory, "run.lock", "active");
@@ -1227,7 +1221,7 @@ test("inspectLock ignores a stray non-owner file and still finds the real marker
 });
 
 test("inspectLock and removeLock treat more than one owner marker as unreadable instead of guessing", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   const run = await store.create(plannedInput());
   const activePath = join(run.directory, "run.lock", "active");
@@ -1281,7 +1275,7 @@ test("removeLock's pre-unlink recheck refuses a same-content replacement lock vi
   // fail: the fabricated identity below leaves the marker's path and byte content completely
   // untouched, so only a dev/ino (directory identity) comparison can distinguish "the same
   // lock we inspected" from "a replacement that happens to look identical".
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const run = await createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 }).create(plannedInput());
   const activePath = join(run.directory, "run.lock", "active");
   const markerPath = join(activePath, "owner-crashed-token.json");
@@ -1318,7 +1312,7 @@ test("removeLock's pre-rmdir recheck refuses a same-content replacement lock via
   // unlinked and immediately before rmdir. If that check were deleted, this test would fail:
   // the fabricated identity below leaves everything else (path, marker bytes) untouched, so
   // only a fresh dev/ino comparison right before rmdir can catch it.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const run = await createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 }).create(plannedInput());
   const activePath = join(run.directory, "run.lock", "active");
   const markerPath = join(activePath, "owner-crashed-token.json");
@@ -1351,7 +1345,7 @@ test("removeLock refuses without throwing when the marker disappears at the fina
   // from ever reaching rmdir on a directory it never re-inspected. Simulated by making the
   // marker disappear (via another actor, in effect) right as removeLock's own unlink call
   // fires — a window the earlier recheck cannot observe because it already ran.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const injection = { markerPath: null, fired: false };
   const fs = {
     ...realFs,
@@ -1391,7 +1385,7 @@ test("removeLock refuses to unlink the marker when a stray entry would make rmdi
   // removeLock/inspectLock would see "no active lock or the owner marker is unreadable" and the
   // pid/startedAt evidence this whole mechanism exists to preserve would be gone for good. This
   // test proves removeLock checks first and refuses before deleting anything.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-run-store-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID_1 });
   const run = await store.create(plannedInput());
   const activePath = join(run.directory, "run.lock", "active");

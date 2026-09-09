@@ -13,6 +13,7 @@ import { createDelegationStore } from "../src/workflow/delegation-store.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 import { createFakeWorkerTransport } from "../src/workflow/worker-transport.js";
+import { tempStateRoot } from "./support/helpers.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -49,12 +50,6 @@ const reviewInput = Object.freeze({
   budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
   remediationTurns: 2,
 });
-
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-delegation-services-"));
-  t.after(() => realFs.rm(root, { recursive: true, force: true }));
-  return join(root, "state");
-}
 
 // Yields the given ids first, then deterministic distinct ids instead of
 // repeating the last value.
@@ -137,7 +132,7 @@ function createTransport({ startImpl, deliverFollowUpImpl, observations = [] } =
 }
 
 async function createFixture(t, { transport, repositories = [{ id: "repository", path: CWD, branch: "main" }] } = {}) {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-services-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
   const run = await store.create({
     projectAlias: PROJECT_ALIAS,

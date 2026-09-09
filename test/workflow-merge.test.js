@@ -12,7 +12,7 @@ import { WorkflowError } from "../src/workflow/errors.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
-import { fixedClock } from "./support/helpers.js";
+import { fixedClock, tempStateRoot } from "./support/helpers.js";
 
 // --- mergeCommand (roadmap item 2.4) ----------------------------------------
 //
@@ -30,12 +30,6 @@ const execFileAsync = promisify(execFile);
 
 async function gitExec(cwd, args) {
   return await execFileAsync("git", args, { cwd });
-}
-
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-merge-"));
-  t.after(() => realFs.rm(root, { recursive: true, force: true }));
-  return join(root, "state");
 }
 
 function mergeLoadRegistry(projects) {
@@ -210,7 +204,7 @@ function withAppendSpy(store) {
 }
 
 async function newStore(t) {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-merge-");
   return createRunStore({ stateRoot, clock: fixedClock("2026-08-06T00:00:00.000Z") });
 }
 
@@ -1103,7 +1097,7 @@ test("the merge lands in the run's event log in the shape workflow result can re
 });
 
 test("a held run lock does not discard a merge that really happened; the report comes back with an evidenceError", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-merge-");
   let elapsedMs = 0;
   const store = createRunStore({
     stateRoot,

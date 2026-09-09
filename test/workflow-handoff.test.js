@@ -17,18 +17,13 @@ import {
   submitHandoff,
   validateHandoffInput,
 } from "../src/workflow/handoff.js";
+import { tempStateRoot } from "./support/helpers.js";
 
 const execFileAsync = promisify(execFile);
 const RUN_ID = "44444444-4444-4444-8444-444444444444";
 
 async function gitExec(cwd, args) {
   return await execFileAsync("git", args, { cwd });
-}
-
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-handoff-state-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  return join(root, "state");
 }
 
 async function createDisposableRepo(t) {
@@ -49,7 +44,7 @@ async function createDisposableRepo(t) {
 }
 
 async function createRunningRun(t, { repositories, tickets = ["A-1"], generation = 1 } = {}) {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-handoff-state-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
   const created = await store.create({
     projectAlias: "ocr",
@@ -300,7 +295,7 @@ test("submitHandoff rejects stale generations before creating result artifacts",
 
 test("submitHandoff refuses non-running runs without creating result artifacts", async (t) => {
   const { repoPath } = await createDisposableRepo(t);
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-handoff-state-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
   const run = await store.create({
     projectAlias: "ocr",

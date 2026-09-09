@@ -10,7 +10,7 @@ import { createDelegationReservationStore } from "../src/workflow/delegation-res
 import { classifyOwnership, createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
 import { createProcessRunner } from "../src/workflow/process.js";
-import { clockSequence, uuidSequence } from "./support/helpers.js";
+import { clockSequence, tempStateRoot, uuidSequence } from "./support/helpers.js";
 
 const FIRST_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_ID = "22222222-2222-4222-8222-222222222222";
@@ -27,12 +27,6 @@ const policy = {
   remediationTurns: 2,
   allowBackgroundWriters: false,
 };
-
-async function tempStateRoot(t) {
-  const root = await mkdtemp(join(tmpdir(), "workflow-delegation-reservations-"));
-  t.after(() => realFs.rm(root, { recursive: true, force: true }));
-  return join(root, "state");
-}
 
 // Unlike uuidSequence, never repeats: every gate acquisition and every reserve() call consumes
 // at least one UUID (reservationId, gate ownerToken, lease ownerToken), so a test that calls
@@ -138,7 +132,7 @@ function fsWithFabricatedIdentityOnNthStat(targetPath, targetCallNumber) {
 }
 
 test("reserves read-only background capacity with opaque private state", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   const reservation = await reservations.reserve({
@@ -165,7 +159,7 @@ test("reserves read-only background capacity with opaque private state", async (
 });
 
 test("enforces background, foreground, and checkout writer limits", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   await reservations.reserve({
@@ -188,7 +182,7 @@ test("enforces background, foreground, and checkout writer limits", async (t) =>
     /readOnlyBackground|capacity/i,
   );
 
-  const foregroundState = await tempStateRoot(t);
+  const foregroundState = await tempStateRoot(t, "workflow-delegation-reservations-");
   const foreground = createStore(foregroundState);
   await foreground.reserve({
     projectAlias: "fixture-single",
@@ -210,7 +204,7 @@ test("enforces background, foreground, and checkout writer limits", async (t) =>
     /foreground|capacity/i,
   );
 
-  const writerState = await tempStateRoot(t);
+  const writerState = await tempStateRoot(t, "workflow-delegation-reservations-");
   const writers = createStore(writerState);
   const writer = await writers.reserve({
     projectAlias: "fixture-single",
@@ -235,7 +229,7 @@ test("enforces background, foreground, and checkout writer limits", async (t) =>
 });
 
 test("serializes concurrent writers and retains released reservation history", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const first = createStore(stateRoot, [FIRST_ID, THIRD_ID, THIRD_ID]);
   const second = createStore(stateRoot, [SECOND_ID, THIRD_ID, THIRD_ID]);
 
@@ -281,7 +275,7 @@ test("serializes concurrent writers and retains released reservation history", a
 });
 
 test("does not remove an active foreign reservation gate", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   // The gate never clears here (genuine crash residue), so acquireGate's bounded retry runs out
   // its full budget before reporting -- drive a simulated clock instead of spending ~2s of real
   // idle wall-clock time waiting it out.
@@ -319,7 +313,7 @@ test("does not remove an active foreign reservation gate", async (t) => {
 // used before this fix (never waits in real time): the gate stays held past the old tolerance,
 // then clears, and reserve() must still succeed within the new budget.
 test("reserve() absorbs a live gate holder that clears only after longer than the old ~200ms retry tolerance", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
   const sleeps = [];
   let elapsedMs = 0;
@@ -365,7 +359,7 @@ test("releaseForDelegation frees a lease without its owner token and restores wr
   // The owner token reserve() mints is never persisted outside the lease file, so
   // release({reservation}) can have no real caller: releasing by delegation
   // identity is what actually lets capacity be reclaimed.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot, [FIRST_ID, SECOND_ID, THIRD_ID, "44444444-4444-4444-8444-444444444444"]);
   const writer = {
     projectAlias: "fixture-single",
@@ -397,7 +391,7 @@ test("releaseForDelegation frees a lease without its owner token and restores wr
 });
 
 test("releaseForDelegation is a no-op for unknown delegations and untouched projects", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   assert.deepEqual(await reservations.releaseForDelegation({ projectAlias: "never-used", delegationId: FIRST_ID }), []);
@@ -420,7 +414,7 @@ test("releaseForDelegation is a no-op for unknown delegations and untouched proj
 });
 
 test("gate marker written during a reserve is version 2 and carries pid and startedAt", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
   const { fs, captured } = fsCapturingRead(markerPath);
   const reservations = createDelegationReservationStore({
@@ -451,7 +445,7 @@ test("gate marker written during a reserve is version 2 and carries pid and star
 });
 
 test("a readOwnOwnership that throws still permits a reserve and writes a gate marker without pid or startedAt", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
   const { fs, captured } = fsCapturingRead(markerPath);
   const reservations = createDelegationReservationStore({
@@ -487,7 +481,7 @@ test("releaseGate accepts a version-1 marker for backward compatibility while st
   // was widened rather than merely happening to still pass because nothing exercises it. Only
   // the byte content read back by releaseGate is swapped to a version-1 shape with the same
   // ownerToken; everything else about the acquisition (paths, identity) is real.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
   let downgraded = false;
   const fs = {
@@ -535,7 +529,7 @@ test("releaseGate accepts a version-1 marker for backward compatibility while st
 });
 
 test("inspectGate returns null for an untouched project and the marker for a held gate, mutating nothing", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   assert.equal(await reservations.inspectGate({ projectAlias: "never-used" }), null);
@@ -561,7 +555,7 @@ test("inspectGate returns null for an untouched project and the marker for a hel
 });
 
 test("inspectGate ignores a stray non-owner file and still finds the real marker", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createDelegationReservationStore({ stateRoot, canonicalPath: async (value) => value });
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
   const markerPath = join(activeGate, "owner.json");
@@ -579,7 +573,7 @@ test("inspectGate ignores a stray non-owner file and still finds the real marker
 });
 
 test("clearGate clears only when allow returns true, refuses without throwing when the marker changes first, and unblocks reserve", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const ids = [FIRST_ID, SECOND_ID, THIRD_ID, "44444444-4444-4444-8444-444444444444"];
   // The initial reserve() below hits a gate that never clears (crash residue) -- drive a
   // simulated clock instead of spending ~2s of real idle wall-clock time waiting out the budget.
@@ -653,7 +647,7 @@ test("clearGate clears only when allow returns true, refuses without throwing wh
 });
 
 test("clearGate refuses without throwing when there is no active gate to clear", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   const result = await reservations.clearGate({ projectAlias: "never-used", allow: () => true });
@@ -667,7 +661,7 @@ test("clearGate's refusal is the public {cleared:false, reason} shape, not mutex
   // `{cleared: false, reason}` shape. mutex-removal.js's own tests only ever assert the internal
   // sentinel (that is its contract); nothing previously asserted that clearGate actually
   // performs the translation, so a caller that forgot it would go uncaught.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   const result = await reservations.clearGate({ projectAlias: "never-used", allow: () => true });
@@ -676,7 +670,7 @@ test("clearGate's refusal is the public {cleared:false, reason} shape, not mutex
 });
 
 test("clearGate rejects a non-function allow before touching the filesystem", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createStore(stateRoot);
 
   await assert.rejects(() => reservations.clearGate({ projectAlias: "never-used", allow: "not-a-function" }), /clearGate allow must be a function/);
@@ -688,7 +682,7 @@ test("clearGate's pre-unlink recheck refuses a same-content replacement gate via
   // fail: the fabricated identity below leaves the marker's path and byte content completely
   // untouched, so only a dev/ino (directory identity) comparison can distinguish "the same
   // gate we inspected" from "a replacement that happens to look identical".
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
   const markerPath = join(activeGate, "owner.json");
   const marker = { version: 2, ownerToken: "crashed-token" };
@@ -725,7 +719,7 @@ test("clearGate's pre-rmdir recheck refuses a same-content replacement gate via 
   // unlinked and immediately before rmdir. If that check were deleted, this test would fail:
   // the fabricated identity below leaves everything else (path, marker bytes) untouched, so
   // only a fresh dev/ino comparison right before rmdir can catch it.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
   const markerPath = join(activeGate, "owner.json");
   const marker = { version: 2, ownerToken: "crashed-token" };
@@ -757,7 +751,7 @@ test("clearGate refuses to unlink the marker when a stray entry would make rmdir
   // clearGate/inspectGate would see "no active gate or the owner marker is unreadable" and the
   // pid/startedAt evidence this whole mechanism exists to preserve would be gone for good. This
   // test proves clearGate checks first and refuses before deleting anything.
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const reservations = createDelegationReservationStore({ stateRoot, canonicalPath: async (value) => value });
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
   const markerPath = join(activeGate, "owner.json");
@@ -835,7 +829,7 @@ async function observeViaUnlockPath(pid) {
 // this gate with a real reader at all, so the ordering was only ever true by inspection. This
 // makes it a fact a future edit cannot silently break.
 test("readOwnOwnership is invoked before the active gate directory exists (the gate's read precedes acquisition, never runs while the mutex is held)", async (t) => {
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const activeGate = activeGatePathFor(stateRoot, "fixture-single");
 
   let activeGateExistedDuringRead;
@@ -881,7 +875,7 @@ test("a reservation gate acquired with the real subprocess ownership reader yiel
     return;
   }
 
-  const stateRoot = await tempStateRoot(t);
+  const stateRoot = await tempStateRoot(t, "workflow-delegation-reservations-");
   const markerPath = join(activeGatePathFor(stateRoot, "fixture-single"), "owner.json");
   const { fs, captured, chmodModes } = fsCapturingRead(markerPath);
   const reservations = createDelegationReservationStore({
