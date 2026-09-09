@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { createWorkflowFixture, loadFixtureDescriptor } from "../src/workflow/fixture.js";
-import { cleanupWorkflowFixture } from "../src/workflow/fixture-cleanup.js";
+import { createWorkflowFixture, loadFixtureDescriptor } from "../test/support/fixture.js";
+import { cleanupWorkflowFixture } from "../test/support/fixture-cleanup.js";
 
 function usage() {
   console.error("USAGE: workflow-fixture create|inspect|remove <root>");

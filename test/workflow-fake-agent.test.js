@@ -4,7 +4,7 @@ import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { createWorkflowFixture } from "../src/workflow/fixture.js";
+import { createWorkflowFixture } from "./support/fixture.js";
 
 async function tempParent() {
   return await mkdtemp(join(tmpdir(), "workflow-fake-"));
