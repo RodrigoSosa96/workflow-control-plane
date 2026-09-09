@@ -43,18 +43,11 @@ function unwrapHerdrPayload(payload, context) {
 
   const error = payload.error ?? (payload.ok === false ? payload : null);
   if (error) {
-    fail(
-      "HERDR",
+    failHerdr(
+      context,
       error.message ?? `${context.binary} ${context.area} ${context.command} failed`,
-      {
-        code: error.code,
-        stdout: context.stdout,
-        stderr: context.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
       context.code || 1,
+      { code: error.code },
     );
   }
 
@@ -63,6 +56,30 @@ function unwrapHerdrPayload(payload, context) {
   }
 
   return payload;
+}
+
+function failHerdr(context, message, code, extraDetails) {
+  fail(
+    "HERDR",
+    message,
+    {
+      ...extraDetails,
+      stdout: context.stdout,
+      stderr: context.stderr,
+      command: context.binary,
+      args: [context.area, context.command, ...context.args],
+      cwd: context.cwd,
+    },
+    code,
+  );
+}
+
+function failExitCode(result, context, { message, code } = {}) {
+  failHerdr(
+    { ...context, stdout: result.stdout, stderr: result.stderr },
+    message ?? `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
+    code ?? result.code,
+  );
 }
 
 // Herdr writes its JSON error envelope to stderr, so a failed command usually leaves stdout empty.
@@ -88,19 +105,12 @@ function parseJsonResult(result, context) {
   if (!stdout) {
     if (result.code && result.code !== 0) {
       const envelope = extractStderrEnvelope(result.stderr);
-      fail(
-        "HERDR",
+      failHerdr(
+        { ...context, stdout: result.stdout, stderr: result.stderr },
         envelope?.message
           ?? `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-        {
-          ...(envelope?.code ? { code: envelope.code } : {}),
-          stdout: result.stdout,
-          stderr: result.stderr,
-          command: context.binary,
-          args: [context.area, context.command, ...context.args],
-          cwd: context.cwd,
-        },
         result.code,
+        envelope?.code ? { code: envelope.code } : undefined,
       );
     }
     return null;
@@ -110,16 +120,9 @@ function parseJsonResult(result, context) {
   try {
     payload = JSON.parse(stdout);
   } catch (error) {
-    fail(
-      "HERDR",
+    failHerdr(
+      { ...context, stdout: result.stdout, stderr: result.stderr },
       `Invalid JSON from ${context.binary} ${context.area} ${context.command}: ${error.message}`,
-      {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
       result.code || 1,
     );
   }
@@ -132,18 +135,7 @@ function parseJsonResult(result, context) {
   });
 
   if (result.code && result.code !== 0) {
-    fail(
-      "HERDR",
-      `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-      {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
-      result.code,
-    );
+    failExitCode(result, context);
   }
 
   return value;
@@ -155,35 +147,13 @@ function parseIntegrationStatusResult(result, context) {
 
   if (!trimmed) {
     if (result.code && result.code !== 0) {
-      fail(
-        "HERDR",
-        `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-        {
-          stdout: result.stdout,
-          stderr: result.stderr,
-          command: context.binary,
-          args: [context.area, context.command, ...context.args],
-          cwd: context.cwd,
-        },
-        result.code,
-      );
+      failExitCode(result, context);
     }
     return [];
   }
 
   if (result.code && result.code !== 0) {
-    fail(
-      "HERDR",
-      `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-      {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
-      result.code,
-    );
+    failExitCode(result, context);
   }
 
   return trimmed.split(/\r?\n/).filter(Boolean).map((rawLine) => {
