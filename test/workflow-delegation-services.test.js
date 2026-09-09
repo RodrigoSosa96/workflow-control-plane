@@ -949,3 +949,89 @@ test("a remediation whose follow-up delivery fails releases the fresh lease so a
   assert.ok(retried.nextActions.includes("begin-remediation"));
   assert.equal(deliveries, 2);
 });
+
+// --- startPostVerifyCritic: the one start path with no human approval digest -------------------
+
+const POST_VERIFY_REVIEW_OF = Object.freeze({
+  verificationDigest: `sha256:${"a".repeat(64)}`,
+  assignmentDigest: `sha256:${"b".repeat(64)}`,
+  fingerprintDigest: `sha256:${"c".repeat(64)}`,
+});
+
+const systemCriticInput = Object.freeze({
+  origin: "system-post-verify",
+  reviewOf: POST_VERIFY_REVIEW_OF,
+  role: "code-reviewer",
+  mode: "background",
+  cwd: CWD,
+  brief: "Review only the approved assignment and observed diff.",
+  task: "Review the current diff against the approved assignment.",
+  budget: { maxRuntimeMs: 300_000, concurrency: 1, maxTurns: 1, maxToolCalls: 24 },
+  remediationTurns: 0,
+});
+
+test("startPostVerifyCritic starts one background critic through policy, reservation and transport", async (t) => {
+  const { services, store, run, transport } = await createFixture(t);
+
+  const report = await services.startPostVerifyCritic({ runId: run.id, input: systemCriticInput });
+
+  assert.equal(report.state, "running");
+  assert.equal(report.delegationId, DELEGATION_ID);
+  assert.deepEqual(report.reviewOf, POST_VERIFY_REVIEW_OF);
+  const start = transport.calls.find((call) => call.method === "start");
+  assert.ok(start, "the transport was asked to start the critic");
+  assert.equal(start.assignment.request.agent, "code-reviewer");
+  assert.equal(start.assignment.request.async, true);
+  assert.equal(start.assignment.delegation.origin, "system-post-verify");
+  assert.equal(start.assignment.delegation.originSessionId, null, "a system critic has no session to deliver to");
+  for (const forbidden of ["edit", "write", "subagent"]) {
+    assert.equal(start.assignment.role.tools.includes(forbidden), false, `role tools must omit ${forbidden}`);
+  }
+
+  const record = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(record.state, "running");
+  assert.equal(record.origin, "system-post-verify");
+  assert.deepEqual(record.reviewOf, POST_VERIFY_REVIEW_OF);
+});
+
+test("startPostVerifyCritic reports a transport start failure as advisory state failed without throwing", async (t) => {
+  const transport = createTransport({
+    startImpl: async () => { throw new Error("spawn pi ENOENT"); },
+  });
+  const { services, store, run } = await createFixture(t, { transport });
+
+  const report = await services.startPostVerifyCritic({ runId: run.id, input: systemCriticInput });
+
+  assert.equal(report.state, "failed");
+  assert.ok(report.nextActions.includes("manual-release-reservation"));
+  const record = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(record.state, "failed");
+  assert.ok(record.startFailure);
+});
+
+test("startPostVerifyCritic rejects inputs that loosen the system critic contract", async (t) => {
+  const { services, run, transport } = await createFixture(t);
+
+  const cases = [
+    ["a different origin", { ...systemCriticInput, origin: "pi-origin-1" }],
+    ["an interactive origin key mixed in", { ...systemCriticInput, originSessionId: "pi-origin-1" }],
+    ["a missing reviewOf", Object.fromEntries(Object.entries(systemCriticInput).filter(([key]) => key !== "reviewOf"))],
+    ["a different role", { ...systemCriticInput, role: "scout" }],
+    ["a foreground mode", { ...systemCriticInput, mode: "foreground" }],
+    ["a loosened budget", { ...systemCriticInput, budget: { ...systemCriticInput.budget, maxToolCalls: 48 } }],
+    ["remediation turns", { ...systemCriticInput, remediationTurns: 1 }],
+  ];
+  for (const [label, input] of cases) {
+    await assert.rejects(() => services.startPostVerifyCritic({ runId: run.id, input }), /critic|origin|reviewOf|role|mode|budget|remediation|field/i, `case: ${label}`);
+  }
+  assert.equal(transport.calls.length, 0, "a rejected input must never reach the transport");
+});
+
+test("createPreview still refuses the system critic shape: no accidental automatic input", async (t) => {
+  const { services, run } = await createFixture(t);
+
+  await assert.rejects(
+    () => services.createPreview({ runId: run.id, input: systemCriticInput }),
+    /unsupported field|origin session/i,
+  );
+});
