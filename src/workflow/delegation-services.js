@@ -4,6 +4,12 @@ import { createPreparedDelegationRequest, validateSubagentRequestPolicy } from "
 import { classifyDelegationRole, resolveDelegationPolicy } from "./delegation-policy.js";
 import { validateDelegationTransportIdentity } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
+import {
+  POST_VERIFY_CRITIC_BUDGET,
+  POST_VERIFY_CRITIC_ORIGIN,
+  POST_VERIFY_CRITIC_REMEDIATION_TURNS,
+  POST_VERIFY_CRITIC_ROLE,
+} from "./post-verify-critic.js";
 import { assertWorkerTransport } from "./worker-transport.js";
 
 const APPROVAL_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
@@ -13,6 +19,8 @@ const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_SHORT_TEXT = 4096;
 const PREVIEW_DELEGATION_ID = "<generated at execute>";
 const REVIEW_EVIDENCE_KEYS = new Set(["generation", "summary", "insideFrozenBrief"]);
+const SYSTEM_CRITIC_INPUT_KEYS = new Set(["origin", "reviewOf", "role", "mode", "cwd", "brief", "task", "budget", "remediationTurns"]);
+const REVIEW_OF_KEYS = new Set(["verificationDigest", "assignmentDigest", "fingerprintDigest"]);
 
 function fail(message, details) {
   throw new WorkflowError("delegation-service", message, { details });
@@ -328,21 +336,20 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     return await validatedPreview(runId, input);
   }
 
-  async function executeApproved({ preview, approvalDigest } = {}) {
-    assertApprovalDigest(approvalDigest);
-    if (!preview || typeof preview !== "object" || Array.isArray(preview)) fail("delegation preview is required");
-    if (preview.approvalDigest !== approvalDigest) staleApprovalDigest();
-    if (consumedApprovalDigests.has(approvalDigest)) fail("Approved delegation preview has already been consumed");
-
-    const fresh = await validatedPreview(preview.runId, previewInput(preview));
-    if (fresh.approvalDigest !== approvalDigest) staleApprovalDigest(fresh.approvalDigest);
-
+  // The shared start path: every delegation that reaches a transport got here, whether it was
+  // approved by a human digest (executeApproved) or constructed by the control plane itself
+  // (startPostVerifyCritic). `fresh` carries the validated fields the transport assignment is
+  // built from; `prepareInput` is what the delegation store persists and re-validates.
+  async function startValidatedDelegation({ fresh, prepareInput, onClaimed }) {
     const prepared = await delegations.prepare({
       runId: fresh.runId,
-      input: previewInput(fresh),
+      input: prepareInput,
     });
     const claimed = await delegations.claim({ runId: fresh.runId, delegationId: prepared.id });
-    consumedApprovalDigests.add(approvalDigest);
+    onClaimed?.();
+    // The start report names the delegation it created; publicState's own shape is reconcile's
+    // documented contract and stays untouched.
+    const startReport = (record, identity, nextActions) => ({ delegationId: claimed.id, ...publicState(record, identity, nextActions) });
 
     let reservation;
     try {
@@ -360,7 +367,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
         delegationId: claimed.id,
         reason: "Delegation reservation failed",
       });
-      return publicState({ ...claimed, state: "failed", result: null }, null, ["create-new-preview", "manual-review"]);
+      return startReport({ ...claimed, state: "failed", result: null }, null, ["create-new-preview", "manual-review"]);
     }
 
     const preparedRequest = createPreparedDelegationRequest({ delegation: claimed, policy });
@@ -379,7 +386,7 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
         delegationId: claimed.id,
         reason: "Delegation request validation failed",
       });
-      return publicState({ ...claimed, state: "failed", result: null }, null, ["manual-release-reservation", "create-new-preview"]);
+      return startReport({ ...claimed, state: "failed", result: null }, null, ["manual-release-reservation", "create-new-preview"]);
     }
 
     try {
@@ -403,15 +410,94 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
         delegationId: claimed.id,
         identity,
       });
-      return publicState(recorded, identity, ["await-result"]);
+      return startReport(recorded, identity, ["await-result"]);
     } catch (_error) {
       const failed = await delegations.recordStartFailure({
         runId: fresh.runId,
         delegationId: claimed.id,
         reason: "Delegation transport start failed",
       });
-      return publicState(failed, null, ["manual-release-reservation", "create-new-preview"]);
+      return startReport(failed, null, ["manual-release-reservation", "create-new-preview"]);
     }
+  }
+
+  // The system critic is the ONE delegation this control plane starts on its own initiative,
+  // so it is also the one input this module validates without a human approval digest. The
+  // contract is closed: exact keys, exact constants, and a reviewOf of three sha256 digests.
+  // The delegation store re-validates the same contract under the run lock at prepare() time.
+  function validateSystemCriticInput(value) {
+    assertObject(value, "post-verify critic input");
+    assertExactKeys(value, SYSTEM_CRITIC_INPUT_KEYS, "post-verify critic input");
+    if (value.origin !== POST_VERIFY_CRITIC_ORIGIN) fail("post-verify critic origin is invalid");
+    const role = assertString(value.role, "post-verify critic role", { limit: 128 });
+    if (role !== POST_VERIFY_CRITIC_ROLE) fail("post-verify critic role is invalid");
+    if (value.mode !== "background") fail("post-verify critic mode is invalid");
+    assertObject(value.reviewOf, "post-verify critic reviewOf");
+    assertExactKeys(value.reviewOf, REVIEW_OF_KEYS, "post-verify critic reviewOf");
+    for (const key of REVIEW_OF_KEYS) {
+      if (typeof value.reviewOf[key] !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewOf[key])) {
+        fail(`post-verify critic reviewOf.${key} must be a sha256 digest`);
+      }
+    }
+    const budget = validateBudget(value.budget, policy, role, value.mode);
+    if (Object.keys(POST_VERIFY_CRITIC_BUDGET).some((field) => budget[field] !== POST_VERIFY_CRITIC_BUDGET[field])) {
+      fail("post-verify critic budget does not match the fixed contract");
+    }
+    if (value.remediationTurns !== POST_VERIFY_CRITIC_REMEDIATION_TURNS) {
+      fail("post-verify critic remediationTurns is invalid");
+    }
+    return {
+      origin: POST_VERIFY_CRITIC_ORIGIN,
+      reviewOf: { ...value.reviewOf },
+      role,
+      mode: value.mode,
+      cwd: assertString(value.cwd, "post-verify critic cwd", { limit: MAX_SHORT_TEXT, absolute: true }),
+      brief: assertString(value.brief, "post-verify critic brief", { limit: MAX_TEXT_BYTES }),
+      task: assertString(value.task, "post-verify critic task", { limit: MAX_TEXT_BYTES }),
+      budget,
+      remediationTurns: POST_VERIFY_CRITIC_REMEDIATION_TURNS,
+    };
+  }
+
+  async function startPostVerifyCritic({ runId, input } = {}) {
+    const run = await runStore.read(assertString(runId, "run ID", { limit: 128 }));
+    if (run.projectAlias !== projectAlias) fail("delegation run does not belong to the selected project");
+    const validated = validateSystemCriticInput(input);
+    const roleDefinition = await loadRoleDefinition(roles, validated.role);
+    validateMode(validated.role, validated.mode, policy);
+    const cwd = resolveDelegationCwd(run, validated.cwd);
+
+    const fresh = {
+      runId: run.id,
+      role: validated.role,
+      mode: validated.mode,
+      cwd,
+      task: validated.task,
+      brief: validated.brief,
+      budget: validated.budget,
+      remediationTurns: validated.remediationTurns,
+      tools: clone(roleDefinition.tools),
+    };
+    const report = await startValidatedDelegation({ fresh, prepareInput: { ...validated, cwd } });
+    return { ...report, reviewOf: clone(validated.reviewOf) };
+  }
+
+  async function executeApproved({ preview, approvalDigest } = {}) {
+    assertApprovalDigest(approvalDigest);
+    if (!preview || typeof preview !== "object" || Array.isArray(preview)) fail("delegation preview is required");
+    if (preview.approvalDigest !== approvalDigest) staleApprovalDigest();
+    if (consumedApprovalDigests.has(approvalDigest)) fail("Approved delegation preview has already been consumed");
+
+    const fresh = await validatedPreview(preview.runId, previewInput(preview));
+    if (fresh.approvalDigest !== approvalDigest) staleApprovalDigest(fresh.approvalDigest);
+
+    return await startValidatedDelegation({
+      fresh,
+      prepareInput: previewInput(fresh),
+      // The digest is consumed the moment a delegation exists for it -- a failed reservation
+      // or transport start afterwards must not make the approval reusable.
+      onClaimed: () => consumedApprovalDigests.add(approvalDigest),
+    });
   }
 
   async function reconcile({ runId, delegationId } = {}) {
@@ -574,5 +660,5 @@ export function createDelegationServices({ registry, projectAlias, runStore, del
     }
   }
 
-  return Object.freeze({ createPreview, executeApproved, reconcile, beginRemediation });
+  return Object.freeze({ createPreview, executeApproved, startPostVerifyCritic, reconcile, beginRemediation });
 }

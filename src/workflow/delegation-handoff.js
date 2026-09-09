@@ -1,5 +1,6 @@
 import { WorkflowError } from "./errors.js";
 import { claimTokenMatchesDigest, reservationMatchesDelegation, validateDelegationTransportIdentity } from "./delegation-invariants.js";
+import { isPostVerifyCriticRecord, validateCriticFindings } from "./post-verify-critic.js";
 
 const ALLOWED_KEYS = new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]);
 const HANDOFF_STATUSES = new Set(["completed", "blocked", "failed"]);
@@ -59,11 +60,12 @@ function validateConcerns(value) {
   return value.map((entry, index) => assertString(entry, `delegation handoff concerns[${index}]`, MAX_CONCERN_BYTES));
 }
 
-function validateInput(value) {
+function validateInput(value, { allowFindings = false } = {}) {
   assertObject(value, "delegation handoff input");
   validateInputBytes(value);
+  const allowed = allowFindings ? new Set([...ALLOWED_KEYS, "findings"]) : ALLOWED_KEYS;
   for (const key of Object.keys(value)) {
-    if (!ALLOWED_KEYS.has(key)) fail(`Delegation handoff input contains unsupported field ${key}`);
+    if (!allowed.has(key)) fail(`Delegation handoff input contains unsupported field ${key}`);
   }
   const status = assertString(value.status, "delegation handoff status", MAX_STATUS_BYTES);
   if (!HANDOFF_STATUSES.has(status)) fail("Delegation handoff status is unsupported");
@@ -75,6 +77,7 @@ function validateInput(value) {
     verification: validateVerification(value.verification),
     concerns: validateConcerns(value.concerns),
     nextAction: assertString(value.nextAction, "delegation handoff nextAction", MAX_NEXT_ACTION_BYTES),
+    ...(allowFindings ? { findings: validateCriticFindings(value.findings ?? [], fail) } : {}),
   };
 }
 
@@ -103,7 +106,9 @@ export async function submitDelegationHandoff({ runId, delegationId, input, stor
   const id = assertString(delegationId, "delegation handoff delegation ID", 128);
   const record = recordFor(run, id);
   assertTransportIdentity(record, run.id, id);
-  const normalized = validateInput(input);
+  // Structured findings belong exclusively to the typed system post-verify critic; an ordinary
+  // advisory handoff carrying them is refused, never silently stripped.
+  const normalized = validateInput(input, { allowFindings: isPostVerifyCriticRecord(record) });
   if (record.generation !== normalized.generation) fail("Delegation handoff generation is not current");
   const matches = (await reservations.list({ projectAlias: run.projectAlias })).filter((reservation) => reservationMatchesDelegation(record, reservation));
   if (matches.length !== 1) fail("Delegation reservation is missing or has changed");

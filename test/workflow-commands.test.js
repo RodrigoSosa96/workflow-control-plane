@@ -8,10 +8,12 @@ import { test } from "node:test";
 import { doctorCommand, inboxCommand, launchCommand, planCommand, reconcileCommand, resultCommand, runsCommand, statusCommand, unlockCommand, VERIFY_EXIT_CODES, verifyCommand } from "../src/workflow/commands.js";
 import { WorkflowError } from "../src/workflow/errors.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
+import { createDelegationStore } from "../src/workflow/delegation-store.js";
+import { createReviewOf } from "../src/workflow/post-verify-critic.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
 import { runVerifyCommand as realRunVerifyCommand } from "../src/workflow/verify-runner.js";
-import { fixedClock, tempStateRoot } from "./support/helpers.js";
+import { fixedClock, tempStateRoot, uuidSequence } from "./support/helpers.js";
 
 const registry = {
   launcher: {
@@ -2419,4 +2421,224 @@ test("a repository entry with a relative path is a recorded error, not a silent 
   // The command must never have run at all -- not in this checkout's own src/ (where "src" would
   // otherwise silently resolve) and not anywhere else either.
   assert.equal(existsSync(markerPath), false, "the command must never have run at all");
+});
+
+// --- verifyCommand's post-verify advisory critic ------------------------------------------------
+//
+// The critic is advisory by construction: it starts only after a PASSING matrix whose evidence
+// event was really persisted, and nothing it does -- including failing to start -- changes
+// verify's passed/exitCode.
+
+const CRITIC_ASSIGNMENT_PATH = "/state/workflow/run/assignment.md";
+const CRITIC_ASSIGNMENT_DIGEST = `sha256:${"b".repeat(64)}`;
+const CRITIC_FINGERPRINT = `sha256:${"c".repeat(64)}`;
+
+function criticCapableRunInput(overrides = {}) {
+  return {
+    projectAlias: "ocr",
+    primaryTicket: "A-1",
+    assignmentPath: CRITIC_ASSIGNMENT_PATH,
+    assignmentDigest: CRITIC_ASSIGNMENT_DIGEST,
+    repositories: [{ id: "ocr", path: "/repo/ocr", branch: "feature/a" }],
+    ...overrides,
+  };
+}
+
+function criticSpies() {
+  const starts = [];
+  return {
+    starts,
+    startPostVerifyCritic: async (args) => {
+      starts.push(structuredClone({ ...args, store: undefined, registry: undefined, run: undefined, runId: args.run?.id }));
+      return { state: "running", delegationId: "99999999-9999-4999-8999-999999999999", reviewOf: args.input.reviewOf, nextActions: ["await-result"] };
+    },
+    fingerprintPostVerifyCritic: async ({ cwd }) => ({ digest: CRITIC_FINGERPRINT, cwd }),
+  };
+}
+
+test("verifyCommand starts exactly one advisory critic after a passing, persisted verification", async (t) => {
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create(criticCapableRunInput());
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+  const runner = scriptedVerifyRunner();
+  const spies = criticSpies();
+
+  const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run, ...spies });
+
+  assert.equal(result.passed, true);
+  assert.equal(result.exitCode, VERIFY_EXIT_CODES.passed);
+  assert.equal(spies.starts.length, 1);
+  assert.equal(spies.starts[0].runId, run.id);
+  assert.equal(spies.starts[0].input.origin, "system-post-verify");
+  assert.equal(spies.starts[0].input.role, "code-reviewer");
+  assert.match(spies.starts[0].input.brief, /assignment\.md/);
+  assert.match(spies.starts[0].input.brief, /sha256:/);
+  assert.equal(result.critic.status, "running");
+  assert.equal(result.critic.delegationId, "99999999-9999-4999-8999-999999999999");
+  assert.match(result.critic.reviewOf.verificationDigest, /^sha256:[0-9a-f]{64}$/);
+});
+
+test("verifyCommand starts no critic for a failed matrix, a refusal, or unpersisted evidence", async (t) => {
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
+
+  // A failed matrix: evidence IS persisted, but nothing passed.
+  {
+    const store = createRunStore({ stateRoot: await tempStateRoot(t, "workflow-runs-command-"), clock: fixedClock("2025-01-01T00:00:00.000Z") });
+    const run = await store.create(criticCapableRunInput());
+    const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+    const runner = scriptedVerifyRunner({ "/repo/ocr::pnpm typecheck": { status: "failed", exitCode: 1 } });
+    const spies = criticSpies();
+
+    const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run, ...spies });
+
+    assert.equal(result.passed, false);
+    assert.equal(spies.starts.length, 0, "failed matrix");
+    assert.equal(result.critic, undefined);
+  }
+
+  // A refusal: the matrix never even ran.
+  {
+    const store = createRunStore({ stateRoot: await tempStateRoot(t, "workflow-runs-command-"), clock: fixedClock("2025-01-01T00:00:00.000Z") });
+    const run = await store.create(criticCapableRunInput({ repositories: [] }));
+    const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+    const runner = scriptedVerifyRunner();
+    const spies = criticSpies();
+
+    const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run, ...spies });
+
+    assert.equal(result.exitCode, VERIFY_EXIT_CODES.refused);
+    assert.equal(spies.starts.length, 0, "refusal");
+    assert.equal(result.critic, undefined);
+  }
+
+  // Evidence that could not be persisted: the matrix passed, but no durable event exists for the
+  // critic to honestly review.
+  {
+    const base = createRunStore({ stateRoot: await tempStateRoot(t, "workflow-runs-command-"), clock: fixedClock("2025-01-01T00:00:00.000Z") });
+    const run = await base.create(criticCapableRunInput());
+    const store = {
+      ...base,
+      async appendEvent() {
+        throw new Error("lock held by another command");
+      },
+    };
+    const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+    const runner = scriptedVerifyRunner();
+    const spies = criticSpies();
+
+    const result = await verifyCommand({ runId: run.id }, { store, loadRegistry, runVerifyCommand: runner.run, ...spies });
+
+    assert.equal(result.passed, true, "the matrix itself passed");
+    assert.match(result.evidenceError, /evidence could not be persisted/i);
+    assert.equal(spies.starts.length, 0, "unpersisted evidence");
+    assert.equal(result.critic, undefined);
+  }
+});
+
+test("verifyCommand turns a critic start failure into advisory evidence, never a verify failure", async (t) => {
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create(criticCapableRunInput());
+  const loadRegistry = verifyLoadRegistry({ ocr: { verify: ["pnpm typecheck"] } });
+  const runner = scriptedVerifyRunner();
+
+  const reported = await verifyCommand({ runId: run.id }, {
+    store,
+    loadRegistry,
+    runVerifyCommand: runner.run,
+    fingerprintPostVerifyCritic: async () => ({ digest: CRITIC_FINGERPRINT }),
+    startPostVerifyCritic: async () => ({ state: "failed", delegationId: "99999999-9999-4999-8999-999999999999", nextActions: ["manual-release-reservation"] }),
+  });
+  assert.equal(reported.passed, true);
+  assert.equal(reported.exitCode, VERIFY_EXIT_CODES.passed);
+  assert.equal(reported.critic.status, "failed");
+
+  const thrown = await verifyCommand({ runId: run.id }, {
+    store,
+    loadRegistry,
+    runVerifyCommand: runner.run,
+    fingerprintPostVerifyCritic: async () => ({ digest: CRITIC_FINGERPRINT }),
+    startPostVerifyCritic: async () => { throw new Error("spawn pi ENOENT"); },
+  });
+  assert.equal(thrown.passed, true);
+  assert.equal(thrown.exitCode, VERIFY_EXIT_CODES.passed);
+  assert.equal(thrown.critic.status, "failed");
+  assert.match(thrown.critic.reason, /spawn pi ENOENT/);
+});
+
+test("resultCommand projects the current critic and marks a superseded one stale", async (t) => {
+  const stateRoot = await tempStateRoot(t, "workflow-runs-command-");
+  const store = createRunStore({ stateRoot, clock: fixedClock("2025-01-01T00:00:00.000Z") });
+  const run = await store.create(criticCapableRunInput());
+
+  // The persisted verification the critic reviews, then the critic delegation itself, built
+  // exactly the way verifyCommand will: reviewOf binds the event as persisted (round-tripped).
+  const verification = JSON.parse(JSON.stringify(await store.appendEvent(run.id, {
+    type: "verification",
+    passed: true,
+    exitCode: 0,
+    results: [{ repositoryId: "ocr", command: "pnpm typecheck", status: "passed", exitCode: 0 }],
+  })));
+  const fingerprints = [{ repositoryId: "ocr", path: "/repo/ocr", digest: CRITIC_FINGERPRINT }];
+  const reviewOf = createReviewOf({
+    verification,
+    assignmentPath: CRITIC_ASSIGNMENT_PATH,
+    assignmentDigest: CRITIC_ASSIGNMENT_DIGEST,
+    fingerprints,
+  });
+
+  const delegations = createDelegationStore({ store, randomUUID: uuidSequence("22222222-2222-4222-8222-222222222222") });
+  await delegations.prepare({
+    runId: run.id,
+    input: {
+      origin: "system-post-verify",
+      reviewOf,
+      role: "code-reviewer",
+      mode: "background",
+      cwd: "/repo/ocr",
+      brief: "Review only the approved assignment and observed diff.",
+      task: "Review the current diff against the approved assignment.",
+      budget: { maxRuntimeMs: 300_000, concurrency: 1, maxTurns: 1, maxToolCalls: 24 },
+      remediationTurns: 0,
+    },
+  });
+  await delegations.claim({ runId: run.id, delegationId: "22222222-2222-4222-8222-222222222222" });
+  await delegations.recordResult({
+    runId: run.id,
+    delegationId: "22222222-2222-4222-8222-222222222222",
+    result: {
+      status: "completed",
+      generation: 1,
+      summary: "Found one blocker",
+      verification: [],
+      concerns: [],
+      findings: [{
+        severity: "blocker",
+        summary: "Missing approval digest check",
+        evidence: "commands.js:42 accepts stale state",
+        path: "src/workflow/commands.js",
+      }],
+      nextAction: "Review the blocker",
+    },
+  });
+
+  const fresh = await resultCommand({ runId: run.id }, { store });
+  assert.equal(fresh.critic.status, "completed");
+  assert.equal(fresh.critic.delegationId, "22222222-2222-4222-8222-222222222222");
+  assert.equal(fresh.critic.result.findings[0].severity, "blocker");
+  assert.equal(fresh.critic.result.findings[0].path, "src/workflow/commands.js");
+
+  // A later verification -- even a FAILED one -- supersedes the critic's reviewOf: the diff it
+  // read is no longer the latest evidence. The historical record is not touched.
+  await store.appendEvent(run.id, {
+    type: "verification",
+    passed: false,
+    exitCode: 1,
+    results: [{ repositoryId: "ocr", command: "pnpm typecheck", status: "failed", exitCode: 1 }],
+  });
+  const superseded = await resultCommand({ runId: run.id }, { store });
+  assert.equal(superseded.critic.status, "stale");
+  assert.equal(superseded.critic.result.findings.length, 1, "a stale critic keeps its findings as history");
+  assert.equal(superseded.exitCode, fresh.exitCode, "the critic never moves result's exit code");
 });

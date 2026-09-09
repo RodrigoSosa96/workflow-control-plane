@@ -53,7 +53,7 @@ function advisoryInput(overrides = {}) {
   };
 }
 
-async function createFixture(t, { reserve = true } = {}) {
+async function createFixture(t, { reserve = true, systemCritic = false } = {}) {
   const stateRoot = await tempStateRoot(t, "workflow-delegation-handoff-");
   const store = createRunStore({ stateRoot, randomUUID: () => RUN_ID });
   const run = await store.create({ projectAlias: PROJECT_ALIAS, primaryTicket: "A-1", state: RUN_STATES.PLANNED });
@@ -69,16 +69,28 @@ async function createFixture(t, { reserve = true } = {}) {
 
   await delegations.prepare({
     runId: run.id,
-    input: {
-      role: "code-reviewer",
-      mode: "background",
-      originSessionId: "pi-origin-1",
-      cwd: CWD,
-      brief: "Review only the frozen brief.",
-      task: "Review only the frozen brief.",
-      budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
-      remediationTurns: 2,
-    },
+    input: systemCritic
+      ? {
+        origin: "system-post-verify",
+        reviewOf: POST_VERIFY_REVIEW_OF,
+        role: "code-reviewer",
+        mode: "background",
+        cwd: CWD,
+        brief: "Review only the approved assignment and observed diff.",
+        task: "Review the current diff against the approved assignment.",
+        budget: { maxRuntimeMs: 300_000, concurrency: 1, maxTurns: 1, maxToolCalls: 24 },
+        remediationTurns: 0,
+      }
+      : {
+        role: "code-reviewer",
+        mode: "background",
+        originSessionId: "pi-origin-1",
+        cwd: CWD,
+        brief: "Review only the frozen brief.",
+        task: "Review only the frozen brief.",
+        budget: { maxRuntimeMs: 60_000, concurrency: 1, maxTurns: 3, maxToolCalls: 12 },
+        remediationTurns: 2,
+      },
   });
   const claimed = await delegations.claim({ runId: run.id, delegationId: DELEGATION_ID });
   await delegations.recordTransportIdentity({ runId: run.id, delegationId: DELEGATION_ID, identity: transportIdentity() });
@@ -430,4 +442,128 @@ test("submitDelegationHandoff rejects a sibling forging a first-generation resul
     git: {},
   });
   assert.equal(accepted.state, "completed");
+});
+
+// --- findings: structured severities, accepted only from the typed system critic -------------
+
+const POST_VERIFY_REVIEW_OF = Object.freeze({
+  verificationDigest: `sha256:${"a".repeat(64)}`,
+  assignmentDigest: `sha256:${"b".repeat(64)}`,
+  fingerprintDigest: `sha256:${"c".repeat(64)}`,
+});
+
+test("submitDelegationHandoff records structured findings for the system post-verify critic", async (t) => {
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t, { systemCritic: true });
+
+  const recorded = await submitDelegationHandoff({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    input: advisoryInput({
+      findings: [{
+        severity: "blocker",
+        summary: "Missing approval digest check",
+        evidence: "commands.js:42 accepts stale state",
+        path: "src/workflow/commands.js",
+      }],
+    }),
+    store,
+    delegations,
+    reservations,
+    claimToken,
+  });
+
+  assert.equal(recorded.state, "completed");
+  assert.deepEqual(recorded.result.findings, [{
+    severity: "blocker",
+    summary: "Missing approval digest check",
+    evidence: "commands.js:42 accepts stale state",
+    path: "src/workflow/commands.js",
+  }]);
+});
+
+test("system critic findings are optional and normalize to an empty array", async (t) => {
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t, { systemCritic: true });
+
+  const recorded = await submitDelegationHandoff({
+    runId: run.id,
+    delegationId: DELEGATION_ID,
+    input: advisoryInput(),
+    store,
+    delegations,
+    reservations,
+    claimToken,
+  });
+
+  assert.deepEqual(recorded.result.findings, []);
+});
+
+test("submitDelegationHandoff rejects findings from an ordinary interactive delegation", async (t) => {
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t);
+
+  await assert.rejects(
+    () => submitDelegationHandoff({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      input: advisoryInput({
+        findings: [{ severity: "aside", summary: "Style note", evidence: "x.js:1" }],
+      }),
+      store,
+      delegations,
+      reservations,
+      claimToken,
+    }),
+    /findings/i,
+  );
+
+  const untouched = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(untouched.state, "running");
+  assert.equal(untouched.result, null);
+});
+
+test("submitDelegationHandoff rejects malformed findings on the system critic", async (t) => {
+  const { store, run, delegations, reservations, claimToken } = await createFixture(t, { systemCritic: true });
+
+  const cases = [
+    ["a severity outside the closed vocabulary", [{ severity: "critical", summary: "s", evidence: "e" }]],
+    ["more than twenty findings", Array.from({ length: 21 }, (_, i) => ({ severity: "aside", summary: `s${i}`, evidence: "e" }))],
+    ["an extra finding key", [{ severity: "aside", summary: "s", evidence: "e", line: 42 }]],
+    ["a missing summary", [{ severity: "aside", evidence: "e" }]],
+    ["an absolute path", [{ severity: "aside", summary: "s", evidence: "e", path: "/etc/passwd" }]],
+    ["a traversal path", [{ severity: "aside", summary: "s", evidence: "e", path: "../escape.js" }]],
+    ["a NUL in the path", [{ severity: "aside", summary: "s", evidence: "e", path: "a\0b" }]],
+    ["an empty path segment", [{ severity: "aside", summary: "s", evidence: "e", path: "a//b" }]],
+    ["a dot segment", [{ severity: "aside", summary: "s", evidence: "e", path: "./a.js" }]],
+  ];
+
+  for (const [label, findings] of cases) {
+    await assert.rejects(
+      () => submitDelegationHandoff({
+        runId: run.id,
+        delegationId: DELEGATION_ID,
+        input: advisoryInput({ findings }),
+        store,
+        delegations,
+        reservations,
+        claimToken,
+      }),
+      /findings|severity|path/i,
+      `case: ${label}`,
+    );
+  }
+
+  const untouched = (await store.read(run.id)).delegations[DELEGATION_ID];
+  assert.equal(untouched.result, null, "no rejected findings payload may leave a result behind");
+});
+
+test("recordResult itself refuses findings on a non-critic delegation, without trusting the handoff layer", async (t) => {
+  const { run, delegations } = await createFixture(t);
+
+  await assert.rejects(
+    () => delegations.recordResult({
+      runId: run.id,
+      delegationId: DELEGATION_ID,
+      result: advisoryInput({ findings: [{ severity: "blocker", summary: "s", evidence: "e" }] }),
+    }),
+    /findings/i,
+  );
 });

@@ -3165,3 +3165,84 @@ test("workflow archive end-to-end against a real dirty worktree: it refuses, rem
   assert.match(gitRun(basePath, ["worktree", "list", "--porcelain"]), new RegExp(worktreePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "the worktree is still registered");
   assert.equal((await store.read(run.id)).archivedAt, undefined, "a refusal never marks the record");
 });
+
+test("verify wires the critic starter lazily: no Pi lookup unless the command actually starts one", async () => {
+  const output = io();
+  const code = await main(["verify", RUN_ID], {
+    ...output,
+    lookupExecutable: async () => {
+      assert.fail("Pi must not be resolved when the verify does not start a critic");
+    },
+    verifyCommand: async (options, deps) => {
+      assert.equal(typeof deps.startPostVerifyCritic, "function");
+      assert.equal(typeof deps.fingerprintPostVerifyCritic, "function");
+      return { command: "verify", runId: options.runId, results: [], passed: false, exitCode: 10, reason: "refused" };
+    },
+    formatWorkflowResult: () => "ok",
+  });
+  assert.equal(code, 10);
+  assert.deepEqual(output.stdout, ["ok"]);
+});
+
+test("verify's critic starter builds the Pi transport and delegation services on demand", async () => {
+  const serviceDeps = [];
+  const fakeTransport = Object.freeze({
+    async start() { throw new Error("transport start is the service's own test double's job"); },
+    async observeExact() { throw new Error("must not observe"); },
+    async deliverFollowUp() { throw new Error("must not deliver"); },
+    async requestGracefulClose() { return { requested: false, manual: true }; },
+  });
+  const output = io();
+  const code = await main(["verify", RUN_ID], {
+    ...output,
+    loadRegistry: async () => ({ launcher: { state_root: "/state/workflow" }, projects: {} }),
+    lookupExecutable: async (name) => {
+      assert.equal(name, "pi");
+      return "/usr/bin/pi";
+    },
+    spawnDelegationChild: async () => {
+      assert.fail("wiring must not spawn Pi itself");
+    },
+    inspectDelegationProcess: async () => {
+      assert.fail("wiring must not inspect processes itself");
+    },
+    createPiDelegationTransport: () => fakeTransport,
+    createDelegationServices: (deps) => {
+      serviceDeps.push(deps);
+      return {
+        async startPostVerifyCritic({ runId, input }) {
+          return { state: "running", delegationId: DELEGATION_ID, reviewOf: input.reviewOf, nextActions: ["await-result"] };
+        },
+      };
+    },
+    verifyCommand: async (options, deps) => {
+      // The store shape createDelegationStore validates at construction; none of these run,
+      // because the injected createDelegationServices double owns the start.
+      const store = { async read() {}, async update() {}, async writePrivateFile() {}, async list() { return []; } };
+      const registry = { marker: "registry" };
+      const report = await deps.startPostVerifyCritic({
+        store,
+        registry,
+        run: { id: RUN_ID, projectAlias: "ocr" },
+        input: { origin: "system-post-verify", reviewOf: { verificationDigest: `sha256:${"a".repeat(64)}` } },
+      });
+      return {
+        command: "verify",
+        runId: options.runId,
+        results: [],
+        passed: true,
+        exitCode: 0,
+        critic: { status: report.state, delegationId: report.delegationId },
+      };
+    },
+    formatWorkflowResult: (command, value) => `${command}:${value.critic.status}:${value.critic.delegationId}`,
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(output.stdout, [`verify:running:${DELEGATION_ID}`]);
+  assert.equal(serviceDeps.length, 1);
+  assert.equal(serviceDeps[0].transport, fakeTransport);
+  assert.equal(serviceDeps[0].projectAlias, "ocr");
+  assert.equal(typeof serviceDeps[0].runStore?.read, "function");
+  assert.equal(typeof serviceDeps[0].roles?.loadDelegationRole, "function");
+});

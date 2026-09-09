@@ -202,6 +202,31 @@ function formatLaunch(value) {
 // Both sections always render, even when empty, so an operator never has to wonder whether a
 // missing section means "nothing to report" or "this view forgot to ask" -- the same discipline
 // formatRuns/formatInbox apply to an empty board (see their own comments).
+// The advisory post-verify critic, rendered after the verification claim/proof sections. It is
+// evidence about the diff, not a gate: `blocker` here means "a human should look", and `stale`
+// means a newer verification (passed or failed) superseded the one this critic reviewed.
+function criticLines(critic, runId) {
+  if (!critic || typeof critic !== "object") return [];
+  const lines = [];
+  const status = text(critic.status, "unknown");
+  const staleNote = critic.status === "stale" ? " — superseded by a newer verification" : "";
+  lines.push(`Critic: ${status}${staleNote}`);
+  const findings = list(critic.result?.findings);
+  for (const finding of findings) {
+    const severity = text(finding?.severity, "aside").toUpperCase();
+    const path = typeof finding?.path === "string" && finding.path ? `${finding.path} — ` : "";
+    lines.push(`  [${severity}] ${path}${text(finding?.summary)}`);
+  }
+  const concerns = list(critic.result?.concerns);
+  for (const concern of concerns) {
+    lines.push(`  [CONCERN] ${text(concern)}`);
+  }
+  if (typeof critic.delegationId === "string" && critic.delegationId && typeof runId === "string" && runId) {
+    lines.push(`  Detail: workflow delegation result ${runId} ${critic.delegationId}`);
+  }
+  return lines;
+}
+
 function verificationClaimLines(result) {
   const claim = list(result?.verification);
   if (claim.length === 0) return ["Reported by the worker: none"];
@@ -237,6 +262,7 @@ function formatResult(value) {
   if (value.result?.summary) lines.push(`Summary: ${value.result.summary}`);
   lines.push(...verificationClaimLines(value.result));
   lines.push(...verificationEvidenceLines(value.verifiedEvidence, value.verifyCommand));
+  lines.push(...criticLines(value.critic, value.runId));
   if (value.resultCommand) lines.push(`Result: ${value.resultCommand}`);
   if (value.statusCommand) lines.push(`Status command: ${value.statusCommand}`);
   if (value.reconcileCommand) lines.push(`Reconcile: ${value.reconcileCommand}`);
@@ -1642,11 +1668,34 @@ function resultOverflowFallback(command, source, limit) {
       commands: commandsRun,
     }
     : (source.verifiedEvidence ?? null);
+  // The critic's findings carry up to 20 bounded-but-large evidence strings; the severity, the
+  // summary (bounded harder here) and the path are the half an operator acts on, so the fallback
+  // keeps those and drops `evidence` -- never stringifying findings into concerns, never dropping
+  // the stale marker.
+  const critic = source.critic && typeof source.critic === "object" ? source.critic : null;
+  const degradedCritic = critic
+    ? {
+      ...critic,
+      ...(critic.result && typeof critic.result === "object"
+        ? {
+          result: {
+            ...critic.result,
+            findings: list(critic.result.findings).map((finding) => ({
+              severity: finding?.severity ?? null,
+              summary: typeof finding?.summary === "string" ? finding.summary.slice(0, 160) : null,
+              ...(typeof finding?.path === "string" ? { path: finding.path } : {}),
+            })),
+          },
+        }
+        : {}),
+    }
+    : critic;
   return {
     ...source,
     verifiedEvidence: degradedEvidence,
+    ...(critic !== null ? { critic: degradedCritic } : {}),
     truncated: true,
-    truncationMarker: `JSON output truncated at ${limit} characters; the verified-evidence matrix (${evidenceResults.length} results) had its captured output dropped to fit, keeping repositoryId/command/status/exitCode per result. \`result\`, \`status\`, and every other field in this response are unabridged. ${source.runId ? `\`workflow verify ${source.runId}\`` : "`workflow verify <run-id>`"} re-runs the same matrix if the full evidence is needed.`,
+    truncationMarker: `JSON output truncated at ${limit} characters; the verified-evidence matrix (${evidenceResults.length} results) had its captured output dropped to fit, keeping repositoryId/command/status/exitCode per result, and any critic findings had their evidence dropped keeping severity/summary/path. \`result\`, \`status\`, and every other field in this response are unabridged. ${source.runId ? `\`workflow verify ${source.runId}\`` : "`workflow verify <run-id>`"} re-runs the same matrix if the full evidence is needed.`,
   };
 }
 

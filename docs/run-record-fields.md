@@ -170,4 +170,4 @@ the same caveat applies to any future field written only by `archiveCommand`.
 
 | Field | Meaning | When it appears | Verified by the check |
 | --- | --- | --- | --- |
-| `delegations` | Map of delegation id to delegation record; internal record shape (`role`, `state`, `budget`, `result`, `remediation`, ...) is `delegation-store.js`'s concern, not enumerated here. | After the first delegation is prepared | Yes |
+| `delegations` | Map of delegation id to delegation record; internal record shape (`role`, `state`, `budget`, `result`, `remediation`, ...) is `delegation-store.js`'s concern, not enumerated here. Three fields of that shape are load-bearing for the record's kind: `origin` (`"interactive"` or `"system-post-verify"`), `originSessionId` (set for interactive records, `null` for the system critic), and `reviewOf` (the system critic's immutable `{verificationDigest, assignmentDigest, fingerprintDigest}` link to the verify event it reviews, `null` for interactive records). | After the first delegation is prepared | Yes |

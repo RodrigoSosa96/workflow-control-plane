@@ -442,3 +442,51 @@ test("rejects oversized or invalid delegation data without echoing it", async (t
 
   assert.deepEqual((await store.read(run.id)).delegations ?? {}, {});
 });
+
+const POST_VERIFY_REVIEW_OF = Object.freeze({
+  verificationDigest: `sha256:${"a".repeat(64)}`,
+  assignmentDigest: `sha256:${"b".repeat(64)}`,
+  fingerprintDigest: `sha256:${"c".repeat(64)}`,
+});
+
+test("persists a typed system post-verify critic without impersonating an origin session", async (t) => {
+  const { run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
+
+  const prepared = await delegations.prepare({
+    runId: run.id,
+    input: {
+      origin: "system-post-verify",
+      reviewOf: POST_VERIFY_REVIEW_OF,
+      role: "code-reviewer",
+      mode: "background",
+      cwd: "/fixture/review",
+      brief: "Review only the approved assignment and observed diff.",
+      task: "Review the current diff against the approved assignment.",
+      budget: { maxRuntimeMs: 300_000, concurrency: 1, maxTurns: 1, maxToolCalls: 24 },
+      remediationTurns: 0,
+    },
+  });
+
+  assert.equal(prepared.origin, "system-post-verify");
+  assert.equal(prepared.originSessionId, null);
+  assert.deepEqual(prepared.reviewOf, POST_VERIFY_REVIEW_OF);
+});
+
+test("rejects system critic inputs that mix an interactive origin or loosen its fixed contract", async (t) => {
+  const { run, delegations } = await createFixture(t, [FIRST_DELEGATION_ID]);
+  const base = {
+    origin: "system-post-verify",
+    reviewOf: POST_VERIFY_REVIEW_OF,
+    role: "code-reviewer",
+    mode: "background",
+    cwd: "/fixture/review",
+    brief: "Review only the approved assignment and observed diff.",
+    task: "Review the current diff against the approved assignment.",
+    budget: { maxRuntimeMs: 300_000, concurrency: 1, maxTurns: 1, maxToolCalls: 24 },
+    remediationTurns: 0,
+  };
+
+  await assert.rejects(() => delegations.prepare({ runId: run.id, input: { ...base, originSessionId: "pi-origin-1" } }), /origin|unsupported/i);
+  await assert.rejects(() => delegations.prepare({ runId: run.id, input: { ...base, budget: { ...base.budget, maxTurns: 2 } } }), /budget|critic/i);
+  await assert.rejects(() => delegations.prepare({ runId: run.id, input: { ...base, reviewOf: undefined } }), /reviewOf|unsupported/i);
+});

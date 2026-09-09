@@ -34,9 +34,10 @@
 | `src/workflow/format.js` | Render compacto y JSON bounded de `critic`/`findings` sin perder severidad o marcador stale. |
 | `bin/workflow.js` | Inyectar el starter y transporte Pi existentes para `verify`, sin exponer sintaxis nueva. |
 | `.pi/agents/code-reviewer.md` | Ordenar el formato `findings` y recordar que blocker no gatea. |
+| `.pi/extensions/workflow-delegation-child.ts` | Aceptar/normalizar el payload `findings` en el schema del tool; la autorización final por origen+rol queda en el handoff del servidor. |
 | `README.md`, `ROADMAP.md`, `docs/run-record-fields.md` | Documentar auto-start advisory y los campos del record de delegación. |
 | `test/workflow-post-verify-critic.test.js` (nuevo) | Pruebas puras del vínculo, brief y selección fresh/stale. |
-| `test/workflow-delegation-store.test.js`, `test/workflow-delegation-handoff.test.js` | Contratos de origen y findings. |
+| `test/workflow-delegation-store.test.js`, `test/workflow-delegation-handoff.test.js`, `test/workflow-pi-extensions.test.js` | Contratos de origen y findings en store, servidor y schema del child. |
 | `test/workflow-delegation-services.test.js` | Reserva/policy/transporte del start automático y fallo advisory. |
 | `test/workflow-commands.test.js`, `test/workflow-format.test.js`, `test/workflow-cli.test.js` | Integración verify/result, proyección, formatos y wiring CLI. |
 
@@ -137,8 +138,10 @@ git commit -m "feat: model post-verify advisory critic metadata"
 **Files:**
 - Modify: `src/workflow/delegation-store.js`
 - Modify: `src/workflow/delegation-handoff.js`
+- Modify: `.pi/extensions/workflow-delegation-child.ts`
 - Test: `test/workflow-delegation-store.test.js`
 - Test: `test/workflow-delegation-handoff.test.js`
+- Test: `test/workflow-pi-extensions.test.js`
 
 **Interfaces:**
 
@@ -188,13 +191,21 @@ Assert persistence unchanged through `delegations.recordResult`. Add rejections 
 
 - [ ] **Step 5: Ejecutar para verificar el fallo**
 
-Run: `WORKFLOW_PROJECTS_FILE= npx node --test test/workflow-delegation-handoff.test.js`
+Run:
 
-Expected: FAIL because `findings` is outside `ALLOWED_KEYS`.
+```bash
+WORKFLOW_PROJECTS_FILE= npx node --test \
+  test/workflow-delegation-handoff.test.js \
+  test/workflow-pi-extensions.test.js
+```
+
+Expected: FAIL because `findings` is outside `ALLOWED_KEYS` and `handoffSchema.properties`.
 
 - [ ] **Step 6: Implementar validación punta a punta de findings**
 
 Add the same normalized `findings` contract to `delegation-handoff.js` and `delegation-store.js`’s `validateResult`; do not trust that handoff validation is the only caller of `recordResult`. Make `findings` optional and normalize absence to `[]` only on system-critic results. Validation must use `path.relative`/`path.isAbsolute` plus segment checks so a relative path has no empty, `.` or `..` segment. Keep current concerns limits and all generic role payloads byte-for-byte compatible when `findings` is absent.
+
+Extend `.pi/extensions/workflow-delegation-child.ts`’s `handoffSchema`, `validateHandoffInput`, byte-size payload and returned normalized value with the identical optional `findings` shape. The child cannot establish the persisted origin safely, so it validates syntax only; `submitDelegationHandoff` remains the sole boundary that rejects findings from interactive/non-critic records. Add a Pi-extension test that the registered tool accepts one valid finding and forwards it unchanged, and rejects malformed keys/severity/path before `submitHandoff` runs.
 
 - [ ] **Step 7: Ejecutar suites focalizadas**
 
@@ -203,7 +214,8 @@ Run:
 ```bash
 WORKFLOW_PROJECTS_FILE= npx node --test \
   test/workflow-delegation-store.test.js \
-  test/workflow-delegation-handoff.test.js
+  test/workflow-delegation-handoff.test.js \
+  test/workflow-pi-extensions.test.js
 ```
 
 Expected: PASS, with existing generic handoff tests unchanged and new system-critic cases green.
@@ -214,8 +226,9 @@ Add `origin`, `originSessionId`, and `reviewOf` to the internal-shape explanatio
 
 ```bash
 git add src/workflow/delegation-store.js src/workflow/delegation-handoff.js \
+  .pi/extensions/workflow-delegation-child.ts \
   test/workflow-delegation-store.test.js test/workflow-delegation-handoff.test.js \
-  docs/run-record-fields.md
+  test/workflow-pi-extensions.test.js docs/run-record-fields.md
 git commit -m "feat: persist post-verify critic origin and findings"
 ```
 

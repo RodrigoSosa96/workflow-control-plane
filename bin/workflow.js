@@ -38,6 +38,9 @@ import {
 import { executeStart as defaultExecuteStart, executeRuntime as defaultExecuteRuntime } from "../src/workflow/execute.js";
 import { ensureCodexWorkerHooks as defaultEnsureCodexWorkerHooks } from "../src/workflow/codex-hooks.js";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
+import { createDelegationServices } from "../src/workflow/delegation-services.js";
+import { createDelegationStore } from "../src/workflow/delegation-store.js";
+import { loadDelegationRole as defaultLoadDelegationRole } from "../src/workflow/delegation-roles.js";
 import { createOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { formatWorkflowResult as defaultFormatWorkflowResult } from "../src/workflow/format.js";
@@ -915,7 +918,29 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
 
     if (args.command === "verify") {
-      const result = await verifyCommand(options, liveDependencies);
+      // The post-verify advisory critic is wired lazily: the Pi transport is resolved only if a
+      // passed, persisted verification actually calls the starter (commands.js gates that), so a
+      // refused or failed verify never touches Pi. A preflight failure inside the starter (Pi not
+      // resolvable, transport start refused) is caught by commands.js and surfaces as advisory
+      // `critic.status: "failed"`, never as a CLI preflight failure.
+      const verifyDependencies = {
+        ...liveDependencies,
+        fingerprintPostVerifyCritic: dependencies.fingerprintPostVerifyCritic ?? (async ({ cwd }) => await liveDependencies.git.fingerprint({ cwd })),
+        startPostVerifyCritic: dependencies.startPostVerifyCritic ?? (async ({ store, registry, run, input }) => {
+          const withTransport = await withLiveDelegationTransport(options, liveDependencies, dependencies);
+          const services = (withTransport.createDelegationServices ?? createDelegationServices)({
+            registry,
+            projectAlias: run.projectAlias,
+            runStore: store,
+            delegations: withTransport.delegations ?? createDelegationStore({ store }),
+            reservations: withTransport.reservations ?? createDelegationReservationStore({ stateRoot: withTransport.stateRoot, readOwnOwnership: withTransport.readOwnOwnership }),
+            transport: withTransport.transport,
+            roles: withTransport.roles ?? { loadDelegationRole: defaultLoadDelegationRole },
+          });
+          return await services.startPostVerifyCritic({ runId: run.id, input });
+        }),
+      };
+      const result = await verifyCommand(options, verifyDependencies);
       emit(out, formatWorkflowResult("verify", result, args.format));
       return Number.isInteger(result.exitCode) ? result.exitCode : 0;
     }

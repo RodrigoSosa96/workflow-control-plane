@@ -9,6 +9,7 @@ import { submitDelegationHandoff as defaultSubmitDelegationHandoff } from "./del
 import { createDelegationReservationStore } from "./delegation-reservations.js";
 import { createDelegationServices as defaultCreateDelegationServices } from "./delegation-services.js";
 import { createDelegationStore } from "./delegation-store.js";
+import { buildPostVerifyCriticInput, createReviewOf, publicPostVerifyCritic } from "./post-verify-critic.js";
 import {
   buildClaudeWorkerSettings,
   buildHarnessResume,
@@ -1618,6 +1619,10 @@ async function readLatestVerificationEvidence(run, fs) {
     passed: latest.passed,
     exitCode: latest.exitCode,
     results: list(latest.results),
+    // The raw event as persisted, for the post-verify critic's staleness check: its reviewOf
+    // digest binds exactly this object, so the projection above (renamed timestamp, defaulted
+    // results) cannot be used to compare.
+    event: latest,
   };
 }
 
@@ -1633,7 +1638,13 @@ export async function resultCommand(options = {}, deps = {}) {
   // and rendered separately -- see format.js's verificationClaimLines/verificationEvidenceLines.
   // Read regardless of whether a result has been registered yet: verification is independent of
   // the handoff, and an operator may well run `workflow verify` before the worker ever reports in.
-  const verifiedEvidence = await readLatestVerificationEvidence(run, fs);
+  const latestEvidence = await readLatestVerificationEvidence(run, fs);
+  // `event` (the raw persisted log line) feeds the critic's staleness digest and stays out of
+  // the public output; `verifiedEvidence` keeps its documented projection shape exactly.
+  const { event: latestVerificationEvent, ...evidenceProjection } = latestEvidence ?? {};
+  const verifiedEvidence = latestEvidence ? evidenceProjection : null;
+  const critic = publicPostVerifyCritic({ delegations: run.delegations, latestVerification: latestVerificationEvent ?? null });
+  const criticField = critic ? { critic } : {};
 
   if (!hasRegisteredResult(run)) {
     const status = resultStatusWithoutArtifact(run);
@@ -1642,6 +1653,7 @@ export async function resultCommand(options = {}, deps = {}) {
       ...base,
       status,
       verifiedEvidence,
+      ...criticField,
       exitCode: stableResultExitCode(status),
       nextActions: status === "pending"
         ? [base.resultCommand, base.reconcileCommand]
@@ -1657,6 +1669,7 @@ export async function resultCommand(options = {}, deps = {}) {
     status,
     result: current.result,
     verifiedEvidence,
+    ...criticField,
     errors: current.errors ?? [],
     exitCode: stableResultExitCode(status),
     nextActions: status === "result-stale" ? [base.reconcileCommand] : [],
@@ -1772,6 +1785,51 @@ async function runVerifyMatrix(repositories, commands, { runVerify, timeoutMs, m
 // leave no evidence behind. Once the matrix actually runs, though, every outcome -- including a
 // missing repository path or a timeout -- is recorded as evidence, not silently dropped, and a
 // verification failure is reported cleanly (passed: false, a nonzero exitCode) rather than thrown.
+// The post-verify advisory critic. Starts ONLY on this exact conjunction: the matrix passed AND
+// its evidence event was persisted (the caller passes the record appendEvent returned). Anything
+// less -- a failed matrix, a refusal, an evidenceError -- means there is no durable evidence the
+// critic could honestly review, so no critic starts. Every failure inside is advisory: bounded,
+// reported, and never thrown back into verify's own result.
+async function startCriticAfterVerification({ run, verification, registry, store, deps }) {
+  if (verification?.passed !== true) return undefined;
+  const starter = deps.startPostVerifyCritic;
+  if (typeof starter !== "function") return undefined;
+  try {
+    const fingerprintOne = deps.fingerprintPostVerifyCritic;
+    if (typeof fingerprintOne !== "function") return undefined;
+    const fingerprints = [];
+    for (const repository of list(run.repositories)) {
+      const fingerprint = await fingerprintOne({ cwd: repository.path, repositoryId: repository.id });
+      if (typeof fingerprint?.digest !== "string") {
+        return { status: "failed", reason: `fingerprint for repository ${repository.id ?? "?"} could not be read` };
+      }
+      fingerprints.push({ repositoryId: repository.id, path: repository.path, digest: fingerprint.digest });
+    }
+    // The event as it actually landed in the log: appendEvent's returned record, round-tripped
+    // through JSON so the digest matches what a later read of events.jsonl parses.
+    const persisted = JSON.parse(JSON.stringify(verification));
+    const reviewOf = createReviewOf({
+      verification: persisted,
+      assignmentPath: run.assignmentPath,
+      assignmentDigest: run.assignmentDigest,
+      fingerprints,
+    });
+    const input = buildPostVerifyCriticInput({ run, verification: persisted, reviewOf, fingerprints });
+    const report = await starter({ store, registry, run, input });
+    if (report?.state === "running") {
+      return { status: "running", delegationId: report.delegationId ?? null, reviewOf };
+    }
+    return {
+      status: "failed",
+      delegationId: report?.delegationId ?? null,
+      reviewOf,
+      reason: `critic start reported ${report?.state ?? "no state"}`,
+    };
+  } catch (error) {
+    return { status: "failed", reason: String(error?.message ?? error).slice(0, 512) };
+  }
+}
+
 export async function verifyCommand(options = {}, deps = {}) {
   const store = await storeForCommand(options, deps);
   const runId = assertRunId(options.runId);
@@ -1818,12 +1876,17 @@ export async function verifyCommand(options = {}, deps = {}) {
   // persistence failure here is recorded on the response instead of thrown -- `evidenceError`
   // names why nothing landed in the run's event log this time, and `workflow verify` can simply be
   // rerun once the lock clears to get both the results AND a persisted record.
+  let verification;
   let evidenceError;
   try {
-    await store.appendEvent(runId, { type: "verification", passed, exitCode, results });
+    verification = await store.appendEvent(runId, { type: "verification", passed, exitCode, results });
   } catch (error) {
     evidenceError = `evidence could not be persisted: ${error?.message ?? String(error)}`;
   }
+
+  const critic = evidenceError === undefined
+    ? await startCriticAfterVerification({ run, verification, registry, store, deps })
+    : undefined;
 
   return {
     command: "verify",
@@ -1832,6 +1895,7 @@ export async function verifyCommand(options = {}, deps = {}) {
     passed,
     exitCode,
     ...(evidenceError ? { evidenceError } : {}),
+    ...(critic ? { critic } : {}),
   };
 }
 
