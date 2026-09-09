@@ -3,6 +3,12 @@ import { isAbsolute, join } from "node:path";
 import { classifyDelegationRole } from "./delegation-policy.js";
 import { claimTokenMatchesDigest, validateDelegationTransportIdentity } from "./delegation-invariants.js";
 import { WorkflowError } from "./errors.js";
+import {
+  POST_VERIFY_CRITIC_BUDGET,
+  POST_VERIFY_CRITIC_ORIGIN,
+  POST_VERIFY_CRITIC_REMEDIATION_TURNS,
+  POST_VERIFY_CRITIC_ROLE,
+} from "./post-verify-critic.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
@@ -14,6 +20,9 @@ const MAX_SHORT_TEXT = 4096;
 const MAX_CONCERNS = 20;
 const MAX_VERIFICATION = 20;
 const SESSION_KINDS = new Set(["pi", "claude", "codex"]);
+const REVIEW_OF_KEYS = new Set(["verificationDigest", "assignmentDigest", "fingerprintDigest"]);
+const SYSTEM_CRITIC_INPUT_KEYS = new Set(["origin", "reviewOf", "role", "mode", "cwd", "brief", "task", "budget", "remediationTurns"]);
+const INTERACTIVE_INPUT_KEYS = new Set(["originSessionId", "role", "mode", "cwd", "brief", "task", "budget", "remediationTurns"]);
 
 function fail(message) {
   throw new WorkflowError("delegation", message);
@@ -142,6 +151,47 @@ function validateManualRecoveryReason(value) {
   return assertString(value, "delegation remediation manual recovery reason", { limit: 128 });
 }
 
+function validateReviewOf(value) {
+  assertObject(value, "delegation reviewOf");
+  assertExactKeys(value, REVIEW_OF_KEYS, "delegation reviewOf");
+  const fields = {};
+  for (const key of REVIEW_OF_KEYS) {
+    const digest = assertString(value[key], `delegation reviewOf.${key}`, { limit: 128 });
+    if (!DIGEST_RE.test(digest)) fail(`delegation reviewOf.${key} must be a sha256 digest`);
+    fields[key] = digest;
+  }
+  return fields;
+}
+
+function sameBudget(left, right) {
+  return Object.keys(left).every((key) => left[key] === right[key]);
+}
+
+function validateDelegationInput(value) {
+  assertObject(value, "delegation input");
+  const system = value.origin !== undefined || value.reviewOf !== undefined;
+  assertExactKeys(value, system ? SYSTEM_CRITIC_INPUT_KEYS : INTERACTIVE_INPUT_KEYS, "delegation input");
+  const role = assertString(value.role, "delegation role", { limit: 128 });
+  classifyDelegationRole(role);
+  if (!MODES.has(value.mode)) fail("delegation mode must be foreground or background");
+  const input = {
+    role,
+    mode: value.mode,
+    cwd: assertString(value.cwd, "delegation cwd", { limit: MAX_SHORT_TEXT, absolute: true }),
+    brief: assertString(value.brief, "delegation brief", { limit: MAX_TEXT_BYTES }),
+    task: assertString(value.task, "delegation task", { limit: MAX_TEXT_BYTES }),
+    budget: validateBudget(value.budget),
+  };
+  if (!system) {
+    const remediationTurns = value.remediationTurns === undefined ? 2 : value.remediationTurns;
+    if (!Number.isInteger(remediationTurns) || remediationTurns < 0 || remediationTurns > 2) fail("delegation remediationTurns must be an integer from 0 through 2");
+    return { ...input, origin: "interactive", originSessionId: assertString(value.originSessionId, "delegation origin session", { limit: 512 }), reviewOf: null, remediationTurns };
+  }
+  if (value.origin !== POST_VERIFY_CRITIC_ORIGIN || role !== POST_VERIFY_CRITIC_ROLE || value.mode !== "background") fail("delegation system critic contract is invalid");
+  if (!sameBudget(input.budget, POST_VERIFY_CRITIC_BUDGET) || value.remediationTurns !== POST_VERIFY_CRITIC_REMEDIATION_TURNS) fail("delegation system critic budget is invalid");
+  return { ...input, origin: POST_VERIFY_CRITIC_ORIGIN, originSessionId: null, reviewOf: validateReviewOf(value.reviewOf), remediationTurns: POST_VERIFY_CRITIC_REMEDIATION_TURNS };
+}
+
 function validateResult(value) {
   assertObject(value, "delegation result");
   assertExactKeys(value, new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]), "delegation result");
@@ -201,20 +251,8 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   if (typeof randomUUID !== "function") fail("delegation randomUUID must be a function");
 
   async function prepare({ runId, input } = {}) {
-    assertObject(input, "delegation input");
-    assertExactKeys(input, new Set(["role", "mode", "originSessionId", "cwd", "brief", "task", "budget", "remediationTurns"]), "delegation input");
-    const role = assertString(input.role, "delegation role", { limit: 128 });
-    classifyDelegationRole(role);
-    if (!MODES.has(input.mode)) fail("delegation mode must be foreground or background");
-    const originSessionId = assertString(input.originSessionId, "delegation origin session", { limit: 512 });
-    const cwd = assertString(input.cwd, "delegation cwd", { limit: MAX_SHORT_TEXT, absolute: true });
-    const brief = assertString(input.brief, "delegation brief", { limit: MAX_TEXT_BYTES });
-    const task = assertString(input.task, "delegation task", { limit: MAX_TEXT_BYTES });
-    const budget = validateBudget(input.budget);
-    const remediationTurns = input.remediationTurns === undefined ? 2 : input.remediationTurns;
-    if (!Number.isInteger(remediationTurns) || remediationTurns < 0 || remediationTurns > 2) {
-      fail("delegation remediationTurns must be an integer from 0 through 2");
-    }
+    const normalizedInput = validateDelegationInput(input);
+    const { role, cwd, brief, task, budget, remediationTurns, origin, originSessionId, reviewOf } = normalizedInput;
     const id = delegationId(randomUUID);
     const timestamp = now(clock);
     const relativePath = privatePath(id, "brief.md");
@@ -230,7 +268,9 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
           parentRunId: run.id,
           role,
           mode: input.mode,
+          origin,
           originSessionId,
+          reviewOf,
           cwd,
           briefDigest: digest(brief),
           taskDigest: digest(task),
