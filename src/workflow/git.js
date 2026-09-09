@@ -179,12 +179,12 @@ function parseMergeTree(output) {
   if (terminatorIndex < 0) conflicts.pop();
 
   // But if the cut lands exactly on the NUL that terminates a path, `split("\0")` produces a
-  // trailing "" that is INDISTINGUISHABLE from git's real end-of-paths marker -- so this function
-  // used to report a 1,196-path prefix of a 1,696-path conflict list as COMPLETE, with no
-  // `truncated` flag, and the digest then bound that prefix as the whole truth. That is precisely
-  // the "a shortened list must never read as complete" property the entire conflictsTruncated
-  // chain exists to guarantee. (Measured repro: OID(40) + NUL + 1195 nine-character paths + one
-  // eight-character path = exactly 12,000 characters.)
+  // trailing "" that is INDISTINGUISHABLE from git's real end-of-paths marker -- so a prefix of
+  // the conflict list would read as COMPLETE, with no `truncated` flag, and the digest would bind
+  // that prefix as the whole truth. That is precisely the "a shortened list must never read as
+  // complete" property the entire conflictsTruncated chain exists to guarantee. (Measured repro:
+  // OID(40) + NUL + 1195 nine-character paths + one eight-character path = exactly 12,000
+  // characters.)
   //
   // The length of the captured stream is what actually settles it: at or above the cap, the stream
   // was cut, whatever the last field happens to look like. An empty field with data AFTER it is
@@ -433,8 +433,7 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     },
 
     // Where the work actually is. Read from the checkout, never derived from a run record: a
-    // recorded branch is a launch-time intention and two of the eight real runs on this machine
-    // name a ref that no longer exists.
+    // recorded branch is a launch-time intention and can name a ref that no longer exists.
     async resolveHead({ cwd, timeoutMs }) {
       const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeoutMs });
       const shaResult = await runner.run("git", ["rev-parse", "HEAD"], { cwd, timeoutMs });

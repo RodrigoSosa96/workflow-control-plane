@@ -186,10 +186,10 @@ function formatLaunch(value) {
     : formatLaunchRun(value);
 }
 
-// --- formatResult's claim/proof split (roadmap item 2.3) ---------------------------------------
+// --- formatResult's claim/proof split -----------------------------------------------------------
 //
-// Two sources, never merged, and no computed verdict about their disagreement (design spec: "A
-// design that overwrote the self-report would destroy the more interesting half of the signal"):
+// Two sources, never merged, and no computed verdict about their disagreement (a renderer that
+// overwrote the self-report would destroy the more interesting half of the signal):
 //  - the claim: the worker's own self-reported `verification[]` from its handoff (handoff.js),
 //    carried on `value.result.verification` exactly as resultCommand already exposes the rest of
 //    the worker's result.
@@ -366,14 +366,14 @@ function formatDelegation(value) {
   return bound(lines.join("\n"));
 }
 
-// --- formatRuns: the compact board for `workflow runs` (roadmap item 2.1) ----------------------
+// --- formatRuns: the compact board for `workflow runs` ------------------------------------------
 //
 // No worktree column: verified against a real record, the paths live inside `repositories[]` as
 // `{id, path, branch}`, one entry per repository, and a multi-repo run carries several under one
 // shared worktree root. A table column cannot honestly render that -- `--format json` carries
 // `repositories` in its own documented projection instead (see `runProjection` below -- not the
-// raw record; a board-scale JSON dump of every field turned out not to fit the shared output
-// budget, see that function's own comment); an operator who needs the paths runs `workflow result
+// raw record; a board-scale JSON dump of every field does not fit the shared output budget, see
+// that function's own comment); an operator who needs the paths runs `workflow result
 // <run-id>`. So this renderer only ever reads `id`/`state`/`projectAlias`/`primaryTicket`/
 // `harness`/`updatedAt` off a run record -- never `repositories`, `runDirectory`, `stateRoot`, or
 // anything else that could carry a filesystem path.
@@ -457,11 +457,10 @@ function appendSkippedLine(lines, skipped) {
   lines.push(`Skipped: ${skipped.length} (${ids})`);
 }
 
-// Roadmap item 2.5's board change, reported exactly the way appendSkippedLine reports crash
-// residue: a run this board chose not to show is NAMED as a count underneath it, never silently
-// dropped. Archived runs are excluded from the default view and from `--all` (that exclusion is the
-// relief item 2.1 named when it measured the 12-14 run JSON ceiling), and an operator must be able
-// to tell "there is nothing else" from "there are four you are not being shown".
+// Reported exactly the way appendSkippedLine reports crash residue: a run this board chose not to
+// show is NAMED as a count underneath it, never silently dropped. Archived runs are excluded from
+// the default view and from `--all`, and an operator must be able to tell "there is nothing else"
+// from "there are four you are not being shown".
 //
 // Only ever rendered when something was actually hidden: an unconditional `Archived: 0` would be
 // noise on every board this repo has printed to date, and `runsCommand` reports 0 for the common
@@ -489,7 +488,7 @@ export function formatRuns(value = {}, deps = {}) {
   return bound(lines.join("\n"));
 }
 
-// --- formatInbox: the compact view for `workflow inbox` (roadmap item 2.2) ---------------------
+// --- formatInbox: the compact view for `workflow inbox` -----------------------------------------
 //
 // Deliberately reuses formatRuns's shape rather than inventing a second board style (see that
 // function's own comment): a table for the actionable entries -- here, blocked runs instead of
@@ -500,16 +499,13 @@ export function formatRuns(value = {}, deps = {}) {
 // step here the way runProjection exists for `runs` -- `--format json` below carries them
 // unchanged.
 //
-// Three lists, not two -- **correction, recorded after running this command against the
-// developer's real state root** (see the correction paragraph in
-// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md): a run in `manual-handoff-required`,
-// `needs-input`, or self-reported `blocked` (`RUN_STATES.BLOCKED`, added by the branch-review I3
-// fix -- a worker's own "I am stuck" is exactly as unambiguous as the other two) whose worker
-// already exited is not a diagnostic, it is the run doing exactly what that state means. `blocked`
-// (a live pane, sitting at a prompt right now, per Herdr's `agent_status`) and `waiting` (the
-// run's own state already means it needs the operator, decided by `AWAITS_OPERATOR_STATES` in
-// commands.js independent of whether the agent even resolved -- see the C1 fix) are both
-// actionable "this needs you" sections; `unresolved` stays a genuine diagnostic, covering an
+// Three lists, not two: a run in `manual-handoff-required`, `needs-input`, or self-reported
+// `blocked` (`RUN_STATES.BLOCKED` -- a worker's own "I am stuck" is exactly as unambiguous as the
+// other two) whose worker already exited is not a diagnostic, it is the run doing exactly what
+// that state means. `blocked` (a live pane, sitting at a prompt right now, per Herdr's
+// `agent_status`) and `waiting` (the run's own state already means it needs the operator, decided
+// by `AWAITS_OPERATOR_STATES` in commands.js independent of whether the agent even resolved) are
+// both actionable "this needs you" sections; `unresolved` stays a genuine diagnostic, covering an
 // *active* run (running/launching/idle-awaiting-handoff/result-stale) whose agent could not be
 // confirmed live or classified into a recognized status -- that one really is surprising, because
 // an active run's worker is supposed to still be there.
@@ -592,7 +588,7 @@ export function formatInbox(value = {}) {
   return bound(lines.join("\n"));
 }
 
-// --- formatVerify: the compact view for `workflow verify` (roadmap item 2.3) -------------------
+// --- formatVerify: the compact view for `workflow verify` ---------------------------------------
 //
 // verifyCommand's own return shape (commands.js): `{command: "verify", runId, results, passed,
 // exitCode}` on a real run, or `{command: "verify", runId, results: [], passed: false, exitCode,
@@ -709,7 +705,7 @@ export function formatVerify(value = {}) {
   return bound(lines.join("\n"));
 }
 
-// --- formatMerge (roadmap item 2.4's `workflow merge`) ----------------------------------------
+// --- formatMerge -----------------------------------------------------------------------------
 //
 // Two shapes reach this renderer and the discriminator is structural, never an import from
 // commands.js: this file is deliberately dependency-free (nothing here imports MERGE_EXIT_CODES or
@@ -717,15 +713,13 @@ export function formatVerify(value = {}) {
 // report by its `merged`/`failed`/`skipped` lists. A refusal is recognized by `refused` on the
 // value, the same way formatVerify recognizes one by `reason`.
 //
-// The four things this view must never lose (Task 2's own interface notes, and the reason the
-// design spec puts a digest in front of this command at all):
+// The four things this view must never lose:
 //   1. the exact argv per repository -- it is what the approval digest binds, so it is rendered
 //      verbatim as JSON rather than shell-joined, exactly as formatLaunchPreview renders its own
 //      `Launch argv:` line;
 //   2. the conflicts -- and never a shortened list rendered as the complete set;
 //   3. the branch mismatch, with the recorded branch and the worktree's actual branch beside each
-//      other (the real-data finding: two of the eight real runs on this machine record a branch
-//      that no longer exists);
+//      other (a run can record a branch that no longer exists by merge time);
 //   4. the verification status, including `none`.
 
 // The last column is `MERGE-TREE`, not `MERGE`, and the name is load-bearing. It answers exactly
@@ -1026,7 +1020,7 @@ export function formatMerge(value = {}) {
   return formatMergePreview(value);
 }
 
-// --- formatArchive (roadmap item 2.5's `workflow archive`) -------------------------------------
+// --- formatArchive ----------------------------------------------------------------------------
 //
 // Three shapes reach this renderer, and the discriminator is structural rather than an import from
 // commands.js -- this file is deliberately dependency-free, so nothing here reads
@@ -1048,9 +1042,9 @@ export function formatMerge(value = {}) {
 //   4. **`argv` is on `removed[]` only.** A `kept[]` entry -- an `unsafe-path`, a spawn that failed
 //      -- has no argv precisely because nothing ran; rendering one would be an audit trail of a
 //      command that never executed.
-//   5. **`tab` has four distinguishable outcomes and `alreadyGone` is the COMMON one** (every
-//      recorded tab id on the machine this was built against is stale). Printing "not closed" for
-//      all of them would make the normal case look broken.
+//   5. **`tab` has four distinguishable outcomes and `alreadyGone` is the COMMON one** (a
+//      recorded tab id is stale once the Herdr server has restarted since the run launched).
+//      Printing "not closed" for all of them would make the normal case look broken.
 
 // `null` is UNKNOWN, and it is spelled out rather than blanked, so a table cell can never be read
 // as a measured zero. Point 2 above, in one function -- every count in this renderer goes through
@@ -1075,12 +1069,10 @@ function archiveLockLine(lock) {
 // `checkedPaneIds` is the honest evidence: the correlated pane is what `agent.paneId` means
 // everywhere else in the control plane, but the gate asks about EVERY pane the run has named, which
 // may be two (a resumed run's original pane can still host a live agent). Naming both is what makes
-// "no live agent" a checkable claim rather than an assurance.
-// **Corrected against real CLI output (step 5).** This used to render
-// `Agent: no live agent (panes checked: none recorded)` for a run that never named a pane -- a
-// claim of having checked, immediately contradicted by the parenthetical saying there was nothing
-// to check. The two cases are genuinely different evidence and now say so: Herdr was asked about
-// specific panes and answered, or Herdr was never asked because the run has no agent to resolve.
+// "no live agent" a checkable claim rather than an assurance. A run that never named a pane and a
+// run whose panes were all checked are genuinely different evidence and say so: Herdr was asked
+// about specific panes and answered, or Herdr was never asked because the run has no agent to
+// resolve.
 function archiveAgentLine(agent) {
   if (!agent || typeof agent !== "object") return "Agent: not reported";
   const checked = list(agent.checkedPaneIds).map((pane) => String(pane));
@@ -1123,14 +1115,9 @@ function archiveRow(record = {}) {
 
 // One line per loss, keyed off `kind` -- a closed vocabulary of three -- with the count rendered
 // through archiveCount so an unmeasurable loss never borrows a measured one's shape. `detail` goes
-// through reasonBlock because it can carry git's own text.
-// **Corrected against real CLI output (step 5).** This label used to spell out
-// `<count> commit(s) on <branch> not in <baseBranch>`, which is very nearly the opening clause of
-// the `detail` printed immediately after it -- so every unmerged loss rendered as
-// `backend | 1 commit(s) on feature/x not in dev: 1 commit(s) on feature/x are not in dev; ...`.
-// The label's job is to be the SCANNABLE classifier beside a sentence, not a paraphrase of it: the
-// count is the number an operator is scanning for, and `UNKNOWN` in the same slot is the fact that
-// must never be mistaken for a zero.
+// through reasonBlock because it can carry git's own text. The label's job is to be the SCANNABLE
+// classifier beside a sentence, not a paraphrase of it: the count is the number an operator is
+// scanning for, and `UNKNOWN` in the same slot is the fact that must never be mistaken for a zero.
 function archiveLossLabel(loss = {}) {
   if (loss.kind === "unmerged-commits" || loss.kind === "unmerged-commits-unknown") {
     return `UNMERGED (${archiveCount(loss.count)})`;
@@ -1178,11 +1165,10 @@ function appendArchiveLosses(lines, losses) {
 // it loses this. Unknown-size losses are counted as their own quantity rather than summed as zero
 // -- point 2 above, at the level of the total rather than the cell.
 //
-// **Kind-aware since C1**, and it has to be: this used to sum `count` across every loss and label
-// the total "unmerged commit(s)". An `ignored-content` loss carries a count too, so the moment that
-// kind existed the headline would have reported deleted files as unmerged commits -- a true number
-// under a false noun, which is worse than no number. Deleted files lead, because they are the only
-// thing here that stops existing.
+// The headline is kind-aware, and it has to be: an `ignored-content` loss carries a count too, so
+// summing `count` across every loss and labelling the total "unmerged commit(s)" would report
+// deleted files as unmerged commits -- a true number under a false noun, which is worse than no
+// number. Deleted files lead, because they are the only thing here that stops existing.
 function archiveLossHeadline(losses) {
   if (losses.length === 0) {
     return "Would be lost: nothing — every worktree is on a branch, every branch is fully merged into its base, and no ignored content would be deleted";
@@ -1213,18 +1199,12 @@ function archiveLossHeadline(losses) {
 }
 
 // `branchMismatch` is literally `recordedBranch !== branch` (commands.js), so a run that recorded no
-// branch at all lands here too -- the same call formatMerge makes, and worth naming for the same
-// reason: on the machine this was built against, two of eight real runs record a branch that no
-// longer exists. Rendered only for a preview; the execute report has already acted on it.
-// **Corrected against real CLI output (step 5), then corrected again in review.** An ALREADY GONE
-// worktree has `branch: null`, so `branchMismatch` -- literally `recordedBranch !== branch`
-// (commands.js) -- is true for every single one of them. The first correction fixed the entry TEXT
-// but left them in the `mismatched` list, so a re-preview of a fully archived run still printed a
-// `Branch mismatch:` header with one entry per repository when nothing disagreed with anything: the
-// worktrees were simply gone. Fixing the sentence and leaving the heading that frames it is the
-// same check-the-clause-not-the-claim mistake one level up.
+// branch at all lands here too -- worth naming: a run can record a branch that no longer exists by
+// archive time. Rendered only for a preview; the execute report has already acted on it.
 //
-// The two are now separate groups with separate headings, and the empty case of each is stated
+// An ALREADY GONE worktree has `branch: null`, so `branchMismatch` is true for every single one of
+// them -- but nothing disagrees with anything there: the worktrees are simply gone. The two are
+// therefore separate groups with separate headings, and the empty case of each is stated
 // explicitly rather than inferred from an absence (formatMerge's own discipline). A vanished
 // worktree is reported as vanished under its own label; only a worktree that is really there can
 // disagree with the record about its branch.
@@ -1255,12 +1235,11 @@ function appendArchiveNextActions(lines, nextActions) {
   for (const action of actions) lines.push(`- ${action}`);
 }
 
-// **Corrected against real CLI output (step 5).** This used to read
-// `Archive: 2 worktree(s) would be removed` for a run whose two worktrees were both ALREADY GONE --
-// re-previewing an already-archived run, which is a shape this command produces routinely (it is
+// The two counts are separated so the headline can never promise a removal that is not going to
+// happen: re-previewing an already-archived run is a shape this command produces routinely (it is
 // how an operator finishes a partial archive, and re-running after a complete one is the obvious
-// thing to try). Nothing would be removed from disk there; git only reclaims the registration. The
-// two counts are separated so the headline can never promise a removal that is not going to happen.
+// thing to try), and for a run whose worktrees are ALREADY GONE nothing is removed from disk --
+// git only reclaims the registration.
 function archiveHeadline(repositories) {
   const gone = repositories.filter((record) => record.present === false).length;
   const present = repositories.length - gone;
@@ -1401,21 +1380,12 @@ export function formatArchive(value = {}) {
   return formatArchivePreview(value);
 }
 
-// The projection roadmap item 2.1's design spec promised ("machines get complete records") was
-// wrong at board scale, and the wrongness is measured, not theoretical: against the 8 real runs
-// on the machine that first ran this command, whole records serialize to 53,791 characters for
-// `--all` and 11,895 for the (2-record) default view -- both against the one shared
-// OUTPUT_LIMIT (12000 characters, this file's top). `--all` already lost: boundedJson's overflow
-// fallback keeps only `{command, runId?, status?, truncated, truncationMarker}`, and a `runs`
-// result has neither `runId` nor `status` for it to preserve, so the fallback degrades to zero
-// run data. The default view was 105 bytes from the same fate. Runs accumulate forever -- there
-// is no cleanup until item 2.5 -- so both numbers only grow.
-//
-// A board is a summary; emitting every field of a run record (~44 of them --
-// docs/run-record-fields.md -- stateHistory, telemetry, launchOperations, launchArgv, request,
-// digests, delegations, ...) was never the right shape for "what is running". This projects each
-// run down to what a board's consumer needs, and nothing else. See this spec's correction
-// paragraph: docs/superpowers/specs/2026-08-04-workflow-runs-board-design.md.
+// A board is a summary; whole run records are the wrong shape for it. Measured against this
+// machine's state root: whole records serialize far past the one shared OUTPUT_LIMIT (12000
+// characters, this file's top), and boundedJson's overflow fallback keeps only
+// `{command, runId?, status?, truncated, truncationMarker}` -- a `runs` result has neither `runId`
+// nor `status` for it to preserve, so the fallback would degrade to zero run data. This projects
+// each run down to what a board's consumer needs, and nothing else.
 //
 // Field-by-field:
 //   - id, directory: what makes a run addressable. `id` is what `workflow result <id>` and every
@@ -1428,16 +1398,15 @@ export function formatArchive(value = {}) {
 //   - repositories: the one field the compact table CANNOT honestly render at all -- a multi-repo
 //     run has one `{id, path, branch}` entry per repository, not a single "worktree" column could
 //     hold (see formatRuns's own comment on why the table drops it) -- and therefore the specific
-//     reason the design spec promised `--format json` would carry more than the table. This is
-//     the field a tool consuming the board actually wants.
+//     reason `--format json` carries more than the table. This is the field a tool consuming the
+//     board actually wants.
+//   - archivedAt: this board hides archived runs from its default view and from `--all`, so a JSON
+//     consumer looking at a `--state completed` listing has to be able to tell which of those rows
+//     are archived residue from which are still waiting to be dealt with. It is `undefined` on
+//     every run that has never been archived, so it costs nothing on the common board
+//     (JSON.stringify omits undefined keys entirely) and appears only where it is true.
 // Everything else stays out on purpose. An operator or script that needs the rest already has the
 // tool sized for exactly that: `workflow result <run-id>` returns one run's full record.
-//   - archivedAt: item 2.5's own field, and the reason it belongs on a BOARD projection rather than
-//     only in `workflow result`: this board now hides archived runs from its default view and from
-//     `--all`, so a JSON consumer looking at a `--state completed` listing has to be able to tell
-//     which of those rows are archived residue from which are still waiting to be dealt with. It is
-//     `undefined` on every run that has never been archived, so it costs nothing on the common
-//     board (JSON.stringify omits undefined keys entirely) and appears only where it is true.
 function runProjection(run) {
   if (!run || typeof run !== "object") return run;
   return {
@@ -1603,27 +1572,20 @@ function inboxOverflowFallback(command, source, limit) {
   };
 }
 
-// The same collapse `runs`/`inbox` measured at board scale can happen to a SINGLE `workflow
-// verify` invocation, because the multiplier here is not run count but repository count x command
-// count (see VERIFY_JSON_OUTPUT_LIMIT's own comment) -- and unlike `runs`/`inbox`, this is not just
-// an extreme-scale edge case: a real multi-repository project with a handful of verify commands
-// each is well within reach of an operator's own registry. The general fallback below was built
-// for single-record commands where "rerun narrower" is real advice (`result`/`reconcile` take one
-// run id, so a caller can always ask for less); `verify` has no way to ask for fewer repositories
-// or commands -- rerunning faces the exact same matrix, still capped the same way -- so its own
+// The same collapse `runs`/`inbox` can hit at board scale can happen to a SINGLE `workflow verify`
+// invocation, because the multiplier here is not run count but repository count x command count
+// (see VERIFY_JSON_OUTPUT_LIMIT's own comment). The general fallback below was built for
+// single-record commands where "rerun narrower" is real advice (`result`/`reconcile` take one run
+// id, so a caller can always ask for less); `verify` has no way to ask for fewer repositories or
+// commands -- rerunning faces the exact same matrix, still capped the same way -- so its own
 // fallback names what actually happened instead of offering advice that does not apply, the same
-// fix runsOverflowFallback/inboxOverflowFallback made for their own commands.
+// choice runsOverflowFallback/inboxOverflowFallback make for their own commands.
 //
-// **Correction (branch review, M6):** this used to drop the `results` array entirely, keeping only
-// `repositoryIds`/`commands` -- which loses every result's status, exit code, and the
-// repository<->command pairing, not just the bulky captured output that actually caused the
-// overflow. `output` is the one field whose size scales with the matrix (VERIFY_JSON_OUTPUT_LIMIT's
-// own comment); status/exitCode do not, so dropping only `output` and keeping
-// `{repositoryId, command, status, exitCode}` per result preserves the half of the evidence an
-// operator can actually act on -- measured (see the headroom test in test/workflow-format.test.js)
-// to stay well under budget even at extreme scale. The stale ROADMAP.md sentence this comment used
-// to contradict ("descarta el texto de output por resultado") was actually describing THIS
-// behavior, not the one the code had -- both now agree.
+// The `results` array is NOT dropped entirely: `output` is the one field whose size scales with
+// the matrix (VERIFY_JSON_OUTPUT_LIMIT's own comment); status/exitCode do not, so dropping only
+// `output` and keeping `{repositoryId, command, status, exitCode}` per result preserves the half
+// of the evidence an operator can actually act on -- measured (see the headroom test in
+// test/workflow-format.test.js) to stay well under budget even at extreme scale.
 function strippedVerifyResult(result) {
   return {
     repositoryId: result?.repositoryId,
@@ -1652,22 +1614,18 @@ function verifyOverflowFallback(command, source, limit) {
 }
 
 // The same collapse can happen to `workflow result`'s embedded evidence: `verifiedEvidence.results`
-// is the exact same matrix `verify` measures, carried here for the claim/proof split (roadmap item
-// 2.3). Unlike `verify`, `result` is a single-record command -- it takes exactly one run id, same
-// as `reconcile` -- so the general fallback below looked like the right one when this branch first
-// shipped it. It is not: that fallback keeps only `{command, runId, status, truncated,
-// truncationMarker}`, and at a realistic evidence size it discarded `result` itself along with it
-// -- the worker's own summary/verification claim, the repositories with their fingerprints,
-// decisions, and nextAction, none of which scale with the evidence matrix at all. Measured directly
-// against this file's own `formatWorkflowResult("result", ..., "json")`, with a realistic envelope
-// (the full runOutputBase fields, a canonicalResult-shaped `result` with three repositories'
-// fingerprints/decisions/nextAction, and a 3-repository x 5-command evidence matrix at each
-// result's real per-command capture cap): the general fallback collapsed this at **n=12** evidence
-// results (n=11 = 11,506 characters, 95.9% of budget; n=12 = 227 characters, `result` gone
-// entirely) -- well inside a plausible registry (3 repositories x 5 commands = 15). The fix mirrors
-// `verify`'s own (see verifyOverflowFallback/strippedVerifyResult above): keep every top-level
-// field -- `result`, `status`, and everything else in the envelope -- and degrade only
-// `verifiedEvidence.results`, the one field whose size actually scales with the matrix.
+// is the exact same matrix `verify` measures, carried here for the claim/proof split. Unlike
+// `verify`, `result` is a single-record command -- it takes exactly one run id, same as
+// `reconcile` -- but the general fallback below is still wrong for it: that fallback keeps only
+// `{command, runId, status, truncated, truncationMarker}`, and at a realistic evidence size it
+// would discard `result` itself along with the evidence -- the worker's own summary/verification
+// claim, the repositories with their fingerprints, decisions, and nextAction, none of which scale
+// with the evidence matrix at all. Measured against this file's own
+// `formatWorkflowResult("result", ..., "json")` with a realistic envelope (3 repositories x 5
+// commands at each result's real per-command capture cap): the general fallback collapses this at
+// n=12 evidence results, dropping `result` entirely -- well inside a plausible registry. So this
+// fallback keeps every top-level field and degrades only `verifiedEvidence.results`, the one field
+// whose size actually scales with the matrix (same choice as verifyOverflowFallback above).
 function resultOverflowFallback(command, source, limit) {
   const evidence = source.verifiedEvidence && typeof source.verifiedEvidence === "object" ? source.verifiedEvidence : null;
   const evidenceResults = list(evidence?.results);

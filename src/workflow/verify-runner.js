@@ -112,32 +112,29 @@ async function checkCwd(cwd) {
 // below, and process-group.js's own header for why this file's trap goes straight to SIGKILL while
 // the shared runner's forwards the received signal first.
 
-// R1 (branch re-review): `detached: true` above (see killChild's own comment) is what lets a
-// timeout reach a backgrounded grandchild's whole process group -- and that part of the fix
-// stands. But the same detachment takes the spawned shell OUT of this CLI's own process group, so
-// a terminal's Ctrl-C -- delivered to the whole *foreground* process group, not to this process by
-// pid -- no longer reaches the child at all. Pre-fix, node and its `/bin/sh` child shared one
-// process group and a Ctrl-C killed both; post-fix, an interrupted CLI exits while the detached
-// shell (and anything it started) is reparented to init with no bound whatsoever -- the
-// `timeoutMs`/`killGraceMs` escalation above lives inside the process that just died, so it never
-// gets to run.
+// `detached: true` above (see killChild's own comment) lets a timeout reach a backgrounded
+// grandchild's whole process group -- but the same detachment takes the spawned shell OUT of this
+// CLI's own process group, so a terminal's Ctrl-C -- delivered to the whole *foreground* process
+// group, not to this process by pid -- does not reach the child at all. Without this trap, an
+// interrupted CLI exits while the detached shell (and anything it started) is reparented to init
+// with no bound whatsoever -- the `timeoutMs`/`killGraceMs` escalation lives inside the process
+// that just died, so it never gets to run.
 //
-// This closes that gap without giving the timeout's own group-kill back up: for exactly as long as
-// this one child is alive, an interrupt delivered to THIS process (SIGINT from a terminal, or
-// SIGTERM from e.g. a process manager) kills the child's whole group first -- SIGKILL, not the
-// timeout path's SIGTERM-then-grace-then-SIGKILL escalation, because this process is about to exit
-// and will not be alive to run that timer, so there is no room for a graceful drain, only an
-// immediate and unmissable one -- and then this process exits the same way an uninterrupted
-// SIGINT/SIGTERM would (128 + signal number, the shell's own convention), rather than continuing
-// to run as though nothing happened.
+// For exactly as long as this one child is alive, an interrupt delivered to THIS process (SIGINT
+// from a terminal, or SIGTERM from e.g. a process manager) kills the child's whole group first --
+// SIGKILL, not the timeout path's SIGTERM-then-grace-then-SIGKILL escalation, because this process
+// is about to exit and will not be alive to run that timer, so there is no room for a graceful
+// drain, only an immediate and unmissable one -- and then this process exits the same way an
+// uninterrupted SIGINT/SIGTERM would (128 + signal number, the shell's own convention), rather
+// than continuing to run as though nothing happened.
 //
-// **SIGKILL is right HERE and wrong in process.js, and the divergence is deliberate.** What this
-// file runs is a verification command -- a test suite, a typecheck -- which owns no lock and no
+// SIGKILL is right HERE and wrong in process.js, and the divergence is deliberate. What this file
+// runs is a verification command -- a test suite, a typecheck -- which owns no lock and no
 // half-written repository, so no cleanup handler has anything to do and killing outright is the
-// strongest guarantee that nothing survives. `process.js` fronts repository MUTATIONS
-// (`git merge --no-ff`, `git worktree add`, `git worktree remove`), where an uncatchable SIGKILL
-// means git never runs the cleanup it registered for catchable signals; its trap therefore forwards
-// the received signal first and escalates only after a grace window. Neither policy belongs in the
+// strongest guarantee that nothing survives. `process.js` fronts repository MUTATIONS (`git merge
+// --no-ff`, `git worktree add`, `git worktree remove`), where an uncatchable SIGKILL means git
+// never runs the cleanup it registered for catchable signals; its trap therefore forwards the
+// received signal first and escalates only after a grace window. Neither policy belongs in the
 // shared process-group.js, which holds only what is true for both.
 //
 // Installed and torn down per spawned child (see the two call sites in spawnAndCollect below), and

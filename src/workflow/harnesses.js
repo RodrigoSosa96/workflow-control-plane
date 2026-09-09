@@ -138,13 +138,10 @@ function expectedLaunch({ profileName, profile, sessionName, cwd, nativeSessionI
 // `workflow resume` (buildHarnessResume). A launch and a resume of the same profile differ in
 // exactly two things, and neither of them is a flag: the `sessionForm` argument — the tokens that
 // name the native session, which each harness spells differently — and the launch-only bootstrap
-// prompt appended by buildHarnessLaunch. Every flag the profile contributes is written here once.
-//
-// It used to be written twice: `workflow resume` hand-assembled its own argv per harness, and the
-// two drifted, so a resumed worker ran outside the security envelope its approval covered — the
-// claude resume dropped `--permission-mode`, the codex resume dropped `--sandbox` and answered
-// `-a never` in place of the approved `--ask-for-approval`. Adding a flag to a launch without
-// adding it to the resume is now structurally impossible rather than merely discouraged.
+// prompt appended by buildHarnessLaunch. Every flag the profile contributes is written here once,
+// so a resumed worker runs under exactly the security envelope its approval covered, and adding a
+// flag to a launch without adding it to the resume is structurally impossible rather than merely
+// discouraged.
 //
 // With one honest exception, which is why buildHarnessResume carries an extra assertion: Claude's
 // `--settings` is gated on the caller-supplied `settingsPath`, not on the profile, so a caller

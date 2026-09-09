@@ -35,7 +35,7 @@ function canonicalize(value) {
   }, {});
 }
 
-// Exported so `mergeCommand` (commands.js, roadmap item 2.4) digests its preview through the SAME
+// Exported so `mergeCommand` (commands.js) digests its preview through the SAME
 // canonicalization this file's approval digest uses, rather than a second copy that could drift in
 // how it orders keys or drops undefined values. Same reason APPROVAL_DIGEST_PATTERN is exported:
 // there is one grammar for an approval digest in this control plane, not one per command.

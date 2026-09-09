@@ -4,12 +4,11 @@
 // read-modify-write, so a genuinely live collision between two processes is millisecond-scale
 // and should be absorbed rather than reported to the operator as crash residue.
 //
-// The budget used to be counted in attempts (three tries, ~50-200ms of jitter total). That unit
-// is machine-speed-dependent: on a slower host or a loaded CI runner, the same three attempts
-// cover less and less wall time until they no longer even span a live collision, and a contender
-// that would have succeeded on a fast machine instead reports the mutex as wedged. Measured
-// locally: 15/15 passes unloaded, 12/12 with 36 CPU-burning workers, and it still failed on a
-// two-core CI runner. Budgeting wall time instead makes the guarantee machine-speed-independent.
+// The budget is wall time, not an attempt count, because an attempt count is
+// machine-speed-dependent: on a slower host or a loaded CI runner, the same N attempts cover
+// less and less wall time until they no longer even span a live collision, and a contender that
+// would have succeeded on a fast machine instead reports the mutex as wedged. Budgeting wall
+// time makes the guarantee machine-speed-independent.
 //
 // MUTEX_RETRY_BUDGET_MS is three to four orders of magnitude above a fast local mkdir + fsync,
 // and still imperceptible to an operator -- it is only ever spent in full when the gate genuinely
