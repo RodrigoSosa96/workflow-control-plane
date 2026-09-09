@@ -2902,3 +2902,67 @@ test("a worktree another finished run also records is named, and a run with noth
   }), "compact");
   assert.match(clean, /^Would be lost: nothing — .*no ignored content would be deleted$/m);
 });
+
+// --- the post-verify critic in workflow result ---------------------------------------------------
+
+test("formatResult renders the critic block with severities, and names staleness", () => {
+  const value = {
+    runId: "11111111-1111-4111-8111-111111111111",
+    status: "completed",
+    critic: {
+      delegationId: "22222222-2222-4222-8222-222222222222",
+      status: "completed",
+      reviewOf: { verificationDigest: `sha256:${"a".repeat(64)}` },
+      result: {
+        status: "completed",
+        summary: "Found one blocker",
+        findings: [{
+          severity: "blocker",
+          summary: "Missing approval digest check",
+          evidence: "commands.js:42 accepts stale state",
+          path: "src/workflow/commands.js",
+        }],
+        concerns: ["style drift"],
+        nextAction: "Review the blocker",
+      },
+    },
+  };
+
+  const compact = formatWorkflowResult("result", value, "compact");
+  assert.match(compact, /Critic: completed/i);
+  assert.match(compact, /\[BLOCKER\] src\/workflow\/commands\.js — Missing approval digest check/);
+  assert.match(compact, /workflow delegation result 11111111-1111-4111-8111-111111111111 22222222-2222-4222-8222-222222222222/);
+
+  const stale = formatWorkflowResult("result", { ...value, critic: { ...value.critic, status: "stale" } }, "compact");
+  assert.match(stale, /Critic: stale/i);
+  assert.match(stale, /superseded|newer verification/i);
+});
+
+test("result JSON keeps the structured critic, and a huge findings payload stays valid and bounded", () => {
+  const critic = {
+    delegationId: "22222222-2222-4222-8222-222222222222",
+    status: "completed",
+    reviewOf: { verificationDigest: `sha256:${"a".repeat(64)}` },
+    result: {
+      status: "completed",
+      summary: "x",
+      findings: Array.from({ length: 20 }, (_, i) => ({
+        severity: i % 2 === 0 ? "blocker" : "concern",
+        summary: `finding ${i} ${"s".repeat(3000)}`,
+        evidence: "e".repeat(4000),
+        path: `src/f${i}.js`,
+      })),
+      concerns: [],
+      nextAction: "x",
+    },
+  };
+  const value = { command: "result", runId: "11111111-1111-4111-8111-111111111111", status: "completed", critic };
+
+  const json = formatWorkflowResult("result", value, "json");
+  assert.ok(json.length <= 12000, `bounded: ${json.length}`);
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.truncated, true);
+  assert.ok(parsed.truncationMarker);
+  // Severity survives for the findings that are still shown: it must never be stringified away.
+  assert.ok(JSON.stringify(parsed.critic).includes("blocker"));
+});
