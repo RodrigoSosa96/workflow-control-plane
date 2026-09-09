@@ -8,6 +8,8 @@ import {
   POST_VERIFY_CRITIC_ORIGIN,
   POST_VERIFY_CRITIC_REMEDIATION_TURNS,
   POST_VERIFY_CRITIC_ROLE,
+  isPostVerifyCriticRecord,
+  validateCriticFindings,
 } from "./post-verify-critic.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -192,9 +194,11 @@ function validateDelegationInput(value) {
   return { ...input, origin: POST_VERIFY_CRITIC_ORIGIN, originSessionId: null, reviewOf: validateReviewOf(value.reviewOf), remediationTurns: POST_VERIFY_CRITIC_REMEDIATION_TURNS };
 }
 
-function validateResult(value) {
+function validateResult(value, { allowFindings = false } = {}) {
   assertObject(value, "delegation result");
-  assertExactKeys(value, new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]), "delegation result");
+  const keys = new Set(["status", "generation", "summary", "verification", "concerns", "nextAction"]);
+  if (allowFindings) keys.add("findings");
+  assertExactKeys(value, keys, "delegation result");
   if (!TERMINAL_STATES.has(value.status)) fail("delegation result status is unsupported");
   if (!Number.isInteger(value.generation) || value.generation < 1) fail("delegation result generation must be a positive integer");
   const verification = value.verification;
@@ -216,6 +220,9 @@ function validateResult(value) {
     }),
     concerns: concerns.map((concern, index) => assertString(concern, `delegation result concerns[${index}]`, { limit: 1024 })),
     nextAction: assertString(value.nextAction, "delegation result nextAction"),
+    // Findings are normalized to [] only on the system critic; every other origin never
+    // gains the key at all, keeping generic role payloads byte-for-byte compatible.
+    ...(allowFindings ? { findings: validateCriticFindings(value.findings ?? [], fail) } : {}),
   };
 }
 
@@ -406,7 +413,12 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
 
   async function recordResult({ runId, delegationId: id, result, claimToken } = {}) {
     assertString(id, "delegation ID", { limit: 128 });
-    const validated = validateResult(result);
+    // Findings are gated on the persisted record's origin+role, so the record must be read
+    // before the result can be validated; the updater re-asserts the same gate under the lock,
+    // because this read is outside it. Handoff validation is not trusted to be the only caller.
+    const existing = await store.read(runId);
+    const existingRecord = delegationMap(existing)[id];
+    const validated = validateResult(result, { allowFindings: isPostVerifyCriticRecord(existingRecord) });
     const relativePath = privatePath(id, "result.json");
     const timestamp = now(clock);
     const written = await store.writePrivateFile(runId, {
@@ -417,6 +429,9 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
         const record = delegations[id];
         if (!record || typeof record !== "object" || Array.isArray(record)) fail("Delegation was not found");
         if (record.state !== "running") fail("Delegation is not running");
+        if (validated.findings !== undefined && !isPostVerifyCriticRecord(record)) {
+          fail("Delegation result findings require the system post-verify critic");
+        }
         if (record.generation !== validated.generation) fail("Delegation result generation is stale");
         const activeRemediation = record.remediation?.state === "active" && record.remediation?.generation === validated.generation
           ? record.remediation

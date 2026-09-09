@@ -10,6 +10,10 @@ export const POST_VERIFY_CRITIC_BUDGET = Object.freeze({
   maxToolCalls: 24,
 });
 export const POST_VERIFY_CRITIC_REMEDIATION_TURNS = 0;
+export const POST_VERIFY_CRITIC_MAX_FINDINGS = 20;
+
+const FINDING_SEVERITIES = new Set(["aside", "concern", "blocker"]);
+const FINDING_KEYS = new Set(["severity", "summary", "evidence", "path"]);
 
 const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
 
@@ -150,6 +154,50 @@ function isPostVerifyCritic(record) {
     && !Array.isArray(record)
     && record.origin === POST_VERIFY_CRITIC_ORIGIN
     && record.role === POST_VERIFY_CRITIC_ROLE;
+}
+
+// The one predicate every findings gate evaluates: delegation-store (recordResult), the handoff
+// boundary, and any future reader must agree on which records may carry structured findings.
+export function isPostVerifyCriticRecord(record) {
+  return isPostVerifyCritic(record);
+}
+
+// Shared findings validator for every boundary a result can cross (handoff and store alike).
+// `fail` is the caller's own error constructor so each boundary keeps its error category.
+// Paths are relative and segment-clean: no absolute path, no empty/`.`/`..` segment, no NUL.
+export function validateCriticFindings(value, fail) {
+  if (!Array.isArray(value) || value.length > POST_VERIFY_CRITIC_MAX_FINDINGS) {
+    fail("delegation result findings must be a bounded array");
+  }
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) fail(`delegation result findings[${index}] must be an object`);
+    for (const key of Object.keys(entry)) {
+      if (!FINDING_KEYS.has(key)) fail(`delegation result findings[${index}] contains unsupported field ${key}`);
+    }
+    const severity = entry.severity;
+    if (typeof severity !== "string" || !FINDING_SEVERITIES.has(severity)) {
+      fail(`delegation result findings[${index}].severity must be aside, concern or blocker`);
+    }
+    for (const field of ["summary", "evidence"]) {
+      const text = entry[field];
+      if (typeof text !== "string" || !text.trim() || text.includes("\0") || Buffer.byteLength(text, "utf8") > 4096) {
+        fail(`delegation result findings[${index}].${field} must be a bounded non-empty string`);
+      }
+    }
+    const finding = { severity, summary: entry.summary.trim(), evidence: entry.evidence.trim() };
+    if (entry.path !== undefined) {
+      const path = entry.path;
+      if (typeof path !== "string" || !path || path.includes("\0") || Buffer.byteLength(path, "utf8") > 512) {
+        fail(`delegation result findings[${index}].path must be a bounded non-empty string`);
+      }
+      if (isAbsolute(path)) fail(`delegation result findings[${index}].path must be relative`);
+      if (path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")) {
+        fail(`delegation result findings[${index}].path must not contain empty, dot or traversal segments`);
+      }
+      finding.path = path;
+    }
+    return finding;
+  });
 }
 
 function recordStatus(record) {
