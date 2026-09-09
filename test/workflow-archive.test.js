@@ -104,15 +104,14 @@ function scriptedGit(script = {}) {
         const entry = entryFor(cwd);
         if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
-        const merging = Object.hasOwn(entry, "merging") ? entry.merging : false;
         if (entry.dirty === null) {
-          return { branch: entry.branch ?? null, dirty: null, entries: [], merging, statusError: entry.statusError ?? "git status failed" };
+          return { branch: entry.branch ?? null, dirty: null, entries: [], statusError: entry.statusError ?? "git status failed" };
         }
         const entries = [
           ...(entry.dirtyPaths ?? []).map((path) => ({ x: " ", y: "M", path })),
           ...(entry.untrackedPaths ?? []).map((path) => ({ x: "?", y: "?", path })),
         ];
-        return { branch: entry.branch ?? null, dirty: entries.length > 0, entries, merging };
+        return { branch: entry.branch ?? null, dirty: entries.length > 0, entries };
       },
       async pendingOperation({ cwd, timeoutMs }) {
         calls.push({ method: "pendingOperation", cwd, timeoutMs });
@@ -474,7 +473,7 @@ test("a worktree reported dirty with no enumerable paths still refuses, with a l
   const git = {
     ...fixture.git,
     async checkoutState() {
-      return { branch: "feature/actual", dirty: true, entries: [{ x: " ", y: "M" }], merging: false };
+      return { branch: "feature/actual", dirty: true, entries: [{ x: " ", y: "M" }] };
     },
   };
 

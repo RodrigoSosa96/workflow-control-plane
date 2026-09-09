@@ -2965,19 +2965,13 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
     return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be read: ${archiveErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
   }
 
-  // Checked BEFORE `dirty`, and independently of it, for the reason git.js's checkoutState records:
-  // a worktree stopped inside an unfinished operation holds resolution work that deleting the
-  // directory destroys, and naming only the uncommitted paths points at `git add`/`git stash`,
-  // which is the wrong move.
-  //
-  // `pendingOperation` rather than `checkoutState`'s `merging`, and that is the fix for half of a
-  // measured commit-destroying path: `merging` comes from a MERGE_HEAD-only probe, so an
-  // interrupted `git rebase` -- which leaves `rebase-merge/` and no MERGE_HEAD -- reported
-  // `merging: false` and sailed straight through this gate. Measured on this machine, git 2.43: an
-  // interrupted `rebase -i` stops with a CLEAN tree on a DETACHED HEAD, so neither this gate nor
-  // the dirty one below saw it. As of B7, `mergeCommand` gates on the same probe through the
-  // shared `pendingOperationFor`/`pendingOperationDetail` -- `merging` is no longer read by either
-  // command, and stays on the adapter only because the adapter's own contract documents it.
+  // Checked BEFORE `dirty`, and independently of it: a worktree stopped inside an unfinished
+  // operation holds resolution work that deleting the directory destroys, and naming only the
+  // uncommitted paths points at `git add`/`git stash`, which is the wrong move. A MERGE_HEAD-only
+  // probe would not suffice here: measured on git 2.43, an interrupted `git rebase -i` stops with
+  // `rebase-merge/` present, no MERGE_HEAD, a CLEAN tree and a DETACHED HEAD, so neither a
+  // merge-only probe nor the dirty gate below would see it. `mergeCommand` gates on the same
+  // probe through the shared `pendingOperationFor`/`pendingOperationDetail` helpers.
   const pending = await pendingOperationFor({ git, path: worktreePath, timeoutMs, errorText: archiveErrorText });
   if (pending?.status === "in-progress") {
     const { operation, remedy } = pendingOperationDetail(pending, worktreePath);
