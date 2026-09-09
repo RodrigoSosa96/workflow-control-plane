@@ -987,7 +987,6 @@ export function createRunStore({
       }
       if (filters.projectAlias !== undefined && run.projectAlias !== filters.projectAlias) continue;
       if (filters.originSessionId !== undefined && run.originSessionId !== filters.originSessionId) continue;
-      if (filters.unconsumed === true && run.consumedAt) continue;
       runs.push(run);
     }
 

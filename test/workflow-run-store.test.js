@@ -941,7 +941,7 @@ test("lists runs with filters and writes private assignments", async (t) => {
     ),
   });
   const first = await store.create(plannedInput({ primaryTicket: "A-1", originSessionId: "pi:one" }));
-  await store.create(plannedInput({ primaryTicket: "A-2", originSessionId: "pi:one", consumedAt: "2025-01-01T00:10:00.000Z" }));
+  await store.create(plannedInput({ primaryTicket: "A-2", originSessionId: "pi:one" }));
   await store.create(plannedInput({ projectAlias: "personalProjectB", primaryTicket: "C-1", originSessionId: "pi:two" }));
 
   const assignment = await store.writeAssignment(RUN_ID_1, "Implement OCR workflow\n");
@@ -950,8 +950,8 @@ test("lists runs with filters and writes private assignments", async (t) => {
   assert.equal(await readFile(assignment.path, "utf8"), "Implement OCR workflow\n");
   assert.equal((await stat(assignment.path)).mode & 0o777, 0o600);
 
-  const listed = await store.list({ projectAlias: "ocr", originSessionId: "pi:one", unconsumed: true });
-  assert.deepEqual(listed.map((run) => run.id), [RUN_ID_1]);
+  const listed = await store.list({ projectAlias: "ocr", originSessionId: "pi:one" });
+  assert.deepEqual(listed.map((run) => run.id), [RUN_ID_1, RUN_ID_2]);
   assert.equal(listed[0].directory, first.directory);
 });
 
