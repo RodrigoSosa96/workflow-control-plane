@@ -43,18 +43,11 @@ function unwrapHerdrPayload(payload, context) {
 
   const error = payload.error ?? (payload.ok === false ? payload : null);
   if (error) {
-    fail(
-      "HERDR",
+    failHerdr(
+      context,
       error.message ?? `${context.binary} ${context.area} ${context.command} failed`,
-      {
-        code: error.code,
-        stdout: context.stdout,
-        stderr: context.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
       context.code || 1,
+      { code: error.code },
     );
   }
 
@@ -63,6 +56,30 @@ function unwrapHerdrPayload(payload, context) {
   }
 
   return payload;
+}
+
+function failHerdr(context, message, code, extraDetails) {
+  fail(
+    "HERDR",
+    message,
+    {
+      ...extraDetails,
+      stdout: context.stdout,
+      stderr: context.stderr,
+      command: context.binary,
+      args: [context.area, context.command, ...context.args],
+      cwd: context.cwd,
+    },
+    code,
+  );
+}
+
+function failExitCode(result, context, { message, code } = {}) {
+  failHerdr(
+    { ...context, stdout: result.stdout, stderr: result.stderr },
+    message ?? `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
+    code ?? result.code,
+  );
 }
 
 // Herdr writes its JSON error envelope to stderr, so a failed command usually leaves stdout empty.
@@ -88,19 +105,12 @@ function parseJsonResult(result, context) {
   if (!stdout) {
     if (result.code && result.code !== 0) {
       const envelope = extractStderrEnvelope(result.stderr);
-      fail(
-        "HERDR",
+      failHerdr(
+        { ...context, stdout: result.stdout, stderr: result.stderr },
         envelope?.message
           ?? `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-        {
-          ...(envelope?.code ? { code: envelope.code } : {}),
-          stdout: result.stdout,
-          stderr: result.stderr,
-          command: context.binary,
-          args: [context.area, context.command, ...context.args],
-          cwd: context.cwd,
-        },
         result.code,
+        envelope?.code ? { code: envelope.code } : undefined,
       );
     }
     return null;
@@ -110,16 +120,9 @@ function parseJsonResult(result, context) {
   try {
     payload = JSON.parse(stdout);
   } catch (error) {
-    fail(
-      "HERDR",
+    failHerdr(
+      { ...context, stdout: result.stdout, stderr: result.stderr },
       `Invalid JSON from ${context.binary} ${context.area} ${context.command}: ${error.message}`,
-      {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
       result.code || 1,
     );
   }
@@ -132,18 +135,7 @@ function parseJsonResult(result, context) {
   });
 
   if (result.code && result.code !== 0) {
-    fail(
-      "HERDR",
-      `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-      {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
-      result.code,
-    );
+    failExitCode(result, context);
   }
 
   return value;
@@ -155,35 +147,13 @@ function parseIntegrationStatusResult(result, context) {
 
   if (!trimmed) {
     if (result.code && result.code !== 0) {
-      fail(
-        "HERDR",
-        `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-        {
-          stdout: result.stdout,
-          stderr: result.stderr,
-          command: context.binary,
-          args: [context.area, context.command, ...context.args],
-          cwd: context.cwd,
-        },
-        result.code,
-      );
+      failExitCode(result, context);
     }
     return [];
   }
 
   if (result.code && result.code !== 0) {
-    fail(
-      "HERDR",
-      `${context.binary} ${context.area} ${context.command} failed with exit code ${result.code}`,
-      {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        command: context.binary,
-        args: [context.area, context.command, ...context.args],
-        cwd: context.cwd,
-      },
-      result.code,
-    );
+    failExitCode(result, context);
   }
 
   return trimmed.split(/\r?\n/).filter(Boolean).map((rawLine) => {
@@ -604,32 +574,22 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
     // Best-effort, idempotent tab closure. `herdr tab close <tab_id>` takes the id as a
     // POSITIONAL, like `tab rename` and `tab focus`, not as an option.
     //
-    // This one reports instead of throwing, and that is deliberate rather than a style choice: its
-    // caller runs it AFTER worktree removals that cannot be undone by re-running, so a throw here
-    // would discard the report of removals that really happened. Every branch therefore returns a
-    // result -- including the caller bug of asking to close a tab that was never recorded.
+    // Reports instead of throwing: its caller runs it AFTER worktree removals that cannot be
+    // undone by re-running, so a throw would discard the report of removals that really happened.
+    // Every branch returns a result -- including the caller bug of closing a tab never recorded.
     //
-    // `tab_not_found` is the COMMON case, not an edge one: measured on this machine, every recorded
-    // tabId is already stale because the Herdr server has been restarted since those runs launched.
-    // It means *already archived*, so it is reported as `not-found` and must never be confused with
-    // a real failure -- an unreachable server, or a tab id we never even sent, is not proof that a
-    // tab is gone.
-    // It is also the one method here that is BOUNDED by default. The rest of this adapter spawns
-    // without a timeout, which is survivable for them; it is not survivable here, because a hung
-    // `herdr` CLI would hang the step that runs after worktree removals that cannot be undone. A
-    // timeout surfaces as an ordinary reported failure, never as `not-found`.
+    // `tab_not_found` is the COMMON case, not an edge one: every recorded tabId is already stale
+    // once the Herdr server has restarted since the run launched. It means *already archived*, so
+    // it is reported as `not-found` and must never be confused with a real failure -- an
+    // unreachable server, or a tab id never even sent, is not proof that a tab is gone.
     //
-    // **The bound is a real wall clock.** An earlier version of this comment, corrected in review,
-    // described process.js's timeout as "signalled at the deadline, not returned by the deadline",
-    // because it reached only the direct child and settled on `close`. B1 ended that: the runner
-    // signals the child's whole process group and escalates to SIGKILL after a grace window, so a
-    // herdr that ignores SIGTERM -- or a grandchild holding the pipes -- is still bounded. What
-    // remains true: a timeout surfaces as an ordinary reported failure, never as `not-found`.
-    //
-    // An explicitly-passed but unusable `timeoutMs` (null, 0, NaN, negative, a string) used to
-    // survive the default parameter and then be dropped by the runner's own finite check -- the
-    // one call that must be bounded, disarmed by the caller's mistake. It now falls back to the
-    // default instead (B4).
+    // The one bounded method in this adapter: a hung `herdr` CLI here would hang the step that
+    // runs after irreversible worktree removals. The bound is a real wall clock -- process.js
+    // signals the child's whole process group and escalates to SIGKILL, so a herdr that ignores
+    // SIGTERM (or a grandchild holding the pipes) is still bounded. An explicitly-passed but
+    // unusable `timeoutMs` (null, 0, NaN, negative, a string) falls back to the default rather
+    // than disarming the one call that must stay bounded. A timeout surfaces as an ordinary
+    // reported failure, never as `not-found`.
     async closeTab({ tabId, timeoutMs } = {}) {
       if (typeof tabId !== "string" || !tabId) {
         return { closed: false, reason: "closeTab requires a tab id" };

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { createWorkflowFixture as defaultCreateWorkflowFixture } from "../src/workflow/fixture.js";
-import { cleanupWorkflowFixture } from "../src/workflow/fixture-cleanup.js";
+import { createWorkflowFixture as defaultCreateWorkflowFixture } from "../test/support/fixture.js";
+import { cleanupWorkflowFixture } from "../test/support/fixture-cleanup.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";

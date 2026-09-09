@@ -36,8 +36,8 @@ export function createWorkflowWorkerLifecycleExtension({
   // events onto the core's event vocabulary and renders the core's harness-neutral decision
   // ({ continuation: { prompt } } | undefined) into Pi's own protocol. Pi's events carry no
   // payload the core reads, so stdinJson is always {}; env is threaded through so the core's
-  // recordDebug can write to the run's hook debug log via env.WORKFLOW_RUN_DIR -- strictly
-  // better than the silent `catch {}` blocks this extension used to have.
+  // recordDebug can write to the run's hook debug log via env.WORKFLOW_RUN_DIR -- rather than
+  // swallowing hook failures silently.
   const runCore = (event: string) =>
     runLifecycleHook({ harness: "pi", event, stdinJson: {}, env, store, lifecycle: life, hasValidHandoff });
 

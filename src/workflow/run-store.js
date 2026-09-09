@@ -608,7 +608,7 @@ export function createRunStore({
   }
 
   // Millisecond-scale lock collisions (launcher final write vs a worker's
-  // fire-and-forget lifecycle hook) previously dropped the losing transition
+  // fire-and-forget lifecycle hook) must not drop the losing transition
   // silently, because hook callers swallow errors by design. A bounded retry
   // makes those collisions survivable while staying fail-fast for stale locks
   // (crash residue), which are never waited on. The retry itself is shared
@@ -987,7 +987,6 @@ export function createRunStore({
       }
       if (filters.projectAlias !== undefined && run.projectAlias !== filters.projectAlias) continue;
       if (filters.originSessionId !== undefined && run.originSessionId !== filters.originSessionId) continue;
-      if (filters.unconsumed === true && run.consumedAt) continue;
       runs.push(run);
     }
 

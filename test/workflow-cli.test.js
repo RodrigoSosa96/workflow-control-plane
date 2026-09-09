@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { DEFAULT_DELEGATION_POLICY } from "../src/workflow/delegation-policy.js";
 import { main, parseArgs } from "../bin/workflow.js";
 import { delegationGateClearCommand as defaultDelegationGateClearCommand, delegationRemediateCommand as defaultDelegationRemediateCommand } from "../src/workflow/commands.js";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
@@ -20,6 +21,7 @@ import { createPiDelegationTransport } from "../src/workflow/pi-delegation-trans
 import { inspectExactProcessByPid } from "../src/workflow/process-observation.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
+import { uuidSequence } from "./support/helpers.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -158,17 +160,7 @@ function delegationRemediationPreview(overrides = {}) {
 const FIXTURE_PROJECT_ALIAS = "fixture";
 const FIXTURE_PROJECT_PATH = "/fixture/shared";
 const FIXTURE_CWD = "/fixture/review";
-const FIXTURE_POLICY = {
-  version: 1,
-  totalInternal: 4,
-  foreground: 3,
-  readOnlyBackground: 3,
-  writersTotal: 1,
-  writersPerCheckout: 1,
-  maxDepth: 1,
-  remediationTurns: 2,
-  allowBackgroundWriters: false,
-};
+const FIXTURE_POLICY = DEFAULT_DELEGATION_POLICY;
 const FIXTURE_REGISTRY = {
   launcher: { delegation: FIXTURE_POLICY },
   projects: {
@@ -218,11 +210,6 @@ const UNUSED_DELEGATION_TRANSPORT = Object.freeze({
     throw new Error("delegation transport must not run: this test's command resolves before touching it");
   },
 });
-
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
-}
 
 function fixtureTransportIdentity(stateRoot, runId = RUN_ID, delegationId = DELEGATION_ID) {
   return {

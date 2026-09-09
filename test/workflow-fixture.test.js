@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createWorkflowFixture, loadFixtureDescriptor, assertOwnedFixture } from "../src/workflow/fixture.js";
-import { cleanupWorkflowFixture } from "../src/workflow/fixture-cleanup.js";
+import { createWorkflowFixture, loadFixtureDescriptor, assertOwnedFixture } from "./support/fixture.js";
+import { cleanupWorkflowFixture } from "./support/fixture-cleanup.js";
 
 const execFileAsync = promisify(execFile);
 

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { access, rm } from "node:fs/promises";
 import { createSmokeRunner, inspectCanaryCompletion } from "../scripts/smoke-workflow-fixture.js";
-import { createWorkflowFixture } from "../src/workflow/fixture.js";
+import { createWorkflowFixture } from "./support/fixture.js";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

@@ -10,6 +10,7 @@ import { createDelegationReservationStore } from "../src/workflow/delegation-res
 import { classifyOwnership, createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
 import { inspectExactProcessByPid, psStatusArgv } from "../src/workflow/process-observation.js";
 import { createProcessRunner } from "../src/workflow/process.js";
+import { clockSequence, uuidSequence } from "./support/helpers.js";
 
 const FIRST_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_ID = "22222222-2222-4222-8222-222222222222";
@@ -33,11 +34,6 @@ async function tempStateRoot(t) {
   return join(root, "state");
 }
 
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
-}
-
 // Unlike uuidSequence, never repeats: every gate acquisition and every reserve() call consumes
 // at least one UUID (reservationId, gate ownerToken, lease ownerToken), so a test that calls
 // reserve() more than once must not rely on a short fixed sequence freezing on its last value —
@@ -50,15 +46,6 @@ function distinctUuidSequence() {
   return () => {
     counter += 1;
     return `00000000-0000-4000-8000-${counter.toString(16).padStart(12, "0")}`;
-  };
-}
-
-function clockSequence(...values) {
-  let index = 0;
-  return {
-    now() {
-      return values[index++] ?? values.at(-1);
-    },
   };
 }
 

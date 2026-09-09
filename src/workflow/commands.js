@@ -49,7 +49,7 @@ export const VERIFY_EXIT_CODES = Object.freeze({
   refused: 10,
 });
 
-// mergeCommand's own exit codes (roadmap item 2.4). `refused` and `conflicted` deliberately reuse
+// mergeCommand's own exit codes. `refused` and `conflicted` deliberately reuse
 // the values bin/workflow.js already maps WorkflowError's PREFLIGHT and CONFLICT categories to
 // (10 and 11), because merge produces both shapes: a refusal the dry-run PRINTS as a preview, and
 // a refusal it THROWS from execute -- and an operator scripting against the exit code must not
@@ -787,22 +787,20 @@ function sortRunsForBoard(runs) {
 // neither, the live set is the default so a run that fell out of it (completed/failed/interrupted)
 // does not linger on the board an operator has stopped watching.
 //
-// Roadmap item 2.5's board change: an ARCHIVED run is excluded from both the default view and
-// `--all`, and an explicit `--state` still shows it. That asymmetry is the point -- `--all` means
-// "every state", not "every record ever created", and the whole reason `workflow archive` marks the
-// record instead of deleting the run directory is so the board can stop showing residue an operator
-// has already dealt with (the relief item 2.1 explicitly named when it measured the 12-14 run JSON
-// ceiling with no cleanup available). An explicit `--state completed` is an explicit ask for that
-// state's records, archived or not, and narrowing it would leave an operator with no way to see an
-// archived run from this command at all.
+// An ARCHIVED run is excluded from both the default view and `--all`, and an explicit `--state`
+// still shows it. That asymmetry is the point -- `--all` means "every state", not "every record
+// ever created", and the reason `workflow archive` marks the record instead of deleting the run
+// directory is so the board can stop showing residue an operator has already dealt with. An
+// explicit `--state completed` is an explicit ask for that state's records, archived or not, and
+// narrowing it would leave an operator with no way to see an archived run from this command at
+// all.
 //
 // The predicate is `typeof run.archivedAt === "string"`, deliberately not truthiness and
 // deliberately not a boolean field: the record has to answer *when*, and only a full archive stamps
 // it (a partial one leaves it unset on purpose, so the board can never hide a run that still has
 // worktrees on disk).
 //
-// What is hidden is COUNTED and returned, never merely dropped -- item 2.1's own rule for skipped
-// crash residue, applied to the residue this command chooses not to show.
+// What is hidden is COUNTED and returned, never merely dropped.
 function isArchivedRun(run) {
   return typeof run?.archivedAt === "string";
 }
@@ -818,7 +816,7 @@ function selectRunsForBoard(runs, { state, all }) {
   return { runs: visible, archivedHidden: inScope.length - visible.length };
 }
 
-// The board underneath `workflow runs` (roadmap item 2.1): answers "what is running right now"
+// The board underneath `workflow runs`: answers "what is running right now"
 // across every project without an operator already knowing a run id. Read-only -- it only ever
 // calls store.list(), never create/update -- so exit code is always 0: a report, not a check, the
 // same contract with runs, without runs, and with skipped records.
@@ -883,12 +881,10 @@ function correlationPaneId(run) {
 // send-keys` by pane, or `workflow result <runId>` for the rest) without exposing the whole run
 // record -- deliberately as small as `runs --format json`'s own projection (see runProjection's
 // comment in format.js for why a board-scale JSON dump of full records is the wrong shape).
-// Carries `state` -- added after running this command against the developer's real state root
-// surfaced a design gap (see the correction paragraph in
-// docs/superpowers/specs/2026-08-04-workflow-inbox-design.md): without it, the renderer cannot
-// tell a `manual-handoff-required`/`needs-input` run whose worker exited normally apart from a
-// `running` run whose pane vanished unexpectedly. Both used to read as the same diagnostic; only
-// `state` lets a caller (here, or `formatInbox`) tell them apart.
+// Carries `state` because without it the renderer cannot tell a
+// `manual-handoff-required`/`needs-input` run whose worker exited normally apart from a `running`
+// run whose pane vanished unexpectedly -- only `state` lets a caller (here, or `formatInbox`) tell
+// them apart.
 function inboxEntry(run, resolvedPaneId) {
   return {
     runId: run.id,
@@ -900,35 +896,30 @@ function inboxEntry(run, resolvedPaneId) {
   };
 }
 
-// States whose own definition already means "waiting on the operator" -- `manual-handoff-required`
+// States whose own definition already means "waiting on the operator": `manual-handoff-required`
 // is written when the worker gave up and needs a human (lifecycle.js:77); `needs-input` is a
 // worker's own handoff saying the same (handoff.js:17); `blocked` is a worker's own self-reported
-// "I am stuck" (handoff.js:16) -- by this design's own Problem section, a worker that told us it
-// is blocked is waiting on the operator exactly as unambiguously as manual-handoff-required is
-// (branch review finding I3). A run in any of these three, whether or not its agent resolved and
-// whatever its agent status turns out to be, belongs in `waiting` -- see `inboxCommand` below,
-// where this set is checked before agent resolution is even attempted, not only inside the
-// branches where resolution failed (that was the C1 finding: a manual-handoff-required run whose
-// agent was still alive and idle -- the ordinary shape right after a "manual" hook action leaves
-// the harness Stop to proceed, per hooks/lib/lifecycle-hook-core.mjs -- fell through this file's
-// old agent-status check and was silently dropped). A run in one of these states having no live
-// Herdr agent is *also* an expected shape, not a surprise: the worker already exited (or, for
-// self-reported `blocked`, said it needed help) and left the next move to the operator. Reporting
-// that the same way as a `running` run's vanished pane -- "No live Herdr agent found for pane X"
-// -- tells the operator the wrong thing: it reads as an infrastructure problem about a pane, when
-// the real, actionable fact is `workflow result <run-id>`. See this file's `inboxCommand` and the
-// design spec's correction paragraph for the real-data run that found this.
+// "I am stuck" (handoff.js:16). A run in any of these three belongs in `waiting` whether or not
+// its agent resolved and whatever its agent status turns out to be -- see `inboxCommand` below,
+// where this set is checked before agent resolution is even attempted: a manual-handoff-required
+// run whose agent is still alive and idle is the ordinary shape right after a "manual" hook action
+// leaves the harness Stop to proceed, and it must not fall through to an agent-status check that
+// would silently drop it. A run in one of these states having no live Herdr agent is *also* an
+// expected shape, not a surprise: the worker already exited (or, for self-reported `blocked`,
+// said it needed help) and left the next move to the operator. Reporting that the same way as a
+// `running` run's vanished pane -- "No live Herdr agent found for pane X" -- tells the operator
+// the wrong thing: it reads as an infrastructure problem about a pane, when the real, actionable
+// fact is `workflow result <run-id>`.
 //
-// `result-stale` is deliberately NOT in this set -- a decision made explicitly during the branch
-// review, not fallen into. Unlike the three states above, it is not a worker self-reporting "I
-// need a human": it means the result recorded on disk no longer matches what the control plane
-// currently expects (missing, invalid, or a generation/fingerprint mismatch -- handoff.js's
-// `readCurrentResult`/`markResultStale`), a fact the worker itself may not know. That is exactly
-// what `unresolved` means -- the control plane does not know what is currently true -- not "a
-// human is needed." Its own recommended next action (`workflow reconcile`, this file's
-// `nextActions` for `status === "result-stale"`) is a diagnostic command, not an acknowledgement.
-// A `result-stale` run whose agent cannot be confirmed keeps the vanished-pane framing in
-// `unresolved`, same as any other active run.
+// `result-stale` is deliberately NOT in this set. Unlike the three states above, it is not a
+// worker self-reporting "I need a human": it means the result recorded on disk no longer matches
+// what the control plane currently expects (missing, invalid, or a generation/fingerprint
+// mismatch -- handoff.js's `readCurrentResult`/`markResultStale`), a fact the worker itself may
+// not know. That is exactly what `unresolved` means -- the control plane does not know what is
+// currently true -- not "a human is needed." Its own recommended next action
+// (`workflow reconcile`, this file's `nextActions` for `status === "result-stale"`) is a
+// diagnostic command, not an acknowledgement. A `result-stale` run whose agent cannot be confirmed
+// keeps the vanished-pane framing in `unresolved`, same as any other active run.
 const AWAITS_OPERATOR_STATES = new Set([
   RUN_STATES.MANUAL_HANDOFF_REQUIRED,
   RUN_STATES.NEEDS_INPUT,
@@ -944,17 +935,17 @@ function awaitsOperatorReason(run) {
 
 // Reason text for an agent whose status this command does not treat as confirming the run clear:
 // absent (Herdr reported no agent_status field at all), `unknown` (Herdr's own documented "could
-// not determine" value), or anything outside HERDR_AGENT_STATUSES entirely (an unrecognized or,
-// per the C2 finding, a possibly-renamed value). All three used to fall through the old bare
-// `agentStatus(agent) === "blocked"` comparison in silence, indistinguishable from "confirmed not
-// blocked" -- naming which one it was is the fix.
+// not determine" value), or anything outside HERDR_AGENT_STATUSES entirely (an unrecognized or
+// possibly-renamed value). All three must be named: a bare `agentStatus(agent) === "blocked"`
+// comparison would let them fall through in silence, indistinguishable from "confirmed not
+// blocked".
 function unresolvedAgentStatusReason(status, pane) {
   if (status === null) return `Herdr reported no agent_status for pane ${pane}`;
   if (status === "unknown") return `Herdr could not determine agent status for pane ${pane} (agent_status: unknown)`;
   return `Herdr reported an unrecognized agent status "${status}" for pane ${pane}, outside the vocabulary this command knows`;
 }
 
-// `workflow inbox` (roadmap item 2.2): which of my workers are waiting on me -- at a permission
+// `workflow inbox`: which of my workers are waiting on me -- at a permission
 // prompt, or because their own state already means they need a human -- across every project,
 // without looking at panes. Anchored on store.list() exactly like runsCommand -- `herdr agent
 // list` returns every agent on the machine, including interactive sessions this control plane
@@ -1764,13 +1755,13 @@ async function runVerifyMatrix(repositories, commands, { runVerify, timeoutMs, m
   return results;
 }
 
-// `workflow verify <run-id>` (roadmap item 2.3): re-runs the project's OWN verify commands, from
+// `workflow verify <run-id>`: re-runs the project's OWN verify commands, from
 // the CURRENT registry, in the EXACT worktree paths the run recorded -- so "verification: passed"
 // stops being the worker's self-report and becomes something an operator can check.
 //
 // The registry is read by run.projectAlias, not options.projectAlias, and deliberately reflects
 // today's registry rather than anything snapshotted on the run (there is no verify-shaped field on
-// a run record to snapshot). This is the mirror of item 1.3's security envelope: a resumed worker
+// a run record to snapshot). This is the mirror of the resume envelope's rule: a resumed worker
 // must run under what was approved, but evidence should reflect today's bar -- if the project has
 // tightened its checks since the run launched, a stale standard would certify work as passing
 // checks the project no longer considers sufficient.
@@ -1844,7 +1835,7 @@ export async function verifyCommand(options = {}, deps = {}) {
   };
 }
 
-// --- workflow merge (roadmap item 2.4) ---------------------------------------
+// --- workflow merge ------------------------------------------------------------
 //
 // The arc's last ungoverned step, put under the same preview -> digest -> execute envelope as its
 // first one. `--dry-run` computes, per repository the run recorded, the exact shell-free
@@ -1856,13 +1847,11 @@ export async function verifyCommand(options = {}, deps = {}) {
 // Two things shape everything below, both from the design doc:
 //
 //   1. The source branch is read from the WORKTREE, never trusted from `repositories[].branch`.
-//      That field is a launch-time intention: two of the eight real runs on this machine record a
-//      ref that no longer exists (run 0b2612a8 records `feature/1216110941098331/registro-impl`
-//      while its worktree is on `feature/registro-impl`). A record-driven merge would fail on a
-//      nonexistent ref at best and integrate a stale branch at worst. The disagreement is named
-//      (`branchMismatch`) and digested -- never silently substituted, and never treated as a
-//      blocking conflict, which would make the command unusable against every real completed
-//      multi-repository run that exists today.
+//      That field is a launch-time intention: a run can record a ref that no longer exists by the
+//      time the merge is previewed. A record-driven merge would fail on a nonexistent ref at best
+//      and integrate a stale branch at worst. The disagreement is named (`branchMismatch`) and
+//      digested -- never silently substituted, and never treated as a blocking conflict, which
+//      would make the command unusable against any completed run whose branch moved on.
 //   2. The merge runs in the BASE CHECKOUT, not the run worktree. The goal is to advance
 //      `base_branch`, which is checked out there; merging into the worktree would advance the
 //      feature branch instead. Git also forbids checking out a branch already checked out in
@@ -1949,8 +1938,8 @@ async function pendingOperationFor({ git, path, timeoutMs, errorText }) {
 }
 
 // `operation` and `remedy` are read defensively for the same reason the probe is wrapped: an
-// `in-progress` result missing `remedy` used to be a TypeError off `.replace`, i.e. a crash on
-// the one branch whose whole job is refusing safely. An unnamed remedy is reported as unnamed and
+// `in-progress` result missing `remedy` must not be a TypeError off `.replace` -- a crash on the
+// one branch whose whole job is refusing safely. An unnamed remedy is reported as unnamed and
 // NEVER replaced by a guessed one -- the point of carrying the operation's own remedy is that
 // `git merge --abort` is the wrong move for a rebase, and inventing a default would reintroduce
 // exactly that bug.
@@ -2011,11 +2000,11 @@ function repositoryLabel(repositoryId, index) {
 //               (launch.js's runRepositories), which is deliberately NOT a registry key, so an
 //               id lookup would fail here for the ordinary case and must not be attempted.
 //
-// `consequence` is what falling through would have DONE, and it is a required argument rather than
-// a defaulted one: this discrimination is now shared by `merge` (which would merge into the meta
+// `consequence` is what falling through would DO, and it is a required argument rather than
+// a defaulted one: this discrimination is shared by `merge` (which would merge into the meta
 // repository) and `archive` (which would measure this run's unmerged work against it), and each
 // has to name its own harm. Defaulting it would let a third caller inherit merge's wording
-// silently -- the same drift the single implementation exists to prevent.
+// silently -- the drift the single implementation exists to prevent.
 function baseCheckoutFor(project, projectAlias, repositoryId, label, consequence) {
   if (project.repository === "group") {
     const entry = project.repositories?.[repositoryId];
@@ -2415,11 +2404,10 @@ async function buildMergePreview(runId, run, options, deps) {
     exitCode: mergeable ? MERGE_EXIT_CODES.merged : MERGE_EXIT_CODES.conflicted,
     nextActions: [],
   };
-  // A blocked preview whose only next action is the dry-run that just printed it is a loop with no
-  // exit, and that is exactly what a checkout stuck mid-operation used to get (task 3, step 5). The
-  // operation's own remedy is named first, per repository actually in that state, so the loop has
-  // a way out -- and it is the operation's own, because `git merge --abort` is the wrong move for a
-  // rebase.
+  // A blocked preview whose only next action is the dry-run that just printed it is a loop with
+  // no exit. The operation's own remedy is named first, per repository actually in that state, so
+  // the loop has a way out -- and it is the operation's own, because `git merge --abort` is the
+  // wrong move for a rebase.
   const abortActions = [...new Set(
     records.filter((record) => record.basePending === "in-progress").map((record) => record.basePendingRemedy ?? `git -C ${record.basePath} status`),
   )];
@@ -2505,12 +2493,10 @@ async function runMergeSequence(records, git, timeoutMs) {
       continue;
     }
 
-    // M4: exit 0 does NOT prove an integration happened. `git merge --no-ff --no-edit <src>`
-    // against an already-integrated branch prints "Already up to date.", exits 0, and creates NO
-    // commit -- and this used to be recorded as `merged`, with a `merge` event appended, claiming
-    // an integration that never occurred. The design's own `--no-ff, always` reasoning is that the
-    // merge commit IS the audit trail, so an audit record that asserts one where none exists is
-    // the thing that reasoning exists to prevent.
+    // Exit 0 does NOT prove an integration happened. `git merge --no-ff --no-edit <src>` against
+    // an already-integrated branch prints "Already up to date.", exits 0, and creates NO commit.
+    // The `--no-ff, always` reasoning is that the merge commit IS the audit trail, so an audit
+    // record that asserts one where none exists is the thing that reasoning exists to prevent.
     //
     // Whether the base branch actually moved is read back rather than parsed out of git's
     // human-readable stdout, which is localizable. `null` means the read failed, which is reported
@@ -2627,13 +2613,13 @@ export async function mergeCommand(options = {}, deps = {}) {
   };
 }
 
-// --- workflow archive (roadmap item 2.5) -------------------------------------
+// --- workflow archive ----------------------------------------------------------
 //
 // The second exception to this repo's no-cleanup policy, and the only one that can destroy
 // something irreplaceable if it is wrong. It removes each `run.repositories[]` worktree and the
 // run's Herdr tab; it preserves the run directory, the branch and every commit.
 //
-// Four things shape everything below, all from the design doc, all measured:
+// Four things shape everything below, all measured:
 //
 //   1. **It never forces.** git's refusal to delete a worktree holding modified or untracked files
 //      is the last line of defence, and this command's job is to refuse BEFORE reaching it -- in
@@ -2965,19 +2951,13 @@ async function inspectRepositoryForArchive({ runId, projectAlias, project, entry
     return { refusal: `Run ${runId} repository ${label} worktree at ${worktreePath} could not be read: ${archiveErrorText(error)}`, actions: [reconcileCommandFor(runId)] };
   }
 
-  // Checked BEFORE `dirty`, and independently of it, for the reason git.js's checkoutState records:
-  // a worktree stopped inside an unfinished operation holds resolution work that deleting the
-  // directory destroys, and naming only the uncommitted paths points at `git add`/`git stash`,
-  // which is the wrong move.
-  //
-  // `pendingOperation` rather than `checkoutState`'s `merging`, and that is the fix for half of a
-  // measured commit-destroying path: `merging` comes from a MERGE_HEAD-only probe, so an
-  // interrupted `git rebase` -- which leaves `rebase-merge/` and no MERGE_HEAD -- reported
-  // `merging: false` and sailed straight through this gate. Measured on this machine, git 2.43: an
-  // interrupted `rebase -i` stops with a CLEAN tree on a DETACHED HEAD, so neither this gate nor
-  // the dirty one below saw it. As of B7, `mergeCommand` gates on the same probe through the
-  // shared `pendingOperationFor`/`pendingOperationDetail` -- `merging` is no longer read by either
-  // command, and stays on the adapter only because the adapter's own contract documents it.
+  // Checked BEFORE `dirty`, and independently of it: a worktree stopped inside an unfinished
+  // operation holds resolution work that deleting the directory destroys, and naming only the
+  // uncommitted paths points at `git add`/`git stash`, which is the wrong move. A MERGE_HEAD-only
+  // probe would not suffice here: measured on git 2.43, an interrupted `git rebase -i` stops with
+  // `rebase-merge/` present, no MERGE_HEAD, a CLEAN tree and a DETACHED HEAD, so neither a
+  // merge-only probe nor the dirty gate below would see it. `mergeCommand` gates on the same
+  // probe through the shared `pendingOperationFor`/`pendingOperationDetail` helpers.
   const pending = await pendingOperationFor({ git, path: worktreePath, timeoutMs, errorText: archiveErrorText });
   if (pending?.status === "in-progress") {
     const { operation, remedy } = pendingOperationDetail(pending, worktreePath);
@@ -3134,13 +3114,10 @@ function archiveLosses(records) {
   const losses = [];
   for (const record of records) {
     if (record.present && !record.branch) {
-      // **Corrected after the reachability split.** This branch used to say "nothing but this
-      // worktree's own HEAD references those commits", and that is now the opposite of what the
-      // command proved: a detached HEAD that NO ref contains is refused outright by
-      // irrecoverableRefusal (headReachable === false), so every record that reaches this line has
-      // `headReachable === true` -- some ref does contain the commit, and that ref is what keeps it
-      // alive after `git worktree remove` deletes the worktree's HEAD and per-worktree reflog.
-      //
+      // A detached HEAD that NO ref contains is refused outright by irrecoverableRefusal
+      // (headReachable === false), so every record that reaches this line has
+      // `headReachable === true` -- some ref does contain the commit, and that ref is what keeps
+      // it alive after `git worktree remove` deletes the worktree's HEAD and per-worktree reflog.
       // So this is a loss of FINDABILITY, not of commits: nothing is destroyed, but the run's work
       // is on no branch of its own, and after the removal there is no name pointing at it that
       // belongs to this run. That is worth naming -- it is the same "removed, and therefore
@@ -3156,9 +3133,9 @@ function archiveLosses(records) {
         detail: `the worktree at ${record.worktreePath} is on a detached HEAD at ${record.headSha ?? "an unknown commit"}; another ref still contains that commit, so removing the worktree destroys nothing — but this run's work is on no branch of its own, so afterwards there is no name of this run's left pointing at it`,
       });
     }
-    // I1's non-refusing half. A live sharer refuses (irrecoverableRefusal), so anything reaching
-    // here is a finished run that also recorded this directory -- removing it settles two records at
-    // once, which is fine but is not something an operator should discover afterwards.
+    // A live sharer refuses (irrecoverableRefusal), so anything reaching here is a finished run
+    // that also recorded this directory -- removing it settles two records at once, which is fine
+    // but is not something an operator should discover afterwards.
     if (record.sharedWith.length > 0) {
       losses.push({
         repositoryId: record.repositoryId,
@@ -3281,15 +3258,12 @@ function describeClause(records, describe, noun) {
 }
 
 // Every condition that makes this run un-archivable, collected across ALL repositories and refused
-// once. THREE classes now, and the run refuses for any of them:
+// once. THREE classes, and the run refuses for any of them:
 //
-//   LIVE SHARED WORKTREE -- another run that is still live records this same directory (I1).
+//   LIVE SHARED WORKTREE -- another run that is still live records this same directory.
 //   DIRTY                -- uncommitted and untracked work has no other copy.
 //   UNREACHABLE HEAD     -- a detached HEAD whose commits no ref contains; removing the worktree
 //                           deletes the only two things referencing them.
-//
-// (The comment that used to sit here listed only the last two, and had drifted onto the wrong
-// function entirely when `describeIgnoredContent` was added above it. Both fixed.)
 //
 // Ignored content is deliberately NOT a class here: it is deleted, named and digested rather than
 // refused -- see ignoredContentFor for why refusing on it would make the command useless.
@@ -3301,20 +3275,19 @@ function describeClause(records, describe, noun) {
 //
 // All classes are reported together, and each lists every affected repository (capped for
 // printing), because an operator shown only the first of three problems fixes one and comes
-// straight back. That is mergeCommand's own conflict-list lesson.
+// straight back.
 function irrecoverableRefusal(runId, run, records, evidence) {
   const dirty = records.filter((record) => record.dirty);
   const unreachable = records.filter((record) => record.headReachable === false);
-  // I1 (whole-branch review). A worktree path this run records that ANOTHER, still-live run also
-  // records. Measured on the machine this was built against: two pairs of the eight real runs record
-  // byte-identical worktree path sets, because the path template derives from project + ticket +
-  // slug, so relaunching a failed run reuses the directory -- the old run goes `failed` (archivable)
-  // and the new one is `running`. Archiving the old one deleted the live one's worktree, reported
-  // `archived`, exited 0, and left the live run's state untouched at `running`.
+  // A worktree path this run records that ANOTHER, still-live run also records. The path template
+  // derives from project + ticket + slug, so relaunching a failed run reuses the directory -- the
+  // old run goes `failed` (archivable) and the new one is `running`. Archiving the old one would
+  // delete the live one's worktree, report `archived`, exit 0, and leave the live run's state
+  // untouched at `running`.
   //
-  // This is the design's acceptance criterion "a run still being worked on cannot be archived by any
-  // combination of flags" -- and it was reachable through a run that is not the one being archived,
-  // which is why none of the three per-run gates saw it.
+  // This is the design's acceptance criterion "a run still being worked on cannot be archived by
+  // any combination of flags" -- reachable through a run that is not the one being archived, which
+  // is why none of the per-run gates see it.
   const liveShared = records.filter((record) => record.sharedWith.some((sharer) => sharer.live));
   if (dirty.length === 0 && unreachable.length === 0 && liveShared.length === 0) return null;
 
@@ -3360,9 +3333,9 @@ function irrecoverableRefusal(runId, run, records, evidence) {
   return archiveRefusal(runId, run, `Run ${runId} cannot be archived: ${clauses.join(" ")}`, [...new Set(actions)], evidence);
 }
 
-// I1. Which OTHER runs record each of this run's worktree paths, read once from the store rather
-// than per repository. Everything this command knew before came from the single `run` object, so a
-// second run recording the same directory was structurally invisible.
+// Which OTHER runs record each of this run's worktree paths, read once from the store rather
+// than per repository. Everything else this command knows comes from the single `run` object, so
+// a second run recording the same directory would be structurally invisible without this read.
 //
 // Fails CLOSED, the same direction as the lock gate and for a stronger reason: a store that cannot
 // list has not proven that nobody else is using these directories, and this command is about to
@@ -3377,8 +3350,7 @@ function irrecoverableRefusal(runId, run, records, evidence) {
 // of a finished run -- it is a record this control plane cannot classify, and the consequence of
 // guessing wrong is deleting the working directory of a run somebody is using. So a sharer is
 // treated as not-live only when its state is a RECOGNIZED state that is also not in
-// LIVE_RUN_STATES; everything else refuses. This is item 0.14's rule, and it is the one place the
-// shared-worktree gate did not follow it when it first shipped.
+// LIVE_RUN_STATES; everything else refuses.
 function sharerIsLive(state) {
   if (!isRunState(state)) return true;
   return LIVE_RUN_STATES.has(state);
@@ -4006,7 +3978,7 @@ async function relaunchSession(identity, deps) {
   };
 }
 
-// Back-compat alias: relaunchSession used to be Pi-only (relaunchPiSession). Nothing in this
+// Back-compat alias: relaunchSession was once Pi-only (relaunchPiSession). Nothing in this
 // module still calls it under the old name, but keep the alias in case an external caller does.
 const relaunchPiSession = relaunchSession;
 
@@ -4284,8 +4256,7 @@ export async function launchCommand(options = {}, deps = {}) {
   // launch's own writes acquire (create, writeAssignment, the LAUNCHING/RUNNING/FAILED
   // transitions) would carry no pid/startedAt, and a crash mid-launch -- the single most
   // crash-prone window in the whole system -- would leave residue `workflow unlock`/`reconcile`
-  // can never prove dead. Final-review finding 1: this call site bypassed storeForCommand
-  // entirely and was the one createRunStore call this roadmap item's own acquisition path missed.
+  // can never prove dead.
   const store = deps.store ?? (deps.createRunStore ?? createRunStore)({ stateRoot, readOwnOwnership: deps.readOwnOwnership });
   const registry = deps.registry ?? await loadRegistry(options.registryPath, { fs: deps.fs });
   const command = await createWorkflowLaunchCommand({ ...options, stateRoot, controlPlaneBin }, {

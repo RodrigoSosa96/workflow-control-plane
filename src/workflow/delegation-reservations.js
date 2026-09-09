@@ -473,9 +473,9 @@ export function createDelegationReservationStore({
 
   // Release by delegation identity rather than by owner token. The token is
   // minted inside reserve() and never persisted outside the lease file, so no
-  // later caller can present it — which is why release() had no callers and
-  // every lease leaked, permanently exhausting per-project capacity (one
-  // successful writer delegation was enough with writersPerCheckout: 1).
+  // later caller can present it -- a token-gated release() would be unreachable
+  // and every lease would leak, permanently exhausting per-project capacity
+  // (one successful writer delegation is enough with writersPerCheckout: 1).
   // Authorization is the caller's: both call sites verify against the
   // authoritative run store that the delegation is no longer running.
   async function releaseForDelegation({ projectAlias, delegationId } = {}) {

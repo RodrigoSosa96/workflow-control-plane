@@ -35,11 +35,10 @@ that test's record but missing from this document fails the suite.**
   column) — a name only mentioned in prose does not count. It does not verify a row's "written by"
   text is accurate, or that a field's documented meaning is correct — that's a human review
   question, same as any other doc.
-- **Not a documented field, because nothing carries it: `run.consumedAt`.** `run-store.js`'s
-  `list()` filters on it (`filters.unconsumed === true && run.consumedAt`), but no production writer ever sets a
-  *top-level* `consumedAt` on a run record — only `run.delegations[id].result.consumedAt`
-  (`delegation-store.js`), a different field that happens to share a name. See the task-2 report
-  for detail; it is intentionally left out of the table below because nothing actually carries it.
+- **`run.consumedAt` no es un campo documentado porque nada lo porta.** Ningún writer de producción
+  estampa un `consumedAt` de nivel superior en un run record — solo `run.delegations[id].result.consumedAt`
+  (`delegation-store.js`), un campo distinto que casualmente comparte el nombre. El filtro
+  `list({unconsumed: true})` que leía ese campo fue removido (era una capacidad sin writer ni caller).
 
 ## `run-store.js` — structural fields, present on every record
 

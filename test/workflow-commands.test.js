@@ -11,6 +11,7 @@ import { formatWorkflowResult } from "../src/workflow/format.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
 import { runVerifyCommand as realRunVerifyCommand } from "../src/workflow/verify-runner.js";
+import { fixedClock } from "./support/helpers.js";
 
 const registry = {
   launcher: {
@@ -1325,10 +1326,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-runs-command-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function fixedClock(timestamp) {
-  return { now: () => timestamp };
 }
 
 // One second per now() call, so ordering assertions get strictly increasing updatedAt values

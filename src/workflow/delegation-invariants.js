@@ -1,46 +1,23 @@
 // The reservation resources/match invariant, defined once. Lease creation
-// (delegation-reservations.js) and every later verification
-// (delegation-handoff.js, coordinator-policy.js) used to hand-roll their own
-// copy of "what does this role/mode/checkout reserve" and "does this
-// reservation still cover that delegation". They had drifted; this module is
-// the one place all three now call, so the layers stay the same predicate
-// evaluated repeatedly rather than separate approximations of it.
+// (delegation-reservations.js) and every later verification (delegation-handoff.js,
+// coordinator-policy.js) evaluate this one predicate, so the layers stay the same predicate
+// applied repeatedly rather than separate approximations that can drift. The match compares the
+// reservation's checkoutDigest against the delegation's cwd and its role/mode against the
+// delegation's: a reservation minted for a different role, mode, or checkout must never
+// authorize the delegation.
 //
-// coordinator-policy.js's copy (reservationResources/reservationAllows) was
-// the weakest: it never compared the reservation's checkoutDigest against
-// the delegation's cwd, it required a checkout:-prefixed resource to merely
-// exist rather than name the right checkout, and it never compared the
-// reservation's role/mode against the delegation's at all — a reservation
-// minted for a different role or mode passed as long as its resource list
-// happened to overlap. Migrating it to this predicate therefore changed that
-// gate's authorization outcome, not just its implementation — see
-// coordinator-policy.js and its tests.
+// The transport identity shape below is the same idea for a different invariant: one strict
+// definition (exact key set, kind === "pi-delegation", bounded strings, absolute
+// sessionPath/cwd, runId/delegationId cross-check) shared by the recording, service-boundary,
+// and untrusted-child-boundary checks, so a tampered or corrupted record fails shape validation
+// instead of silently proceeding.
 //
-// The transport identity shape below is the same story for a different
-// invariant. delegation-store.js (recording the identity a worker transport
-// returned), delegation-services.js (validating that same return value at
-// the service boundary), and delegation-handoff.js (re-checking the
-// persisted identity at the untrusted-child boundary) each hand-rolled their
-// own copy. delegation-store.js's was the strictest — exact key set,
-// kind === "pi-delegation", bounded strings, absolute sessionPath/cwd, and a
-// runId/delegationId cross-check — and is the definition below.
-// delegation-services.js's copy matched it field-for-field (only its
-// cross-check message text and error category differed), so migrating it
-// changed no accept/reject outcome. delegation-handoff.js's was the
-// loosest: it checked only kind/runId/delegationId, so a persisted identity
-// missing sessionPath/cwd/pid/processStartedAt, carrying the wrong type for
-// any of them, or carrying extra fields, passed it untouched as long as
-// those three fields lined up. Migrating it to this definition means a
-// handoff on a tampered/corrupted record now fails shape validation instead
-// of silently proceeding — see delegation-handoff.js and its tests.
-//
-// pi-delegation-transport.js keeps its own copy rather than calling this
-// one: it validates a standalone identity with no expected runId/delegationId
-// to cross-check against (that check, where it applies, happens one layer up
-// via remediationContext), and it canonicalizes sessionPath/cwd with
-// path.resolve() to match the containment checks (ensureContained) the rest
-// of that module relies on for path-traversal safety. That is a different
-// job, not a laxer version of this one, so it is not migrated here.
+// pi-delegation-transport.js keeps its own copy rather than calling this one: it validates a
+// standalone identity with no expected runId/delegationId to cross-check against (that check,
+// where it applies, happens one layer up via remediationContext), and it canonicalizes
+// sessionPath/cwd with path.resolve() to match the containment checks (ensureContained) the rest
+// of that module relies on for path-traversal safety. That is a different job, not a laxer
+// version of this one, so it is not migrated here.
 
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";

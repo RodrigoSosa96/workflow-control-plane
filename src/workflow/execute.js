@@ -551,7 +551,7 @@ async function resolveBootstrapContext(plan, worktreeOperation, ensured, herdr) 
 // instead and report the same shape an attached agent would produce.
 // Herdr's `agent start` blocks until the agent reports "ready", up to this timeout. Under load an
 // interactive Pi (model init + extensions) can take a while, so keep this generous — a spurious
-// readiness timeout used to fail the whole launch and drop the transport identity.
+// readiness timeout fails the whole launch and drops the transport identity.
 const AGENT_START_TIMEOUT_MS = 90000;
 
 async function startAgentProcess({ herdr, plan, launch, paneId, tabId }) {

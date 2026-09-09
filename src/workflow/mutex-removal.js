@@ -1,19 +1,15 @@
 // Shared choreography for removing a mutex whose owner is proven dead.
 //
-// The eleven steps enumerated below are the shared ones. The plan's twelfth — rejecting a
-// non-function `allow` — deliberately stays in each caller, because its message names the
-// caller's own function and its error category differs per store. A new caller must add that
-// guard itself; nothing here enforces it.
+// The eleven steps enumerated below are the shared ones. Rejecting a non-function `allow`
+// deliberately stays in each caller, because its message names the caller's own function and its
+// error category differs per store. A new caller must add that guard itself; nothing here
+// enforces it.
 //
-// run-store.js's removeLock and delegation-reservations.js's clearGate are the only code in
-// this repository that removes crash residue: the standing policy everywhere else is that
-// residue is preserved and reported, never removed automatically. These two run only behind a
-// confirmed operator command, and only after the caller's `allow` predicate has proven the
-// marker's owner is dead. Before this file existed the two stores carried byte-for-byte
-// identical copies of this algorithm with different nouns, and had already required one
-// synchronized fix across both files (dc55ba4, the stray-entry guard below) — the risk of one
-// shared copy is smaller than the risk of the two drifting the next time a hazard like that one
-// is found.
+// run-store.js's removeLock and delegation-reservations.js's clearGate are the only code in this
+// repository that removes crash residue: the standing policy everywhere else is that residue is
+// preserved and reported, never removed automatically. These two run only behind a confirmed
+// operator command, and only after the caller's `allow` predicate has proven the marker's owner
+// is dead.
 //
 // Every refusal branch below exists because a specific hazard was found. In order:
 //   1. inspect; refuse if the target or its marker is absent (an ambiguous multi-marker
@@ -27,10 +23,10 @@
 //   5. refuse if the marker's path or raw bytes changed since step 1 — same hazard, caught by
 //      content instead of identity, because a replacement acquisition could theoretically reuse
 //      the same directory identity on some filesystems.
-//   6. refuse if the directory holds anything besides the marker (dc55ba4): unlinking the
-//      marker first and discovering a stray entry only at rmdir would leave the mutex wedged
-//      with no marker to recover from, destroying the ownership evidence this mechanism exists
-//      to preserve. Refuse before deleting anything.
+//   6. refuse if the directory holds anything besides the marker: unlinking the marker first
+//      and discovering a stray entry only at rmdir would leave the mutex wedged with no marker
+//      to recover from, destroying the ownership evidence this mechanism exists to preserve.
+//      Refuse before deleting anything.
 //   7. unlink the marker; ENOENT/ENOTDIR is a graceful refusal (a normal concurrent release),
 //      not an anomaly.
 //   8. stat the directory again; ENOENT/ENOTDIR is again a graceful refusal.

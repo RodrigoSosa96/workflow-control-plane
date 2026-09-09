@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { delegationGateClearCommand, delegationReconcileCommand, delegationReleaseCommand, delegationRemediateCommand, delegationResultCommand } from "../src/workflow/commands.js";
+import { DEFAULT_DELEGATION_POLICY } from "../src/workflow/delegation-policy.js";
 import { formatWorkflowResult } from "../src/workflow/format.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -10,17 +11,7 @@ const CWD = "/fixture/review";
 const REGISTRY = {
   launcher: {
     state_root: "/state/workflow",
-    delegation: {
-      version: 1,
-      totalInternal: 4,
-      foreground: 3,
-      readOnlyBackground: 3,
-      writersTotal: 1,
-      writersPerCheckout: 1,
-      maxDepth: 1,
-      remediationTurns: 2,
-      allowBackgroundWriters: false,
-    },
+    delegation: DEFAULT_DELEGATION_POLICY,
   },
   projects: {
     [PROJECT_ALIAS]: {

@@ -14,6 +14,7 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
+import { fixedClock } from "./support/helpers.js";
 
 // --- archiveCommand (roadmap item 2.5) ---------------------------------------
 //
@@ -36,10 +37,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-archive-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function fixedClock(timestamp) {
-  return { now: () => timestamp };
 }
 
 function archiveLoadRegistry(projects) {
@@ -104,15 +101,14 @@ function scriptedGit(script = {}) {
         const entry = entryFor(cwd);
         if (entry.missing) throw new WorkflowError("PROCESS", `spawn git ENOENT (${cwd})`, { exitCode: 12 });
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
-        const merging = Object.hasOwn(entry, "merging") ? entry.merging : false;
         if (entry.dirty === null) {
-          return { branch: entry.branch ?? null, dirty: null, entries: [], merging, statusError: entry.statusError ?? "git status failed" };
+          return { branch: entry.branch ?? null, dirty: null, entries: [], statusError: entry.statusError ?? "git status failed" };
         }
         const entries = [
           ...(entry.dirtyPaths ?? []).map((path) => ({ x: " ", y: "M", path })),
           ...(entry.untrackedPaths ?? []).map((path) => ({ x: "?", y: "?", path })),
         ];
-        return { branch: entry.branch ?? null, dirty: entries.length > 0, entries, merging };
+        return { branch: entry.branch ?? null, dirty: entries.length > 0, entries };
       },
       async pendingOperation({ cwd, timeoutMs }) {
         calls.push({ method: "pendingOperation", cwd, timeoutMs });
@@ -474,7 +470,7 @@ test("a worktree reported dirty with no enumerable paths still refuses, with a l
   const git = {
     ...fixture.git,
     async checkoutState() {
-      return { branch: "feature/actual", dirty: true, entries: [{ x: " ", y: "M" }], merging: false };
+      return { branch: "feature/actual", dirty: true, entries: [{ x: " ", y: "M" }] };
     },
   };
 

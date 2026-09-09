@@ -12,6 +12,7 @@ import { WorkflowError } from "../src/workflow/errors.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
+import { fixedClock } from "./support/helpers.js";
 
 // --- mergeCommand (roadmap item 2.4) ----------------------------------------
 //
@@ -35,10 +36,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-merge-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function fixedClock(timestamp) {
-  return { now: () => timestamp };
 }
 
 function mergeLoadRegistry(projects) {
@@ -84,16 +81,11 @@ function scriptedGit(script = {}) {
         calls.push({ method: "checkoutState", cwd, timeoutMs });
         const entry = entryFor(cwd);
         if (entry.headError) throw new WorkflowError("PROCESS", entry.headError, { exitCode: 12 });
-        // `merging` is part of the adapter's contract (git.js's checkoutState), so the double
-        // answers it like the real thing does: an explicit `false` unless a test scripts
-        // otherwise. Leaving it `undefined` would let these tests pass against a commands.js that
-        // fails OPEN on an unanswerable MERGE_HEAD probe, which is the exact bug this models.
-        const merging = Object.hasOwn(entry, "merging") ? entry.merging : false;
         if (entry.dirty === null) {
-          return { branch: entry.branch ?? null, dirty: null, entries: [], merging, statusError: entry.statusError ?? "git status failed" };
+          return { branch: entry.branch ?? null, dirty: null, entries: [], statusError: entry.statusError ?? "git status failed" };
         }
         const entries = (entry.dirtyPaths ?? []).map((path) => ({ x: " ", y: "M", path }));
-        return { branch: entry.branch ?? null, dirty: Boolean(entry.dirty) || entries.length > 0, entries, merging };
+        return { branch: entry.branch ?? null, dirty: Boolean(entry.dirty) || entries.length > 0, entries };
       },
       // Models the ref namespace of ONE checkout. `refsFrom` is the ordinary linked-worktree
       // topology -- base checkout and run worktree share a ref store, so the branch resolves to
@@ -1668,7 +1660,7 @@ test("a base checkout whose dirty state is absent entirely is a conflict, never 
     ...scriptedGit(groupFixture()).git,
     async checkoutState({ cwd }) {
       // `dirty` and `entries` omitted altogether -- an older or partial adapter.
-      return { branch: "dev", merging: false, ...(cwd === "/base/panel" ? {} : { dirty: false, entries: [] }) };
+      return { branch: "dev", ...(cwd === "/base/panel" ? {} : { dirty: false, entries: [] }) };
     },
   };
 

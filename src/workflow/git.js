@@ -179,12 +179,12 @@ function parseMergeTree(output) {
   if (terminatorIndex < 0) conflicts.pop();
 
   // But if the cut lands exactly on the NUL that terminates a path, `split("\0")` produces a
-  // trailing "" that is INDISTINGUISHABLE from git's real end-of-paths marker -- so this function
-  // used to report a 1,196-path prefix of a 1,696-path conflict list as COMPLETE, with no
-  // `truncated` flag, and the digest then bound that prefix as the whole truth. That is precisely
-  // the "a shortened list must never read as complete" property the entire conflictsTruncated
-  // chain exists to guarantee. (Measured repro: OID(40) + NUL + 1195 nine-character paths + one
-  // eight-character path = exactly 12,000 characters.)
+  // trailing "" that is INDISTINGUISHABLE from git's real end-of-paths marker -- so a prefix of
+  // the conflict list would read as COMPLETE, with no `truncated` flag, and the digest would bind
+  // that prefix as the whole truth. That is precisely the "a shortened list must never read as
+  // complete" property the entire conflictsTruncated chain exists to guarantee. (Measured repro:
+  // OID(40) + NUL + 1195 nine-character paths + one eight-character path = exactly 12,000
+  // characters.)
   //
   // The length of the captured stream is what actually settles it: at or above the cap, the stream
   // was cut, whatever the last field happens to look like. An empty field with data AFTER it is
@@ -197,51 +197,16 @@ function parseMergeTree(output) {
   return { tree: OBJECT_ID.test(tree) ? tree : "", conflicts, complete: terminated };
 }
 
-// Is this checkout sitting inside an unfinished merge? Deliberately NOT
-// `rev-parse --verify --quiet MERGE_HEAD`, which cannot answer the question: measured on git 2.43,
-// an ABSENT MERGE_HEAD, a corrupt one, and one this process cannot read all exit 1 with empty
-// stderr -- and all three print the identical `fatal: Needed a single revision` when --quiet is
-// dropped. So an exit-code probe reports "not merging" for a checkout whose merge state it simply
-// could not read, which is the opposite of what this adapter promises.
-//
-// Reading the file is what distinguishes them, and ENOENT is the only answer that PROVES "not
-// merging". Everything else -- unreadable, permission denied, contents that are not an object id
-// -- is `null`, "cannot say", which callers must treat as a conflict. The path comes from git
-// rather than being assembled here because a linked worktree's `.git` is a file, not a directory,
-// and its MERGE_HEAD lives under the worktree's own admin directory. One git call, same as the
-// probe it replaces.
-async function readMergeState({ runner, fs, cwd, timeoutMs }) {
-  let path;
-  try {
-    const result = await runner.run("git", ["rev-parse", "--git-path", "MERGE_HEAD"], { cwd, timeoutMs });
-    path = trimLine(result.stdout);
-  } catch {
-    return null;
-  }
-  if (!path) return null;
-
-  let contents;
-  try {
-    contents = await fs.readFile(isAbsolute(path) ? path : resolve(cwd, path), "utf8");
-  } catch (error) {
-    return error?.code === "ENOENT" ? false : null;
-  }
-  // An octopus merge records one parent per line; the first is enough to prove a merge is running.
-  return OBJECT_ID.test(trimLine(String(contents).split("\n")[0] ?? "")) ? true : null;
-}
-
 // The unfinished operations git can leave a worktree sitting inside, in the order git's own
-// `wt_status_get_state` resolves them, each with the remedy that actually applies to it.
+// `wt_status_get_state` resolves them, each with the remedy that actually applies to it. This
+// is the only "is a git operation in progress?" probe in the adapter: an interrupted
+// `git rebase -i` leaves `rebase-merge/` present, MERGE_HEAD ABSENT, HEAD DETACHED and the
+// tree CLEAN (measured on git 2.43), so a MERGE_HEAD-only probe and a dirty check both see
+// nothing while the worktree holds rebased commits no ref references.
 //
-// Item 2.4 recorded "MERGE_HEAD only" as a deferred gap. It stopped being deferrable when it turned
-// out to be half of a path from "clean archive" to "destroyed commit": measured on this machine,
-// git 2.43, an interrupted `git rebase -i` leaves `rebase-merge/` present, MERGE_HEAD ABSENT, HEAD
-// DETACHED and the tree CLEAN -- so a MERGE_HEAD-only probe and a dirty check both see nothing
-// while the worktree holds rebased commits no ref references.
-//
-// The probe is EXISTENCE, deliberately weaker than readMergeState's content parsing: a marker whose
-// bytes are unreadable still means an operation is in progress, and every caller of this fails
-// closed. `rebase-apply/applying` is git's own discriminator between `git am` and a rebase using the
+// The probe is EXISTENCE, deliberately weaker than content parsing: a marker whose bytes are
+// unreadable still means an operation is in progress, and every caller of this fails closed.
+// `rebase-apply/applying` is git's own discriminator between `git am` and a rebase using the
 // apply backend; the remedies differ, so the two are not collapsed.
 const PENDING_OPERATIONS = Object.freeze([
   { entry: "rebase-merge", operation: "rebase", remedy: "git rebase --abort" },
@@ -468,8 +433,7 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     },
 
     // Where the work actually is. Read from the checkout, never derived from a run record: a
-    // recorded branch is a launch-time intention and two of the eight real runs on this machine
-    // name a ref that no longer exists.
+    // recorded branch is a launch-time intention and can name a ref that no longer exists.
     async resolveHead({ cwd, timeoutMs }) {
       const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeoutMs });
       const shaResult = await runner.run("git", ["rev-parse", "HEAD"], { cwd, timeoutMs });
@@ -481,32 +445,19 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
     },
 
     // Is this checkout safe to merge into right now? `dirty: null` means the status could not be
-    // read; the caller must treat that as a conflict and never as clean — same direction as
-    // reconcile.js's `safeStatus`, applied to a heavier operation.
-    //
-    // `merging` is a SEPARATE fact from `dirty`, and it exists because "dirty" alone was
-    // under-specified in exactly the case it matters most. Found running the real CLI (roadmap item
-    // 2.4, task 3, step 5): a `git merge` that fails at commit time — a rejecting
-    // `pre-merge-commit` hook, and equally a real conflict `merge-tree` did not predict — leaves
-    // the base checkout mid-merge, with MERGE_HEAD present and the merged content staged. The next
-    // preview correctly refused, but described that checkout only as "has 1 uncommitted path(s)",
-    // whose natural reading is `git add`/`git stash` — the wrong move. The right one is
-    // `git merge --abort`, and a caller cannot say so without being able to tell the two states
-    // apart. `true`/`false`/`null` for unknown, never throwing: an unanswerable probe degrades
-    // to "cannot say" rather than to "not merging" — see readMergeState for why that required
-    // reading the file rather than asking `rev-parse`.
+    // read; the caller must treat that as a conflict and never as clean. Whether a git operation
+    // is in progress is `pendingOperation`'s question, not this one's — MERGE_HEAD alone cannot
+    // see a rebase, a cherry-pick, a revert, an `am` or a bisect, so this probe does not try.
     async checkoutState({ cwd, timeoutMs }) {
       const branchResult = await runner.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeoutMs });
       const branch = normalizeHeadBranch(trimLine(branchResult.stdout));
 
-      const merging = await readMergeState({ runner, fs, cwd, timeoutMs });
-
       try {
         const statusResult = await runner.run("git", ["status", "--porcelain=v1", "-z"], { cwd, timeoutMs });
         const entries = parseStatus(statusResult.stdout);
-        return { branch, dirty: entries.length > 0, entries, merging };
+        return { branch, dirty: entries.length > 0, entries };
       } catch (error) {
-        return { branch, dirty: null, entries: [], merging, statusError: reasonFrom(error) };
+        return { branch, dirty: null, entries: [], statusError: reasonFrom(error) };
       }
     },
 
@@ -730,10 +681,9 @@ export function createGitAdapter({ runner, fs = defaultFs, env = process.env }) 
       }
     },
 
-    // Is this worktree sitting inside an unfinished git operation of ANY kind? A superset of
-    // checkoutState's `merging`, which probes MERGE_HEAD alone and therefore cannot see a rebase, a
-    // cherry-pick, a revert, an `am` or a bisect -- see PENDING_OPERATIONS for the measurement that
-    // made this necessary rather than merely tidier.
+    // Is this worktree sitting inside an unfinished git operation of ANY kind? Not just a merge:
+    // a rebase, a cherry-pick, a revert, an `am` or a bisect all leave the tree in a state that
+    // `dirty` alone cannot describe -- see PENDING_OPERATIONS for the measurement.
     //
     // Three outcomes, never a tri-state boolean: `{status:"none"}` (proven idle),
     // `{status:"in-progress", operation, path, remedy}`, and `{status:"unknown", reason}`. Callers

@@ -11,6 +11,7 @@ import { createDelegationStore } from "../src/workflow/delegation-store.js";
 import { submitDelegationHandoff } from "../src/workflow/delegation-handoff.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
+import { uuidSequence } from "./support/helpers.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -19,11 +20,6 @@ const RESERVATION_ID = "44444444-4444-4444-8444-444444444444";
 const RESERVATION_OWNER = "55555555-5555-4555-8555-555555555555";
 const PROJECT_ALIAS = "fixture";
 const CWD = "/fixture/review";
-
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
-}
 
 async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-delegation-handoff-"));

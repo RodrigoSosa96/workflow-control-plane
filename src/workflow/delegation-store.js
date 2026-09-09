@@ -169,6 +169,27 @@ function validateResult(value) {
   };
 }
 
+function assertExpectedGeneration(value) {
+  if (!Number.isInteger(value) || value < 1) {
+    fail("expected delegation generation must be a positive integer");
+  }
+}
+
+function assertTerminalCurrentResult(record) {
+  if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
+    fail("Delegation does not have a terminal current result");
+  }
+}
+
+// The shared gate for the three remediation-launch transitions: the caller must hold the launch
+// claim token, which only the digest of is ever persisted — the record is readable by every
+// delegation child through its run directory.
+function assertPendingRemediationLaunch(record, expectedGeneration, claimToken) {
+  if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
+  if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
+  if (!claimTokenMatchesDigest(claimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
+}
+
 function privatePath(id, name) {
   return `delegations/${id}/${name}`;
 }
@@ -388,9 +409,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   }
 
   async function claimRemediationLaunch({ runId, delegationId: id, expectedGeneration } = {}) {
-    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
-      fail("expected delegation generation must be a positive integer");
-    }
+    assertExpectedGeneration(expectedGeneration);
     // Same rule as claim(): only the digest is persisted, because the record is
     // readable by every delegation child through its run directory.
     const claimToken = mintClaimToken(randomUUID);
@@ -400,9 +419,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       expectedStates: REMEDIABLE_STATES,
       mutate: (record) => {
         if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
-        if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
-          fail("Delegation does not have a terminal current result");
-        }
+        assertTerminalCurrentResult(record);
         if (!record.transportIdentity) fail("Delegation transport identity is missing");
         if (record.remediation) fail("Delegation remediation launch is already claimed");
         if (record.remediationTurnsUsed >= record.remediationTurns) fail("Delegation remediation limit is exhausted");
@@ -422,9 +439,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   }
 
   async function completeRemediationLaunch({ runId, delegationId: id, expectedGeneration, claimToken, identity } = {}) {
-    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
-      fail("expected delegation generation must be a positive integer");
-    }
+    assertExpectedGeneration(expectedGeneration);
     const validatedClaimToken = validateClaimToken(claimToken);
     const nextIdentity = validateDelegationTransportIdentity(identity, runId, id, fail);
     return await updateRecord({
@@ -432,9 +447,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       delegationId: id,
       expectedStates: REMEDIABLE_STATES,
       mutate: (record) => {
-        if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
-        if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (!claimTokenMatchesDigest(validatedClaimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
+        assertPendingRemediationLaunch(record, expectedGeneration, validatedClaimToken);
         if (record.remediation.generation !== expectedGeneration + 1) fail("Delegation remediation launch generation is stale");
         if (!record.transportIdentity) fail("Delegation transport identity is missing");
         if (
@@ -466,18 +479,14 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   }
 
   async function rollbackRemediationLaunch({ runId, delegationId: id, expectedGeneration, claimToken } = {}) {
-    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
-      fail("expected delegation generation must be a positive integer");
-    }
+    assertExpectedGeneration(expectedGeneration);
     const validatedClaimToken = validateClaimToken(claimToken);
     return await updateRecord({
       runId,
       delegationId: id,
       expectedStates: REMEDIABLE_STATES,
       mutate: (record) => {
-        if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
-        if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (!claimTokenMatchesDigest(validatedClaimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
+        assertPendingRemediationLaunch(record, expectedGeneration, validatedClaimToken);
         return {
           ...record,
           remediation: null,
@@ -487,9 +496,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
   }
 
   async function markRemediationLaunchManualRecovery({ runId, delegationId: id, expectedGeneration, claimToken, reason } = {}) {
-    if (!Number.isInteger(expectedGeneration) || expectedGeneration < 1) {
-      fail("expected delegation generation must be a positive integer");
-    }
+    assertExpectedGeneration(expectedGeneration);
     const validatedClaimToken = validateClaimToken(claimToken);
     const manualReason = validateManualRecoveryReason(reason);
     return await updateRecord({
@@ -497,9 +504,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       delegationId: id,
       expectedStates: REMEDIABLE_STATES,
       mutate: (record) => {
-        if (record.generation !== expectedGeneration) fail("Delegation generation is stale");
-        if (!record.remediation || record.remediation.state !== "launching") fail("Delegation remediation launch is not pending");
-        if (!claimTokenMatchesDigest(validatedClaimToken, record.remediation.claimTokenDigest)) fail("Delegation remediation launch claim is stale");
+        assertPendingRemediationLaunch(record, expectedGeneration, validatedClaimToken);
         return {
           ...record,
           remediation: {
@@ -519,9 +524,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       delegationId: id,
       expectedStates: TERMINAL_STATES,
       mutate: (record) => {
-        if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
-          fail("Delegation does not have a terminal current result");
-        }
+        assertTerminalCurrentResult(record);
         if (record.originSessionId !== consumer) fail("Delegation result belongs to a different origin session");
         if (record.result.consumedBySessionId || record.result.consumedAt) fail("Delegation result has already been consumed");
         return {
@@ -543,9 +546,7 @@ export function createDelegationStore({ store, clock = () => new Date().toISOStr
       delegationId: id,
       expectedStates: TERMINAL_STATES,
       mutate: (record) => {
-        if (!record.result || !TERMINAL_STATES.has(record.result.status) || record.result.generation !== record.generation) {
-          fail("Delegation does not have a terminal current result");
-        }
+        assertTerminalCurrentResult(record);
         if (record.result.consumedBySessionId || record.result.consumedAt) fail("Delegation result has already been consumed");
         return {
           ...record,

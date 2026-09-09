@@ -377,15 +377,14 @@ test("resolveHead passes its timeoutMs through to both reads", async () => {
 test("checkoutState passes its timeoutMs through to every read it spawns", async () => {
   const fixture = fixtureRunner({
     "git rev-parse --abbrev-ref HEAD": async () => ({ code: 0, stdout: "dev\n", stderr: "" }),
-    "git rev-parse --git-path MERGE_HEAD": async () => ({ code: 0, stdout: ".git/MERGE_HEAD\n", stderr: "" }),
     "git status --porcelain=v1 -z": async () => ({ code: 0, stdout: "", stderr: "" }),
   });
   const git = createGitAdapter({ runner: fixture.runner });
 
   await git.checkoutState({ cwd: "/repo", timeoutMs: 4321 });
 
-  assert.equal(fixture.calls.length, 3);
-  assert.deepEqual(fixture.calls.map((call) => call.options.timeoutMs), [4321, 4321, 4321]);
+  assert.equal(fixture.calls.length, 2);
+  assert.deepEqual(fixture.calls.map((call) => call.options.timeoutMs), [4321, 4321]);
 });
 
 test("resolveHead reports a detached HEAD as a null branch", async () => {
@@ -429,9 +428,7 @@ test("checkoutState reports a clean checkout as not dirty", async () => {
 
   const state = await git.checkoutState({ cwd: "/repo" });
 
-  // `merging: null` here, not `false`: this fixture scripts no MERGE_HEAD probe, and an
-  // unanswerable probe must degrade to "cannot say" rather than to "not merging".
-  assert.deepEqual(state, { branch: "dev", dirty: false, entries: [], merging: null });
+  assert.deepEqual(state, { branch: "dev", dirty: false, entries: [] });
 });
 
 test("checkoutState reports dirty: null with a reason when git status cannot be read", async () => {
@@ -640,7 +637,7 @@ test("resolveHead and checkoutState read a real repository, detached HEAD includ
   assert.match(head.sha, /^[0-9a-f]{40}$/);
 
   const clean = await git.checkoutState({ cwd: repoPath });
-  assert.deepEqual(clean, { branch: "main", dirty: false, entries: [], merging: false });
+  assert.deepEqual(clean, { branch: "main", dirty: false, entries: [] });
 
   await writeFile(join(repoPath, "README.md"), "changed\n");
   const dirty = await git.checkoutState({ cwd: repoPath });
@@ -897,40 +894,6 @@ test("mergeBranch performs a real --no-ff merge and leaves a merge commit", asyn
   assert.equal((await git.checkoutState({ cwd: repoPath })).dirty, false);
 });
 
-// Roadmap item 2.4, task 3, step 5: a `git merge` that fails at commit time leaves the checkout
-// mid-merge, and `dirty: true` alone described that state only as "there are uncommitted paths" --
-// which reads as `git add`/`git stash` when the correct move is `git merge --abort`. Real git, a
-// real rejecting hook, and a real stopped merge, because the whole point is what git leaves behind.
-test("checkoutState distinguishes a checkout stuck mid-merge from an ordinarily dirty one", async (t) => {
-  const { repoPath } = await createDisposableRepo(t);
-  const git = createGitAdapter({ runner: createProcessRunner() });
-
-  await gitExec(repoPath, ["checkout", "-b", "feature/work"]);
-  await writeFile(join(repoPath, "feature.txt"), "feature\n");
-  await gitExec(repoPath, ["add", "feature.txt"]);
-  await gitExec(repoPath, ["commit", "-m", "feature work"]);
-  await gitExec(repoPath, ["checkout", "main"]);
-
-  const beforeMerge = await git.checkoutState({ cwd: repoPath });
-  assert.equal(beforeMerge.dirty, false);
-  assert.equal(beforeMerge.merging, false, "a clean checkout is not mid-merge");
-
-  // A hook that rejects at commit time -- the exact shape found running the real CLI.
-  const hookPath = join(repoPath, ".git", "hooks", "pre-merge-commit");
-  await writeFile(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-  await assert.rejects(() => gitExec(repoPath, ["merge", "--no-ff", "--no-edit", "feature/work"]));
-
-  const afterFailedMerge = await git.checkoutState({ cwd: repoPath });
-  assert.equal(afterFailedMerge.merging, true, "MERGE_HEAD is present; this checkout is mid-merge");
-  assert.equal(afterFailedMerge.dirty, true);
-  assert.equal(afterFailedMerge.branch, "main");
-
-  await gitExec(repoPath, ["merge", "--abort"]);
-  const afterAbort = await git.checkoutState({ cwd: repoPath });
-  assert.equal(afterAbort.merging, false, "the abort is what actually resolves it");
-  assert.equal(afterAbort.dirty, false);
-});
-
 // Node reports a missing `cwd` and a missing executable identically, as `spawn <cmd> ENOENT`. The
 // real CLI printed "Failed to start git: spawn git ENOENT" for a run whose worktree had been
 // deleted, sending the operator to check their git installation.
@@ -1020,34 +983,6 @@ test("a clean merge whose informational tail was capped stays clean rather than 
   const preview = await git.previewMerge({ cwd: "/base", base: "dev", source: "feature/task" });
   assert.equal(preview.status, "clean");
   assert.deepEqual(preview.conflicts, []);
-});
-
-// --- M6: the merge probe must fail closed on an unreadable MERGE_HEAD -------------------------
-//
-// Measured on git 2.43: `rev-parse --verify --quiet MERGE_HEAD` exits 1 with EMPTY stderr for an
-// absent MERGE_HEAD, a corrupt one, AND one this process cannot read -- and prints the identical
-// `fatal: Needed a single revision` for all three when --quiet is dropped. The exit code cannot
-// answer the question, so the file is read instead: ENOENT is the only proof of "not merging".
-test("a corrupt MERGE_HEAD reports an unknown merge state rather than 'not merging'", async (t) => {
-  const { repoPath } = await createDisposableRepo(t);
-  const git = createGitAdapter({ runner: createProcessRunner() });
-
-  assert.equal((await git.checkoutState({ cwd: repoPath })).merging, false, "absent MERGE_HEAD is the only proof of not-merging");
-
-  await writeFile(join(repoPath, ".git", "MERGE_HEAD"), "not-a-sha\n");
-  assert.equal(
-    (await git.checkoutState({ cwd: repoPath })).merging,
-    null,
-    "a MERGE_HEAD git cannot resolve must degrade to 'cannot say', which the caller treats as a conflict",
-  );
-
-  // The exit-code probe this replaced cannot tell that case from an absent ref: both exit 1.
-  const probe = await createProcessRunner().run("git", ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], { cwd: repoPath, allowFailure: true });
-  assert.equal(probe.code, 1, "identical to the absent case -- which is why the exit code cannot be the answer");
-  assert.equal(probe.stderr.trim(), "");
-
-  await writeFile(join(repoPath, ".git", "MERGE_HEAD"), `${await gitExec(repoPath, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim())}\n`);
-  assert.equal((await git.checkoutState({ cwd: repoPath })).merging, true);
 });
 
 // --- 2.5: removing a worktree without ever forcing -------------------------------------------
@@ -1681,10 +1616,9 @@ test("pendingOperation names each unfinished operation, and proves the absence o
   assert.match(pending.remedy, /git rebase --abort/);
   assert.match(pending.path, /rebase-merge$/);
 
-  // The gap this closes, stated as an assertion rather than as a comment: the MERGE_HEAD probe
-  // `checkoutState` uses sees nothing here, and the tree is clean.
+  // The gap pendingOperation closes, stated as an assertion rather than as a comment: this
+  // rebase leaves the tree clean, so a dirty check alone would see nothing.
   const state = await git.checkoutState({ cwd: worktreePath });
-  assert.equal(state.merging, false, "MERGE_HEAD really is absent during a rebase");
   assert.equal(state.dirty, false, "and this rebase stopped with a clean tree");
   assert.equal(state.branch, null, "on a detached HEAD");
 });

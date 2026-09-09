@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { MUTEX_RETRY_BUDGET_MS } from "../src/workflow/bounded-retry.js";
 import { RUN_STATES, transitionRun } from "../src/workflow/run-state.js";
 import { createRunStore, SUPPORTED_RUN_VERSION } from "../src/workflow/run-store.js";
+import { clockSequence, uuidSequence } from "./support/helpers.js";
 
 const RUN_ID_1 = "11111111-1111-4111-8111-111111111111";
 const RUN_ID_2 = "22222222-2222-4222-8222-222222222222";
@@ -19,20 +20,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-run-store-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
-}
-
-function clockSequence(...values) {
-  let index = 0;
-  return {
-    now() {
-      return values[index++] ?? values.at(-1);
-    },
-  };
 }
 
 async function fileMode(path) {
@@ -941,7 +928,7 @@ test("lists runs with filters and writes private assignments", async (t) => {
     ),
   });
   const first = await store.create(plannedInput({ primaryTicket: "A-1", originSessionId: "pi:one" }));
-  await store.create(plannedInput({ primaryTicket: "A-2", originSessionId: "pi:one", consumedAt: "2025-01-01T00:10:00.000Z" }));
+  await store.create(plannedInput({ primaryTicket: "A-2", originSessionId: "pi:one" }));
   await store.create(plannedInput({ projectAlias: "personalProjectB", primaryTicket: "C-1", originSessionId: "pi:two" }));
 
   const assignment = await store.writeAssignment(RUN_ID_1, "Implement OCR workflow\n");
@@ -950,8 +937,8 @@ test("lists runs with filters and writes private assignments", async (t) => {
   assert.equal(await readFile(assignment.path, "utf8"), "Implement OCR workflow\n");
   assert.equal((await stat(assignment.path)).mode & 0o777, 0o600);
 
-  const listed = await store.list({ projectAlias: "ocr", originSessionId: "pi:one", unconsumed: true });
-  assert.deepEqual(listed.map((run) => run.id), [RUN_ID_1]);
+  const listed = await store.list({ projectAlias: "ocr", originSessionId: "pi:one" });
+  assert.deepEqual(listed.map((run) => run.id), [RUN_ID_1, RUN_ID_2]);
   assert.equal(listed[0].directory, first.directory);
 });
 

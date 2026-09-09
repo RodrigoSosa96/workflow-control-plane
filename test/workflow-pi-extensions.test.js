@@ -6,6 +6,7 @@ import { checkoutDigestFor } from "../src/workflow/delegation-invariants.js";
 import { createWorkflowDelegationChildExtension } from "../.pi/extensions/workflow-delegation-child.ts";
 import { createWorkflowCoordinatorExtension, createWorkflowCoordinatorRuntime } from "../.pi/extensions/workflow-coordinator/index.ts";
 import { createSubprocessOwnOwnershipReader } from "../src/workflow/ownership.js";
+import { DEFAULT_DELEGATION_POLICY } from "../src/workflow/delegation-policy.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -14,17 +15,7 @@ const ORIGIN_SESSION_ID = "pi-origin-1";
 const LATER_SESSION_ID = "pi-origin-2";
 const CWD = "/fixture/review";
 const TASK = "Review the frozen brief.";
-const policy = {
-  version: 1,
-  totalInternal: 4,
-  foreground: 3,
-  readOnlyBackground: 3,
-  writersTotal: 1,
-  writersPerCheckout: 1,
-  maxDepth: 1,
-  remediationTurns: 2,
-  allowBackgroundWriters: false,
-};
+const policy = DEFAULT_DELEGATION_POLICY;
 
 function createFakePi() {
   const tools = new Map();

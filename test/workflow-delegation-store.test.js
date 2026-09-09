@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { createDelegationStore } from "../src/workflow/delegation-store.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 import { createRunStore } from "../src/workflow/run-store.js";
+import { clockSequence, uuidSequence } from "./support/helpers.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const FIRST_DELEGATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -17,20 +18,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-delegation-store-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
-}
-
-function clockSequence(...values) {
-  let index = 0;
-  return {
-    now() {
-      return values[index++] ?? values.at(-1);
-    },
-  };
 }
 
 async function fileMode(path) {

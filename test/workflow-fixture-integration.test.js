@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { createWorkflowFixture } from "../src/workflow/fixture.js";
+import { createWorkflowFixture } from "./support/fixture.js";
 import { launchCommand, handoffCommand, resultCommand } from "../src/workflow/commands.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";

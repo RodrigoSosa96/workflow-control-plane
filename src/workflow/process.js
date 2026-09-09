@@ -30,16 +30,11 @@ function appendBounded(current, chunk) {
 }
 
 // Node reports a missing `cwd` and a missing executable with the SAME error: `spawn <cmd> ENOENT`,
-// with no field distinguishing them. That collapse is actively misleading for this codebase, whose
-// commands run `git` inside operator-supplied directories: `workflow merge` against a run whose
-// worktree has been deleted printed "Failed to start git: spawn git ENOENT", which sends an
-// operator to check their git installation when what is actually missing is the directory named
-// two words earlier in the same refusal. Found running the real CLI (roadmap item 2.4, task 3,
-// step 5).
-//
-// ENOENT is the only code that is ambiguous this way, and the `existsSync` only ever runs on that
-// already-failed path -- never in the success path of any spawn. `cwd` is re-checked rather than
-// assumed: by the time the error arrives, the directory really is the thing to ask about.
+// with no field distinguishing them. That collapse misleads here, where commands run `git` inside
+// operator-supplied directories: "Failed to start git: spawn git ENOENT" sends an operator to
+// check their git installation when what is missing is the directory named two words earlier.
+// ENOENT is the only ambiguous code, so the `existsSync` check runs only on the already-failed
+// path, never in the success path of any spawn.
 function startFailureMessage(command, cwd, error) {
   if (error?.code === "ENOENT" && typeof cwd === "string" && cwd && !existsSync(cwd)) {
     return `Failed to start ${command}: working directory does not exist: ${cwd}`;
@@ -56,70 +51,52 @@ function toProcessError(message, details) {
 
 // --- The interrupt trap -----------------------------------------------------------------------
 //
-// `detached: true` (see killChild in process-group.js) is what lets a timeout reach a grandchild's
-// whole process group -- and the same detachment takes the child OUT of this CLI's own process
-// group, so a terminal's Ctrl-C, delivered to the whole *foreground group* and not to this process
-// by pid, no longer reaches it. That regression is not hypothetical: item 2.3 shipped exactly this
-// fix inside verify-runner.js and had to close the same hole in a re-review. An interrupted CLI
-// would otherwise exit while the detached child is reparented to init with no bound at all, because
-// the SIGTERM -> grace -> SIGKILL escalation lives inside the process that just died.
+// `detached: true` (see killChild in process-group.js) lets a timeout reach a grandchild's whole
+// process group -- and the same detachment takes the child OUT of this CLI's own process group,
+// so a terminal's Ctrl-C, delivered to the whole *foreground group*, does not reach it. Without
+// this trap an interrupted CLI would exit while the detached child is reparented to init with no
+// bound at all, because the SIGTERM -> grace -> SIGKILL escalation lives inside the process that
+// just died.
 //
 // So: for exactly as long as at least one child is alive, an interrupt delivered to THIS process
 // (SIGINT from a terminal, SIGTERM from e.g. a process manager) reaches every live child's group
 // before this process exits, and this process then exits the way an uninterrupted SIGINT/SIGTERM
 // would (128 + signal number).
 //
-// **What that interrupt sends is the third deliberate difference from verify-runner.js, and it is
-// the one a copy gets wrong.** That file SIGKILLs, which is right for a verification command --
-// nothing it runs cleans up after itself. This runner fronts repository MUTATIONS: `git merge
-// --no-ff` (git.js:665), `git worktree add` (:457, :466), `git worktree remove` (:845). SIGKILL
-// cannot be caught or handled, so a killed command never runs the cleanup it registered; git
-// installs exactly such a handler (`sigchain_push_common`, which removes its tempfiles and
-// lockfiles) and it only ever runs for a signal git is allowed to receive. Forwarding is therefore
-// strictly better than killing for anything that tidies up after itself, and this runner's callers
-// all do.
+// The trap FORWARDS the signal it received rather than SIGKILLing. This runner fronts repository
+// MUTATIONS (`git merge --no-ff`, `git worktree add`, `git worktree remove`): SIGKILL cannot be
+// caught, so a killed command never runs the cleanup it registered -- git installs exactly such a
+// handler (`sigchain_push_common`, which removes its tempfiles and lockfiles) and it only runs
+// for a signal git is allowed to receive. Forwarding is strictly better than killing for anything
+// that tidies up after itself, and this runner's callers all do. (verify-runner.js instead
+// SIGKILLs, which is right for a verification command: nothing it runs cleans up after itself.)
+// Escalation comes only after forwarding: SIGKILL plus `process.exit` from a short timer. A second
+// interrupt while that is pending skips the wait -- an operator pressing Ctrl-C twice is asking
+// for exactly that -- and the escalation is a hard ceiling, so an ignored signal costs one grace
+// window, never an unbounded hang.
 //
-// The review that found this reported a measured case of an interrupted `git commit` leaving
-// `.git/index.lock` behind. That specific artifact did NOT reproduce here: probed against git 2.43,
-// no `*.lock` exists under `.git` during pre-commit, prepare-commit-msg, commit-msg, post-commit,
-// post-merge or post-checkout, nor while a blocking `GIT_EDITOR` is open. The lock window is
-// version- and command-dependent; the reason to forward is not, which is why it is stated above as
-// the property (an uncatchable signal runs no handler) rather than as a number this file cannot
-// stand behind. The tests assert the mechanism -- the child receives a catchable signal -- not a
-// lockfile this git never creates.
+// While that shutdown is draining, no run may hand control back to its caller. A child dying of
+// the forwarded SIGINT settles like any other signalled child, and an `allowFailure` caller would
+// take that as an ordinary nonzero result and march on to its NEXT step -- removing a worktree,
+// say -- inside a process that is already exiting. `shuttingDown` below is what stops that:
+// settles still release their registry slot (so the escalation knows when everything is gone),
+// but the promise is left pending and the exit happens on the trap's own schedule.
 //
-// So the trap FORWARDS the signal it received to each live group, and only then escalates: SIGKILL
-// plus `process.exit` from a short timer, which this process is alive to run precisely because it
-// owns the handler that is deferring its own exit. A second interrupt while that is pending skips
-// the wait -- an operator pressing Ctrl-C twice is asking for exactly that -- and the escalation is
-// a hard ceiling, so an ignored signal costs one grace window, never an unbounded hang.
-//
-// While that shutdown is draining, no run may hand control back to its caller. A child dying of the
-// forwarded SIGINT settles like any other signalled child, and an `allowFailure` caller would take
-// that as an ordinary nonzero result and march on to its NEXT step -- removing a worktree, say --
-// inside a process that is already exiting. `shuttingDown` below is what stops that: settles still
-// release their registry slot (so the escalation knows when everything is gone), but the promise is
-// left pending and the exit happens on the trap's own schedule.
-//
-// **This is where it differs from verify-runner.js, and the difference is the reason it is not a
-// copy-paste.** That file runs one child at a time, so its comment can say "at most one trap is
-// ever active" and install a listener pair per child. This is the SHARED runner: every git and
-// Herdr call in the repo goes through it, sequentially and sometimes concurrently. A listener pair
-// per child would mean N pairs for N concurrent spawns -- node warns at 10 listeners precisely
-// because that pattern is how leaks look -- and any missed teardown would accumulate across the
-// hundreds of short spawns a single command makes. Instead there is ONE listener pair over a
-// registry of live children: installed when the registry goes from empty to non-empty, removed
-// when it goes back to empty. Per child, what is tracked is membership in that registry, released
-// in `settle` alongside the timers, exactly once.
+// This is the SHARED runner -- every git and Herdr call in the repo goes through it, sequentially
+// and sometimes concurrently -- so there is ONE listener pair over a registry of live children:
+// installed when the registry goes from empty to non-empty, removed when it goes back to empty.
+// A listener pair per child would mean N pairs for N concurrent spawns (node warns at 10
+// listeners precisely because that pattern is how leaks look), and any missed teardown would
+// accumulate across the hundreds of short spawns a single command makes. Per child, what is
+// tracked is membership in that registry, released in `settle` alongside the timers, exactly once.
 //
 // Never registered while no child is alive, which matters for more than tidiness: a registered
 // SIGINT listener suppresses node's own default termination, so leaving one installed would change
 // how the CLI responds to Ctrl-C at every other moment of its life. The one case where it stays
-// installed indefinitely is a child that really is still alive: an untimed run whose `close` never
-// arrives is never released, so its registry slot -- and the trap -- outlive every later command in
-// that process, and a SIGINT handler registered afterwards never runs because this one exits first.
-// That is the honest reading of "a child is alive", not a leak, and B2/B3/B4 giving those call
-// sites a `timeoutMs` is what removes the case rather than papering over it.
+// installed indefinitely is a child that really is still alive: an untimed run whose `close`
+// never arrives is never released, so its registry slot -- and the trap -- outlive every later
+// command in that process. That is the honest reading of "a child is alive", not a leak; the
+// `timeoutMs` bounds on the call sites are what keep the case from arising.
 const liveChildren = new Set();
 let installedTrap = null;
 // Set once an interrupt has been received and never cleared: this process is on its way out, and
