@@ -3,21 +3,12 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { createPreparedDelegationRequest, validateSubagentRequestPolicy } from "../src/workflow/coordinator-policy.js";
 import { checkoutDigestFor } from "../src/workflow/delegation-invariants.js";
+import { DEFAULT_DELEGATION_POLICY } from "../src/workflow/delegation-policy.js";
 
 const DELEGATION_ID = "11111111-1111-4111-8111-111111111111";
 const task = "Review the frozen brief.";
 const taskDigest = `sha256:${createHash("sha256").update(task, "utf8").digest("hex")}`;
-const policy = {
-  version: 1,
-  totalInternal: 4,
-  foreground: 3,
-  readOnlyBackground: 3,
-  writersTotal: 1,
-  writersPerCheckout: 1,
-  maxDepth: 1,
-  remediationTurns: 2,
-  allowBackgroundWriters: false,
-};
+const policy = DEFAULT_DELEGATION_POLICY;
 
 function delegation(overrides = {}) {
   return {

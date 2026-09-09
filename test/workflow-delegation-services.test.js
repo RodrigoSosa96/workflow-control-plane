@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createPreparedDelegationRequest, validateSubagentRequestPolicy } from "../src/workflow/coordinator-policy.js";
 import { createDelegationReservationStore } from "../src/workflow/delegation-reservations.js";
+import { DEFAULT_DELEGATION_POLICY } from "../src/workflow/delegation-policy.js";
 import { submitDelegationHandoff } from "../src/workflow/delegation-handoff.js";
 import { createDelegationServices } from "../src/workflow/delegation-services.js";
 import { createDelegationStore } from "../src/workflow/delegation-store.js";
@@ -23,17 +24,7 @@ const CWD = "/fixture/review";
 const TASK = "Review only the frozen task.";
 const BRIEF = "Review only the frozen task. Keep all findings inside scope.";
 
-const policy = {
-  version: 1,
-  totalInternal: 4,
-  foreground: 3,
-  readOnlyBackground: 3,
-  writersTotal: 1,
-  writersPerCheckout: 1,
-  maxDepth: 1,
-  remediationTurns: 2,
-  allowBackgroundWriters: false,
-};
+const policy = DEFAULT_DELEGATION_POLICY;
 
 const registry = {
   launcher: { delegation: policy },
@@ -63,11 +54,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-delegation-services-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
 }
 
 // Yields the given ids first, then deterministic distinct ids instead of

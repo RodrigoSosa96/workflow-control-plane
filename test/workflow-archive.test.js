@@ -14,6 +14,7 @@ import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
 import { LIVE_RUN_STATES, RUN_STATES } from "../src/workflow/run-state.js";
+import { fixedClock } from "./support/helpers.js";
 
 // --- archiveCommand (roadmap item 2.5) ---------------------------------------
 //
@@ -36,10 +37,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-archive-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function fixedClock(timestamp) {
-  return { now: () => timestamp };
 }
 
 function archiveLoadRegistry(projects) {

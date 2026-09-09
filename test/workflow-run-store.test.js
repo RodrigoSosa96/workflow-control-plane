@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { MUTEX_RETRY_BUDGET_MS } from "../src/workflow/bounded-retry.js";
 import { RUN_STATES, transitionRun } from "../src/workflow/run-state.js";
 import { createRunStore, SUPPORTED_RUN_VERSION } from "../src/workflow/run-store.js";
+import { clockSequence, uuidSequence } from "./support/helpers.js";
 
 const RUN_ID_1 = "11111111-1111-4111-8111-111111111111";
 const RUN_ID_2 = "22222222-2222-4222-8222-222222222222";
@@ -19,20 +20,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-run-store-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function uuidSequence(...values) {
-  let index = 0;
-  return () => values[index++] ?? values.at(-1);
-}
-
-function clockSequence(...values) {
-  let index = 0;
-  return {
-    now() {
-      return values[index++] ?? values.at(-1);
-    },
-  };
 }
 
 async function fileMode(path) {

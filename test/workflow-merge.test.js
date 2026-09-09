@@ -12,6 +12,7 @@ import { WorkflowError } from "../src/workflow/errors.js";
 import { createGitAdapter } from "../src/workflow/git.js";
 import { createProcessRunner } from "../src/workflow/process.js";
 import { createRunStore } from "../src/workflow/run-store.js";
+import { fixedClock } from "./support/helpers.js";
 
 // --- mergeCommand (roadmap item 2.4) ----------------------------------------
 //
@@ -35,10 +36,6 @@ async function tempStateRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "workflow-merge-"));
   t.after(() => realFs.rm(root, { recursive: true, force: true }));
   return join(root, "state");
-}
-
-function fixedClock(timestamp) {
-  return { now: () => timestamp };
 }
 
 function mergeLoadRegistry(projects) {
