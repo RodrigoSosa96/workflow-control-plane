@@ -8,7 +8,10 @@ const CAPABILITIES = Object.freeze({
   opencode: Object.freeze({ model: false, usage: false, cost: false, context: false, session: false }),
 });
 const SUPPORTED_VERSIONS = Object.freeze({
-  pi: new Set(["0.80.10", "0.81.1"]),
+  // 0.85.1 verified against the real canary (scripts/smoke-workflow-fixture.js --real --agent
+  // pi): full run completed and the telemetry snapshot recorded 16 turns, 17 tool calls, and
+  // usage/cost/model all "reported" through the validating store.
+  pi: new Set(["0.80.10", "0.81.1", "0.85.1"]),
   claude: new Set(["2.1.218"]),
   codex: new Set(["0.144.3"]),
   opencode: new Set(["1.0.126"]),
