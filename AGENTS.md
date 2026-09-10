@@ -11,18 +11,19 @@ This repository coordinates Rodrigo's AI-assisted development workflows across p
 
 ## Operating rules
 
-- Ask which project and task are active before modifying another repository.
-- Resolve project paths and runtime commands from `projects.yaml`; do not guess them.
-- Treat Asana, meeting notes, and existing specs as context sources, not as permission to implement.
-- For work projects, triage ticket context before selecting work.
-- For feature implementation, prefer one git worktree per ticket or feature.
-- Never run two writing agents in the same checkout concurrently.
-- Keep persistent dev processes in a separate Herdr tab from interactive agents.
-- Name Pi sessions and Herdr tabs after the project and ticket/feature.
+Hard invariants — never negotiable:
+
 - Do not expose secrets from `.env`, credentials, auth stores, or project integrations.
 - Do not deploy, mutate production data, or run destructive migrations without explicit approval.
-- Follow the target repository's own `AGENTS.md`, `CLAUDE.md`, and local skills after entering it.
-- Never clone reference material into this repository. Read-only reference checkouts live in `~/projects/references/` (see below).
+- Never run two writing agents in the same checkout concurrently.
+- Never clone reference material into this repository; read-only reference checkouts live in `~/projects/references/` (see below).
+
+Principles — apply with judgment:
+
+- Resolve project paths and runtime commands from `projects.yaml`; do not guess them.
+- Asana, meeting notes, and existing specs are context sources, not permission to implement; ask which project and task are active before modifying another repository, and triage ticket context before selecting work.
+- Prefer one git worktree per ticket or feature; follow the target repository's own `AGENTS.md`, `CLAUDE.md`, and local skills after entering it.
+- Keep persistent dev processes in a separate Herdr tab from interactive agents, and name Pi sessions and Herdr tabs after the project and ticket/feature.
 
 ## Reference material
 
