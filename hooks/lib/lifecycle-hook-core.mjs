@@ -67,7 +67,9 @@ async function persistMarker(store, runId, patch, debug) {
 }
 
 export function continuationPrompt(runId, generation) {
-  return `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}.`;
+  // Points at the assignment's Structured Handoff section rather than restating the command:
+  // the assignment is the single source for the exact handoff invocation.
+  return `Before ending this turn, create the workflow handoff for run ${runId}, generation ${generation}, as specified in your assignment's Structured Handoff section.`;
 }
 
 export async function handoffExists(store, runId, generation) {

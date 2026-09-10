@@ -463,11 +463,16 @@ function runInput(preview, { stateRoot, controlPlaneBin, originSession } = {}) {
   };
 }
 
-function assignmentWithExecutionHeader(run, assignment) {
+export function assignmentWithExecutionHeader(run, assignment) {
   return [
     `Workflow Run: ${run.id}`,
     `Generation: ${run.generation ?? 1}`,
     `Run Directory: ${run.directory}`,
+    "",
+    "## References (load on demand)",
+    `- Run record (approved plan, digests, registered repositories): ${join(run.directory, "run.json")}`,
+    `- Handoff input to write when the work is done: ${join(run.directory, "handoff-input.json")}`,
+    "- Project instructions inside the assigned worktree: AGENTS.md / CLAUDE.md at its root, when present",
     "",
     assignment,
   ].join("\n");

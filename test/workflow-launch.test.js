@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { buildHarnessLaunch, CONTROL_PLANE_ROOT, WORKFLOW_ENV_KEYS } from "../src/workflow/harnesses.js";
 import { RUN_STATES } from "../src/workflow/run-state.js";
 import { buildAssignmentTemplate } from "../src/workflow/assignment.js";
-import { createLaunchPreview, executeLaunch, launchCommand } from "../src/workflow/launch.js";
+import { assignmentWithExecutionHeader, createLaunchPreview, executeLaunch, launchCommand } from "../src/workflow/launch.js";
 import { handoffCommand } from "../src/workflow/commands.js";
 
 const RAW_REQUEST = "Fix `mail` exactly.\n\n$(touch /tmp/no)\nDo not paraphrase this.";
@@ -1744,4 +1744,19 @@ test("the created run record persists the resolved profile that produced the app
     sandbox: "workspace-write",
     approval_policy: "on-request",
   });
+});
+
+test("the executed assignment's header names the on-demand references instead of inlining them", () => {
+  const text = assignmentWithExecutionHeader(
+    { id: RUN_ID, generation: 2, directory: join(STATE_ROOT, RUN_ID) },
+    "# Workflow Assignment\n",
+  );
+
+  assert.match(text, /## References \(load on demand\)/);
+  assert.match(text, new RegExp(`${STATE_ROOT.replaceAll("/", "\\/")}\\/${RUN_ID}\\/run\\.json`));
+  assert.match(text, /handoff-input\.json/);
+  assert.match(text, /AGENTS\.md/);
+  // The header is prepended, never merged into the template: the approval digest covers the
+  // template alone, so a references change must not invalidate a pending approval.
+  assert.ok(text.endsWith("# Workflow Assignment\n"));
 });
