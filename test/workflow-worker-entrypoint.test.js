@@ -154,3 +154,96 @@ test("refuses a launch record whose digest does not match the run", async () => 
   assert.match(stderr.text(), /digest mismatch/i);
   assert.equal(spawned, 0);
 });
+
+test("a settled worker renames its own pane to name the run and outcome", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "workflow-worker-entrypoint-"));
+  const runDirectory = join(stateRoot, RUN_ID);
+  await mkdir(join(runDirectory, "worker-launches"), { recursive: true });
+
+  const recordText = JSON.stringify({
+    version: 1,
+    harness: "pi",
+    command: "pi",
+    argv: ["pi", "--name", "fixture", "--print", "--mode", "json"],
+    cwd: null,
+    env: { WORKFLOW_RUN_ID: RUN_ID },
+    harnessVersion: "0.80.10",
+  });
+  await writeFile(join(runDirectory, "worker-launches", `${WORKER_ID}.json`), recordText);
+
+  const spawns = [];
+  const spawnFn = (command, args) => {
+    spawns.push({ command, args });
+    return {
+      kill() {},
+      on(event, handler) {
+        if (event === "close") queueMicrotask(handler);
+        return this;
+      },
+    };
+  };
+  const code = await main(["node", "workflow-worker.js", "--run", RUN_ID, "--worker", WORKER_ID], {
+    env: { WORKFLOW_STATE_ROOT: stateRoot, WORKFLOW_PANE_ID: "w1:p7" },
+    stderr: collector(),
+    spawn: spawnFn,
+    createStore: () => ({
+      async read() {
+        return {
+          id: RUN_ID,
+          directory: runDirectory,
+          fixtureMode: true,
+          workerLaunches: { [WORKER_ID]: { digest: sha256Digest(recordText), harness: "pi" } },
+        };
+      },
+      async writePrivateFile() {},
+      async appendEvent() {},
+    }),
+    createSupervisor: () => ({ async run() { return { exitCode: 0 }; } }),
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(spawns, [{
+    command: "herdr",
+    args: ["pane", "rename", "w1:p7", `run ${RUN_ID.slice(0, 8)} — completed`],
+  }]);
+});
+
+test("a settled worker without a pane id renames nothing", async () => {
+  const stateRoot = await mkdtemp(join(tmpdir(), "workflow-worker-entrypoint-"));
+  const runDirectory = join(stateRoot, RUN_ID);
+  await mkdir(join(runDirectory, "worker-launches"), { recursive: true });
+
+  const recordText = JSON.stringify({
+    version: 1,
+    harness: "pi",
+    command: "pi",
+    argv: ["pi", "--name", "fixture"],
+    cwd: null,
+    env: {},
+    harnessVersion: "0.80.10",
+  });
+  await writeFile(join(runDirectory, "worker-launches", `${WORKER_ID}.json`), recordText);
+
+  let spawned = 0;
+  const code = await main(["node", "workflow-worker.js", "--run", RUN_ID, "--worker", WORKER_ID], {
+    env: { WORKFLOW_STATE_ROOT: stateRoot },
+    stderr: collector(),
+    spawn: () => { spawned += 1; },
+    createStore: () => ({
+      async read() {
+        return {
+          id: RUN_ID,
+          directory: runDirectory,
+          fixtureMode: true,
+          workerLaunches: { [WORKER_ID]: { digest: sha256Digest(recordText), harness: "pi" } },
+        };
+      },
+      async writePrivateFile() {},
+      async appendEvent() {},
+    }),
+    createSupervisor: () => ({ async run() { return { exitCode: 1 } } }),
+  });
+
+  assert.equal(code, 1, "the supervisor's own exit code is preserved");
+  assert.equal(spawned, 0, "no pane rename without WORKFLOW_PANE_ID");
+});

@@ -44,6 +44,25 @@ export async function main(rawArgv = process.argv, { spawn: spawnChild = spawn, 
     return 1;
   }
 
+  // The pane this worker runs in stops being a live worker when the run settles; naming the
+  // outcome is what keeps the leftover pane readable instead of showing a dead command line.
+  // Best-effort and bounded: a rename failure must never change the exit code.
+  const renamePaneOnSettle = async (outcome) => {
+    const paneId = env.WORKFLOW_PANE_ID;
+    if (typeof paneId !== "string" || !paneId) return;
+    try {
+      await new Promise((resolve) => {
+        const child = spawnChild("herdr", ["pane", "rename", paneId, `run ${runId.slice(0, 8)} — ${outcome}`], { stdio: "ignore" });
+        const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5000);
+        timer.unref?.();
+        child.on("error", () => { clearTimeout(timer); resolve(); });
+        child.on("close", () => { clearTimeout(timer); resolve(); });
+      });
+    } catch {
+      // Best-effort only.
+    }
+  };
+
   const stateRoot = env.WORKFLOW_STATE_ROOT;
   if (!stateRoot) {
     stderr.write("Missing WORKFLOW_STATE_ROOT environment variable\n");
@@ -72,8 +91,10 @@ export async function main(rawArgv = process.argv, { spawn: spawnChild = spawn, 
     const telemetry = createTelemetry({ store });
     const supervisor = createSupervisor({ spawn: spawnChild, telemetry, createAdapter: createTelemetryAdapter });
     const result = await supervisor.run({ runId, workerId, launch: record });
+    await renamePaneOnSettle(result.exitCode === 0 ? "completed" : "failed");
     return result.exitCode ?? 1;
   } catch (error) {
+    await renamePaneOnSettle("failed");
     stderr.write(`workflow-worker: ${error.message}\n`);
     return 1;
   }

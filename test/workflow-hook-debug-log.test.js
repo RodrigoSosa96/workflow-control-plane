@@ -146,3 +146,79 @@ test("the debug log stops accepting entries at its size cap", async (t) => {
   // Refusals are reported, not thrown.
   assert.equal(await recordHookDebug({ runDirectory, harness: "pi", event: "Stop", scope: "marker", error: line }), false);
 });
+
+test("a terminal stop renames the worker's pane to name the run and outcome", async (t) => {
+  const runDirectory = await tempRunDirectory(t);
+  const spawns = [];
+  const spawnFn = (command, args) => {
+    spawns.push({ command, args });
+    return {
+      kill() {},
+      on(event, handler) {
+        if (event === "close") queueMicrotask(handler);
+        return this;
+      },
+    };
+  };
+
+  await runLifecycleHook({
+    harness: "claude",
+    event: "Stop",
+    env: {
+      WORKFLOW_RUN_ID: RUN_ID,
+      WORKFLOW_HARNESS: "claude",
+      WORKFLOW_RUN_DIR: runDirectory,
+      WORKFLOW_PANE_ID: "w1:p1",
+    },
+    store: { async read() { return { id: RUN_ID, generation: 1, state: "completed" }; } },
+    lifecycle: { async onStop() { return { action: "settled" }; } },
+    hasValidHandoff: async () => true,
+    spawnFn,
+  });
+
+  assert.equal(spawns.length, 1);
+  assert.equal(spawns[0].command, "herdr");
+  assert.deepEqual(spawns[0].args, ["pane", "rename", "w1:p1", `run ${RUN_ID.slice(0, 8)} — settled`]);
+});
+
+test("a terminal stop without a pane id renames nothing, and a continuation never renames", async (t) => {
+  const runDirectory = await tempRunDirectory(t);
+  const spawns = [];
+  const spawnFn = (command, args) => {
+    spawns.push({ command, args });
+    return {
+      kill() {},
+      on(event, handler) {
+        if (event === "close") queueMicrotask(handler);
+        return this;
+      },
+    };
+  };
+
+  // No WORKFLOW_PANE_ID: nothing to rename.
+  await runLifecycleHook({
+    harness: "claude",
+    event: "Stop",
+    env: { WORKFLOW_RUN_ID: RUN_ID, WORKFLOW_HARNESS: "claude", WORKFLOW_RUN_DIR: runDirectory },
+    store: { async read() { return { id: RUN_ID, generation: 1, state: "completed" }; } },
+    lifecycle: { async onStop() { return { action: "settled" }; } },
+    hasValidHandoff: async () => true,
+    spawnFn,
+  });
+  assert.equal(spawns.length, 0);
+
+  // A continuation stop is not terminal: the pane still hosts the live worker.
+  await runLifecycleHook({
+    harness: "claude",
+    event: "Stop",
+    env: { WORKFLOW_RUN_ID: RUN_ID, WORKFLOW_HARNESS: "claude", WORKFLOW_RUN_DIR: runDirectory, WORKFLOW_PANE_ID: "w1:p1" },
+    store: {
+      async read() { return { id: RUN_ID, generation: 1, state: "running", claudePendingContinuation: false }; },
+      async update() {},
+    },
+    lifecycle: { async onStop() { return { action: "continue" }; } },
+    hasValidHandoff: async () => false,
+    spawnFn,
+  });
+  assert.equal(spawns.length, 0);
+});
