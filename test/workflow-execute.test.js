@@ -205,7 +205,7 @@ function buildWorkspaceState({
 function createHerdr(calls, {
   ensureResult = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1", disposition: "created" },
   splitResult = { paneId: "w1:p2" },
-  startResult = { agentId: "a1", tabId: "w1:t1", paneId: "w1:p2" },
+  startResult = { agentId: "a1", tabId: "w1:t1" },
   failRename = null,
   failStart = null,
   failListTabs = null,
@@ -259,10 +259,15 @@ function createHerdr(calls, {
       if (failSplit) throw failSplit;
       return splitResult;
     },
+    async exportWorkflowEnv({ paneId, env }) {
+      calls.push({ kind: "herdr.pane.exportEnv", paneId, env });
+      return { exported: Object.keys(env ?? {}).length };
+    },
     async startAgent({ name, paneId, kind, argv, focus }) {
       calls.push({ kind: "herdr.agent.start", name, paneId, harnessKind: kind, argv, focus });
       if (failStart) throw failStart;
-      return startResult;
+      // The agent lives in the pane it was started in -- the single-pane layout's whole point.
+      return { ...startResult, paneId };
     },
     async listAgents() {
       calls.push({ kind: "herdr.agent.list" });
@@ -473,14 +478,13 @@ test("creates native worktree and starts a named Pi session without a prompt", a
   const calls = [];
   const report = await executeStart(buildPlan(), fakeAdapters(calls));
 
+  // Single-pane layout: no split, no bootstrap close -- the agent starts in the tab's root
+  // pane, after the WORKFLOW_* env is exported into that shell.
   assert.deepEqual(calls.map((call) => call.kind), [
     "herdr.worktree.create",
     "herdr.tab.rename",
-    "herdr.pane.split",
+    "herdr.pane.exportEnv",
     "herdr.agent.start",
-    "herdr.tab.list",
-    "herdr.pane.list",
-    "herdr.pane.close",
   ]);
   const launch = calls.find((call) => call.kind === "herdr.agent.start");
   assert.deepEqual(launch.argv, ["pi", "--name", sessionName]);
@@ -504,7 +508,7 @@ test("an interactive start reports a pi-session identity with session, pane, and
   assert.equal(agentOp.sessionIdentity.kind, "pi-session");
   assert.equal(agentOp.sessionIdentity.harness, "pi");
   assert.equal(agentOp.sessionIdentity.sessionId, "sess-1");
-  assert.equal(agentOp.sessionIdentity.paneId, "w1:p2");
+  assert.equal(agentOp.sessionIdentity.paneId, "w1:p1");
   assert.equal(agentOp.sessionIdentity.tabId, "w1:t1");
   assert.equal(agentOp.sessionIdentity.workspaceId, "w1");
   assert.equal(agentOp.sessionIdentity.cwd, plan.agent.worktreePath);
@@ -543,7 +547,7 @@ test("an interactive start recovers the identity when Herdr's readiness wait tim
     git: {},
     herdr: createHerdr(calls, {
       failStart: new Error("timed out waiting for agent startup"),
-      agentsAfterStart: [{ agent: "pi", pane_id: "w1:p2", tab_id: "w1:t1", agent_status: "idle" }],
+      agentsAfterStart: [{ agent: "pi", pane_id: "w1:p1", tab_id: "w1:t1", agent_status: "idle" }],
     }),
   }, { buildAgentLaunch: () => launchSpec });
 
@@ -551,7 +555,7 @@ test("an interactive start recovers the identity when Herdr's readiness wait tim
   assert.equal(agentOp.status, "created");
   assert.equal(agentOp.sessionIdentity.kind, "pi-session");
   assert.equal(agentOp.sessionIdentity.sessionId, "sess-1");
-  assert.equal(agentOp.sessionIdentity.paneId, "w1:p2");
+  assert.equal(agentOp.sessionIdentity.paneId, "w1:p1");
   assert.equal(agentOp.sessionIdentity.tabId, "w1:t1");
   assert.ok(calls.some((call) => call.kind === "herdr.agent.list"), "recovery must consult agent list");
 });
@@ -619,7 +623,7 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
     "herdr.worktree.create",
     "herdr.tab.rename",
     "launch.builder",
-    "herdr.pane.split",
+    "herdr.pane.exportEnv",
     "herdr.agent.start",
   ]);
   const builderCall = calls.find((call) => call.kind === "launch.builder");
@@ -629,15 +633,15 @@ test("uses an injected launch builder immediately before Herdr agent start", asy
   assert.equal(builderCall.input.cwd, workspacePath);
   assert.deepEqual(builderCall.input.run, plan.run);
 
-  const split = calls.find((call) => call.kind === "herdr.pane.split");
-  assert.equal(split.paneId, "w1:p1");
-  assert.equal(split.cwd, workspacePath);
-  assert.deepEqual(split.env, launchSpec.env);
+  const exportEnv = calls.find((call) => call.kind === "herdr.pane.exportEnv");
+  assert.equal(exportEnv.paneId, "w1:p1");
+  // The launch env plus the pane-scoped id the worker needs to name its pane when it settles.
+  assert.deepEqual(exportEnv.env, { ...launchSpec.env, WORKFLOW_PANE_ID: "w1:p1" });
 
   const launch = calls.find((call) => call.kind === "herdr.agent.start");
   assert.deepEqual(launch.argv, launchSpec.argv);
   assert.equal(launch.harnessKind, "codex");
-  assert.equal(launch.paneId, "w1:p2");
+  assert.equal(launch.paneId, "w1:p1");
 
   const agentOp = report.operations.find((operation) => operation.id === "agent");
   assert.equal(agentOp.sessionIdentity.kind, "codex-session");
@@ -653,8 +657,8 @@ test("an interactive codex start discovers the session id from herdr agent list"
   plan.operations = plan.operations.map((o) => o.id === "agent" ? { ...o, kind: "agent.session.start", command: "codex" } : o);
   const launchSpec = { argv: ["codex", "-C", plan.agent.worktreePath], env: {},
     expected: { harness: "codex", nativeSessionId: null, cwd: plan.agent.worktreePath } };
-  // herdr reports the started codex agent (pane w1:p2) with its generated session id
-  const herdr = createHerdr(calls, { agentsAfterStart: [{ agent: "codex", pane_id: "w1:p2", agent_session: { kind: "id", value: "codex-sess-9" } }] });
+  // herdr reports the started codex agent (the tab's root pane) with its generated session id
+  const herdr = createHerdr(calls, { agentsAfterStart: [{ agent: "codex", pane_id: "w1:p1", agent_session: { kind: "id", value: "codex-sess-9" } }] });
   const report = await executeStart(plan, { git: {}, herdr }, { buildAgentLaunch: () => launchSpec });
   const agentOp = report.operations.find((o) => o.id === "agent");
   assert.equal(agentOp.sessionIdentity.kind, "codex-session");
@@ -684,7 +688,7 @@ test("accepts an exact OpenCode agent identity before Herdr mutation", async () 
   const launch = calls.find((call) => call.kind === "herdr.agent.start");
   assert.deepEqual(launch.argv, launchSpec.argv);
   assert.equal(launch.harnessKind, "opencode");
-  assert.equal(launch.paneId, "w1:p2");
+  assert.equal(launch.paneId, "w1:p1");
 });
 
 test("runs a fixture supervisor in the prepared pane instead of attaching it as a Herdr agent", async () => {
@@ -702,16 +706,18 @@ test("runs a fixture supervisor in the prepared pane instead of attaching it as 
   assert.equal(report.status, "completed");
   assert.equal(calls.find((call) => call.kind === "herdr.agent.start"), undefined);
 
-  const split = calls.find((call) => call.kind === "herdr.pane.split");
-  assert.equal(split.env.WORKFLOW_RUN_ID, "run-123");
+  // The WORKFLOW_* env lands via the export into the tab's root pane, not via a split.
+  const exportEnv = calls.find((call) => call.kind === "herdr.pane.exportEnv");
+  assert.equal(exportEnv.paneId, "w1:p1");
+  assert.equal(exportEnv.env.WORKFLOW_RUN_ID, "run-123");
 
-  const run = calls.find((call) => call.kind === "herdr.pane.run");
-  assert.equal(run.paneId, "w1:p2");
+  const run = calls.find((call) => call.kind === "herdr.pane.run" && call.argv);
+  assert.equal(run.paneId, "w1:p1");
   assert.deepEqual(run.argv, launchSpec.argv);
 
   const agentOperation = report.operations.find((operation) => operation.id === "agent");
   assert.equal(agentOperation.status, "created");
-  assert.equal(agentOperation.paneId, "w1:p2");
+  assert.equal(agentOperation.paneId, "w1:p1");
   assert.equal(agentOperation.sessionIdentity, undefined);
 });
 
@@ -797,7 +803,22 @@ test("rejects a generic start operation whose harness and command disagree befor
   assert.deepEqual(calls, []);
 });
 
-test("closes the bootstrap shell when the started pane matches the selected non-Pi harness", async () => {
+test("starts the agent in the agent tab's root pane, without splitting or closing anything", async () => {
+  const calls = [];
+  const report = await executeStart(buildPlan(), fakeAdapters(calls));
+
+  // The single-pane layout: no split, no leftover bootstrap shell, nothing to close.
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.split"), false);
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  const exportEnv = calls.find((call) => call.kind === "herdr.pane.exportEnv");
+  assert.equal(exportEnv.paneId, "w1:p1", "the env lands on the tab's root pane");
+  const start = calls.find((call) => call.kind === "herdr.agent.start");
+  assert.equal(start.paneId, "w1:p1", "the agent starts on that same pane");
+  assert.equal(report.status, "completed");
+  assert.deepEqual(report.notes, []);
+});
+
+test("starts a non-Pi agent in the tab's root pane the same way", async () => {
   const calls = [];
   const report = await executeStart(buildPlan({
     agentHarness: "claude",
@@ -808,65 +829,14 @@ test("closes the bootstrap shell when the started pane matches the selected non-
       arguments: [],
       permission_mode: "manual",
     },
-  }), fakeAdapters(calls, {
-    panes: {
-      w1: [
-        {
-          pane_id: "w1:p1",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-        },
-        {
-          pane_id: "w1:p2",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-          agent: "claude",
-          agent_status: "working",
-          agent_session: {
-            agent: "claude",
-            kind: "path",
-            source: "herdr:claude",
-            value: "/tmp/claude-session.jsonl",
-          },
-        },
-      ],
-    },
-  }));
+  }), fakeAdapters(calls));
 
   assert.equal(report.status, "completed");
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close" && call.paneId === "w1:p1"), true);
-});
-
-test("a failed bootstrap-pane close does NOT degrade a successful start to partial", async () => {
-  // The agent is already started; closing the leftover bootstrap shell pane is cosmetic cleanup.
-  // If closePane throws it must become a note, never flip the launch to partial/failed (which the
-  // CLI then reports as a failed launch even though the run is running).
-  const calls = [];
-  const report = await executeStart(buildPlan({
-    agentHarness: "claude",
-    agentProfileName: "claude-worker",
-    agentProfile: { mode: "interactive", model: null, arguments: [], permission_mode: "manual" },
-  }), fakeAdapters(calls, {
-    failClosePane: new Error("pane close failed"),
-    panes: {
-      w1: [
-        { pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: workspacePath, foreground_cwd: workspacePath },
-        { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", cwd: workspacePath, foreground_cwd: workspacePath,
-          agent: "claude", agent_status: "working",
-          agent_session: { agent: "claude", kind: "path", source: "herdr:claude", value: "/tmp/claude-session.jsonl" } },
-      ],
-    },
-  }));
-
-  // closePane WAS attempted (canClose passed), it threw, but the start still succeeded.
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close" && call.paneId === "w1:p1"), true);
-  assert.equal(report.status, "completed");
-  assert.equal(report.operations.find((operation) => operation.id === "agent").status, "created");
-  assert.match(report.notes.join("\n"), /retained|bootstrap shell|pane close failed/i);
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.split"), false);
+  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
+  const start = calls.find((call) => call.kind === "herdr.agent.start");
+  assert.equal(start.harnessKind, "claude");
+  assert.equal(start.paneId, "w1:p1");
 });
 
 test("reuses an already-open compatible workspace without mutating anything", async () => {
@@ -891,17 +861,14 @@ test("reopens a closed workspace before renaming the bootstrap tab and starting 
   const calls = [];
   const report = await executeStart(buildPlan({ worktreeStatus: "closed" }), fakeAdapters(calls, {
     ensureResult: { workspaceId: "w2", tabId: "w2:t1", paneId: "w2:p1", disposition: "opened" },
-    startResult: { agentId: "a2", tabId: "w2:t1", paneId: "w2:p2" },
+    startResult: { agentId: "a2", tabId: "w2:t1" },
   }));
 
   assert.deepEqual(calls.map((call) => call.kind), [
     "herdr.worktree.open",
     "herdr.tab.rename",
-    "herdr.pane.split",
+    "herdr.pane.exportEnv",
     "herdr.agent.start",
-    "herdr.tab.list",
-    "herdr.pane.list",
-    "herdr.pane.close",
   ]);
   assert.equal(report.operations[0].status, "opened");
 });
@@ -965,12 +932,12 @@ test("recovers a partial rerun from live Herdr workspace facts when open reconci
     "herdr.tab.list",
     "herdr.pane.list",
     "herdr.tab.rename",
-    "herdr.pane.split",
+    "herdr.pane.exportEnv",
     "herdr.agent.start",
   ]);
   assert.equal(calls.find((call) => call.kind === "herdr.tab.rename").tabId, "w1:t7");
-  assert.equal(calls.find((call) => call.kind === "herdr.pane.split").paneId, "w1:p9");
-  assert.equal(calls.find((call) => call.kind === "herdr.agent.start").paneId, "w1:p2");
+  assert.equal(calls.find((call) => call.kind === "herdr.pane.exportEnv").paneId, "w1:p9");
+  assert.equal(calls.find((call) => call.kind === "herdr.agent.start").paneId, "w1:p9");
   assert.deepEqual(report.operations.map((operation) => operation.status), [
     "reused",
     "reused",
@@ -997,163 +964,6 @@ test("rejects all conflicts before any mutation", async () => {
   );
 
   assert.deepEqual(calls, []);
-});
-
-test("retains the bootstrap shell when the Pi pane safety condition is not met", async () => {
-  const calls = [];
-  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
-    startResult: { agentId: "a1", tabId: "w1:t1", paneId: "w1:p1" },
-  }));
-
-  assert.deepEqual(calls.map((call) => call.kind), [
-    "herdr.worktree.create",
-    "herdr.tab.rename",
-    "herdr.pane.split",
-    "herdr.agent.start",
-    "herdr.tab.list",
-    "herdr.pane.list",
-  ]);
-  assert.match(report.notes.join("\n"), /retained|bootstrap shell|safety/i);
-});
-
-test("retains the bootstrap shell when Herdr reports the started Pi pane on the wrong tab", async () => {
-  const calls = [];
-  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
-    startResult: { agentId: "a1", tabId: "w1:t9", paneId: "w1:p2" },
-    tabs: {
-      w1: [
-        { tab_id: "w1:t1", workspace_id: "w1", label: "agent" },
-        { tab_id: "w1:t9", workspace_id: "w1", label: "other" },
-      ],
-    },
-    panes: {
-      w1: [
-        {
-          pane_id: "w1:p1",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-        },
-        {
-          pane_id: "w1:p2",
-          tab_id: "w1:t9",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-          agent: "pi",
-          agent_status: "working",
-        },
-      ],
-    },
-  }));
-
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
-  assert.match(report.notes.join("\n"), /retained|safety/i);
-});
-
-test("retains the bootstrap shell when the started Pi pane is not confirmed in the expected workspace", async () => {
-  const calls = [];
-  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
-    panes: {
-      w1: [
-        {
-          pane_id: "w1:p1",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-        },
-      ],
-    },
-  }));
-
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
-  assert.match(report.notes.join("\n"), /retained|safety/i);
-});
-
-test("retains the bootstrap shell when the started pane belongs to a non-Pi agent", async () => {
-  const calls = [];
-  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
-    panes: {
-      w1: [
-        {
-          pane_id: "w1:p1",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-        },
-        {
-          pane_id: "w1:p2",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-          agent: "claude",
-          agent_status: "working",
-          agent_session: {
-            agent: "claude",
-            kind: "path",
-            source: "herdr:claude",
-            value: "/tmp/claude-session.jsonl",
-          },
-        },
-      ],
-    },
-  }));
-
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
-  assert.match(report.notes.join("\n"), /retained|bootstrap shell|safety/i);
-});
-
-test("retains the bootstrap shell and still succeeds when post-start close safety inspection fails", async () => {
-  const calls = [];
-  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
-    failListTabs: new Error("tab inspection failed"),
-  }));
-
-  assert.deepEqual(calls.map((call) => call.kind), [
-    "herdr.worktree.create",
-    "herdr.tab.rename",
-    "herdr.pane.split",
-    "herdr.agent.start",
-    "herdr.tab.list",
-  ]);
-  assert.equal(report.status, "completed");
-  assert.equal(report.operations.find((operation) => operation.id === "agent").status, "created");
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
-  assert.match(report.notes.join("\n"), /retained|bootstrap shell|inspection|tab inspection failed/i);
-});
-
-test("retains the bootstrap shell when the bootstrap root pane is no longer idle", async () => {
-  const calls = [];
-  const report = await executeStart(buildPlan(), fakeAdapters(calls, {
-    panes: {
-      w1: [
-        {
-          pane_id: "w1:p1",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-          foreground_command: "vim",
-        },
-        {
-          pane_id: "w1:p2",
-          tab_id: "w1:t1",
-          workspace_id: "w1",
-          cwd: workspacePath,
-          foreground_cwd: workspacePath,
-          agent: "pi",
-          agent_status: "working",
-        },
-      ],
-    },
-  }));
-
-  assert.equal(calls.some((call) => call.kind === "herdr.pane.close"), false);
-  assert.match(report.notes.join("\n"), /retained|safety/i);
 });
 
 test("runtime creates runtime panes from trusted registry commands", async () => {

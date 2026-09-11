@@ -325,8 +325,6 @@ function buildGroupPlan({ registry, projectAlias, project, bundle, slug, feature
       worktreePath: workspacePath,
       tabLabel: "runtime",
     },
-    retainCoordinatorShell,
-    agentSplit,
     operations: [
       {
         id: "meta-worktree",

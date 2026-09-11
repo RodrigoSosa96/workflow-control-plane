@@ -3916,17 +3916,17 @@ function transportForRun(run, deps, command) {
 // Relaunch a dead *-session so it comes back exactly as the interactive launch left it: same
 // native session (`--session-id <exact>`, never `--last`/`--continue`) AND the same
 // lifecycle/observability wiring the interactive start set up (see execute.js's
-// executeOrdinaryStart/executeGroupStart: createTab -> splitPane({ env }) -> startAgent). A
-// pane from herdr.createTab carries no env on its own, so skipping the split-with-env step
-// here would resume the native history with the widget/telemetry/lifecycle wiring silently
-// dead. session-transport.js deliberately does not implement this itself (its start/
+// executeOrdinaryStart/executeGroupStart: tab's root pane + exportWorkflowEnv -> startAgent). A
+// pane from herdr.createTab carries no env on its own, so skipping the env export here would
+// resume the native history with the widget/telemetry/lifecycle wiring silently dead.
+// session-transport.js deliberately does not implement this itself (its start/
 // deliverFollowUp are stubs) — relaunch is owned by resume. The per-harness argv itself comes
 // from buildHarnessResume (harnesses.js), shared with `workflow launch`; the one thing that
 // still branches on `identity.harness` here is regenerating Claude's --settings file.
 async function relaunchSession(identity, deps) {
   const herdr = deps.herdr;
-  if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.splitPane !== "function" || typeof herdr.startAgent !== "function") {
-    delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab, splitPane, and startAgent", 10);
+  if (!herdr || typeof herdr.createTab !== "function" || typeof herdr.exportWorkflowEnv !== "function" || typeof herdr.startAgent !== "function") {
+    delegationError("PREFLIGHT", "resume relaunch requires a Herdr adapter with createTab, exportWorkflowEnv, and startAgent", 10);
   }
   if (typeof deps.lookupExecutable !== "function") {
     delegationError("PREFLIGHT", "resume relaunch requires a lookupExecutable dependency", 10);
@@ -3999,34 +3999,27 @@ async function relaunchSession(identity, deps) {
     sessionId: identity.sessionId,
     settingsPath,
   });
-  // buildHarnessResume also returns `env`, discarded here: splitPane below needs the WORKFLOW_*
-  // env before this argv exists, so it already took it from runEnv(run, harness) above instead.
+  // buildHarnessResume also returns `env`; the WORKFLOW_* values are the same runEnv(run,
+  // harness) taken above, exported into the fresh tab's root pane below.
 
-  // A fresh tab (no env — Herdr's createTab has no env parameter) gives us a root pane to
-  // split from, exactly like the interactive launch's bootstrap pane.
+  // A fresh tab gives us a root pane at the worktree cwd; the agent starts directly in it —
+  // same single-pane layout as the launch, no split, no leftover shell pane.
   const tab = await herdr.createTab({
     workspaceId: identity.workspaceId,
     cwd: identity.cwd,
     label: sessionName,
     focus: true,
   });
-  // The WORKFLOW_* env goes on the split pane, exactly as the interactive launch's agent pane.
-  const agentPane = await herdr.splitPane({
-    paneId: tab.paneId,
-    direction: "down",
-    cwd: identity.cwd,
-    env,
-    focus: true,
-  });
+  await herdr.exportWorkflowEnv({ paneId: tab.paneId, env: { ...env, WORKFLOW_PANE_ID: tab.paneId } });
 
   const started = await herdr.startAgent({
     name: sessionName,
-    paneId: agentPane.paneId,
+    paneId: tab.paneId,
     kind: harness,
     argv,
     timeout: 30000,
   });
-  const newPaneId = started.paneId ?? agentPane.paneId;
+  const newPaneId = started.paneId ?? tab.paneId;
   // Focus the resumed agent pane, not the fresh tab's empty root pane. createTab -> splitPane
   // leaves an empty shell pane above the agent (same shape as launch), and createTab/splitPane
   // focus lands on that shell; without this the relaunch surfaces the empty panel (observed).

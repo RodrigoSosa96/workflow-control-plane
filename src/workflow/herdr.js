@@ -7,6 +7,9 @@ const WORKFLOW_ENV_KEYS = new Set([
   "WORKFLOW_HARNESS",
   "WORKFLOW_STATE_ROOT",
   "WORKFLOW_CONTROL_PLANE_BIN",
+  // Pane-scoped, not run-scoped: injected at the export call site (which is where the pane id
+  // exists), never produced by runEnv(). Lets a finished worker name its own pane.
+  "WORKFLOW_PANE_ID",
 ]);
 
 function fail(category, message, details, exitCode = 1) {
@@ -467,6 +470,20 @@ export function createHerdrAdapter({ runner, binary = "herdr", sleep = defaultSl
       }
       pushFocus(args, focus);
       return normalizePaneResult(await invoke("pane", "split", args, { cwd }));
+    },
+
+    // Delivers the WORKFLOW_* env to a pane whose shell is already alive, for agent starts that
+    // run directly in a tab's root pane rather than in a fresh split (a split can carry --env
+    // itself; an existing shell cannot). Exported before the agent starts; the agent inherits
+    // the shell's environment.
+    async exportWorkflowEnv({ paneId, env } = {}) {
+      if (typeof paneId !== "string" || !paneId) {
+        fail("PREFLIGHT", "exportWorkflowEnv requires a pane ID", { paneId }, 10);
+      }
+      const entries = normalizeWorkflowEnv(env);
+      if (entries.length === 0) return { exported: 0 };
+      await invoke("pane", "run", [paneId, `export ${entries.map(shellQuote).join(" ")}`]);
+      return { exported: entries.length };
     },
 
     // `pane run` types its command into the pane's shell rather than executing argv
