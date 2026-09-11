@@ -146,7 +146,7 @@ test("claude relaunch builds claude --resume <exact> --settings, no bootstrap, v
   const startCalls = [];
   const herdr = { async listAgents() { return { agents: [] }; },
     async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane() { return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv() { return { paneId: "w3:p1" }; },
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
   const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN,
@@ -171,7 +171,7 @@ test("codex relaunch builds `codex resume <exact>` subcommand, no bootstrap, val
   const startCalls = [];
   const herdr = { async listAgents() { return { agents: [] }; },
     async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane() { return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv() { return { paneId: "w3:p1" }; },
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
   const run = { id: RUN_ID, transportIdentity: identity, directory: RUN_DIRECTORY, generation: 1, stateRoot: RUN_STATE_ROOT, controlPlaneBin: RUN_CONTROL_PLANE_BIN, profileName: "codex-worker", harness: "codex",
@@ -202,7 +202,7 @@ test("a resumed codex worker runs under the approved approval policy and sandbox
   const startCalls = [];
   const herdr = { async listAgents() { return { agents: [] }; },
     async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane() { return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv() { return { paneId: "w3:p1" }; },
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
   const run = {
@@ -228,7 +228,7 @@ test("a resumed claude worker carries --permission-mode manual, the flag the old
   const startCalls = [];
   const herdr = { async listAgents() { return { agents: [] }; },
     async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane() { return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv() { return { paneId: "w3:p1" }; },
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
   const run = {
@@ -250,7 +250,7 @@ test("a resumed pi worker carries the profile's --model and arguments when set",
   const startCalls = [];
   const herdr = { async listAgents() { return { agents: [] }; },
     async createTab() { return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane() { return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv() { return { paneId: "w3:p1" }; },
     async startAgent(a) { startCalls.push(a); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {} };
   const run = {
@@ -276,7 +276,7 @@ test("a builder-level failure (assertProfile passes, the argv builder demands mo
   const herdr = {
     async listAgents() { return { agents: [] }; },
     async createTab(args) { herdrCalls.push({ method: "createTab", args }); return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane(args) { herdrCalls.push({ method: "splitPane", args }); return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv(args) { herdrCalls.push({ method: "exportWorkflowEnv", args }); return { paneId: "w3:p1" }; },
     async startAgent(args) { herdrCalls.push({ method: "startAgent", args }); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent(args) { herdrCalls.push({ method: "focusAgent", args }); },
   };
@@ -306,7 +306,7 @@ test("a resume whose identity harness disagrees with the approved profile's harn
   const herdr = {
     async listAgents() { return { agents: [] }; },
     async createTab(args) { herdrCalls.push({ method: "createTab", args }); return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane(args) { herdrCalls.push({ method: "splitPane", args }); return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv(args) { herdrCalls.push({ method: "exportWorkflowEnv", args }); return { paneId: "w3:p1" }; },
     async startAgent(args) { herdrCalls.push({ method: "startAgent", args }); return { agentId: "a", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent(args) { herdrCalls.push({ method: "focusAgent", args }); },
   };
@@ -355,7 +355,7 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
       tabCalls.push(args);
       return { tabId: "w3:t1", paneId: "w3:p0" };
     },
-    async splitPane(args) {
+    async exportWorkflowEnv(args) {
       splitCalls.push(args);
       return { paneId: "w3:p1" };
     },
@@ -406,17 +406,16 @@ test("resumeCommand reports needs-confirmation for a dead pi-session and relaunc
   // A fresh tab is opened with no env (matching Herdr's createTab, which has no env param).
   assert.deepEqual(tabCalls, [{ workspaceId: identity.workspaceId, cwd: identity.cwd, label: "resume-s1", focus: true }]);
 
-  // The WORKFLOW_* env is carried by the split pane under that tab — exactly like the
-  // interactive launch (createTab -> splitPane({ env }) -> startAgent) in execute.js.
+  // The WORKFLOW_* env is exported into the fresh tab's root pane, and the agent starts in
+  // that same pane — exactly like the interactive launch's single-pane layout in execute.js.
   assert.equal(splitCalls.length, 1);
   assert.equal(splitCalls[0].paneId, "w3:p0");
-  assert.equal(splitCalls[0].cwd, identity.cwd);
-  assert.deepEqual(splitCalls[0].env, expectedEnv);
+  assert.deepEqual(splitCalls[0].env, { ...expectedEnv, WORKFLOW_PANE_ID: "w3:p0" });
 
   // argv must resume the exact session (--session-id, no --last/--continue) and reload both
   // workflow extensions, or the resumed pane's widget/telemetry/lifecycle wiring is dead.
   assert.equal(startCalls.length, 1);
-  assert.equal(startCalls[0].paneId, "w3:p1");
+  assert.equal(startCalls[0].paneId, "w3:p0");
   assert.equal(startCalls[0].kind, "pi");
   assert.equal(startCalls[0].timeout, 30000);
   assert.deepEqual(startCalls[0].argv, [
@@ -460,7 +459,7 @@ test("relaunch gives Herdr a valid agent name for a real UUID session id (<=32 c
     async listAgents() { return { agents: [] }; },
     async agentSendKeys() { assert.fail("resume must never send exit keys"); },
     async createTab(args) { tabCalls.push(args); return { tabId: "w3:t1", paneId: "w3:p0" }; },
-    async splitPane() { return { paneId: "w3:p1" }; },
+    async exportWorkflowEnv() { return { paneId: "w3:p1" }; },
     async startAgent(args) { startCalls.push(args); return { agentId: "a9", tabId: "w3:t1", paneId: "w3:p1" }; },
     async focusAgent() {},
   };
@@ -537,7 +536,7 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
       tabCalls.push(args);
       return { tabId: "w3:t1", paneId: "w3:p0" };
     },
-    async splitPane(args) {
+    async exportWorkflowEnv(args) {
       splitCalls.push(args);
       return { paneId: "w3:p1" };
     },
@@ -584,7 +583,7 @@ test("resumeCommand resolves its own run store from stateRoot (registry state_ro
     WORKFLOW_CONTROL_PLANE_BIN: RUN_CONTROL_PLANE_BIN,
   };
   assert.equal(splitCalls.length, 1);
-  assert.deepEqual(splitCalls[0].env, expectedEnv);
+  assert.deepEqual(splitCalls[0].env, { ...expectedEnv, WORKFLOW_PANE_ID: splitCalls[0].paneId });
   assert.equal(startCalls.length, 1);
 
   // The confirmed relaunch's persistence write must have landed through the resolved store:

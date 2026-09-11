@@ -266,6 +266,10 @@ function createFakeHerdr({ repoKey }) {
       workspace.panes.push(pane);
       return { paneId: pane.pane_id };
     },
+    async exportWorkflowEnv({ paneId, env }) {
+      calls.push({ kind: "herdr.pane.exportEnv", paneId, env });
+      return { exported: Object.keys(env ?? {}).length };
+    },
     async startAgent({ name, paneId, kind, argv, focus }) {
       calls.push({ kind: "herdr.agent.start", name, paneId, harnessKind: kind, argv, focus });
       const workspace = [...workspacesByPath.values()].find((candidate) => candidate.panes.some((pane) => pane.pane_id === paneId));

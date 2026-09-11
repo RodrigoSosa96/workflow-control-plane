@@ -24,9 +24,32 @@
 // `runLifecycleHook({ harness: "claude" | "codex", ... })`. A run is single-harness, so the
 // marker fields never collide even though they share the run record — no per-harness rename is
 // needed beyond the `${harness}` prefix already baked into the field names below.
+import { spawn } from "node:child_process";
 import { RUN_STATES } from "../../src/workflow/run-state.js";
 import { notifyRun, notifyStop } from "../../src/workflow/notifier.js";
 import { recordHookDebug } from "./hook-debug-log.mjs";
+
+// When a run reaches a terminal stop, the pane that hosted the worker stops being a live agent
+// and becomes residue; renaming it to name the run and the outcome is what keeps a finished
+// tab readable instead of anonymous. Best-effort, bounded, and invisible on failure — a pane
+// rename must never break a lifecycle hook. `WORKFLOW_PANE_ID` arrives via the launcher's
+// exportWorkflowEnv into the pane shell the worker runs in.
+async function renamePaneOnTerminalStop({ env, runId, action, debug, spawnFn = spawn }) {
+  const paneId = env?.WORKFLOW_PANE_ID;
+  if (typeof paneId !== "string" || paneId.length === 0) return;
+  const shortId = typeof runId === "string" ? runId.slice(0, 8) : "unknown";
+  try {
+    await new Promise((resolve) => {
+      const child = spawnFn("herdr", ["pane", "rename", paneId, `run ${shortId} — ${action}`], { stdio: "ignore" });
+      const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5000);
+      timer.unref?.();
+      child.on("error", () => { clearTimeout(timer); resolve(); });
+      child.on("close", () => { clearTimeout(timer); resolve(); });
+    });
+  } catch (error) {
+    await debug?.("pane-rename", error);
+  }
+}
 
 // Maps a lifecycle.onStop action to a telemetry phase. The telemetry phase vocabulary is
 // fixed (see TELEMETRY_PHASES), so the neutral run states are projected onto the closest
@@ -90,6 +113,7 @@ export async function runLifecycleHook({
   telemetry,
   hasValidHandoff,
   recordDebug = recordHookDebug,
+  spawnFn,
 } = {}) {
   const debug = async (scope, error) => {
     // Called from the outermost catch, so it must tolerate a missing env rather
@@ -148,6 +172,7 @@ export async function runLifecycleHook({
           // swallow: a notifier must never break the lifecycle hook
           await debug("notify-stop", error);
         }
+        await renamePaneOnTerminalStop({ env, runId, action, debug, ...(spawnFn ? { spawnFn } : {}) });
       }
       if (action === "continue") {
         // Mark the continuation BEFORE returning the harness-neutral decision, so the

@@ -339,21 +339,6 @@ function runtimeFailureReason(process, processInfo) {
   return `Runtime process ${process.id} has mismatched executable or command evidence`;
 }
 
-function paneHarness(pane) {
-  return pane?.agent ?? pane?.agent_session?.agent ?? pane?.agentSession?.agent ?? null;
-}
-
-function matchesExpectedHarnessPane(pane, expectedHarness) {
-  return paneHarness(pane) === expectedHarness;
-}
-
-function isIdleBootstrapPane(pane) {
-  if (!pane) return false;
-  if (pane.agent || pane.agent_session || pane.agent_status) return false;
-  if (pane.command || pane.foreground_command || pane?.process?.command) return false;
-  return true;
-}
-
 function readKnownOpenContext(worktreeOperation) {
   const reconciliation = worktreeOperation.reconciliation ?? {};
   return {
@@ -416,9 +401,9 @@ function ensureStartShape({ herdr, worktreeOperation, workspaceOperation, agentT
   }
   if (typeof herdr.ensureNativeWorktree !== "function"
     || typeof herdr.renameTab !== "function"
-    || typeof herdr.splitPane !== "function"
+    || typeof herdr.exportWorkflowEnv !== "function"
     || typeof herdr.startAgent !== "function") {
-    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, split, and agent methods", {}, 10);
+    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, env, and agent methods", {}, 10);
   }
   if (!worktreeOperation || !workspaceOperation || !agentTabOperation || !agentOperation) {
     fail("PREFLIGHT", "executeStart requires ordinary start operations for worktree, workspace, agent-tab, and agent", {
@@ -669,34 +654,6 @@ async function recoverStartedAgent({ herdr, error, paneId, tabId }) {
   };
 }
 
-async function verifyCloseSafety({ herdr, workspaceId, expectedTabId, bootstrapPaneId, startedAgent, expectedHarness }) {
-  if (typeof herdr.listTabs !== "function" || typeof herdr.listPanes !== "function") {
-    return false;
-  }
-
-  const tabs = listValue(await herdr.listTabs({ workspaceId }), "tabs");
-  const panes = listValue(await herdr.listPanes({ workspaceId }), "panes");
-
-  const startedTabExists = tabs.some((tab) => getTabId(tab) === startedAgent.tabId && getWorkspaceId(tab) === workspaceId);
-  const startedPane = panes.find((pane) => (
-    getPaneId(pane) === startedAgent.paneId
-      && getTabId(pane) === startedAgent.tabId
-      && getWorkspaceId(pane) === workspaceId
-  ));
-  const bootstrapPane = panes.find((pane) => (
-    getPaneId(pane) === bootstrapPaneId
-      && getTabId(pane) === expectedTabId
-      && getWorkspaceId(pane) === workspaceId
-  ));
-
-  if (!startedTabExists) return false;
-  if (startedAgent.tabId !== expectedTabId) return false;
-  if (!startedPane || !matchesExpectedHarnessPane(startedPane, expectedHarness)) return false;
-  if (!bootstrapPane || !isIdleBootstrapPane(bootstrapPane)) return false;
-  if (getPaneId(bootstrapPane) === getPaneId(startedPane)) return false;
-  return true;
-}
-
 function childAliasFromOperation(operation) {
   if (operation?.id?.startsWith("child-worktree:")) return operation.id.slice("child-worktree:".length);
   if (operation?.id?.startsWith("child-tab:")) return operation.id.slice("child-tab:".length);
@@ -754,9 +711,9 @@ function ensureGroupStartShape({ git, herdr, metaWorktreeOperation, coordinatorT
   if (typeof herdr.ensureNativeWorktree !== "function"
     || typeof herdr.renameTab !== "function"
     || typeof herdr.createTab !== "function"
-    || typeof herdr.splitPane !== "function"
+    || typeof herdr.exportWorkflowEnv !== "function"
     || typeof herdr.startAgent !== "function") {
-    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, split, and agent methods", {}, 10);
+    fail("PREFLIGHT", "executeStart requires Herdr worktree, tab, env, and agent methods", {}, 10);
   }
   if (!metaWorktreeOperation || !coordinatorTabOperation || !agentOperation || childWorktreeOperations.length === 0 || childTabOperations.length === 0) {
     fail("PREFLIGHT", "executeStart requires group start operations for meta worktree, child worktrees, coordinator tab, child tabs, and agent", {
@@ -782,13 +739,11 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessio
 
   let ensured;
   let bootstrapContext = null;
-  let bootstrapCreatedFromReturnedRootPane = false;
   let currentOperation = worktreeOperation;
 
   try {
     ensured = await ensureWorktreeStart(worktreeOperation, herdr);
     bootstrapContext = ensured.result ?? null;
-    bootstrapCreatedFromReturnedRootPane = Boolean(ensured.mutated);
 
     report.operations.push(buildOperationReport(worktreeOperation, ensured.status));
     completedIds.add(worktreeOperation.id);
@@ -831,18 +786,16 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessio
       cwd: plan.agent.worktreePath,
       run: plan.run ?? null,
     });
-    const agentPane = await herdr.splitPane({
-      paneId: agentTabPaneId,
-      direction: "down",
-      cwd: plan.agent.worktreePath,
-      env: launch.env,
-      focus: false,
-    });
+    // The agent starts directly in the agent tab's root pane: a fresh tab's root pane is already
+    // an idle interactive shell at the worktree cwd, so no split is needed and no bootstrap shell
+    // is left behind. The WORKFLOW_* env the split used to carry is exported into that shell
+    // first; startAgent's agent_pane_busy retry absorbs the millisecond-scale export window.
+    await herdr.exportWorkflowEnv({ paneId: agentTabPaneId, env: { ...launch.env, WORKFLOW_PANE_ID: agentTabPaneId } });
     const startedAgent = await startAgentProcess({
       herdr,
       plan,
       launch,
-      paneId: agentPane.paneId,
+      paneId: agentTabPaneId,
       tabId: agentTabId,
     });
 
@@ -860,46 +813,6 @@ async function executeOrdinaryStart(plan, { herdr, buildAgentLaunch, codexSessio
       ...(sessionIdentity ? { sessionIdentity } : {}),
     }));
     completedIds.add(agentOperation.id);
-
-    if (bootstrapCreatedFromReturnedRootPane && typeof herdr.closePane === "function") {
-      const bootstrapPaneId = bootstrapContext?.paneId ?? ensured.result?.paneId ?? null;
-      const expectedTabId = agentTabId ?? bootstrapContext?.tabId ?? ensured.result?.tabId ?? null;
-      let canClose = false;
-
-      if (isNonEmptyString(workspaceId)
-        && isNonEmptyString(bootstrapPaneId)
-        && isNonEmptyString(expectedTabId)
-        && isNonEmptyString(startedAgent?.paneId)) {
-        try {
-          canClose = await verifyCloseSafety({
-            herdr,
-            workspaceId,
-            expectedTabId,
-            bootstrapPaneId,
-            startedAgent,
-          expectedHarness: plan.agent.harness ?? "pi",
-          });
-        } catch (error) {
-          report.notes.push(`Retained the bootstrap shell pane because the post-start close safety inspection failed: ${error.message}`);
-        }
-      }
-
-      if (canClose) {
-        // Closing the leftover bootstrap shell pane is cosmetic cleanup — the agent is already
-        // started. A failure here must never propagate to the outer catch (which would flip the
-        // whole start to "partial" and make the launch report a failed run for a running worker);
-        // record it as a note instead, mirroring the verifyCloseSafety failure handling above.
-        try {
-          await herdr.closePane({ paneId: bootstrapPaneId });
-        } catch (error) {
-          report.notes.push(`Retained the bootstrap shell pane because closing it failed: ${error.message}`);
-        }
-      } else if (report.notes.length === 0) {
-        report.notes.push("Retained the bootstrap shell pane because the close safety checks did not pass.");
-      }
-    } else if (bootstrapContext?.paneId ?? ensured.result?.paneId) {
-      report.notes.push("Retained the bootstrap shell pane because the close safety checks did not pass.");
-    }
 
     return report;
   } catch (error) {
@@ -948,7 +861,6 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
 
   let ensured;
   let bootstrapContext = null;
-  let bootstrapCreatedFromReturnedRootPane = false;
   let currentOperation = metaWorktreeOperation;
 
   try {
@@ -956,7 +868,6 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
 
     ensured = await ensureWorktreeStart(metaWorktreeOperation, herdr);
     bootstrapContext = ensured.result ?? null;
-    bootstrapCreatedFromReturnedRootPane = Boolean(ensured.mutated);
 
     report.operations.push(buildOperationReport(metaWorktreeOperation, ensured.status));
     completedIds.add(metaWorktreeOperation.id);
@@ -1064,18 +975,14 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
       cwd: plan.agent.worktreePath,
       run: plan.run ?? null,
     });
-    const agentPane = await herdr.splitPane({
-      paneId: coordinatorTabPaneId,
-      direction: plan.agentSplit ?? "down",
-      cwd: plan.agent.worktreePath,
-      env: launch.env,
-      focus: false,
-    });
+    // Same single-pane layout as the ordinary lane: the agent starts in the coordinator tab's
+    // root pane, with the WORKFLOW_* env exported into that shell first.
+    await herdr.exportWorkflowEnv({ paneId: coordinatorTabPaneId, env: { ...launch.env, WORKFLOW_PANE_ID: coordinatorTabPaneId } });
     const startedAgent = await startAgentProcess({
       herdr,
       plan,
       launch,
-      paneId: agentPane.paneId,
+      paneId: coordinatorTabPaneId,
       tabId: coordinatorTabId,
     });
 
@@ -1092,41 +999,6 @@ async function executeGroupStart(plan, { git, herdr, buildAgentLaunch, codexSess
       ...(sessionIdentity ? { sessionIdentity } : {}),
     }));
     completedIds.add(agentOperation.id);
-
-    const retainCoordinatorShell = plan.retainCoordinatorShell === true;
-    if (!retainCoordinatorShell && typeof herdr.closePane === "function") {
-      const bootstrapPaneId = coordinatorTabPaneId;
-      const expectedTabId = coordinatorTabId;
-      let canClose = false;
-      if (isNonEmptyString(workspaceId)
-        && isNonEmptyString(bootstrapPaneId)
-        && isNonEmptyString(expectedTabId)
-        && isNonEmptyString(startedAgent?.paneId)) {
-        try {
-          canClose = await verifyCloseSafety({
-            herdr,
-            workspaceId,
-            expectedTabId,
-            bootstrapPaneId,
-            startedAgent,
-            expectedHarness: plan.agent.harness ?? "pi",
-          });
-        } catch (error) {
-          report.notes.push(`Retained the coordinator bootstrap shell pane because the post-start close safety inspection failed: ${error.message}`);
-        }
-      }
-      if (canClose) {
-        try {
-          await herdr.closePane({ paneId: bootstrapPaneId });
-        } catch (error) {
-          report.notes.push(`Retained the coordinator bootstrap shell pane because closing it failed: ${error.message}`);
-        }
-      } else if (report.notes.length === 0) {
-        report.notes.push("Retained the coordinator bootstrap shell pane because the close safety checks did not pass.");
-      }
-    } else if (retainCoordinatorShell && (bootstrapCreatedFromReturnedRootPane || coordinatorTabPaneId)) {
-      report.notes.push("Retained the coordinator bootstrap shell pane for manual cross-repository coordination.");
-    }
 
     return report;
   } catch (error) {
